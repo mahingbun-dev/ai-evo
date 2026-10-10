@@ -1,0 +1,377 @@
+import axios from 'axios'
+
+const request = axios.create({
+  baseURL: '/api/v1',
+  timeout: 60000,
+  withCredentials: true
+})
+
+// ==================== 本地登录 token 管理 ====================
+const TOKEN_KEY = 'ai_evo_token'
+
+export const getToken = () => localStorage.getItem(TOKEN_KEY) || ''
+export const setToken = (token) => localStorage.setItem(TOKEN_KEY, token)
+export const clearToken = () => localStorage.removeItem(TOKEN_KEY)
+// WebSocket 连接用：以 query 参数携带 token（握手阶段无法自定义 header）
+export const getWsTokenQuery = () =>
+  getToken() ? `?token=${encodeURIComponent(getToken())}` : ''
+
+// 请求拦截器：注入 Authorization: Bearer <token>
+request.interceptors.request.use(
+  config => {
+    const token = getToken()
+    if (token) {
+      config.headers['Authorization'] = `Bearer ${token}`
+    }
+    return config
+  },
+  error => {
+    return Promise.reject(error)
+  }
+)
+
+// 响应拦截器
+request.interceptors.response.use(
+  response => {
+    // 需要读取响应头（如下载文件名）的场景，通过 rawResponse 取回完整响应
+    if (response.config?.rawResponse) {
+      return response
+    }
+    return response.data
+  },
+  async error => {
+    // 401：登录态失效，清除本地 token 并跳转登录页
+    // 登录/注册接口自身的 401（密码错误等）不触发跳转，正常走错误提示
+    if (error.response?.status === 401) {
+      const reqUrl = error.config?.url || ''
+      const isAuthRequest = reqUrl.includes('/auth/login') || reqUrl.includes('/auth/register')
+      if (!isAuthRequest) {
+        clearToken()
+        if (!window.location.pathname.startsWith('/login')) {
+          const redirect = encodeURIComponent(window.location.pathname + window.location.search)
+          window.location.href = `/login?redirect=${redirect}`
+          return new Promise(() => {}) // 阻止后续错误处理
+        }
+      }
+    }
+
+    // responseType 为 blob 时，后端返回的 JSON 错误体也是 Blob，先解析出 detail
+    let payload = error.response?.data
+    if (payload instanceof Blob) {
+      try {
+        payload = JSON.parse(await payload.text())
+        error.response.data = payload
+      } catch {
+        // 不是 JSON，保持原样
+      }
+    }
+
+    // 提取后端返回的错误消息
+    if (error.response && payload) {
+      const detail = payload.detail
+      if (detail) {
+        // 创建新错误对象，包含后端返回的详细错误消息
+        const customError = new Error(typeof detail === 'string' ? detail : JSON.stringify(detail))
+        customError.response = error.response
+        return Promise.reject(customError)
+      }
+    }
+    return Promise.reject(error)
+  }
+)
+
+export default request
+
+// 模型配置API
+export const modelApi = {
+  list: (params) => request.get('/models', { params }),
+  get: (id) => request.get(`/models/${id}`),
+  create: (data) => request.post('/models', data),
+  update: (id, data) => request.put(`/models/${id}`, data),
+  delete: (id) => request.delete(`/models/${id}`),
+  getVariables: (id) => request.get(`/models/${id}/variables`),
+  parseCurl: (curlCommand) => request.post('/models/parse-curl', { curl_command: curlCommand })
+}
+
+// 裁判模型API
+export const judgeApi = {
+  list: (params) => request.get('/judge-models', { params }),
+  get: (id) => request.get(`/judge-models/${id}`),
+  create: (data) => request.post('/judge-models', data)
+}
+
+// Claude Code 裁判全局配置API
+export const claudeCodeApi = {
+  getConfig: () => request.get('/claude-code-config'),
+  update: (data) => request.put('/claude-code-config', data),
+  test: () => request.post('/claude-code-config/test')
+}
+
+// DeepSeek Harness 裁判全局配置API
+export const deepSeekHarnessApi = {
+  getConfig: () => request.get('/deepseek-harness-config'),
+  update: (data) => request.put('/deepseek-harness-config', data),
+  test: () => request.post('/deepseek-harness-config/test')
+}
+
+// 评测前处理脚本API
+export const preJudgeScriptApi = {
+  list: (params) => request.get('/pre-judge-scripts', { params }),
+  get: (id) => request.get(`/pre-judge-scripts/${id}`),
+  create: (data) => request.post('/pre-judge-scripts', data),
+  update: (id, data) => request.put(`/pre-judge-scripts/${id}`, data),
+  delete: (id) => request.delete(`/pre-judge-scripts/${id}`),
+  debug: (id, data) => request.post(`/pre-judge-scripts/${id}/debug`, data),
+  // 导出单个脚本（含 entrypoint/契约 JSON），responseType blob 供前端触发下载
+  export: (id) => request.get(`/pre-judge-scripts/${id}/export`, { responseType: 'blob' }),
+  // 上传 script 类型脚本的 .py 文件（multipart 字段 file），服务端存 uploads/pre_judge_scripts/{id}.py；
+  // 阶段E起可附带 risk_acknowledged / declared_requirements 表单字段（风险声明 / 依赖声明 JSON 数组字符串）
+  uploadFile: (id, formData) => request.post(`/pre-judge-scripts/${id}/upload`, formData, {
+    headers: { 'Content-Type': 'multipart/form-data' }
+  }),
+  // ---------- 脚本包 / 多文件管理接口（供脚本库后续阶段的编辑器与包导入导出使用） ----------
+  // 从预置模板创建脚本（JSON body：模板标识与初始参数）
+  createFromTemplate: (data) => request.post('/pre-judge-scripts/from-template', data),
+  // 导入脚本包（唯一导入通道，multipart：files 与 relative_paths 一一对应 + overwrite；
+  // 单 .py / .json 契约导入已下线，后端 POST /pre-judge-scripts/import 端点已删除）
+  importPackage: (formData) => request.post('/pre-judge-scripts/import-package', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' }
+  }),
+  // 导出脚本包（契约 + 全量文件打包为 zip），responseType blob 供前端触发下载
+  exportPackage: (id) => request.get(`/pre-judge-scripts/${id}/export-package`, { responseType: 'blob' }),
+  // 脚本文件列表（script 类型多文件管理）
+  listFiles: (id) => request.get(`/pre-judge-scripts/${id}/files`),
+  // 读取单个脚本文件内容（按 path 定位）
+  readFile: (id, path) => request.get(`/pre-judge-scripts/${id}/file`, { params: { path } }),
+  // 保存（覆盖）单个脚本文件内容；非 2xx（如 409 冲突）经响应拦截器抛错并保留 e.response.status 可查
+  saveFile: (id, data) => request.put(`/pre-judge-scripts/${id}/file`, data),
+  // 新建脚本文件
+  createFile: (id, data) => request.post(`/pre-judge-scripts/${id}/file`, data),
+  // 删除脚本文件（按 path 定位）
+  deleteFile: (id, path) => request.delete(`/pre-judge-scripts/${id}/file`, { params: { path } }),
+  // 重命名/移动脚本文件
+  renameFile: (id, data) => request.post(`/pre-judge-scripts/${id}/file/rename`, data),
+  // 上传 zip 脚本包（multipart 字段 file，包根必须含 main.py，≤20MB；可附带风险/依赖声明）
+  uploadPackage: (id, formData) => request.post(`/pre-judge-scripts/${id}/upload-package`, formData, {
+    headers: { 'Content-Type': 'multipart/form-data' }
+  }),
+  // 脚手架模板列表（阶段E）：{total, items:[{name, title, description, filename, size, download_path}]}
+  listTemplates: () => request.get('/pre-judge-scripts/templates'),
+  // 下载脚手架模板 zip（blob 保存）
+  // 注意：templates 列表返回的 download_path 缺 /api/v1 前缀（后端已知问题，不改后端）——
+  // 这里统一剥掉可能存在的 /api/v1 前缀后交给 axios 实例（baseURL=/api/v1）拼接，两种形态都能工作
+  downloadTemplate: (tpl) => {
+    const fallback = `/pre-judge-scripts/templates/${encodeURIComponent(tpl?.name || '')}/download`
+    const path = String(tpl?.download_path || fallback).replace(/^\/api\/v1/, '')
+    return request.get(path, { responseType: 'blob' })
+  }
+}
+
+// 评测指令API
+export const instructionApi = {
+  list: (params) => request.get('/instruction/config', { params }),
+  create: (data) => request.post('/instruction/config', data),
+  update: (id, data) => request.put(`/instruction/config/${id}`, data),
+  delete: (id) => request.delete(`/instruction/config/${id}`),
+  preview: (data) => request.post('/instruction/preview', data),
+  scenes: () => request.get('/instruction/scenes'),
+  // 批量迁移旧版评测模板（steps 合并进 score_details，幂等；返回 {total, migrated, skipped, errors}）
+  migrateAllLegacy: () => request.post('/instruction/configs/migrate-legacy-all')
+}
+
+// 数据集API
+export const datasetApi = {
+  list: (params) => request.get('/evaluation/datasets', { params }),
+  get: (id) => request.get(`/evaluation/datasets/${id}`),
+  create: (data) => request.post('/evaluation/datasets', data),
+  update: (id, data) => request.put(`/evaluation/datasets/${id}`, data),
+  delete: (id) => request.delete(`/evaluation/datasets/${id}`),
+  cleanupDuplicates: () => request.post('/evaluation/datasets/cleanup-duplicates'),
+  // 下载模板
+  downloadTemplate: () => request.get('/evaluation/datasets/download-template', { responseType: 'blob' }),
+  // 导出数据集为 Excel（rawResponse 取回完整响应，用于解析 Content-Disposition 中的文件名）
+  exportExcel: (id) => request.get(`/evaluation/datasets/${id}/export/excel`, {
+    responseType: 'blob',
+    rawResponse: true
+  }),
+  // 获取数据集字段结构
+  getFields: (id) => request.get(`/evaluation/datasets/${id}/fields`),
+  // 预览导入（支持动态字段）
+  previewImportV2: (id, formData) => request.post(`/evaluation/datasets/${id}/import/preview/v2`, formData, {
+    headers: { 'Content-Type': 'multipart/form-data' }
+  }),
+  // 删除预览阶段上传的临时文件
+  deleteTempFile: (datasetId, dataIndex, tempFileId, field = 'answer') => request.delete(`/evaluation/datasets/${datasetId}/import/preview/temp-file/${tempFileId}?data_index=${dataIndex}&field=${field}`),
+  // 确认导入（编辑态追加大库 + 慢环境 confirm 耗时可达分钟级，与 from-hub 同样放宽超时）
+  confirmImport: (id, formData) => request.post(`/evaluation/datasets/${id}/import/confirm`, formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+    timeout: 600000
+  }),
+  // Agent 会话文件导入预览（multipart，文件字段名 files）
+  previewSessionImport: (formData) => request.post('/evaluation/datasets/import/sessions/preview', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' }
+  }),
+  // Agent 会话文件导入确认（multipart，文件字段名 files）
+  confirmSessionImport: (formData) => request.post('/evaluation/datasets/import/sessions/confirm', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' }
+  }),
+  // 从 anc-hub 拉取会话文件并导入（JSON：{file_ids, name, description, real_dataset_id}）
+  // 同步链路含大包下载解包（执行包可达几十 MB），超时放宽到 10 分钟
+  importSessionsFromHub: (data) => request.post('/evaluation/datasets/import/sessions/from-hub', data, { timeout: 600000 }),
+  dataListV2: (id, params) => request.get(`/evaluation/datasets/${id}/data/v2`, { params }),
+  addData: (id, data) => request.post(`/evaluation/datasets/${id}/data`, data),
+  updateData: (datasetId, dataId, data) => request.put(`/evaluation/datasets/${datasetId}/data/${dataId}`, data),
+  deleteData: (dataId) => request.delete(`/evaluation/datasets/data/${dataId}`),
+  getDataFiles: (datasetId, dataId, field) => request.get(`/evaluation/datasets/${datasetId}/data/${dataId}/files`, { params: { field } }),
+  deleteDataFile: (datasetId, dataId, fileId, field = 'answer') => request.delete(`/evaluation/datasets/${datasetId}/data/${dataId}/files/${fileId}?field=${field}`)
+}
+
+// anc-hub 文件API（file_query 透传，驱动「从 anc-hub 导入」页签远端浏览；阶段D 扩展文件树/预览/下载/匹配预览）
+export const hubApi = {
+  queryFiles: (data) => request.post('/hub-files/query', data),
+  // 执行包文件树（登记表 file_index，零文件 IO）：{file_id, unpack_status, file_index:[{path,type,size,is_nested_zip}]}
+  getFileTree: (fileId) => request.get(`/hub-files/${encodeURIComponent(fileId)}/tree`),
+  // 嵌套 zip 内层清单：{file_id, path, entries:[...]}
+  getNestedTree: (fileId, path) => request.get(`/hub-files/${encodeURIComponent(fileId)}/nested-tree`, { params: { path } }),
+  // 文本类预览（JSON 返回 {content, mime, truncated}）；图片同样走此接口但需 blob 方式（见 getFileContentBlob）
+  getFileContent: (fileId, path) => request.get(`/hub-files/${encodeURIComponent(fileId)}/content`, { params: { path } }),
+  // 图片预览（content 接口对图片返回 FileResponse，走 blob 转 objectURL 展示，鉴权随 cookie）
+  getFileContentBlob: (fileId, path) => request.get(`/hub-files/${encodeURIComponent(fileId)}/content`, { params: { path }, responseType: 'blob' }),
+  // 下载包内任意文件（blob 保存，中文文件名后端已 URL 编码）
+  downloadFile: (fileId, path) => request.get(`/hub-files/${encodeURIComponent(fileId)}/download`, { params: { path }, responseType: 'blob' }),
+  // glob 匹配预览：{matched_count, sample_paths[], sample_data_index}
+  matchPreview: (data) => request.post('/hub-files/match-preview', data),
+  // 人工补传文件（multipart：files ×N + relative_paths ×N + target_dir；zip 后端自动解压）
+  // → {file_id, added_count, added:[{path,size}], overwritten:[被覆盖路径]}
+  uploadSupplements: (fileId, formData) => request.post(
+    `/hub-files/${encodeURIComponent(fileId)}/supplements`,
+    formData,
+    { headers: { 'Content-Type': 'multipart/form-data' }, timeout: 300000 }
+  ),
+  // 删除单个人工补传文件（原始执行包文件只读，后端拒删）→ {file_id, deleted, remaining_count}
+  deleteSupplement: (fileId, path) => request.delete(`/hub-files/${encodeURIComponent(fileId)}/supplements`, { params: { path } })
+}
+
+// anc-hub 执行包批量导入任务API（阶段C）
+export const hubImportApi = {
+  // 创建导入 job（JSON：{file_ids, name, description, real_dataset_id}）→ {id(job_id), dataset_id, status, total_count, ...}
+  createJob: (data) => request.post('/evaluation/datasets/import/hub-files', data),
+  // 查询导入进度：{status, total_count, success_count, fail_count, fail_detail}
+  getJob: (jobId) => request.get(`/hub-import-jobs/${encodeURIComponent(jobId)}`),
+  // 重跑失败项（幂等，已成功的不重复导入）
+  retryJob: (jobId) => request.post(`/hub-import-jobs/${encodeURIComponent(jobId)}/retry`)
+}
+
+// 统计API
+export { statsApi, coverageApi, efficiencyApi } from './stats'
+
+// 评测任务API
+export const taskApi = {
+  list: (params) => request.get('/evaluation/tasks', { params }),
+  get: (id) => request.get(`/evaluation/tasks/${id}`),
+  getConfig: (id) => request.get(`/evaluation/tasks/${id}/config`),
+  create: (data) => request.post('/evaluation/tasks', data),
+  update: (id, data) => request.put(`/evaluation/tasks/${id}`, data),
+  delete: (id) => request.delete(`/evaluation/tasks/${id}`),
+  run: (id) => request.post(`/evaluation/tasks/${id}/run`),
+  stop: (id) => request.post(`/evaluation/tasks/${id}/stop`),
+  executions: (id, params) => request.get(`/evaluation/tasks/${id}/executions`, { params }),
+  getDatasetFields: (datasetId) => request.get(`/evaluation/tasks/datasets/${datasetId}/fields`),
+  // 迁移单个旧版任务配置（steps 合并进 score_details、pre_scripts 转为 script_output 待评测数据行，幂等）
+  migrateConfig: (id) => request.post(`/evaluation/tasks/${id}/migrate-config`),
+  // 批量迁移全部旧版任务配置（幂等；返回 {total, migrated, skipped, errors}）
+  migrateAllLegacy: () => request.post('/evaluation/tasks/migrate-legacy-all')
+}
+
+// 评测结果API
+export const resultApi = {
+  get: (id) => request.get(`/evaluation/results/${id}`),
+  history: (id, params) => request.get(`/evaluation/results/${id}/history`, { params })
+}
+
+// 批量操作API
+export const batchApi = {
+  run: (taskIds) => request.post('/evaluation/tasks/batch-run', { task_ids: taskIds }),
+  delete: (taskIds) => request.post('/evaluation/tasks/batch-delete', { task_ids: taskIds }),
+  stop: (taskIds) => request.post('/evaluation/tasks/batch-stop', { task_ids: taskIds })
+}
+
+// A/B 测试API
+export const abTestApi = {
+  listSessions: (params) => request.get('/ab-test/sessions', { params }),
+  getSession: (id) => request.get(`/ab-test/sessions/${id}`),
+  saveSession: (data) => request.post('/ab-test/sessions', data),
+  deleteSession: (id) => request.delete(`/ab-test/sessions/${id}`)
+}
+
+// 用户文档API
+export const docsApi = {
+  getUserGuide: () => request.get('/docs/user-guide'),
+  updateUserGuide: (content) => request.put('/docs/user-guide', { content })
+}
+
+// 团队管理API（V2 新增）
+export const teamApi = {
+  list: (params) => request.get('/teams', { params }),
+  getMembers: (teamCode, params) => request.get(`/teams/${teamCode}/members`, { params }),
+  setMemberStatus: (teamCode, userCode, isActive) => request.patch(`/teams/${teamCode}/members/${userCode}/status`, { is_active: isActive })
+}
+
+// 审计日志API（V2 新增）
+export const auditApi = {
+  list: (params) => request.get('/audit-logs', { params })
+}
+
+// 认证API（本地账号密码登录）
+export const authApi = {
+  status: () => request.get('/auth/status'),
+  register: (data) => request.post('/auth/register', data),
+  login: (data) => request.post('/auth/login', data),
+  logout: () => request.post('/auth/logout')
+}
+
+// OSS 直传上传API（企业内网 OSS 可选功能，地址经 VITE_OSS_BASE_URL 构建时注入；未配置则功能不可用）
+const OSS_BASE_URL = import.meta.env.VITE_OSS_BASE_URL || ''
+const OSS_TENANT_CODE = import.meta.env.VITE_OSS_TENANT_CODE || ''
+
+export const ossApi = {
+  get enabled() {
+    return Boolean(OSS_BASE_URL)
+  },
+  ossUrlPattern: OSS_BASE_URL
+    ? new RegExp(`^https?://${OSS_BASE_URL.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/api-oss/public/oss/file/hashDownload/.+\\.\\w+$`)
+    : null,
+  /**
+   * 上传文件到 OSS
+   * @param {File} file - 要上传的文件
+   * @returns {Promise<string>} - 返回 download URL
+   */
+  upload: async (file) => {
+    if (!OSS_BASE_URL) {
+      throw new Error('OSS 上传未配置（缺少 VITE_OSS_BASE_URL）')
+    }
+    const ossRequest = axios.create({
+      baseURL: OSS_BASE_URL,
+      timeout: 60000,
+      withCredentials: true
+    })
+    ossRequest.interceptors.request.use(config => {
+      if (OSS_TENANT_CODE) {
+        config.headers['tenantCode'] = OSS_TENANT_CODE
+      }
+      return config
+    })
+    const formData = new FormData()
+    formData.append('bucket', 'uap')
+    formData.append('businessKey', 'default')
+    formData.append('publicRead', '1')
+    formData.append('file', file)
+    const response = await ossRequest.post('/api-oss/oss/file/v2/upload', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' }
+    })
+    // 从响应中解析 download URL
+    const data = response.data
+    const downloadUrl = data?.data?.downUrl || ''
+    return downloadUrl
+  }
+}

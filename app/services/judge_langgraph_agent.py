@@ -1,0 +1,171 @@
+"""
+Judge LangGraph Agent — 主类
+
+提供:
+1. Graph 实例缓存 (同一 task 的图只编译一次)
+2. 单裁判执行 (run)
+3. 多裁判并行执行 (run_parallel)
+4. LangFuse 追踪集成
+"""
+import json
+import logging
+from typing import Dict, Any, List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from langgraph.graph.state import CompiledStateGraph
+from .judge_graph_builder import compile_judge_graph
+from .judge_graph_state import JudgeAgentState
+import uuid
+
+logger = logging.getLogger(__name__)
+
+
+class JudgeLangGraphAgent:
+    """
+    LangGraph 裁判 Agent。
+
+    同一个 task 的 graph 实例可缓存复用，
+    因为拓扑只由 evaluation_metrics 决定，不随数据变化。
+
+    用法:
+        agent = JudgeLangGraphAgent(task, langfuse_host="https://langfuse.example.com")
+        results = agent.run_parallel(state_input, judge_count=6)
+    """
+
+    # 类级别缓存: {task_id: CompiledStateGraph}
+    _graph_cache: Dict[str, CompiledStateGraph] = {}
+
+    def __init__(
+        self,
+        task,
+        langfuse_host: str = "",
+    ):
+        """
+        Args:
+            task: 评测任务对象
+            langfuse_host: LangFuse 服务地址，用于构造 trace URL。为空时不创建 trace。
+        """
+        self.task = task
+        self.langfuse_host = langfuse_host
+
+        # 缓存 Graph
+        cache_key = str(task.id)
+        if cache_key not in self._graph_cache:
+            self._graph_cache[cache_key] = compile_judge_graph(task)
+        self.graph = self._graph_cache[cache_key]
+
+    def run(
+        self,
+        state_input: JudgeAgentState,
+        judge_index: int = 0,
+    ) -> Dict[str, Any]:
+        """
+        执行单个裁判的完整评测流程。
+
+        Args:
+            state_input: 初始状态
+            judge_index: 裁判索引 (用于 LangFuse 区分)
+
+        Returns:
+            裁判评分结果 (与 JudgeClient.judge() 兼容)
+        """
+        trace_id = None
+        trace_url = None
+        handler = None
+
+        if self.langfuse_host:
+            try:
+                from langfuse.langchain import CallbackHandler
+
+                trace_id = uuid.uuid4().hex  # 32位小写十六进制，LangFuse v4 要求的格式
+                handler = CallbackHandler(trace_context={"trace_id": trace_id})
+                trace_url = f"{self.langfuse_host.rstrip('/')}/trace/{trace_id}"
+            except Exception as e:
+                logger.warning(f"[JudgeAgent] 创建 LangFuse trace 失败: {e}")
+                trace_id = None
+                trace_url = None
+                handler = None
+
+        config = {
+            "metadata": {
+                "langfuse_session_id": f"{state_input['task_id']}_judge_{judge_index}",
+                "langfuse_tags": [f"judge_{judge_index}", "langgraph_judge"],
+            }
+        }
+        if handler:
+            config["callbacks"] = [handler]
+
+        try:
+            result_state = self.graph.invoke(state_input, config)
+        except Exception as e:
+            logger.exception(f"[JudgeAgent] 裁判 {judge_index} 执行失败")
+            result = {
+                "score": 0,
+                "feedback": f"裁判执行失败: {str(e)}",
+                "dimension_scores": {},
+            }
+            if trace_id:
+                result["langfuse_trace_id"] = trace_id
+                result["langfuse_trace_url"] = trace_url
+            return result
+
+        # format_output 将结果序列化为 raw_output
+        raw_str = result_state.get("raw_output", "{}")
+        try:
+            result = json.loads(raw_str)
+        except (json.JSONDecodeError, TypeError):
+            result = {
+                "score": result_state.get("final_score", 0),
+                "feedback": result_state.get("final_feedback", ""),
+                "dimension_scores": result_state.get("final_dimension_scores", {}),
+            }
+
+        if trace_id:
+            result["langfuse_trace_id"] = trace_id
+            result["langfuse_trace_url"] = trace_url
+        return result
+
+    def run_parallel(
+        self,
+        state_input: JudgeAgentState,
+        judge_count: int,
+    ) -> List[Dict[str, Any]]:
+        """
+        并发执行多个裁判。
+
+        Args:
+            state_input: 初始状态 (所有裁判共享)
+            judge_count: 裁判数量
+
+        Returns:
+            裁判结果列表
+        """
+        judge_count = max(judge_count, 1)
+        max_workers = min(judge_count, 4)  # 最多4线程
+        results = []
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(self.run, state_input, i): i
+                for i in range(judge_count)
+            }
+            for future in as_completed(futures):
+                try:
+                    results.append(future.result())
+                except Exception as e:
+                    logger.error(f"[JudgeAgent] 并行执行中某个裁判失败: {e}")
+                    results.append({
+                        "score": 0,
+                        "feedback": f"执行失败: {e}",
+                        "dimension_scores": {},
+                    })
+
+        logger.info(
+            f"[JudgeAgent] {judge_count} 个裁判并行完成，"
+            f"平均分: {sum(r.get('score', 0) for r in results) / len(results):.2f}"
+        )
+        return results
+
+    @classmethod
+    def clear_cache(cls):
+        """清理 Graph 缓存 (测试用)"""
+        cls._graph_cache.clear()

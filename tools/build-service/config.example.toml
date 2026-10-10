@@ -1,0 +1,81 @@
+# ai-evo 构建服务配置模板
+#
+# 部署到服务器：/apps/qa-code/ai-evo/build-service/config.toml
+#   1. cp config.example.toml config.toml
+#   2. 填入真实的 token 与 GitLab 凭据
+#   3. chmod 600 config.toml   —— 含凭据，不要入库
+#
+# 路径约定与 docs/build-pipeline.md 一致。
+
+[auth]
+# GitLab CI 调用时携带的 X-Build-Token，取值与 GitLab 项目的
+# CI/CD Variable BUILD_API_TOKEN 一致（建议 32 位以上随机串）
+token = "CHANGE_ME_TO_A_LONG_RANDOM_STRING"
+
+[paths]
+# 生产工作区：仅用于读取 git remote，不作为构建目录
+workspace = "/apps/qa-code/ai-evo"
+# 隔离的构建工作区：build-service 独占，git checkout/clean 都在这里发生，
+# 避免污染生产工作区（其中有运行中的 compose 与 .env）
+build_workspace = "/apps/qa-code/ai-evo-build"
+# docker compose 实际运行目录（部署时同步 compose 到这里、更新这里的 .env）
+deploy_dir = "/apps/qa-code/ai-evo"
+# 构建服务自身的数据目录（releases/ 版本记录、logs/ 任务日志）
+data_dir = "/apps/qa-code/ai-evo/build-service/data"
+
+[builder]
+# 预烘焙工具链的构建容器镜像（在开发机构建后导出到服务器，见 docs/build-pipeline.md）
+image = "ai-evo-builder:latest"
+# 构建出的应用镜像名
+image_name = "ai-evo"
+# 跨构建复用的缓存目录（宿主机目录，不要用 docker 卷——卷落在 docker root 分区）
+cache_dir = "/apps/qa-code/ai-evo-build-cache"
+
+[deploy]
+compose_file = "docker-compose.yml"
+env_file = ".env"
+# 部署后要求全部处于 running 的服务
+services = ["api", "worker"]
+# 部署后的 HTTP 探活地址（/api/v1/auth/status 在鉴权白名单内，无需 cookie）
+health_url = "http://127.0.0.1:8100/api/v1/auth/status"
+# nginx 的前端静态根（宿主机路径，见 /etc/nginx/conf.d/eval-frontend.conf 的 root）。
+#
+# 用户访问的站点由 nginx 直接托管这个目录，**不是**容器里 FastAPI 托管的那份 dist。
+# 只部署容器、不同步这里，用户看到的仍是旧前端——首次部署实际踩到过。
+# 留空则跳过前端同步（仅当前端不由 nginx 托管时才应留空）。
+frontend_root = "/apps/qa-code/ai-evo/frontend/dist"
+# 保留的前端备份份数（每次同步前会把旧 dist 改名备份，便于快速回退）
+keep_frontend_backups = 3
+# 保留的可回滚版本数。
+# 同时作用于两处：releases/ 里的版本记录，以及宿主机上按 tag 累积的旧镜像
+#（每个镜像约 500MB，不清理的话几十次部署就会占满磁盘）。
+# 清理时始终额外保留 .env 里正在使用的 tag 与 releases 记录里出现过的 tag，
+# 且 docker 会拒绝删除正在被容器使用的镜像——回滚目标不会丢。
+# 设为 0 可关闭镜像清理。
+keep_releases = 5
+
+[timeouts]
+# 构建超时（秒）：前端 pnpm build + docker build
+build_sec = 3600
+# 部署超时（秒）：注意 worker 的 stop_grace_period 是 900s，
+# 若部署时正好有长任务在执行，compose 会等它跑完，因此这里要留足
+deploy_sec = 1800
+
+[gitlab]
+host = "https://gitlab.example.com"
+# 克隆地址必须内嵌 Deploy Token，否则 build-service 从远端 clone 构建工作区时
+# 会因为仓库是私有的而失败。用户名的 "+" 要写成 %2B。
+# 本项目的 Deploy Token 含 read_repository scope，正好用于克隆。
+# 参考同机 anc 项目的做法（其构建工作区 remote 就是这种形式）。
+repo_url = "https://gitlab+deploy-token:<token>@gitlab.example.com/group/project.git"
+# 项目数字 ID（已确认）。必须是数字 ID：Deploy Token 没有 read_project 权限，
+# 用项目路径查询 API 会返回 404 Project Not Found。
+# 查法见 docs/build-pipeline.md 第 4.2.1 节。
+project_id = "152361"
+# 离线快照包名（与 tools/upload-offline-snapshot.sh 的 SNAPSHOT_PACKAGE 一致）
+snapshot_package = "ai-evo-offline-snapshot"
+# Deploy Token「ci/cd」的凭据：用户名形如 gitlab+deploy-token-<n>，密码是 token 值。
+# 该 token 的 scope 为 read_repository + read_package_registry + write_package_registry，
+# 下载离线快照只需要 read_package_registry。
+deploy_token_user = ""
+deploy_token_pass = ""

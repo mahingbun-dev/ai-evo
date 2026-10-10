@@ -1,0 +1,15 @@
+# 离线快照的额外约束
+#
+# 仅用于 tools/prepare-offline.sh 生成 wheelhouse，不影响本地开发环境
+# （本地 venv 是较新的 Python 版本，装旧 numpy 会没有对应 wheel）。
+
+# numpy 必须锁在 2.2.6：它是最后一个提供 manylinux_2_17 / manylinux2014 wheel
+# 的版本，该 wheel 按基线指令集编译，不含 AVX2。
+# numpy 2.3.5 起只发 manylinux_2_28 wheel（编译时启用 x86-64-v2 指令），
+# 而部署 VM 的 CPU 缺少 X86_V2 指令集，装上会直接崩溃。
+#
+# 该约束复现了原 Dockerfile 里这一段的实际效果：
+#   pip download --platform manylinux2014_x86_64 ... numpy
+#   pip install --no-index --find-links=/tmp/wheels --force-reinstall numpy
+# 实测：不约束时 pip 会选 numpy 2.4.6，加上该约束后正确落到 2.2.6。
+numpy==2.2.6

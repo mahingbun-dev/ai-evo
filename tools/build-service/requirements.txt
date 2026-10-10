@@ -1,0 +1,8 @@
+# ai-evo 构建服务自身的依赖（与主应用的 requirements.txt 无关）
+#
+# 这个服务常驻在部署机上，只需要能调用 docker CLI 与提供 HTTP 接口，
+# 因此依赖刻意保持极小。镜像在开发机构建（有外网），不受部署机离线限制。
+#
+# 注：tomllib 是 Python 3.11+ 标准库，无需第三方 tomli。
+fastapi==0.128.6
+uvicorn==0.40.0

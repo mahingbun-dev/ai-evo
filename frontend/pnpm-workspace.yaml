@@ -1,0 +1,18 @@
+# pnpm 设置文件（settings-only，不声明 workspace 成员）
+#
+# allowBuilds：显式声明依赖的构建脚本是否执行。
+#
+# 为什么需要：pnpm 11 默认禁止依赖运行构建脚本，且把「有脚本但未表态」
+# 视为错误（strictDepBuilds）——`pnpm install` 会以非零码退出，
+# 紧接着 `pnpm build` 的依赖状态检查也会失败，构建直接中断。
+# 只传 --config.strictDepBuilds=false 并不够：实测 pnpm 仍会自己生成一个
+# 内容是 "set this to true or false" 的占位文件，构建照旧失败。
+#
+# 这里显式声明为 false（不执行），与开发机现状一致：
+# 开发机 node_modules/.modules.yaml 里 esbuild 与 vue-demi 同样在
+# ignoredBuilds 列表中，`pnpm dev` 一直正常——esbuild 的平台二进制走
+# optionalDependencies（@esbuild/linux-x64 等），不依赖 postinstall 下载。
+# 声明为 false 还有个好处：离线构建时不会因 postinstall 尝试联网而失败。
+allowBuilds:
+  esbuild: false
+  vue-demi: false

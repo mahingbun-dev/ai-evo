@@ -1,0 +1,62 @@
+*.pyc
+.DS_Store
+.env
+.env_local
+*.local.ini
+outputs/*
+*/cache/*.json
+allure-results/
+allure-results/**
+*/allure-results/
+*/allure-results/**
+**/allure-results/
+**/allure-results/**
+cache/
+*/cache/
+**/cache/
+cache/**
+**/cache/**
+cache/
+**/cache/
+**/cache/**
+.worktrees/
+.superpowers/
+cache/**
+**/cache/**
+cache/
+**/cache/
+**/cache/**
+.worktrees/
+*/__pycache__/*
+docs/*.docx
+docs/*.xlsx
+docs/*.md
+!docs/user_guide.md
+# 构建部署流水线手册：被 .gitlab-ci.yml 与 Dockerfile 注释引用，必须入库
+!docs/build-pipeline.md
+docs/superpowers/
+logs/
+node_modules/
+centos7_offline/*
+.vscode/
+deepeval/
+
+# ===== 离线构建快照（由 tools/prepare-offline.sh 生成，走 GitLab Packages 分发）=====
+# 注意：.offline-snapshot.json 需要入库——构建服务靠它校验快照与锁文件是否一致
+.wheels/
+.pnpm-store/
+# 离线 claude CLI（由 build-service 按 tools/claude-bin.json 下载就位，产物不入库）
+claude-local/
+.claude-bin-version
+
+# ===== 构建产物与部署包（由 CI / 打包脚本生成，不再入库）=====
+frontend/dist/
+ai-evo-deploy.tar.gz
+ai-evo-image.tar
+# tools/build-and-export-infra.sh 的产物。注意加 ignore 不能漏——
+# 曾经因为漏了这两条，把 3 个约 280MB 的包误提交进了历史。
+infra-images.tar
+infra-images.tar.gz
+
+# 本地 alembic 连接串（含真实库密码，不入库）
+alembic_local.ini

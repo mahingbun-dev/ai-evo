@@ -1,0 +1,65 @@
+# ============ Web Framework ============
+fastapi==0.128.6
+uvicorn==0.40.0
+starlette==0.52.1
+python-multipart==0.0.22
+
+# ============ Database & ORM ============
+SQLAlchemy==2.0.46
+alembic==1.18.3
+psycopg2-binary==2.9.11
+redis==7.2.1
+
+# ============ Data Processing ============
+pandas==3.0.0
+openpyxl==3.1.5
+xlrd==2.0.2
+Pillow==12.1.1
+pdfplumber==0.11.9
+beautifulsoup4==4.14.3
+jsonpath-ng==1.7.0
+jsonpath==0.82.2
+
+# ============ Configuration ============
+pydantic==2.12.5
+pydantic-settings==2.12.0
+python-dotenv==1.2.1
+PyYAML==6.0.3
+
+# ============ Async Task Queue ============
+celery==5.4.0
+APScheduler==3.11.2
+
+# ============ HTTP Clients & WebSocket ============
+httpx==0.28.1
+requests==2.32.5
+aiohttp==3.13.3
+websockets==16.0
+
+# ============ AI/LLM ============
+openai==2.24.0
+anthropic==0.83.0
+langgraph>=0.4.0
+langfuse>=2.0.0
+ragas==0.4.3
+deepeval>=4.0.0
+# Claude Code Agent 裁判引擎（运行时依赖镜像内 Claude Code CLI，见 Dockerfile）
+claude-agent-sdk==0.2.163
+# DeepSeek Harness Agent 裁判引擎（捆绑 linux/amd64 原生运行时 wheel，无需 Node.js）
+deepseek-harness-sdk==0.1.5rc1
+
+# ============ Template & Formatting ============
+Jinja2==3.1.6
+rich==14.3.2
+
+# ============ Utilities ============
+nest-asyncio==1.6.0
+atlassian-python-api==4.0.7
+websocket-client==1.9.0
+
+# ============ Testing ============
+pytest==9.0.2
+pytest-asyncio==1.3.0
+pytest-xdist==3.8.0
+pytest-rerunfailures==16.1
+allure-pytest==2.15.3

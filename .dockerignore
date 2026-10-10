@@ -1,0 +1,41 @@
+.git
+.gitignore
+.gitlab-ci.yml
+__pycache__/
+*.pyc
+.venv/
+.idea/
+.vscode/
+*.log
+logs/
+.env
+.env_local
+.deepeval/
+.pytest_cache/
+node_modules/
+# docs/* 而非 docs/：目录级排除会阻断子项反排除（!规则），子项级排除不受影响
+docs/*
+!docs/user_guide.md
+!docs/assets/
+scripts/
+tools/
+tests/
+test_dataset.xlsx
+数据集模板.xlsx
+QUICK_START.md
+USAGE_GUIDE.md
+README.md
+conftest.py
+pytest.ini
+
+# ===== 构建产物 / 离线包：461MB 级，绝不能进构建上下文 =====
+ai-evo-deploy.tar.gz
+ai-evo-image.tar
+.worktrees/
+deepeval/
+output/
+
+# pnpm 离线 store 只在 builder 容器内使用，docker build 不需要
+.pnpm-store/
+
+# 注意：.wheels/ 必须保留在构建上下文中——Dockerfile 需要 COPY 它做离线安装

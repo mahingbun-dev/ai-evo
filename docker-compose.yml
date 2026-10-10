@@ -1,0 +1,65 @@
+# 部署由 GitLab CI 驱动（见 docs/build-pipeline.md）：
+#   - 镜像 tag 由 CI 写入 .env 的 IMAGE_TAG，回滚即改回旧 tag
+#   - 数据库/Redis 等敏感配置放服务器上的 .env（不入库）
+#   - OPENBLAS_CORETYPE / MKL_DEBUG_CPU_TYPE 是老旧 CPU（缺 X86_V2 指令集）
+#     的规避参数，非敏感配置，留在 environment 中
+services:
+  redis:
+    image: redis:7
+    container_name: ai-evo-redis
+    restart: unless-stopped
+    networks:
+      - ai-evo-net
+
+  api:
+    image: ai-evo:${IMAGE_TAG:-latest}
+    container_name: ai-evo-api
+    depends_on:
+      - redis
+    env_file:
+      - .env
+    environment:
+      - SERVICE_TYPE=api
+      - LANGFUSE_ENABLED=false
+      - OPENBLAS_CORETYPE=GENERIC
+      - MKL_DEBUG_CPU_TYPE=5
+    ports:
+      - "8100:8100"
+    volumes:
+      - ./logs:/app/logs
+      # 上传产物持久化（执行包解包区 / 人工补传区 / 脚本包 / 任务产物）：
+      # 此前落在容器可写层，容器重建即丢；人工补传文件无法从 anc-hub 幂等
+      # 重建，丢失后必须重新人工上传，故挂宿主卷持久化（api 与 worker 共享
+      # 同一宿主卷；首次部署为空，历史包需重新导入，见部署文档）
+      - ./uploads:/app/uploads
+    restart: unless-stopped
+    networks:
+      - ai-evo-net
+
+  worker:
+    image: ai-evo:${IMAGE_TAG:-latest}
+    container_name: ai-evo-worker
+    depends_on:
+      - redis
+    env_file:
+      - .env
+    environment:
+      - SERVICE_TYPE=worker
+      - LANGFUSE_ENABLED=false
+      - OPENBLAS_CORETYPE=GENERIC
+      - MKL_DEBUG_CPU_TYPE=5
+    # 停止时给 Celery 优雅退出的时间：收到 SIGTERM 后跑完当前任务再退出，
+    # 排队中的任务保留在 Redis 队列由新 worker 接手（部署脚本不再清空队列）
+    stop_grace_period: 900s
+    volumes:
+      - ./logs:/app/logs
+      # 与 api 共享同一宿主卷（worker 的 Celery 任务也读写 uploads：执行包
+      # 解包、评测镜像、脚本运行产物）
+      - ./uploads:/app/uploads
+    restart: unless-stopped
+    networks:
+      - ai-evo-net
+
+networks:
+  ai-evo-net:
+    driver: bridge
