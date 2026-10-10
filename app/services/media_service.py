@@ -3,10 +3,12 @@
 """
 import uuid
 import os
+from pathlib import Path
 from typing import List, Optional, Dict, Any
 from sqlalchemy.orm import Session
 from fastapi import UploadFile
 from app.models.media_models import MediaResource
+from app.utils.path_safety import sanitize_upload_filename
 
 
 class MediaService:
@@ -36,10 +38,10 @@ class MediaService:
         file_type = self._get_file_type(file.filename)
         mime_type = file.content_type or self._get_mime_type(file_type)
 
-        # 保存文件到磁盘
-        file_path = os.path.join(self.upload_dir, f"{media_id}_{file.filename}")
-        with open(file_path, "wb") as f:
-            f.write(content)
+        # 保存文件到磁盘（客户端文件名压成 basename 防穿越）
+        safe_name = sanitize_upload_filename(file.filename)
+        file_path = os.path.join(self.upload_dir, f"{media_id}_{safe_name}")
+        Path(file_path).write_bytes(content)
 
         # 创建数据库记录
         media = MediaResource(

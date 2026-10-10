@@ -7,6 +7,9 @@ import os
 import tempfile
 import logging
 import pandas as pd
+from pathlib import Path
+
+from app.utils.path_safety import sanitize_upload_ext
 from typing import List, Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
@@ -477,14 +480,14 @@ class DatasetService:
         os.makedirs(upload_dir, exist_ok=True)
 
         # 生成文件ID和保存路径（包含field信息）
+        # 扩展名来自客户端文件名，仅保留 .字母数字 形式防穿越
         file_id = f"file_{uuid.uuid4().hex[:12]}"
-        file_ext = os.path.splitext(file.filename)[1] if file.filename else ""
+        file_ext = sanitize_upload_ext(file.filename)
         file_path = os.path.join(upload_dir, f"{data_id}_{field}_{file_id}{file_ext}")
 
         # 保存文件
         content = file.file.read()
-        with open(file_path, "wb") as f:
-            f.write(content)
+        Path(file_path).write_bytes(content)
 
         # 获取文件大小
         file_size = os.path.getsize(file_path)

@@ -26,6 +26,15 @@ V2 格式为完全扁平的 JSON，所有字段和 *_is_media 标志在同一层
 import argparse
 import sys
 import os
+
+
+def _ensure_within(root: str, *parts) -> str:
+    """realpath 兜底：拼接结果必须仍在 root 内（防主键异常值路径穿越）"""
+    root_real = os.path.realpath(root)
+    target = os.path.realpath(os.path.join(root_real, *(str(x) for x in parts)))
+    if target != root_real and not target.startswith(root_real + os.sep):
+        raise SystemExit(f"路径越界（逃出 {root_real}）: {target}")
+    return target
 import uuid
 import json
 import shutil
@@ -90,7 +99,7 @@ def create_backup(dataset_ids: list, db_session, backup_root: str = "backups") -
             print(f"  跳过不存在的数据集: {dataset_id}")
             continue
 
-        dataset_dir = os.path.join(backup_dir, dataset_id)
+        dataset_dir = _ensure_within(backup_dir, dataset_id)
         os.makedirs(dataset_dir, exist_ok=True)
 
         # 备份 V1 数据
@@ -117,9 +126,8 @@ def create_backup(dataset_ids: list, db_session, backup_root: str = "backups") -
                 "is_active": item.is_active,
             })
 
-        v1_path = os.path.join(dataset_dir, "evaluation_data.json")
-        with open(v1_path, "w", encoding="utf-8") as f:
-            json.dump(v1_data, f, ensure_ascii=False, indent=2)
+        v1_path = _ensure_within(backup_dir, dataset_id, "evaluation_data.json")
+        Path(v1_path).write_text(json.dumps(v1_data, ensure_ascii=False, indent=2), encoding="utf-8")
 
         # 备份 V2 数据
         v2_items = db_session.query(EvaluationDataV2).filter(
@@ -136,9 +144,8 @@ def create_backup(dataset_ids: list, db_session, backup_root: str = "backups") -
                 "is_active": item.is_active,
             })
 
-        v2_path = os.path.join(dataset_dir, "evaluation_data_v2.json")
-        with open(v2_path, "w", encoding="utf-8") as f:
-            json.dump(v2_data, f, ensure_ascii=False, indent=2)
+        v2_path = _ensure_within(backup_dir, dataset_id, "evaluation_data_v2.json")
+        Path(v2_path).write_text(json.dumps(v2_data, ensure_ascii=False, indent=2), encoding="utf-8")
 
         # 备份数据集元信息
         dataset_meta = {
@@ -218,7 +225,7 @@ def restore_backup(backup_dir: str, db_session, dataset_id: str = None) -> int:
     for ds_info in target_datasets:
         ds_id = ds_info["id"]
         ds_name = ds_info["name"]
-        dataset_dir = os.path.join(backup_dir, ds_id)
+        dataset_dir = _ensure_within(backup_dir, ds_id)
 
         if not os.path.exists(dataset_dir):
             print(f"  跳过: 备份目录不存在 {dataset_dir}")

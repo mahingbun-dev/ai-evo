@@ -16,10 +16,12 @@ from app.services.dataset_export_service import (
     MAX_EXPORT_ROWS,
 )
 from app.models.dataset_models import EvaluationDataset, ImportTempFile
+from app.utils.path_safety import sanitize_upload_filename
 import pandas as pd
 import io
 import json
 import os
+from pathlib import Path
 import logging
 
 logger = logging.getLogger(__name__)
@@ -1473,10 +1475,11 @@ async def upload_temp_file(
     # 保存文件到临时目录
     temp_dir = "./uploads/datasets/temp"
     os.makedirs(temp_dir, exist_ok=True)
-    file_path = os.path.join(temp_dir, f"{temp_file_id}_{file.filename}")
+    # 文件名来自客户端，压成 basename 防穿越（../、盘符、反斜杠变形均无效）
+    safe_name = sanitize_upload_filename(file.filename)
+    file_path = os.path.join(temp_dir, f"{temp_file_id}_{safe_name}")
 
-    with open(file_path, "wb") as f:
-        f.write(content)
+    Path(file_path).write_bytes(content)
 
     # 获取文件类型（扩展支持音频、图片、表格）
     def get_file_type(filename):

@@ -1,0 +1,47 @@
+# 本地开发基础设施：PostgreSQL + Redis（宿主机直连，后端在宿主机跑）
+# 用法：docker compose -f docker-compose.dev.yml up -d
+# 注意：宿主机 6379 常被其他项目占用，本机 Redis 映射到 6380
+services:
+  postgres:
+    image: postgres:16
+    container_name: ai-evo-dev-pg
+    environment:
+      - POSTGRES_USER=ai_evo
+      - POSTGRES_PASSWORD=ai_evo_dev
+      - POSTGRES_DB=ai_evo
+    ports:
+      - "5432:5432"
+    volumes:
+      - ai-evo-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ai_evo -d ai_evo"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - ai-evo-dev
+
+  redis:
+    image: redis:7
+    container_name: ai-evo-dev-redis
+    ports:
+      - "6380:6379"
+    volumes:
+      - ai-evo-redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - ai-evo-dev
+
+volumes:
+  ai-evo-pgdata:
+  ai-evo-redisdata:
+
+networks:
+  ai-evo-dev:
+    driver: bridge

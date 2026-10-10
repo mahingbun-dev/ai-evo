@@ -42,6 +42,12 @@ class AuthMiddleware(BaseHTTPMiddleware):
         if path == "/" or any(path.startswith(prefix) for prefix in WHITELIST_PREFIXES):
             return await call_next(request)
 
+        # 非 API 路径放行：生产模式前端构建产物由本服务托管（SPA catch-all 返回
+        # index.html），前端路由（/login、/tasks 等）必须可直达，登录态由前端
+        # 路由守卫控制；接口数据仍全部走下方 token 校验
+        if not path.startswith("/api/"):
+            return await call_next(request)
+
         # 步骤1: 提取 Authorization: Bearer <token>
         auth_header = request.headers.get("authorization", "")
         if not auth_header.lower().startswith("bearer "):

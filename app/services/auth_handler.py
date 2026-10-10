@@ -373,6 +373,8 @@ class AuthHandler:
             if not auth_value:
                 # 直接使用同步requests库发送登录请求，避免asyncio嵌套问题
                 import requests
+                from app.utils.path_safety import ensure_http_url
+
                 try:
                     login_url = auth_config.get("login_url")
                     login_method = auth_config.get("login_method", "POST").upper()
@@ -380,6 +382,7 @@ class AuthHandler:
                     login_body = auth_config.get("login_body", {})
                     login_params = auth_config.get("login_params", {})
 
+                    ensure_http_url(login_url)  # 仅允许 http/https，阻断 file:/ftp: 等变形
                     if login_method == "GET":
                         response = requests.get(login_url, params=login_params, headers=login_headers, timeout=60)
                     else:

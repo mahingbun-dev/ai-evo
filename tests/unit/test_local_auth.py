@@ -222,7 +222,7 @@ def client_factory(monkeypatch):
         app = FastAPI()
         app.add_middleware(AuthMiddleware)
 
-        @app.get("/protected")
+        @app.get("/api/v1/protected")
         def protected(request: Request):
             return {"username": request.state.user["username"],
                     "super_admin_flag": request.state.user["super_admin_flag"]}
@@ -255,39 +255,40 @@ class TestAuthMiddleware:
         assert client.get("/api/v1/auth/login").status_code == 200
         assert client.get("/api/v1/auth/register").status_code == 404  # 已过中间件，404 来自路由未注册
         assert client.get("/").status_code == 404  # 根路径白名单，404 来自路由缺失而非 401
+        assert client.get("/login").status_code == 404  # 非 API 路径放行（SPA 前端路由由 catch-all 托管）
 
     def test_missing_token_401(self, client_factory):
         client = client_factory(users=[_active_user()])
-        resp = client.get("/protected")
+        resp = client.get("/api/v1/protected")
         assert resp.status_code == 401
         assert resp.json()["code"] == 401
 
     def test_valid_token_sets_state_user(self, client_factory):
         client = client_factory(users=[_active_user(super_admin=1)])
         token = jwt_service.create_token("u_alice", "alice")
-        resp = client.get("/protected", headers={"Authorization": f"Bearer {token}"})
+        resp = client.get("/api/v1/protected", headers={"Authorization": f"Bearer {token}"})
         assert resp.status_code == 200
         assert resp.json() == {"username": "alice", "super_admin_flag": 1}
 
     def test_invalid_token_401(self, client_factory):
         client = client_factory(users=[_active_user()])
-        resp = client.get("/protected", headers={"Authorization": "Bearer not-a-jwt"})
+        resp = client.get("/api/v1/protected", headers={"Authorization": "Bearer not-a-jwt"})
         assert resp.status_code == 401
 
     def test_wrong_scheme_401(self, client_factory):
         client = client_factory(users=[_active_user()])
         token = jwt_service.create_token("u_alice", "alice")
-        resp = client.get("/protected", headers={"Authorization": f"Basic {token}"})
+        resp = client.get("/api/v1/protected", headers={"Authorization": f"Basic {token}"})
         assert resp.status_code == 401
 
     def test_inactive_user_401(self, client_factory):
         client = client_factory(users=[_active_user(active=False)])
         token = jwt_service.create_token("u_alice", "alice")
-        resp = client.get("/protected", headers={"Authorization": f"Bearer {token}"})
+        resp = client.get("/api/v1/protected", headers={"Authorization": f"Bearer {token}"})
         assert resp.status_code == 401
 
     def test_unknown_user_401(self, client_factory):
         client = client_factory()
         token = jwt_service.create_token("u_ghost", "ghost")
-        resp = client.get("/protected", headers={"Authorization": f"Bearer {token}"})
+        resp = client.get("/api/v1/protected", headers={"Authorization": f"Bearer {token}"})
         assert resp.status_code == 401

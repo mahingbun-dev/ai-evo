@@ -10,7 +10,7 @@ anc-hub file-store 文件服务（MCP streamable-HTTP 通道）
 响应为 SSE 时取最后一个非空 data: 行；偶发空响应自动重试一次。
 
 端点从环境变量 ANC_HUB_MCP_ENDPOINT 读取，缺省时回退 Settings（.env），均缺失时抛出中文错误。
-自签名证书的端点统一跳过证书校验（verify=False）。
+TLS 证书默认严格校验；自签名内网端点需显式设 AIEVO_HUB_TLS_INSECURE=1 才跳过。
 缓存目录 uploads/hub_files/{file_id}/：已存在且 sha256 校验通过则跳过下载。
 
 数据集迭代新增（anc-hub 执行包导入）：
@@ -47,6 +47,7 @@ import requests
 import urllib3
 
 from app.core.config import get_settings
+from app.utils.path_safety import ensure_within
 
 # 内网自签证书跳过校验后的告警噪音只保留在 debug 场景，不刷业务日志
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -114,6 +115,11 @@ def resolve_hub_bearer_token(request) -> Optional[str]:
 
 # 数据集字段元数据中表示 hub_file 通道的 value_type（field_type 自由字符串列）
 HUB_FIELD_TYPE = "hub_file"
+
+
+def _hub_tls_insecure() -> bool:
+    """是否跳过 anc-hub 端点的 TLS 证书校验（仅显式环境变量 opt-in，默认校验）"""
+    return os.environ.get("AIEVO_HUB_TLS_INSECURE", "").strip().lower() in ("1", "true", "yes")
 
 # MCP initialize 参数（与参考实现保持一致）
 _MCP_INITIALIZE_PARAMS = {
@@ -208,12 +214,14 @@ class HubMcpClient:
         return headers
 
     def _post(self, msg: Dict[str, Any]):
+        # TLS 证书校验默认开启；自签名内网端点可显式设 AIEVO_HUB_TLS_INSECURE=1 跳过
+        # （原实现无条件 verify=False，存在中间人风险）
         resp = requests.post(
             self.endpoint,
             data=json.dumps(msg).encode("utf-8"),
             headers=self._headers(),
             timeout=self.timeout,
-            verify=False,
+            verify=not _hub_tls_insecure(),
         )
         if resp.status_code >= 400:
             raise HubFileError(
@@ -279,7 +287,7 @@ class HubMcpClient:
                 self.endpoint,
                 headers=self._headers(),
                 timeout=30,
-                verify=False,
+                verify=not _hub_tls_insecure(),
             )
         except Exception:
             pass
@@ -369,7 +377,8 @@ def _unpack_zip(zip_path: str, unpack_root: str) -> List[Dict[str, Any]]:
             rel = _safe_zip_rel_path(zi.filename)
             if rel is None:
                 raise HubFileError(f"zip 条目路径不安全: {zi.filename!r}，中止解压")
-            dest = os.path.join(unpack_root, *rel.split("/"))
+            # 成员名校验之外再做 realpath 越界兜底（symlink/编码变形由 realpath 兜底）
+            dest = ensure_within(unpack_root, *rel.split("/"))
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             written = 0
             with zf.open(zi) as src, open(dest, "wb") as out:
@@ -467,7 +476,8 @@ class HubFileService:
             return hit
 
         os.makedirs(target_dir, exist_ok=True)
-        tmp_path = os.path.join(target_dir, f".download_{os.getpid()}.part")
+        # dest_dir 允许调用方指定，但落盘路径必须仍在该目录内（realpath 兜底）
+        tmp_path = ensure_within(target_dir, f".download_{os.getpid()}.part")
 
         endpoint = self._endpoint or get_hub_endpoint()
         filename: Optional[str] = None
@@ -533,7 +543,7 @@ class HubFileService:
             raise
 
         safe_name = sanitize_hub_name(filename, fallback=file_id)
-        final_path = os.path.join(target_dir, safe_name)
+        final_path = ensure_within(target_dir, safe_name)
         os.replace(tmp_path, final_path)
 
         meta = {
@@ -587,12 +597,11 @@ class HubFileService:
 
     def _write_unpacked_manifest(self, target_dir: str, files: List[Dict[str, Any]]) -> None:
         """把解压清单写回 meta.json（失败仅告警，下次调用会重新解压）"""
-        meta_path = self._meta_path(target_dir)
         try:
-            with open(meta_path, "r", encoding="utf-8") as f:
+            with open(self._meta_path(target_dir), "r", encoding="utf-8") as f:
                 meta = json.load(f)
             meta["unpacked_files"] = [{"rel_path": f["rel_path"], "size": f["size"]} for f in files]
-            with open(meta_path, "w", encoding="utf-8") as f:
+            with open(self._meta_path(target_dir), "w", encoding="utf-8") as f:
                 json.dump(meta, f, ensure_ascii=False, indent=2)
         except (OSError, json.JSONDecodeError, ValueError) as e:
             logger.warning(f"[hub_file] 写入解压清单失败（下次将重新解压）: {e}")
@@ -982,10 +991,11 @@ def unpack_zip_safely(zip_path: str, dest_dir: str) -> Dict[str, int]:
             rel = _safe_member_name(info.filename)
             if rel.endswith("/"):
                 # 目录成员：建目录即可
-                os.makedirs(os.path.join(dest_dir, *rel.split("/")[:-1]), exist_ok=True)
+                os.makedirs(ensure_within(dest_dir, *rel.split("/")[:-1]), exist_ok=True)
                 continue
             parts = [p for p in rel.split("/") if p]
-            target = os.path.join(dest_dir, *parts) if parts else None
+            # 成员名校验之外再做 realpath 越界兜底
+            target = ensure_within(dest_dir, *parts) if parts else None
             if target is None:
                 continue
             os.makedirs(os.path.dirname(target), exist_ok=True)
@@ -1675,7 +1685,7 @@ def add_supplements(
             if display.lower().endswith(".zip"):
                 # zip：blob 流式落盘（zip 本体无独立上限）→ unpack_zip_safely
                 # 安全解压（自带条目/单文件/总量预检与 zip slip 校验）
-                blob_path = os.path.join(staging, f"blob_{i}.zip")
+                blob_path = ensure_within(staging, f"blob_{i}.zip")
                 os.makedirs(os.path.dirname(blob_path), exist_ok=True)
                 with open(blob_path, "wb") as out:
                     shutil.copyfileobj(fileobj, out, 1024 * 1024)
@@ -1691,7 +1701,8 @@ def add_supplements(
                 # 散文件：落 target_dir/relative_path（缺省用原始文件名的 basename）
                 rel_src = rel_arg if rel_arg.strip() else os.path.basename(display.replace("\\", "/"))
                 rel = "/".join(target_parts + _clean_supplement_rel(rel_src).split("/"))
-                dest = os.path.join(staging, "loose", *rel.split("/"))
+                # 路径清洗之外再做 realpath 越界兜底
+                dest = ensure_within(os.path.join(staging, "loose"), *rel.split("/"))
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
                 written = 0
                 with open(dest, "wb") as out:

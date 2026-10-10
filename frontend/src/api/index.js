@@ -286,7 +286,9 @@ export const taskApi = {
 // 评测结果API
 export const resultApi = {
   get: (id) => request.get(`/evaluation/results/${id}`),
-  history: (id, params) => request.get(`/evaluation/results/${id}/history`, { params })
+  history: (id, params) => request.get(`/evaluation/results/${id}/history`, { params }),
+  // 批量导出（Excel/CSV）：rawResponse 取完整响应以读 blob 与 content-type
+  exportBatch: (data) => request.post('/evaluation/results/batch-export', data, { responseType: 'blob', rawResponse: true })
 }
 
 // 批量操作API

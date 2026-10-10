@@ -34,6 +34,15 @@ import threading
 import time
 import tomllib
 import urllib.request
+from urllib.parse import urlparse
+
+def ensure_http_url(url: str) -> str:
+    """校验外呼 URL 仅允许 http/https scheme（阻断 file:/ftp: 等变形）"""
+    scheme = urlparse(str(url or "")).scheme.lower()
+    if scheme not in ("http", "https"):
+        raise ValueError(f"仅允许 http/https URL，收到: {url!r}")
+    return url
+
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -301,6 +310,7 @@ def sync_offline_snapshot(version: str, logf) -> None:
     headers = {"Authorization": f"Basic {auth}"}
 
     def fetch(name: str, dest: Path):
+        ensure_http_url(f"{base}/{name}")
         req = urllib.request.Request(f"{base}/{name}", headers=headers)
         with urllib.request.urlopen(req, timeout=1800) as r, open(dest, "wb") as f:
             while True:
@@ -380,6 +390,7 @@ def ensure_claude_bin(logf) -> None:
     tarball = work / "claude-bin.tar.gz"
 
     logf.write(f"[claude] 下载 claude-bin.tar.gz (version={version})\n")
+    ensure_http_url(f"{base}/claude-bin.tar.gz")
     req = urllib.request.Request(f"{base}/claude-bin.tar.gz", headers=headers)
     with urllib.request.urlopen(req, timeout=1800) as r, open(tarball, "wb") as f:
         while True:
@@ -676,6 +687,7 @@ def verify_deploy(logf) -> None:
     # HTTP 探活：/api/v1/auth/status 在鉴权白名单内，不需要 cookie
     for _ in range(30):
         try:
+            ensure_http_url(HEALTH_URL)
             with urllib.request.urlopen(HEALTH_URL, timeout=5) as r:
                 if r.status == 200:
                     logf.write(f"[verify] HTTP 探活通过: {HEALTH_URL}\n")

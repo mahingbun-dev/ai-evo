@@ -8,6 +8,8 @@ Token 管理模块
 import time
 import logging
 import requests
+
+from app.utils.path_safety import ensure_http_url
 from typing import Optional, Dict, Any
 from dataclasses import dataclass, field
 
@@ -104,7 +106,7 @@ class TokenManager:
             logger.error("Token 管理器未正确配置")
             return None
 
-        url = f"{self._base_url}{self._login_url}"
+        url = ensure_http_url(f"{self._base_url}{self._login_url}")
         payload = {
             "username": self._username,
             "password": self._password,

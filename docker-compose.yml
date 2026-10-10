@@ -3,9 +3,36 @@
 #   - 数据库/Redis 等敏感配置放服务器上的 .env（不入库）
 #   - OPENBLAS_CORETYPE / MKL_DEBUG_CPU_TYPE 是老旧 CPU（缺 X86_V2 指令集）
 #     的规避参数，非敏感配置，留在 environment 中
+#
+# 自建在线部署（如群晖，联网可用）：
+#   - api/worker 带 build 定义，本地无 ai-evo 镜像时自动用 Dockerfile.online
+#     构建（前端 dist 在镜像内现构建，依赖从 PyPI 安装，可用 PIP_INDEX_URL 换源）
+#   - .env 里设 COMPOSE_PROFILES=bundled-db 可一并启动内置 PostgreSQL
+#     （生产 CI 部署不设该 profile，行为与原来完全一致）
 services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:16}
+    container_name: ai-evo-postgres
+    profiles: ["bundled-db"]
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-ai_evo}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-ai_evo_dev}
+      - POSTGRES_DB=${POSTGRES_DB:-ai_evo}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ai_evo} -d ${POSTGRES_DB:-ai_evo}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - ai-evo-net
+
   redis:
-    image: redis:7
+    image: ${REDIS_IMAGE:-redis:7}
     container_name: ai-evo-redis
     restart: unless-stopped
     networks:
@@ -13,6 +40,14 @@ services:
 
   api:
     image: ai-evo:${IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile.online
+      args:
+        - NODE_IMAGE=${NODE_IMAGE:-node:24-slim}
+        - PY_IMAGE=${PY_IMAGE:-python:3.12-slim}
+        - PIP_INDEX_URL=${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+        - NPM_REGISTRY=${NPM_REGISTRY:-https://registry.npmmirror.com}
     container_name: ai-evo-api
     depends_on:
       - redis
@@ -24,20 +59,30 @@ services:
       - OPENBLAS_CORETYPE=GENERIC
       - MKL_DEBUG_CPU_TYPE=5
     ports:
-      - "8100:8100"
+      - "${AIEVO_PORT:-8100}:8100"
     volumes:
-      - ./logs:/app/logs
+      # 卷形态可用 env 切换：默认 bind 到 compose 目录下；NAS 等经代理工具
+      # 执行 compose 的场景可设 LOGS_VOLUME/UPLOADS_VOLUME 为命名卷
+      - ${LOGS_VOLUME:-./logs}:/app/logs
       # 上传产物持久化（执行包解包区 / 人工补传区 / 脚本包 / 任务产物）：
       # 此前落在容器可写层，容器重建即丢；人工补传文件无法从 anc-hub 幂等
-      # 重建，丢失后必须重新人工上传，故挂宿主卷持久化（api 与 worker 共享
-      # 同一宿主卷；首次部署为空，历史包需重新导入，见部署文档）
-      - ./uploads:/app/uploads
+      # 重建，丢失后必须重新人工上传，故挂卷持久化（api 与 worker 共享
+      # 同一卷；首次部署为空，历史包需重新导入，见部署文档）
+      - ${UPLOADS_VOLUME:-./uploads}:/app/uploads
     restart: unless-stopped
     networks:
       - ai-evo-net
 
   worker:
     image: ai-evo:${IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile.online
+      args:
+        - NODE_IMAGE=${NODE_IMAGE:-node:24-slim}
+        - PY_IMAGE=${PY_IMAGE:-python:3.12-slim}
+        - PIP_INDEX_URL=${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+        - NPM_REGISTRY=${NPM_REGISTRY:-https://registry.npmmirror.com}
     container_name: ai-evo-worker
     depends_on:
       - redis
@@ -52,13 +97,19 @@ services:
     # 排队中的任务保留在 Redis 队列由新 worker 接手（部署脚本不再清空队列）
     stop_grace_period: 900s
     volumes:
-      - ./logs:/app/logs
-      # 与 api 共享同一宿主卷（worker 的 Celery 任务也读写 uploads：执行包
+      - ${LOGS_VOLUME:-./logs}:/app/logs
+      # 与 api 共享同一卷（worker 的 Celery 任务也读写 uploads：执行包
       # 解包、评测镜像、脚本运行产物）
-      - ./uploads:/app/uploads
+      - ${UPLOADS_VOLUME:-./uploads}:/app/uploads
     restart: unless-stopped
     networks:
       - ai-evo-net
+
+volumes:
+  pgdata:
+  # 群晖等部署通过 .env 设 UPLOADS_VOLUME/LOGS_VOLUME 指向这两个命名卷
+  uploads:
+  logs:
 
 networks:
   ai-evo-net:

@@ -208,12 +208,13 @@ class TestGetHubEndpoint:
         assert get_hub_endpoint() == "https://hub.from.env/hub-api/mcp"
 
 
-class TestTlsVerifySkipped:
-    """域名端点为内网 CA 自签证书（用户确认跳过校验），MCP 请求必须携带 verify=False"""
+class TestTlsVerify:
+    """TLS 证书校验默认开启；仅显式 AIEVO_HUB_TLS_INSECURE=1 时跳过
+    （原实现无条件 verify=False，存在中间人风险，2026-10 起改为 opt-in）"""
 
     ENDPOINT_HTTPS = "https://hub.test:8081/hub-api/mcp"
 
-    def test_post_skips_tls_verify(self, monkeypatch):
+    def test_post_verifies_by_default(self, monkeypatch):
         calls = {}
 
         def fake_post(url, **kwargs):
@@ -224,9 +225,9 @@ class TestTlsVerifySkipped:
         monkeypatch.setattr(hub_file_service.requests, "post", fake_post)
         client = HubMcpClient(self.ENDPOINT_HTTPS)
         client._post({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
-        assert calls.get("verify") is False
+        assert calls.get("verify") is True
 
-    def test_close_skips_tls_verify(self, monkeypatch):
+    def test_close_verifies_by_default(self, monkeypatch):
         calls = {}
 
         def fake_delete(url, **kwargs):
@@ -238,6 +239,19 @@ class TestTlsVerifySkipped:
         client = HubMcpClient(self.ENDPOINT_HTTPS)
         client.session_id = SESSION_ID
         client.close()
+        assert calls.get("verify") is True
+
+    def test_insecure_opt_in_skips_verify(self, monkeypatch):
+        calls = {}
+
+        def fake_post(url, **kwargs):
+            calls.update(kwargs)
+            return FakeResp(text=rpc_result(1, {}), headers={})
+
+        monkeypatch.setattr(hub_file_service.requests, "post", fake_post)
+        monkeypatch.setenv("AIEVO_HUB_TLS_INSECURE", "1")
+        client = HubMcpClient(self.ENDPOINT_HTTPS)
+        client._post({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
         assert calls.get("verify") is False
 
 

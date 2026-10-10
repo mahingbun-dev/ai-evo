@@ -84,7 +84,7 @@ def insert_model_configs(db):
         model_type="gpt-4",
         model_role="evaluation",
         endpoint="https://api.test.com/v1/chat/completions",
-        api_key="mock-api-key-12345",
+        api_key=os.environ.get("MOCK_EVAL_API_KEY", ""),
         auth_type="bearer",
         auth_config={"header_name": "Authorization", "header_value_prefix": "Bearer"},
         request_config={
@@ -111,7 +111,7 @@ def insert_model_configs(db):
         model_type="claude-3-opus",
         model_role="judge",
         endpoint="https://api.test.com/v1/chat/completions",
-        api_key="mock-judge-key-12345",
+        api_key=os.environ.get("MOCK_JUDGE_API_KEY", ""),
         auth_type="bearer",
         auth_config={"header_name": "Authorization", "header_value_prefix": "Bearer"},
         request_config={

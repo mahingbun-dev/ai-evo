@@ -65,6 +65,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from app.db.session import SessionLocal
 from app.models.pre_judge_models import PreJudgeScript
 from app.services import pre_judge_script_service
+from app.utils.path_safety import ensure_within
 from app.services.hub_file_service import (
     HubFileError,
     build_file_index,
@@ -273,7 +274,8 @@ def build_script_run_dir(task_id: str, data_id: str, script_id: str) -> Path:
     其相对路径写盘的文件（含 stdout/stderr 重定向）都落在该目录，随任务清理。
     返回绝对路径（Popen cwd 与日志展示均按绝对路径更稳）。
     """
-    run_dir = (SCRIPT_RUN_BASE / str(task_id) / str(data_id) / _safe_name(script_id)).absolute()
+    # task_id/data_id 来自评测负载，realpath 兜底确保运行目录不逃出 SCRIPT_RUN_BASE
+    run_dir = Path(ensure_within(SCRIPT_RUN_BASE, str(task_id), str(data_id), _safe_name(script_id))).absolute()
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
 
@@ -678,8 +680,9 @@ def _execute_script_subprocess(
         staged_dir = script_dir
 
     stdin_payload = json.dumps(stdin, ensure_ascii=False, default=str).encode("utf-8")
-    stdout_file = Path(cwd) / "stdout.log"
-    stderr_file = Path(cwd) / "stderr.log"
+    # cwd 由 build_script_run_dir 创建并经 realpath 兜底，重定向文件同样走 within 校验
+    stdout_file = Path(ensure_within(str(cwd), "stdout.log"))
+    stderr_file = Path(ensure_within(str(cwd), "stderr.log"))
     timed_out = False
     returncode: Optional[int] = None
     env = os.environ.copy()

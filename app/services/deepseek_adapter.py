@@ -8,11 +8,13 @@ DeepSeek Harness 适配器（deepseek-harness-sdk）
   外层再套线程级超时兜底（run_sync_with_timeout）
 """
 import logging
+from pathlib import Path
 import shutil
 import tempfile
 from typing import Any, Dict, Optional, Tuple
 
 from app.services.harness_adapter import HarnessAdapter, run_sync_with_timeout
+from app.utils.path_safety import ensure_within
 
 logger = logging.getLogger(__name__)
 
@@ -81,9 +83,8 @@ def build_provider_patch(config: Dict[str, Any], workspace: str) -> str:
     except ImportError:
         import json
         content = json.dumps(patch, ensure_ascii=False, indent=2)
-    path = f"{workspace.rstrip('/')}/dsh-provider-patch.yml"
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
+    path = ensure_within(workspace, "dsh-provider-patch.yml")
+    Path(path).write_text(content, encoding="utf-8")
     return path
 
 

@@ -1668,14 +1668,11 @@ const handleExport = async (format) => {
       downloadBlob(blob, `evaluation_result_${selectedTaskId.value}_${Date.now()}.json`)
       ElMessage.success('JSON 导出成功')
     } else if (format === 'excel' || format === 'csv') {
-      // Excel/CSV 使用批量导出接口，需要用 axios 处理 blob 响应
-      const axios = (await import('axios')).default
-      const response = await axios.post('/api/v1/evaluation/results/batch-export', {
+      // Excel/CSV 使用批量导出接口；必须走带鉴权拦截器的 request 实例
+      // （裸 axios 不带 Authorization 头，后端 401），blob 响应由拦截器透传
+      const response = await resultApi.exportBatch({
         task_ids: [selectedTaskId.value],
         format: format
-      }, {
-        responseType: 'blob',
-        withCredentials: true
       })
 
       const blob = new Blob([response.data], {

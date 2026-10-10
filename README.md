@@ -1,94 +1,99 @@
-# AgentEvo — AI 评测平台
+# AgentEvo — Self-hosted AI Evaluation Platform
 
-对 LLM / Agent 的响应质量做系统化、可量化评测的自研平台。覆盖「准备 → 评测 → 分析」完整流程：模型配置、数据集管理、评测前处理脚本、9 种评测类型、结果聚合与统计分析、A/B 对比测试。
+Systematically and quantitatively evaluate the response quality of LLMs and Agents — model configs, dataset management, pre-evaluation scripts, 9 evaluation types with AI judges, result analytics and A/B testing. Built with FastAPI + Vue 3 + Celery, deployable as a single Docker Compose stack.
 
-## 功能总览
+![Home](docs/assets/00-home.png)
 
-| 模块 | 能力 |
+![License](https://img.shields.io/badge/license-Apache--2.0-blue)
+![Python](https://img.shields.io/badge/Python-3.12%2B-blue)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.128-teal)
+![Vue 3](https://img.shields.io/badge/Vue-3-brightgreen)
+
+[中文文档](README.zh-CN.md)
+
+## What it does
+
+Preparation → Evaluation → Analysis, in one platform:
+
+| Module | Capabilities |
 |---|---|
-| 模型配置 | OpenAI / Anthropic 兼容接口、自定义 HTTP（curl 导入）、运行时变量注入、连通性流式测试 |
-| 数据集管理 | Excel 导入（动态字段）、Agent 会话文件导入、媒体字段、字段级校验 |
-| 脚本库 | 评测前处理脚本（zip / 文件夹包）、`model.py` 契约声明、在线文件树编辑、脚手架模板 |
-| 评测任务 | AI 裁判员 / Agent 长会话 / 一致性 / 成功率 / RAG 检索 / 二分分类等类型，批量运行、实时进度（WebSocket） |
-| 裁判引擎 | Claude Code 裁判、DeepSeek Harness 裁判、通用 LLM 裁判，评测维度动态配置 |
-| 结果与分析 | 评分明细、历史对比、Excel/JSON/CSV 导出、趋势统计、双模型 A/B 并排对比 |
-| 管理 | 团队与用户启停（超级管理员）、审计日志、内置使用文档 |
+| Model configs | OpenAI / Anthropic compatible endpoints, custom HTTP (import from curl), runtime variable injection, streaming connectivity test |
+| Datasets | Excel import (dynamic fields), Agent session file import, media fields, field-level validation |
+| Script library | Pre-evaluation scripts (zip / folder packages), `model.py` contract declaration, online file-tree editing, scaffold templates |
+| Evaluation tasks | AI judge / Agent long-session / consistency / success-rate / RAG retrieval / binary classification, batch runs, real-time progress over WebSocket |
+| Judge engines | Claude Code judge, DeepSeek Harness judge, generic LLM judge graph; per-task evaluation dimensions |
+| Results & analytics | Score details, run-to-run history, Excel/JSON/CSV export, trend statistics, side-by-side A/B comparison |
+| Administration | Teams and user enable/disable (super admin), audit log, built-in user guide |
 
-完整功能说明与截图见 [docs/user_guide.md](docs/user_guide.md)。
+First registered user automatically becomes the super admin; sessions are JWT (`Authorization: Bearer`), passwords stored as PBKDF2-HMAC-SHA256 hashes.
 
-## 快速开始（本地开发）
+## Quick start (local development)
 
-依赖：Python 3.12+、Node.js 18+（pnpm）、PostgreSQL、Redis。
+Prerequisites: Python 3.12+, Node.js 18+ with pnpm, Docker (for PostgreSQL and Redis).
 
 ```bash
-# 1. 安装后端依赖
+# 1. Start PostgreSQL + Redis (dev containers)
+docker compose -f docker-compose.dev.yml up -d
+
+# 2. Backend dependencies (use a virtualenv)
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# 2. 配置环境（.env 不入库）
+# 3. Configure environment (.env is not committed)
 cp .env.example .env
-#   编辑 .env：DATABASE_URL / REDIS_URL / AUTH_JWT_SECRET（生产必填，见下文）
+#   set DATABASE_URL / REDIS_URL / AUTH_JWT_SECRET
 
-# 3. 建表（数据库迁移；连接串经 AIEVO_DATABASE_URL 或 alembic_local.ini 提供）
+# 4. Run database migrations
+export AIEVO_DATABASE_URL="$DATABASE_URL"
 alembic upgrade head
 
-# 4. 启动后端（默认 8100）
+# 5. Start the backend (port 8100)
 python scripts/run_local_dev.py
 
-# 5. 启动前端（另一终端）
-cd frontend && pnpm install && pnpm dev   # https://localhost:3000，/api 代理到 8100
+# 6. Start the frontend (another terminal, /api proxies to 8100)
+cd frontend && pnpm install && pnpm dev   # https://localhost:3000
 ```
 
-打开 `https://localhost:3000` → 注册账号（**首个注册用户自动成为超级管理员**）→ 登录使用。
+Open `https://localhost:3000` → register (first user becomes super admin) → add a target model and a judge model under **Model Configs** → import a dataset from Excel → create and run an evaluation task.
 
-## 登录与鉴权
+## Deploy with Docker Compose
 
-- 本地账号密码登录，注册即用；密码 PBKDF2-HMAC-SHA256 哈希存储，会话为 HS256 JWT（`Authorization: Bearer`），WebSocket 握手经 `?token=` 传递
-- 关键环境变量（见 `.env.example`）：
-  - `AUTH_JWT_SECRET` — JWT 签名密钥，**生产必须显式配置**（缺省时基于 `DATABASE_URL` 派生，仅限本地开发）
-  - `AUTH_REGISTER_ENABLED` — 注册开关（`false` 时仅已建账号可登录）
-  - `AUTH_TOKEN_EXPIRE_HOURS` — 登录态有效期（默认 168 小时）
-- 管理能力：超级管理员可在「团队管理」禁用/启用用户账号
-
-## 部署（Docker Compose）
+The image is built online (`Dockerfile.online`: Node stage builds the frontend, Python stage installs dependencies):
 
 ```bash
-# 服务器上准备 .env（参考 .env.example），然后：
-docker compose up -d    # api + worker + redis；前端构建产物由镜像内 FastAPI 托管
+cp .env.example .env   # set DATABASE_URL / REDIS_URL / AUTH_JWT_SECRET / IMAGE_TAG
+docker compose up -d --build
 ```
 
-构建与离线部署细节见 [docs/build-pipeline.md](docs/build-pipeline.md)。
+- `api` serves both the REST API and the built frontend on port 8100 (`AIEVO_PORT` to change)
+- `worker` runs Celery evaluation tasks; `logs/` and `uploads/` are persisted via volumes
+- set `COMPOSE_PROFILES=bundled-db` in `.env` to also start a bundled PostgreSQL
 
-**可选集成**：「从 anc-hub 导入」执行包功能对接 MCP 中台——可部署开源的 [plugin-hub](https://github.com/mahingbun-dev/plugin-hub) 并把 `ANC_HUB_MCP_ENDPOINT` 指向其 MCP 面；对接契约与内部 anc-hub 完全一致。
+The full offline/CI pipeline (locked wheels, bundled Claude Code CLI) is described in [docs/build-pipeline.md](docs/build-pipeline.md).
 
-## 项目结构
+## Evaluation types
 
-```
-├── app/            # FastAPI 后端（api/ services/ models/ middleware/ tasks/）
-├── frontend/       # Vue 3 + Vite + Element Plus 前端
-├── alembic/        # 数据库迁移
-├── scripts/        # 本地开发与运维脚本
-├── tests/          # pytest 单元/E2E 测试
-├── tools/          # 构建/离线包工具
-├── docker-compose.yml
-└── docs/           # 使用文档（user_guide.md）与部署手册
-```
+| Type | One-liner | Needs a judge model |
+|---|---|---|
+| AI judge | LLM judge scores model outputs on configured dimensions | Yes |
+| Agent (long session) | Judge scores imported agent session transcripts | Yes |
+| Consistency | Same input called N times, measures output stability | Optional |
+| Success rate | Share of successful calls | No |
+| RAG retrieval | Precision / recall and 4 more retrieval metrics | Partial |
+| Binary classification | Label comparison: accuracy / sensitivity / specificity | No |
 
-## 开发
+## Documentation
 
-```bash
-# 后端单测
-pytest tests/ -q --ignore=tests/e2e
+- [User guide (中文, with screenshots)](docs/user_guide.md)
+- [Quick start (中文)](QUICK_START.md)
+- API docs are served by the backend at `/api-docs` once running
 
-# 本地后端（热重载）
-python scripts/run_local_dev.py --reload
+## Security notes
 
-# 前端（Vite dev，自签 HTTPS）
-cd frontend && pnpm dev
-```
-
-接口文档：后端启动后访问 `/api-docs`（Swagger UI）与 `/docs`（内置使用文档页）。
+- Set a strong `AUTH_JWT_SECRET` in production (missing values fall back to a derived key, local development only)
+- anc-hub endpoints use strict TLS verification by default; self-signed internal endpoints can opt out with `AIEVO_HUB_TLS_INSECURE=1`
+- This platform intentionally calls user-configured model endpoints (including internal gateways) — deploy it inside a trust boundary you control
 
 ## License
 
-仅供学习与内部工程实践参考。
+[Apache-2.0](LICENSE)

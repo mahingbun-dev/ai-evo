@@ -13,8 +13,11 @@ from app.api.judge_config_api import router as judge_config_router
 
 
 # 创建独立的测试 app，不含鉴权中间件
+# 路由自身已带 /judge-config 前缀（与 main.py 的挂载方式一致：
+# include_router(judge_config_router, prefix=API_V1_STR + "/evaluation")），
+# 这里只补外层 /api/v1/evaluation，避免路径出现双重 /judge-config
 test_app = FastAPI()
-test_app.include_router(judge_config_router, prefix="/api/v1/evaluation/judge-config")
+test_app.include_router(judge_config_router, prefix="/api/v1/evaluation")
 client = TestClient(test_app)
 
 
@@ -31,7 +34,7 @@ class TestJudgeConfigApi:
         assert "evaluation_targets" in data
 
     def test_preview_renders_jinja2_template(self):
-        """测试 POST preview 正确渲染包含 {{target.name}} 的模板"""
+        """测试 POST preview 正确渲染：系统模板渲染 targets，用户提示词由 judge_variable_config 组装"""
         response = client.post(
             "/api/v1/evaluation/judge-config/preview",
             json={
@@ -47,7 +50,18 @@ class TestJudgeConfigApi:
                     }
                 ],
                 "dataset_item": {},
-                "model_result": {"content": "模型输出内容"}
+                "model_result": {"content": "模型输出内容"},
+                # 用户提示词由 prompt_type=user 的裁判变量组装（现行契约，
+                # 与前端 Tasks.vue 发送的结构一致），格式为【变量名】值
+                "judge_variable_config": [
+                    {
+                        "key": "model_output",
+                        "name": "模型输出",
+                        "source": "model_output",
+                        "source_config": {},
+                        "prompt_type": "user"
+                    }
+                ]
             }
         )
         assert response.status_code == 200

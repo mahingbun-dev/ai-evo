@@ -216,8 +216,7 @@ LOG_FORMAT=%(asctime)s - %(name)s - %(levelname)s - %(message)s
 """
 
         try:
-            with open(self.env_file, "w") as f:
-                f.write(env_content)
+            Path(self.env_file).write_text(env_content, encoding="utf-8")
             print(f"✅ 环境变量文件已创建: {self.env_file}")
             print("   ⚠️  请编辑此文件并填写正确的配置")
             return True
@@ -249,8 +248,8 @@ LOG_FORMAT=%(asctime)s - %(name)s - %(levelname)s - %(message)s
         }
 
         try:
-            with open(self.test_data_file, "w") as f:
-                json.dump(sample_data, f, indent=2, ensure_ascii=False)
+            Path(self.test_data_file).write_text(
+                json.dumps(sample_data, indent=2, ensure_ascii=False), encoding="utf-8")
             print(f"✅ 示例测试数据已创建: {self.test_data_file}")
             return True
         except Exception as e:

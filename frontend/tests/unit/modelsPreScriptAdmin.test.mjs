@@ -159,7 +159,7 @@ function buildView({
       scriptDialogVisible, isScriptEdit, editingScript, scriptFormRef, scriptForm,
       scriptFiles, activeFilePath, activeFileContent, currentEditorText, editorDirty,
       baselineUpdatedAt, editorActiveTab, hasModelPy,
-      scriptInputFieldRows, scriptOutputSchemaText,
+      scriptInputFieldRows, scriptOutputSchemaRows,
       openScriptDialog, loadScriptFiles, selectScriptFile, saveActiveFile,
       saveScriptMeta,
       togglePreScriptActive, deletePreScript,
@@ -650,7 +650,10 @@ describe('D6 编辑弹窗 Tab 化与 model.py 声明联动', () => {
     assert.deepEqual(calls.api.saveFile[0][1].path, 'model.py')
     assert.deepEqual(api.scriptInputFieldRows.value,
       [{ name: 'src', value_type: 'local', description: '数据源' }])
-    assert.ok(api.scriptOutputSchemaText.value.includes('hits'))
+    // 输出声明已由纯文本改为树行 scriptOutputSchemaRows（叶子解析为 type/description，
+    // int 经 OUTPUT_TYPE_ALIASES 规范化为 integer）
+    assert.deepEqual(api.scriptOutputSchemaRows.value,
+      [{ name: 'hits', type: 'integer', description: '命中数', collapsed: false, children: [] }])
     assert.equal(api.editingScript.value.input_fields.src.value_type, 'local')
     assert.ok(calls.message.some(([, m]) => String(m).includes('model.py 声明已同步')))
   })

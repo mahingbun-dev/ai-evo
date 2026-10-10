@@ -159,8 +159,14 @@ class TestCheckOfflineSnapshot:
                 "pnpm_lock_hash": hashlib.sha256(pnpm_text.encode()).hexdigest(),
             }
         if meta is not False:
-            (ws / ".offline-snapshot.json").write_text(
-                json.dumps(meta), encoding="utf-8"
+            meta_bytes = json.dumps(meta).encode("utf-8")
+            (ws / ".offline-snapshot.json").write_bytes(meta_bytes)
+            # check_offline_snapshot 还会校验 .snapshot-version 标记
+            # （由 sync_offline_snapshot 写入，防止目录在但内容是旧快照）
+            import hashlib as _hashlib
+
+            (ws / ".snapshot-version").write_text(
+                _hashlib.sha256(meta_bytes).hexdigest()[:12], encoding="utf-8"
             )
 
         monkeypatch.setattr(bs, "BUILD_WS", ws)

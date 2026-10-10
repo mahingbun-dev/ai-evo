@@ -8,7 +8,7 @@ import uuid
 import time
 from typing import Dict, Any, List, Optional, Callable
 from dataclasses import dataclass, field
-from jinja2 import Template
+from jinja2.sandbox import SandboxedEnvironment
 
 from app.services.model_caller import ModelCaller
 from app.services.instruction_builder import InstructionBuilder
@@ -253,8 +253,11 @@ class JudgeEvaluationEngine:
             消息列表
         """
         targets_list = list(resolved_targets.values())
-        system_content = Template(system_template).render(targets=targets_list)
-        user_content = Template(user_template).render(targets=targets_list)
+        # 模板来自用户配置（评测提示词模板），必须用沙箱环境渲染，
+        # 阻断 {{ ''.__class__ }} 之类逃逸到 Python 对象模型的写法
+        env = SandboxedEnvironment(autoescape=False)
+        system_content = env.from_string(system_template).render(targets=targets_list)
+        user_content = env.from_string(user_template).render(targets=targets_list)
         return [
             {"role": "system", "content": system_content.strip()},
             {"role": "user", "content": user_content.strip()}

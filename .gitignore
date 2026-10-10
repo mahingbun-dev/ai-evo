@@ -60,3 +60,7 @@ infra-images.tar.gz
 
 # 本地 alembic 连接串（含真实库密码，不入库）
 alembic_local.ini
+
+# ===== 运行产物 / 本地工具状态（不入库）=====
+uploads/
+.mimosa/

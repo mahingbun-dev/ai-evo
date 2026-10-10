@@ -100,8 +100,11 @@ async def list_users(
 
 
 @router.get("/{user_code}", response_model=UserResponse, summary="获取指定用户信息")
-async def get_user(user_code: str, db: Session = Depends(get_db)):
-    """根据 user_code 获取用户详情"""
+async def get_user(user_code: str, request: Request, db: Session = Depends(get_db)):
+    """根据 user_code 获取用户详情（仅本人或超级管理员：响应含邮箱等联系方式）"""
+    caller = getattr(request.state, "user", None) or {}
+    if caller.get("super_admin_flag") != 1 and caller.get("user_code") != user_code:
+        raise HTTPException(status_code=403, detail="仅可查看本人信息（管理员除外）")
     user = db.get(User, user_code)
     if not user:
         raise HTTPException(status_code=404, detail="用户不存在")

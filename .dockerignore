@@ -13,6 +13,7 @@ logs/
 .deepeval/
 .pytest_cache/
 node_modules/
+**/node_modules/
 # docs/* 而非 docs/：目录级排除会阻断子项反排除（!规则），子项级排除不受影响
 docs/*
 !docs/user_guide.md
