@@ -1,6 +1,7 @@
 """
 DeepEval 集成端到端测试
 """
+import pytest
 import requests
 import json
 import time
@@ -8,6 +9,15 @@ import os
 
 BASE_URL = "http://localhost:8000/api/v1"
 AUTH_TOKEN = os.environ.get("TEST_AUTH_TOKEN", "")
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _live_backend():
+    """依赖本地运行中的后端服务，未启动时整组跳过（如 CI 环境）"""
+    try:
+        requests.get(BASE_URL.replace("/api/v1", "") + "/openapi.json", timeout=2)
+    except requests.RequestException:
+        pytest.skip("后端服务未运行（http://localhost:8000），跳过 DeepEval 端到端集成测试")
 
 
 def get_headers():

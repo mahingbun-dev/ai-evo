@@ -1,9 +1,10 @@
 # 在线构建镜像（联网环境用，如群晖 docker compose build）
 #
 # 与生产离线 Dockerfile 的差异：
-# - 不依赖 .wheels/ 离线 wheel 包与 claude-local/ 离线 CLI，直接从 PyPI 安装
-#   requirements.txt（可用 PIP_INDEX_URL 换源加速）；Claude Code CLI 由官方
-#   安装脚本在线安装（钉版与离线流水线一致，见 tools/claude-bin.json）
+# - 不依赖 .wheels/ 离线 wheel 包，直接从 PyPI 安装 requirements.txt（可用
+#   PIP_INDEX_URL 换源加速）；Claude Code CLI 走可选的 claude-local/ 离线
+#   携带（版本与 tools/claude-bin.json 对齐），目录缺失时跳过——仅 Claude
+#   Code Agent 裁判引擎不可用，其余功能完整
 # - 前端 dist 在 node 阶段现构建（离线版由构建机预构建后 COPY）
 #
 # 构建：docker build -f Dockerfile.online -t ai-evo:online .
@@ -41,10 +42,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 # 相同的离线携带方式——claude-local/bin/claude 由构建方从官方发布
 # （storage.googleapis.com/claude-code-dist-*/claude-code-releases/<ver>/linux-x64/claude，
 # 版本与 tools/claude-bin.json 对齐）预先下载就位，自包含 Bun 二进制，
-# 无需 Node.js 运行时；不入 git，构建前必须存在
-COPY claude-local/ /root/.local/
+# 无需 Node.js 运行时；不入 git。
+# 通配 COPY：claude-local/ 缺失时为空操作（CI / OSS clone 构建仍可成功）
+COPY claude-local* /root/.local/
 RUN ln -sf /root/.local/bin/claude /usr/local/bin/claude \
-    && /usr/local/bin/claude --version
+    && if [ -x /root/.local/bin/claude ]; then /usr/local/bin/claude --version; \
+    else echo "[warn] claude-local/ 未提供，镜像不含 Claude Code CLI"; fi
 
 # DeepSeek Harness 裁判引擎无需额外安装：requirements.txt 中的
 # deepseek-harness-sdk wheel 自带 linux/amd64 原生运行时（deepseek_harness_runtime）

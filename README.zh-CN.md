@@ -4,6 +4,7 @@
 
 ![首页](docs/assets/00-home.png)
 
+[![CI](https://github.com/mahingbun-dev/ai-evo/actions/workflows/ci.yml/badge.svg)](https://github.com/mahingbun-dev/ai-evo/actions/workflows/ci.yml)
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![Python](https://img.shields.io/badge/Python-3.12%2B-blue)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.128-teal)

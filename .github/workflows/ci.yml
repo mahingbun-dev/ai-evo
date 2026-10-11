@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  backend-tests:
+    name: Backend tests (pytest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # 迁移类测试直接 inspect 真实库 schema，WebSocket 端点会启动 Redis PubSub
+    # 监听——与部署形态一致，pytest 前先起 PG / Redis 并跑 alembic 迁移
+    env:
+      DATABASE_URL: postgresql://ai_evo:ai_evo@127.0.0.1:5432/ai_evo
+      REDIS_URL: redis://127.0.0.1:6379/0
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: ai_evo
+          POSTGRES_PASSWORD: ai_evo
+          POSTGRES_DB: ai_evo
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ai_evo"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      # 与项目约定一致，依赖装进独立 venv
+      - name: Create venv and install dependencies
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install -r requirements.txt
+
+      - name: Run database migrations
+        run: .venv/bin/alembic upgrade head
+        env:
+          AIEVO_DATABASE_URL: postgresql://ai_evo:ai_evo@127.0.0.1:5432/ai_evo
+
+      - name: Run test suite
+        run: .venv/bin/pytest
+
+  frontend-build:
+    name: Frontend build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      # pnpm 11 与 Dockerfile.online 的 corepack 钉版一致
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm build
+
+  docker-image:
+    name: Docker image build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # 验证 Dockerfile.online 在干净 clone 上可构建（claude-local/ 不入 git，
+      # 通配 COPY 缺失时跳过，镜像不含 Claude Code CLI 但构建不失败）
+      - name: Build image
+        run: >-
+          docker build -f Dockerfile.online
+          --build-arg PIP_INDEX_URL=https://pypi.org/simple
+          --build-arg NPM_REGISTRY=https://registry.npmjs.org
+          -t ai-evo:ci .
