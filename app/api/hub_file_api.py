@@ -48,6 +48,10 @@ from app.services.hub_file_service import (
 )
 from app.services.hub_file_service import PREVIEW_TEXT_LIMIT
 
+# mimetypes 内建表不含 .log，Linux 上回退查系统 /etc/mime.types（精简镜像/CI 常缺），
+# 会把脚本日志下载成 application/octet-stream——显式补齐保证跨平台一致
+mimetypes.add_type("text/plain", ".log")
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/hub-files", tags=["anc-hub 文件"])

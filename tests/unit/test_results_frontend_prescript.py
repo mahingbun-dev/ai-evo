@@ -32,12 +32,17 @@ def _node_bin() -> str | None:
 
 
 def _run_node_test(test_file: Path) -> str:
-    """运行单个 node:test 文件并断言全过，返回 stdout 供断言统计"""
+    """运行单个 node:test 文件并断言全过，返回 TAP stdout 供断言统计
+
+    --test-reporter=tap 钉死输出格式：Node 默认报告器随版本/TTY 变化
+    （Node ≥22 非 TTY 也输出 spec 的 ℹ 汇总行，Node 20 输出 TAP），直接解析
+    默认输出会跨平台误报。
+    """
     node = _node_bin()
     assert node is not None, "未找到 node，无法运行前端逻辑单测"
     assert test_file.is_file(), f"测试文件缺失: {test_file}"
     proc = subprocess.run(
-        [node, "--test", str(test_file)],
+        [node, "--test", "--test-reporter=tap", str(test_file)],
         cwd=str(PROJECT_ROOT),
         capture_output=True,
         text=True,
@@ -67,7 +72,8 @@ class TestFrontendLogicNodeSuite:
         if _node_bin() is None:
             pytest.skip("未找到 node，跳过前端逻辑单测")
         stdout = _run_node_test(test_file)
-        # 汇总行校验：确有用例执行且全部通过（防止测试文件为空导致假通过）
-        summary = [ln for ln in stdout.splitlines() if ln.startswith("ℹ")]
-        assert any("tests" in ln for ln in summary), f"未解析到测试统计：\n{stdout}"
-        assert "fail 0" in stdout, f"存在失败用例：\n{stdout}"
+        # TAP 计划行校验：确有用例执行（防止测试文件为空导致假通过）；
+        # 全部通过由 _run_node_test 的 returncode == 0 保证
+        plan_lines = [ln for ln in stdout.splitlines() if ln.startswith("1..")]
+        assert plan_lines, f"未解析到 TAP 计划行：\n{stdout}"
+        assert plan_lines[0] != "1..0", f"测试文件没有执行任何用例：\n{stdout}"
