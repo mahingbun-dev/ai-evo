@@ -1,0 +1,13 @@
+{
+  "case_id": "TC_013",
+  "actions": [
+    {
+      "action": "click",
+      "target": "#btn-query"
+    },
+    {
+      "action": "assert",
+      "expect": "表格刷新"
+    }
+  ]
+}

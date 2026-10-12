@@ -1,0 +1,6 @@
+{
+  "case_id": "TC_003",
+  "category": "assertion_failed",
+  "message": "期望返回明确报错，实际返回空列表",
+  "screenshot": "screenshots/TC_003.png"
+}

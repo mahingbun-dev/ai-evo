@@ -1,0 +1,194 @@
+[
+  {
+    "path": "62ed5009-2f58-40bd-9e43-8bac7a9eacbf-attempt-1/acceptance-map.json",
+    "type": "text",
+    "size": 387,
+    "is_nested_zip": false
+  },
+  {
+    "path": "62ed5009-2f58-40bd-9e43-8bac7a9eacbf-attempt-1/action-files/EXPORT_TC013.xlsx",
+    "type": "binary",
+    "size": 1545,
+    "is_nested_zip": false
+  },
+  {
+    "path": "62ed5009-2f58-40bd-9e43-8bac7a9eacbf-attempt-1/actions/EXPORT_TC013.json",
+    "type": "text",
+    "size": 182,
+    "is_nested_zip": false
+  },
+  {
+    "path": "62ed5009-2f58-40bd-9e43-8bac7a9eacbf-attempt-1/case_list.json",
+    "type": "text",
+    "size": 39,
+    "is_nested_zip": false
+  },
+  {
+    "path": "62ed5009-2f58-40bd-9e43-8bac7a9eacbf-attempt-1/case_list.json.lock",
+    "type": "binary",
+    "size": 57,
+    "is_nested_zip": false
+  },
+  {
+    "path": "62ed5009-2f58-40bd-9e43-8bac7a9eacbf-attempt-1/clarifications.html",
+    "type": "text",
+    "size": 93,
+    "is_nested_zip": false
+  },
+  {
+    "path": "62ed5009-2f58-40bd-9e43-8bac7a9eacbf-attempt-1/clarifications.json",
+    "type": "text",
+    "size": 209,
+    "is_nested_zip": false
+  },
+  {
+    "path": "62ed5009-2f58-40bd-9e43-8bac7a9eacbf-attempt-1/claude-thread.zip",
+    "type": "archive",
+    "size": 257,
+    "is_nested_zip": true
+  },
+  {
+    "path": "62ed5009-2f58-40bd-9e43-8bac7a9eacbf-attempt-1/execution-context.json",
+    "type": "text",
+    "size": 305,
+    "is_nested_zip": false
+  },
+  {
+    "path": "62ed5009-2f58-40bd-9e43-8bac7a9eacbf-attempt-1/execution-manifest.json",
+    "type": "text",
+    "size": 606,
+    "is_nested_zip": false
+  },
+  {
+    "path": "62ed5009-2f58-40bd-9e43-8bac7a9eacbf-attempt-1/failure-analysis.json",
+    "type": "text",
+    "size": 167,
+    "is_nested_zip": false
+  },
+  {
+    "path": "62ed5009-2f58-40bd-9e43-8bac7a9eacbf-attempt-1/handoff.json",
+    "type": "text",
+    "size": 186,
+    "is_nested_zip": false
+  },
+  {
+    "path": "62ed5009-2f58-40bd-9e43-8bac7a9eacbf-attempt-1/report-receipt.json",
+    "type": "text",
+    "size": 210,
+    "is_nested_zip": false
+  },
+  {
+    "path": "62ed5009-2f58-40bd-9e43-8bac7a9eacbf-attempt-1/reports/allure_html/index.html",
+    "type": "text",
+    "size": 67,
+    "is_nested_zip": false
+  },
+  {
+    "path": "62ed5009-2f58-40bd-9e43-8bac7a9eacbf-attempt-1/reports/allure_results/01tc001-result.json",
+    "type": "text",
+    "size": 370,
+    "is_nested_zip": false
+  },
+  {
+    "path": "62ed5009-2f58-40bd-9e43-8bac7a9eacbf-attempt-1/reports/allure_results/02tc002-result.json",
+    "type": "text",
+    "size": 370,
+    "is_nested_zip": false
+  },
+  {
+    "path": "62ed5009-2f58-40bd-9e43-8bac7a9eacbf-attempt-1/reports/allure_results/03tc003-result.json",
+    "type": "text",
+    "size": 439,
+    "is_nested_zip": false
+  },
+  {
+    "path": "62ed5009-2f58-40bd-9e43-8bac7a9eacbf-attempt-1/reports/allure_results/0a1b2c3d-attachment.json",
+    "type": "text",
+    "size": 90,
+    "is_nested_zip": false
+  },
+  {
+    "path": "62ed5009-2f58-40bd-9e43-8bac7a9eacbf-attempt-1/reports/logs/run.log",
+    "type": "text",
+    "size": 76,
+    "is_nested_zip": false
+  },
+  {
+    "path": "62ed5009-2f58-40bd-9e43-8bac7a9eacbf-attempt-1/reports/screenshots/TC_003.png",
+    "type": "image",
+    "size": 69,
+    "is_nested_zip": false
+  },
+  {
+    "path": "62ed5009-2f58-40bd-9e43-8bac7a9eacbf-attempt-1/scripts/test_customer_query.py",
+    "type": "text",
+    "size": 111,
+    "is_nested_zip": false
+  },
+  {
+    "path": "62ed5009-2f58-40bd-9e43-8bac7a9eacbf-attempt-1/segments/0ff0ab4c-5c45-4752-82fb-0003fee7c24d/allure-data/8aac20fe-result.json",
+    "type": "text",
+    "size": 67,
+    "is_nested_zip": false
+  },
+  {
+    "path": "62ed5009-2f58-40bd-9e43-8bac7a9eacbf-attempt-1/segments/0ff0ab4c-5c45-4752-82fb-0003fee7c24d/handoff-input.json",
+    "type": "text",
+    "size": 142,
+    "is_nested_zip": false
+  },
+  {
+    "path": "62ed5009-2f58-40bd-9e43-8bac7a9eacbf-attempt-1/segments/0ff0ab4c-5c45-4752-82fb-0003fee7c24d/pytest.log",
+    "type": "text",
+    "size": 59,
+    "is_nested_zip": false
+  },
+  {
+    "path": "62ed5009-2f58-40bd-9e43-8bac7a9eacbf-attempt-1/segments/0ff0ab4c-5c45-4752-82fb-0003fee7c24d/runtime/wms_support/__init__.py",
+    "type": "text",
+    "size": 45,
+    "is_nested_zip": false
+  },
+  {
+    "path": "62ed5009-2f58-40bd-9e43-8bac7a9eacbf-attempt-1/segments/0ff0ab4c-5c45-4752-82fb-0003fee7c24d/runtime/wms_support/registry.json",
+    "type": "text",
+    "size": 62,
+    "is_nested_zip": false
+  },
+  {
+    "path": "62ed5009-2f58-40bd-9e43-8bac7a9eacbf-attempt-1/segments/0ff0ab4c-5c45-4752-82fb-0003fee7c24d/runtime-config.json",
+    "type": "text",
+    "size": 122,
+    "is_nested_zip": false
+  },
+  {
+    "path": "62ed5009-2f58-40bd-9e43-8bac7a9eacbf-attempt-1/self-check.json",
+    "type": "text",
+    "size": 293,
+    "is_nested_zip": false
+  },
+  {
+    "path": "62ed5009-2f58-40bd-9e43-8bac7a9eacbf-attempt-1/self-check.md",
+    "type": "text",
+    "size": 63,
+    "is_nested_zip": false
+  },
+  {
+    "path": "62ed5009-2f58-40bd-9e43-8bac7a9eacbf-attempt-1/source/anc-source.json",
+    "type": "text",
+    "size": 211,
+    "is_nested_zip": false
+  },
+  {
+    "path": "62ed5009-2f58-40bd-9e43-8bac7a9eacbf-attempt-1/source/cases.json",
+    "type": "text",
+    "size": 62,
+    "is_nested_zip": false
+  },
+  {
+    "path": "62ed5009-2f58-40bd-9e43-8bac7a9eacbf-attempt-1/source/source-manifest.json",
+    "type": "text",
+    "size": 105,
+    "is_nested_zip": false
+  }
+]

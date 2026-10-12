@@ -1,0 +1,20 @@
+{
+  "task_id": "local_dev",
+  "data_id": "sample_attempt",
+  "fields": {},
+  "inputs": {
+    "hub_pkg": {
+      "root": "inputs/hub_pkg",
+      "index_path": "inputs/hub_pkg_index.json"
+    },
+    "hub_pkg_all": {
+      "root": "inputs/hub_pkg",
+      "index_path": "inputs/hub_pkg_index.json"
+    }
+  },
+  "model_output": null,
+  "session": null,
+  "params": {},
+  "upstream": {},
+  "_run_dir": "."
+}

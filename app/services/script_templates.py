@@ -70,10 +70,33 @@ SINGLE_README_MD = '''# 评测前处理脚本（single 模板）
 
 - 入口：根级 `main.py` 顶层 `def run(stdin: dict) -> dict`
 - 标准输入 `stdin` 键：`task_id` / `data_id` / `fields`（字段名 → 本地文件路径）/
+  `inputs`（hub 执行包通道：配 path_pattern → `{root, files:[{path,rel_path,size,type}]}`；
+  未配 → `{root, index_path}`）/
   `params` / `upstream`（前序脚本输出）/ `_run_dir`（产物目录）
 - 标准输出（run 返回值）：`{status: ok|skip|fail, output, files, summary,
   finish_reason, error}`
 - 产物文件写 `_run_dir` 下，并把绝对路径注册进 `files`
+
+## 运行时工作区目录结构（每条数据评完即清）
+
+平台执行脚本时会把「脚本包副本 + 输入副本」组装进单条数据工作区（绝对路径都经
+stdin 传入，源码里禁止自行拼接）：
+
+```
+uploads/script_runs/{task_id}/{data_id}/            ← 单条数据工作区（_run_dir，产物只写这里）
+├── scripts/{script_key}/                           ← 脚本包副本（从副本执行；cwd 为工作区直下 {script_id}/，stdout/stderr 落 cwd）
+├── inputs/{字段名}.{ext}                            ← inline/local 字段副本（fields 值即此路径）
+├── inputs/{字段名}/                                 ← hub 执行包整目录副本（inputs.root 即此目录）
+│   └── {execution_id}-attempt-1/                   ← zip 原始最外层，平台原样保留
+│       ├── execution-manifest.json
+│       └── reports/ logs/ ...
+└── inputs/{字段名}_index.json                       ← 未配 path_pattern 时的索引文件
+```
+
+要点：`inputs.root` 是解包根（attempt 目录的上一级），`rel_path` 一律带
+`{execution_id}-attempt-1/` 前缀；不要在源码里硬编码 attempt 目录名（每个执行包的
+execution_id 不同），按 rel_path 首段推导或按后缀定位文件；脚本读写只影响本条
+这一份副本（严格拷贝语义），评完随工作区清理。
 
 ## 开发指引
 
@@ -198,9 +221,33 @@ FOLDER_README_MD = '''# 评测前处理脚本（folder 模板）
 ## 契约速览
 
 - 标准输入 `stdin` 键：`task_id` / `data_id` / `fields`（字段名 → 本地文件路径）/
+  `inputs`（hub 执行包通道：配 path_pattern → `{root, files:[{path,rel_path,size,type}]}`；
+  未配 → `{root, index_path}`）/
   `params` / `upstream` / `_run_dir`（产物目录）
 - 标准输出：`{status: ok|skip|fail, output, files, summary, finish_reason, error}`
 - 产物文件写 `_run_dir` 下，并把绝对路径注册进 `files`
+
+## 运行时工作区目录结构（每条数据评完即清）
+
+平台执行脚本时会把「脚本包副本 + 输入副本」组装进单条数据工作区（绝对路径都经
+stdin 传入，源码里禁止自行拼接）：
+
+```
+uploads/script_runs/{task_id}/{data_id}/            ← 单条数据工作区（_run_dir，产物只写这里）
+├── scripts/{script_key}/                           ← 脚本包副本（从副本执行；cwd 为工作区直下 {script_id}/，stdout/stderr 落 cwd）
+│   └── main.py  model.py  utils.py
+├── inputs/{字段名}.{ext}                            ← inline/local 字段副本（fields 值即此路径）
+├── inputs/{字段名}/                                 ← hub 执行包整目录副本（inputs.root 即此目录）
+│   └── {execution_id}-attempt-1/                   ← zip 原始最外层，平台原样保留
+│       ├── execution-manifest.json
+│       └── reports/ logs/ ...
+└── inputs/{字段名}_index.json                       ← 未配 path_pattern 时的索引文件
+```
+
+要点：`inputs.root` 是解包根（attempt 目录的上一级），`rel_path` 一律带
+`{execution_id}-attempt-1/` 前缀；不要在源码里硬编码 attempt 目录名（每个执行包的
+execution_id 不同），按 rel_path 首段推导或按后缀定位文件；脚本读写只影响本条
+这一份副本（严格拷贝语义），评完随工作区清理。
 
 ## 开发指引
 

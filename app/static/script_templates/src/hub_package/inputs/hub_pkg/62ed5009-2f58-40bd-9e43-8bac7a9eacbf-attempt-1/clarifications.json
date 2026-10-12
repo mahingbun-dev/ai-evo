@@ -1,0 +1,11 @@
+{
+  "schema_version": "clarifications_v1",
+  "items": [
+    {
+      "id": "C_001",
+      "question": "客户查询口径？",
+      "answer": "按租户下全部客户",
+      "status": "resolved"
+    }
+  ]
+}

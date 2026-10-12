@@ -1,0 +1,23 @@
+{
+  "uuid": "uuid-0003",
+  "name": "TC_003",
+  "status": "failed",
+  "statusDetails": {
+    "message": "期望返回明确报错，实际返回空列表"
+  },
+  "start": 1758074400003,
+  "stop": 1758074401003,
+  "labels": [
+    {
+      "name": "suite",
+      "value": "非正品登记单增加客户查询"
+    }
+  ],
+  "attachments": [
+    {
+      "name": "screenshot",
+      "source": "TC_003.png",
+      "type": "image/png"
+    }
+  ]
+}

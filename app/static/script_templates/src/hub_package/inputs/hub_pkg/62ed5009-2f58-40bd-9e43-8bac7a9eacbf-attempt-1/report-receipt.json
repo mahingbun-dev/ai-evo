@@ -1,0 +1,8 @@
+{
+  "schema_version": "report_receipt_v1",
+  "execution_id": "62ed5009-2f58-40bd-9e43-8bac7a9eacbf",
+  "accepted_at": "2026-09-17T10:07:00+08:00",
+  "report_files": [
+    "reports/allure_html/index.html"
+  ]
+}

@@ -6,8 +6,8 @@ app/static/script_templates/{name}.zip（包根含 main.py / README.md / lib/）
 保证模板自身可通过平台校验。
 
 用法:
-    python scripts/build_script_templates.py          # 构建全部并自检
-    python scripts/build_script_templates.py basic    # 只构建指定模板
+    python scripts/build_script_templates.py              # 构建全部并自检
+    python scripts/build_script_templates.py hub_package  # 只构建指定模板
 """
 import shutil
 import sys
@@ -36,6 +36,8 @@ def build_template_zip(name: str) -> Path:
         for path in sorted(src_dir.rglob("*")):
             if not path.is_file() or "__pycache__" in path.parts:
                 continue
+            if path.name.startswith("."):  # .DS_Store 等本地产物不入包
+                continue
             arcname = path.relative_to(src_dir).as_posix()
             info = zipfile.ZipInfo(arcname, date_time=ZIP_TIMESTAMP)
             info.compress_type = zipfile.ZIP_DEFLATED
@@ -46,17 +48,24 @@ def build_template_zip(name: str) -> Path:
 
 
 def verify_template_zip(zip_path: Path) -> None:
-    """解包产物到临时目录并跑上传校验链（与平台上传通道同一条链）"""
+    """解包产物到临时目录并跑上传校验链（与平台上传通道同一条链）
+
+    脚手架 zip 的根是运行时工作区骨架（scripts/{script_key}/ + inputs/ 样例），
+    不是可直接上传的脚本包——脚本包本体在 scripts/ 下唯一含 main.py 的目录里，
+    校验链以该目录为包根执行（与用户按 README 指引打包上传后的形态一致）。
+    """
     from app.services.hub_file_service import unpack_zip_safely
     from app.services.pre_judge_script_service import (
         _collect_package_sources,
-        _locate_package_root,
         validate_script_chain,
     )
 
     with tempfile.TemporaryDirectory(prefix="tpl_verify_") as tmp:
         unpack_zip_safely(str(zip_path), tmp)
-        package_root = _locate_package_root(Path(tmp))
+        entries = [p for p in Path(tmp).rglob("main.py") if "inputs" not in p.parts]
+        if len(entries) != 1:
+            raise SystemExit(f"模板 {zip_path.name} 应含唯一脚本入口 main.py（scripts/{'{script_key}'}/ 下）")
+        package_root = entries[0].parent
         sources = _collect_package_sources(package_root)
         entry = package_root / "main.py"
         check = validate_script_chain(sources, entry)
@@ -70,7 +79,7 @@ def verify_template_zip(zip_path: Path) -> None:
 
 
 def main(argv: list) -> int:
-    names = argv[1:] or ["basic", "allure_analysis", "file_diff"]
+    names = argv[1:] or ["hub_package"]
     for name in names:
         zip_path = build_template_zip(name)
         verify_template_zip(zip_path)

@@ -1,0 +1,8 @@
+{
+  "schema_version": "handoff_v2",
+  "execution_id": "62ed5009-2f58-40bd-9e43-8bac7a9eacbf",
+  "attempt": 1,
+  "segments_total": 2,
+  "next_action": "report",
+  "status": "completed"
+}

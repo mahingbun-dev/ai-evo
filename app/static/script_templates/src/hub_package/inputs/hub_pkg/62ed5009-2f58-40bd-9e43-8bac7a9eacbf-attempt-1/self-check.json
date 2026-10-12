@@ -1,0 +1,15 @@
+{
+  "schema_version": "self_check_v2",
+  "execution_id": "62ed5009-2f58-40bd-9e43-8bac7a9eacbf",
+  "checks": [
+    {
+      "name": "query_executed",
+      "passed": true
+    },
+    {
+      "name": "screenshot_captured",
+      "passed": false
+    }
+  ],
+  "conclusion": "TC_003 截图缺失"
+}

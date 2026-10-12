@@ -1,0 +1,21 @@
+{
+  "schema_version": "execution_attempt_v2",
+  "session_id": "run-样例-非正品登记单增加客户查询-1b19ffbb-r5",
+  "execution_id": "62ed5009-2f58-40bd-9e43-8bac7a9eacbf",
+  "attempt": 1,
+  "execution_scope": "full_target",
+  "artifact_status": "complete",
+  "status": "completed",
+  "lifecycle_status": "failed",
+  "aggregate_status": "failed",
+  "started_at": "2026-09-17T10:00:00+08:00",
+  "finished_at": "2026-09-17T10:06:32+08:00",
+  "case_results": {
+    "TC_001": "passed",
+    "TC_002": "passed",
+    "TC_003": "failed"
+  },
+  "scope": [
+    "非正品登记单增加客户查询"
+  ]
+}

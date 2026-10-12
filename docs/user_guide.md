@@ -566,13 +566,11 @@ class PreScriptOutput(BaseModel):
 
 ### 脚手架模板
 
-「脚本库」页 →「脚手架模板」可下载三个模板（均为 main.py + model.py + README + lib/ 结构，自身即通过校验链，可直接上传体验）：
+「脚本库」页 →「脚手架模板」下载唯一脚手架 `hub_package`（自带脚本包通过校验链）。解压后即脚本运行时工作区骨架：`scripts/hub_package/` 是**只读参考模板**（main.py + model.py + lib + 契约 README），你的脚本在 `scripts/` 下另建目录开发（见下方三步上手），`inputs/hub_pkg/{execution_id}-attempt-1/` 是 anc-hub 执行包样例（manifest/acceptance-map/嵌套 zip 等）+ `inputs/hub_pkg_index.json` 索引 + `sample_stdin.json` 本地试跑样例。
 
-| 模板 | 用途 |
-|---|---|
-| `basic` | 基础模板：stdin 契约回显，遍历 inputs 文件两种模式 |
-| `allure_analysis` | 解析 allure-results，统计状态分布与失败清单 |
-| `file_diff` | 执行包内两份文本文件逐行差异对比 |
+> 注意：`hub_pkg` 只是样例选的字段名——`stdin.inputs` 的键随 model.py 声明与编排映射走，脚本应遍历 `stdin.inputs` 消费、不要写死字段名（模板 main.py 即示范）。真实执行包有数百个文件、数十 MB，样例仅示意形状，脚本遍历永远以 stdin 传入的文件清单/索引为准。
+
+三步上手：① 解压根直接 `python scripts/hub_package/main.py < sample_stdin.json` 本地试跑（模板即示例）；② 以 `scripts/hub_package/` 为**只读参考模板**，在 `scripts/` 下新建自己的 `{脚本名}/` 目录开发（可拷贝模板起步，`main.py` + `model.py` 为最小结构，可多个脚本并存）；③ 把**自己的脚本目录**内的文件打包为 zip（main.py 在包根）走「上传包」导入——`scripts/hub_package/`（模板本体）、`inputs/`、`sample_stdin.json` 为参考与对照样例，不要打进上传包。
 
 ---
 

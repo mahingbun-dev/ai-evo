@@ -1,0 +1,13 @@
+{
+  "schema_version": "execution_context_v3",
+  "execution_id": "62ed5009-2f58-40bd-9e43-8bac7a9eacbf",
+  "target": {
+    "system": "wms",
+    "module": "非正品登记",
+    "case": "客户查询"
+  },
+  "environment": {
+    "base_url": "https://wms-uat.example.com",
+    "tenant": "样例租户"
+  }
+}

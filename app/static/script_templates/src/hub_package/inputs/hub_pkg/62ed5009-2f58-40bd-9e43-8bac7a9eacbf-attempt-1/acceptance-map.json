@@ -1,0 +1,18 @@
+{
+  "schema_version": "wms_acceptance_map_v6",
+  "prevention_contract": "wms_prevention_v1",
+  "cases": [
+    {
+      "case_id": "TC_001",
+      "title": "正常登记单查询返回客户信息"
+    },
+    {
+      "case_id": "TC_002",
+      "title": "无客户信息时返回空列表"
+    },
+    {
+      "case_id": "TC_003",
+      "title": "非法单号返回明确报错"
+    }
+  ]
+}

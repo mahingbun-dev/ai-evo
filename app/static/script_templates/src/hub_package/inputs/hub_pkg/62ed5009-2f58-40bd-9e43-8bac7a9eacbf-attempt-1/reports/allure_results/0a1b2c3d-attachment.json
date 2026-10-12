@@ -1,0 +1,5 @@
+{
+  "name": "environment",
+  "source": "environment.json",
+  "type": "application/json"
+}

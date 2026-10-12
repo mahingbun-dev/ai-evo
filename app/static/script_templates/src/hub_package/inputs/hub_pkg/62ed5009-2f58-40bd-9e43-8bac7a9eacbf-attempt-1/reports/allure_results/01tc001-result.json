@@ -1,0 +1,21 @@
+{
+  "uuid": "uuid-0001",
+  "name": "TC_001",
+  "status": "passed",
+  "statusDetails": {},
+  "start": 1758074400001,
+  "stop": 1758074401001,
+  "labels": [
+    {
+      "name": "suite",
+      "value": "非正品登记单增加客户查询"
+    }
+  ],
+  "attachments": [
+    {
+      "name": "screenshot",
+      "source": "TC_001.png",
+      "type": "image/png"
+    }
+  ]
+}

@@ -265,6 +265,12 @@ def scan_hardcoded_paths(sources: Dict[str, str]) -> List[str]:
     return hits
 
 
+# 冒烟样例执行包的唯一顶层目录名：模拟真实 anc-hub 执行包 zip 外层的
+# {execution_id}-attempt-1/ 目录（解包根下仅此一个顶层目录，rel_path 全部带此前缀）。
+# 样例层级与生产一致，模板/脚本在冒烟里写惯的 path_pattern 与遍历逻辑到真实任务不变形
+SMOKE_ATTEMPT_DIR = "e2a6c9d4-1b2f-4c3d-9e8f-5a6b7c8d9e0f-attempt-1"
+
+
 def build_smoke_stdin(run_dir: Path) -> Dict[str, Any]:
     """构造契约冒烟用的样例 stdin（E2）：覆盖契约全键并在 run_dir 落真实样例文件
 
@@ -273,6 +279,10 @@ def build_smoke_stdin(run_dir: Path) -> Dict[str, Any]:
     inputs 演示 hub_file 通道两种模式：path_pattern 模式 {root, files:[...]}（文件对象
     数组：path/rel_path/size/type）与 root/index_path 模式（索引 JSON 文件路径）；
     fields 携带 inline/local 通道值（值为本地路径字符串）。
+
+    hub 样例目录按真实执行包层级组织：root 下唯一顶层目录 {execution_id}-attempt-1/，
+    其内多层子目录（reports/allure_results、logs），rel_path 携带 attempt 前缀——
+    与 resolve_hub_file_fields 镜像 + copy_into_workspace 拷贝后的生产形态一致。
     """
     inputs_dir = run_dir / "inputs"
     inputs_dir.mkdir(parents=True, exist_ok=True)
@@ -280,25 +290,38 @@ def build_smoke_stdin(run_dir: Path) -> Dict[str, Any]:
     note_file.write_text("平台上传校验：契约冒烟样例输入", encoding="utf-8")
 
     pkg_dir = run_dir / "hub_pkg"
-    pkg_dir.mkdir(parents=True, exist_ok=True)
+    attempt_dir = pkg_dir / SMOKE_ATTEMPT_DIR
+    attempt_dir.mkdir(parents=True, exist_ok=True)
     sample_files = {
-        "sample.txt": "样例文本文件内容\n",
-        "sample.json": json.dumps({"code": 0, "message": "ok"}, ensure_ascii=False),
+        "execution-manifest.json": json.dumps({
+            "execution_id": SMOKE_ATTEMPT_DIR.removesuffix("-attempt-1"),
+            "case_results": {"TC_001": "passed", "TC_002": "failed"},
+            "scope": ["冒烟样例分段"],
+        }, ensure_ascii=False),
+        "reports/allure_results/case-1-result.json": json.dumps(
+            {"name": "TC_001", "status": "passed"}, ensure_ascii=False),
+        "reports/allure_results/case-2-result.json": json.dumps(
+            {"name": "TC_002", "status": "failed", "message": "样例失败信息"}, ensure_ascii=False),
+        "logs/run.log": "INFO 冒烟样例日志行\n",
     }
     files_array = []
     for rel, text in sample_files.items():
-        target = pkg_dir / rel
+        target = attempt_dir / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text, encoding="utf-8")
         files_array.append({
             "path": str(target),
-            "rel_path": rel,
+            "rel_path": f"{SMOKE_ATTEMPT_DIR}/{rel}",
             "size": target.stat().st_size,
             "type": "text",
         })
     index_path = inputs_dir / "hub_pkg_index.json"
+    # 索引条目与生产 build_file_index 产物同构：{path: 相对 root 的 posix 路径,
+    # type, size, is_nested_zip[, nested_index]}——path 与 files 数组的 rel_path 同值
     index_path.write_text(
         json.dumps(
-            [{"path": item["path"], "rel_path": item["rel_path"], "size": item["size"], "type": item["type"]}
+            [{"path": item["rel_path"], "type": item["type"], "size": item["size"],
+              "is_nested_zip": False}
              for item in files_array],
             ensure_ascii=False, indent=2,
         ),
@@ -1866,7 +1889,8 @@ def _locate_package_root(staging_dir: Path) -> Path:
         return subdirs[0]
     raise ValueError(
         "脚本包根目录必须包含 main.py（入口约定：python 直接执行包根 main.py，"
-        "包内同目录模块可直接 import）"
+        "包内同目录模块可直接 import）。若上传的是多目录工程/脚手架整包，"
+        "请只打包脚本包本体（含 main.py 的目录内容）后重试"
     )
 
 
@@ -1888,24 +1912,16 @@ def _collect_package_sources(package_root: Path) -> Dict[str, str]:
 SCRIPT_TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "static" / "script_templates"
 
 # 模板元数据：name → 说明（列表接口透出，引导用户按契约开发）
+# 仅一套脚手架：下载即运行时工作区骨架（scripts/{script_key}/ 脚本包本体 +
+# inputs/{字段}/{execution_id}-attempt-1/ 执行包样例 + 索引 + 本地试跑样例）
 SCRIPT_TEMPLATE_DEFS: Dict[str, Dict[str, Any]] = {
-    "basic": {
-        "name": "basic",
-        "title": "基础模板（stdin 契约回显）",
-        "description": "读 stdin 契约输入，遍历 inputs 文件数组（root/files 模式）与 root/index_path 模式，"
-                       "输出文件清单与样例字段值，适合作为自定义脚本的起点",
-    },
-    "allure_analysis": {
-        "name": "allure_analysis",
-        "title": "Allure 结果分析模板",
-        "description": "解析 inputs 执行包内 allure-results 的 *-result.json，统计 passed/failed/broken/skipped "
-                       "状态分布与失败用例清单，输出裁判可见的硬事实",
-    },
-    "file_diff": {
-        "name": "file_diff",
-        "title": "多文件对比模板",
-        "description": "对 inputs 执行包内两份文本文件（params 指定 rel_path_a/rel_path_b）逐行差异对比，"
-                       "输出是否一致、差异行数与差异摘要",
+    "hub_package": {
+        "name": "hub_package",
+        "title": "预判脚本脚手架（运行时工作区骨架）",
+        "description": "下载即脚本运行时的真实目录世界：scripts/{script_key}/ 是脚本包本体"
+                       "（main.py+model.py+lib），inputs/{字段}/{execution_id}-attempt-1/ 是"
+                       " anc-hub 执行包样例（manifest/acceptance-map/嵌套 zip 等）+ 索引文件，"
+                       "附本地试跑样例 stdin；三步上手：本地试跑→开发→打包 scripts 内文件上传",
     },
 }
 
