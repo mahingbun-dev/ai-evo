@@ -105,6 +105,26 @@ services:
     networks:
       - ai-evo-net
 
+  # anc-hub 插件 sidecar：把 ai-evo 核心能力暴露为 MCP 工具（见 docs/hub-plugin.md）。
+  # 与 hub 家族其他插件一致走 host 网络——hub（同机）经回环拨插件 :9500，
+  # 插件经回环调本机 api :8100，advertise 地址填 hub 视角可拨通的回环即可。
+  # 注意：不挂 env_file（.env 里的 DATABASE_URL 等凭证与本服务无关，不进容器）；
+  # ${AIEVO_HUB_*} 插值仍从部署目录 .env 读取（compose 项目级行为）。
+  hub-plugin:
+    image: ai-evo:${IMAGE_TAG:-latest}
+    container_name: ai-evo-hub-plugin
+    depends_on:
+      - api
+    environment:
+      - SERVICE_TYPE=hub-plugin
+      - HUB_ADDR=${AIEVO_HUB_ADDR:-http://127.0.0.1:8093}
+      - HUB_ADVERTISE_ADDR=${AIEVO_HUB_ADVERTISE_ADDR:-http://127.0.0.1:9500}
+      - HUB_LISTEN_ADDR=:9500
+      - HUB_INSTANCE_ID=ai-evo-hub-plugin-1
+      - AIEVO_API_BASE=${AIEVO_API_BASE:-http://127.0.0.1:8100}
+    restart: unless-stopped
+    network_mode: host
+
 volumes:
   pgdata:
   # 群晖等部署通过 .env 设 UPLOADS_VOLUME/LOGS_VOLUME 指向这两个命名卷

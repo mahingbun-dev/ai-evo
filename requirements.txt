@@ -36,6 +36,12 @@ requests==2.32.5
 aiohttp==3.13.3
 websockets==16.0
 
+# ============ anc-hub 插件（app/hub_plugin，vendored hubkit 的运行时下限） ============
+# grpcio/protobuf 版本由 hubkit/proto/hubv1 生成代码在 import 期硬校验（低了直接抛错）；
+# 钉中台插件工程在部署机（缺 x86-64-v2 老CPU）验证过的同款版本组合
+grpcio==1.84.0
+protobuf==7.36.2
+
 # ============ AI/LLM ============
 openai==2.24.0
 anthropic==0.83.0

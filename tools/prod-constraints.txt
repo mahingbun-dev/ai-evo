@@ -59,7 +59,7 @@ frozenlist==1.8.0
 fsspec==2026.6.0
 googleapis-common-protos==1.75.1
 greenlet==3.5.5
-grpcio==1.83.0
+grpcio==1.84.0
 h11==0.16.0
 hf-xet==1.6.0
 httpcore==1.0.9
@@ -118,7 +118,7 @@ portalocker==4.1.0
 posthog==7.39.1
 prompt_toolkit==3.0.53
 propcache==0.5.2
-protobuf==7.35.1
+protobuf==7.36.2
 psycopg2-binary==2.9.11
 pyarrow==25.0.1
 pycparser==3.0

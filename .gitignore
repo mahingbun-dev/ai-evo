@@ -34,8 +34,12 @@ docs/*.md
 !docs/user_guide.md
 # 构建部署流水线手册：被 .gitlab-ci.yml 与 Dockerfile 注释引用，必须入库
 !docs/build-pipeline.md
+# anc-hub 插件（hub-plugin 服务）的部署/运维/工具面文档，必须入库
+!docs/hub-plugin.md
 docs/superpowers/
 logs/
+# 脚手架模板源码里的样例日志属于模板交付物，必须入库（否则全新 clone 重建 zip 会与提交版不一致）
+!app/static/script_templates/src/**/logs/
 node_modules/
 centos7_offline/*
 .vscode/

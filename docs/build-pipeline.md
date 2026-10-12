@@ -93,6 +93,7 @@ socket 直接 build 进宿主机 daemon，省掉了 `docker save` / 传输 / `do
 | build-service 镜像名 | `build-service:latest` | `ai-evo-build-service:latest` | **镜像名相同会让 `docker load` 顶掉 anc 的 tag，anc 容器一旦重启就会启动错误的镜像、打断它的流水线** |
 | builder 镜像名 | `anc-builder:latest` | `ai-evo-builder:latest` | 不冲突 |
 | runner tag | `anc-build` | 复用同一个 | 同机，无需新注册 |
+| hub 插件端口 | anc-hub 插件家族 `9000/9100/9200/9300/9400` | `hub-plugin` 用 `9500` | ai-evo 侧口子沿用 anc-hub 插件段位分配，见下文「hub-plugin 服务」 |
 
 **不要**把本项目的镜像改成 `build-service:latest` 这类通用名——那是给 anc 用的。
 
@@ -360,6 +361,25 @@ worker 优雅退出期间容器处于 Stopping、不出现在 `docker ps` 里，
 > ⚠️ **服务器上的 `scripts/` 目录不由 CI 同步**——build-service 只同步
 > `docker-compose.yml` 并维护 `.env`。改了 `scripts/` 下的文件，需要手工同步到
 > `/apps/qa-code/ai-evo/scripts/`，否则线上跑的还是旧版本。
+
+### hub-plugin 服务（anc-hub 插件）
+
+compose 第四个服务 `hub-plugin`（与 api/worker 共用镜像，`SERVICE_TYPE=hub-plugin`），
+把 ai-evo 核心能力注册为 anc-hub MCP 工具，详见 `docs/hub-plugin.md`。部署相关要点：
+
+- **端口**：`network_mode: host` 监听 `:9500`，对齐 anc-hub 插件家族端口段
+  （中台插件自 9000 起按段位分配、逐插件 +100），
+  上线前在部署机 `ss -tlnp` 确认空闲。
+- **`build-service/config.toml` 的 `[deploy].services` 需手工加 `"hub-plugin"`**
+  （默认只有 `api`、`worker`）。该文件在服务器本地、不入库，CI 管不到；不加则
+  `verify_deploy` 不校验该容器（部署不失败，但缺了部署校验与守护覆盖）。
+- **首次部署该服务的顺序**：插件注册到 hub 需拨通 ai-evo api 才自报健康
+  （`/api/v1/auth/status`），而 `compose up -d` 全家一起起——不满足也不怕，
+  插件每 5s 重试注册，api 就绪后自动补上；确认方式见插件容器日志的
+  `"msg":"已注册到中台"`。
+- 与 `ensure_worker.sh` 无关：该脚本只盯 `ai-evo-worker`；hub-plugin 容器靠
+  `restart: unless-stopped` 与 hubkit 骨架的自注册重试自愈。
+
 
 ---
 

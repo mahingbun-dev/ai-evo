@@ -213,9 +213,10 @@ greenlet==3.5.5
     # via
     #   -c /src/prod-constraints.txt
     #   sqlalchemy
-grpcio==1.83.0
+grpcio==1.84.0
     # via
     #   -c /src/prod-constraints.txt
+    #   -r /src/requirements.txt
     #   deepeval
 h11==0.16.0
     # via
@@ -543,9 +544,10 @@ propcache==0.5.2
     #   -c /src/prod-constraints.txt
     #   aiohttp
     #   yarl
-protobuf==7.35.1
+protobuf==7.36.2
     # via
     #   -c /src/prod-constraints.txt
+    #   -r /src/requirements.txt
     #   googleapis-common-protos
     #   opentelemetry-proto
 psycopg2-binary==2.9.11

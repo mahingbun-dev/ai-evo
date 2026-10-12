@@ -32,6 +32,9 @@ ENV CLAUDE_CODE_PATH=/usr/local/bin/claude
 
 # 复制应用代码
 COPY app/ app/
+# vendored anc-hub 插件 SDK（app/hub_plugin 的运行时骨架；来源与升级方式见
+# hubkit/README-vendored.md；`python -m app.hub_plugin` 从 /app 直接 import）
+COPY hubkit/ hubkit/
 COPY alembic/ alembic/
 COPY alembic.ini .
 COPY alembic_local.ini .
