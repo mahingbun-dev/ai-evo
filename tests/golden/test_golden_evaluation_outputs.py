@@ -90,6 +90,15 @@ def _exporter():
     return ResultExporter
 
 
+def _xlsx_members(data: bytes) -> dict:
+    """xlsx（zip 容器）解压后的成员字节表：跨 zlib 版本稳定的比对形态"""
+    import io
+    import zipfile
+
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        return {name: z.read(name) for name in z.namelist()}
+
+
 def _assert_bytes_equal(baseline: Path, actual: bytes) -> None:
     if UPDATE:
         BASELINE_DIR.mkdir(parents=True, exist_ok=True)
@@ -100,6 +109,24 @@ def _assert_bytes_equal(baseline: Path, actual: bytes) -> None:
         f"GOLDEN_UPDATE=1 pytest tests/golden -q 生成后再提交"
     )
     expected = baseline.read_bytes()
+
+    # xlsx 是 zip 容器：容器字节随 zlib 实现/Python 版本变化（deflate 压缩层
+    # 非确定性），但成员内容确定。门禁锚定「容器内全部成员逐字节一致」——
+    # 评测结论/列/样式任何漂移仍会红，压缩器实现差异不再误报。
+    if baseline.suffix == ".xlsx":
+        exp_members, act_members = _xlsx_members(expected), _xlsx_members(actual)
+        if exp_members == act_members:
+            return
+        drifted = sorted(
+            name for name in set(exp_members) | set(act_members)
+            if exp_members.get(name) != act_members.get(name)
+        )
+        pytest.fail(
+            f"golden 漂移: {baseline.name}\n"
+            f"xlsx 成员内容不一致: {drifted[:8]}\n"
+            f"评测结论出现非预期变化——若为有意变更，GOLDEN_UPDATE=1 重生成并在 MR 说明"
+        )
+
     if actual == expected:
         return
     detail = f"字节长度 期望={len(expected)} 实际={len(actual)}"
