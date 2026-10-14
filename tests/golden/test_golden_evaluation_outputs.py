@@ -90,13 +90,32 @@ def _exporter():
     return ResultExporter
 
 
+def _canon_xml(raw: bytes) -> bytes:
+    """XML 规范化：解析后重新序列化，消除序列化器实现差异。
+
+    openpyxl 装了 lxml 时自动切换 lxml 序列化（自闭合标签 ` />`），无 lxml
+    走 et_xmlfile（`/>`）——同一份表格数据的 XML 字面不同。门禁锚定语义：
+    解析-再序列化后逐字节比对，序列化器实现差异不再参与判定。
+    """
+    import xml.etree.ElementTree as ET
+
+    return ET.tostring(ET.fromstring(raw))
+
+
 def _xlsx_members(data: bytes) -> dict:
-    """xlsx（zip 容器）解压后的成员字节表：跨 zlib 版本稳定的比对形态"""
+    """xlsx（zip 容器）解压后的成员内容表：XML 成员规范化，跨 zlib/序列化器
+    实现稳定；非 XML 成员（如有）保留原字节。"""
     import io
     import zipfile
 
     with zipfile.ZipFile(io.BytesIO(data)) as z:
-        return {name: z.read(name) for name in z.namelist()}
+        out = {}
+        for name in z.namelist():
+            raw = z.read(name)
+            if name.endswith((".xml", ".rels")):
+                raw = _canon_xml(raw)
+            out[name] = raw
+        return out
 
 
 def _assert_bytes_equal(baseline: Path, actual: bytes) -> None:
