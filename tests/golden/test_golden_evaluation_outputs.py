@@ -121,9 +121,13 @@ def _assert_bytes_equal(baseline: Path, actual: bytes) -> None:
             name for name in set(exp_members) | set(act_members)
             if exp_members.get(name) != act_members.get(name)
         )
+        sample = drifted[0] if drifted else "?"
+        exp_repr = repr(exp_members.get(sample, b"")[:300])
+        act_repr = repr(act_members.get(sample, b"")[:300])
         pytest.fail(
             f"golden 漂移: {baseline.name}\n"
             f"xlsx 成员内容不一致: {drifted[:8]}\n"
+            f"首个漂移成员 {sample!r}\n  期望: {exp_repr}\n  实际: {act_repr}\n"
             f"评测结论出现非预期变化——若为有意变更，GOLDEN_UPDATE=1 重生成并在 MR 说明"
         )
 
