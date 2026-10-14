@@ -385,8 +385,13 @@ class TestTemplatePackageSmoke:
         经 runner 真实子进程在白名单 env 下执行成功（PATH/LANG 足够）：
         消费 32 文件执行包、提取 manifest 摘要、产物落 outputs/ 注册 files。
 
-        模板设计意图：scripts/hub_package/ 为脚本包根（main.py + lib/ 兄弟
-        import），inputs/ 为样例执行包数据——冒烟按该布局组包。"""
+        模板设计意图：scripts/hub_package/ 为脚本包根（main.py + lib 兄弟
+        import），inputs/ 为样例执行包数据——冒烟按该布局组包。
+        ARCH-1-4 后缺省执行模式为 container：本用例断言的是 local 通道契约
+        （白名单 env 下宿主侧产物路径可见），显式声明 local——与
+        tests/unit/conftest.py 的套件级钉 local 同口径（tests/security 无
+        套件 conftest，用例体内自声明）。"""
+        monkeypatch.setenv("SCRIPT_EXEC_MODE", "local")
         upload_base = tmp_path / "pre_judge_scripts"
         upload_base.mkdir()
         monkeypatch.setattr(pre_judge_script_service, "SCRIPT_UPLOAD_BASE", upload_base)
@@ -421,10 +426,13 @@ class TestTemplatePackageSmoke:
         assert summary_path.parent.name == "outputs"
 
     def test_folder_scaffold_template_runs_via_service(
-            self, db_session, tmp_path, isolated_upload_paths):
+            self, db_session, tmp_path, isolated_upload_paths, monkeypatch):
         """from-template 脚手架生成的 folder 多文件工程（main.py 调 utils
         兄弟模块）经 runner 真实子进程在白名单 env 下执行成功——覆盖
-        「现有模板脚本包跑通」的脚手架生成链路"""
+        「现有模板脚本包跑通」的脚手架生成链路。
+        ARCH-1-4 后缺省执行模式为 container：本用例断言 local 通道契约
+        （宿主侧产物路径可见），显式声明 local（同上用例口径）"""
+        monkeypatch.setenv("SCRIPT_EXEC_MODE", "local")
         service = PreJudgeScriptService(db_session)
         created = service.create_from_template("folder", f"w1_smoke_{uuid.uuid4().hex[:6]}")
         script_def = {

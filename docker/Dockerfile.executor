@@ -1,0 +1,53 @@
+# ============================================================
+# ai-evo executor —— 沙箱执行服务镜像（ARCH-1-1）
+#
+#   构建（仓库根为上下文）：
+#     docker build -f docker/Dockerfile.executor -t ai-evo-executor:latest .
+#
+#   设计（plans/2026-10-15-企业级评测系统架构设计.md §2.2 拓扑 / §2.3 D1）：
+#   executor 是 compose 内唯一挂 docker.sock 的角色——非 root（USER 10002）、
+#   无凭证、无 DB 依赖的 FastAPI 小服务；docker CLI 经 subprocess 调宿主
+#   daemon（sock 由 compose 挂载并授组权限，条目 1-3）。
+#
+#   注：设计终态为「主镜像 overlay + docker-cli」（§6 文件级清单，走既有
+#   离线构建/LAN 交付流程）；本 Dockerfile 用 python:3.12-slim 独立基座，
+#   便于本机/CI 独立构建验证（条目 1-1 完成标准）。
+#
+#   运行约定：
+#   - 单进程 uvicorn（不加 --workers）：run 登记表在进程内存，多进程会分裂
+#     （executor/app.py 模块 docstring 同约定）；
+#   - EXECUTOR_TOKEN 从 env 注入（D6：走 .env，不入库；未配置 fail-closed）；
+#   - /app/uploads 为 compose 挂载点（工作区卷，bind mount 白名单根
+#     /app/uploads/script_runs 见 executor/sandbox_params.py）。
+# ============================================================
+FROM python:3.12-slim
+
+# pip 源可在构建时覆盖（内网源：--build-arg PIP_INDEX_URL=...）
+ARG PIP_INDEX_URL=https://pypi.org/simple
+
+# Web 框架（版本与仓库 requirements.txt 钉死一致）
+RUN pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" \
+    fastapi==0.128.6 uvicorn==0.40.0
+
+# docker CLI（sock 客户端；daemon 在宿主侧，镜像内不装也不跑 daemon——
+# Debian 13 起 docker.io 不再捆绑客户端，docker-cli 是独立包，官方源自带、
+# 离线内网镜像源可达，无需 Docker 官方源）
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends docker-cli \
+    && rm -rf /var/lib/apt/lists/*
+
+# 非 root 运行用户（uid/gid 10002，与平台主镜像 USER app 计划一致，D3）
+RUN groupadd -g 10002 app \
+    && useradd -m -u 10002 -g 10002 -s /usr/sbin/nologin app
+
+WORKDIR /app
+ENV PYTHONPATH=/app
+
+# 仅服务代码：executor/sandbox_params.py 是与 worker 侧
+# app/services/script_container.py 共用的参数构造单一事实源（ARCH-1-1），
+# 属本目录成员——服务对仓库其余代码零依赖（无凭证/无 DB 的信任边界前提）
+COPY executor/ /app/executor/
+
+USER 10002
+EXPOSE 8300
+CMD ["python", "-m", "uvicorn", "executor.app:app", "--host", "0.0.0.0", "--port", "8300"]

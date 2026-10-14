@@ -161,6 +161,35 @@ services:
       - LANGFUSE_ENABLED=false
       - OPENBLAS_CORETYPE=GENERIC
       - MKL_DEBUG_CPU_TYPE=5
+      # ARCH-1-4：前处理脚本执行模式缺省切 container（设计 §3 Phase 1 表
+      # 1-4 行）——合规态即缺省态，代码默认（app/core/config.py）与本条
+      # compose 显式声明一致。经插值给 .env 留显式覆盖口（environment
+      # 优先级高于 env_file，插值缺省即 container）：过渡期回退在 .env 显式
+      # 设 SCRIPT_EXEC_MODE=local 后 docker compose up -d worker 重启生效
+      # （改 env 即回退，无需改 compose/回滚镜像；local 同边界风险见
+      # docs/build-pipeline.md 第九节，仅限过渡期止损）。注意 container 的
+      # 前置是沙箱面（executor + egress，第十节）：未启用
+      # COMPOSE_PROFILES=sandbox 且未配 EXECUTOR_URL 时，含前处理脚本的任务
+      # 会因 worker 容器内无 docker 通道而明确失败（fail-loud，不静默落
+      # local）。
+      - SCRIPT_EXEC_MODE=${SCRIPT_EXEC_MODE:-container}
+      # ARCH-1-3：worker 服务端外呼（模型测连/OSS 媒体拉取）统一切 egress
+      # 出口代理（设计 D2，SSRF 面收口）。只经 compose 接线、不改代码：进程
+      # 内遵守 *_PROXY 环境变量的 HTTP 客户端（requests/httpx/urllib）统一
+      # 收口，内网目标由 NO_PROXY 直连。灰度开关：WORKER_EGRESS_PROXY 缺省
+      # 空 = 不走 proxy（与既有部署行为一致）；启用沙箱面
+      # （COMPOSE_PROFILES=sandbox）且 egress 服务健康后，.env 设
+      # WORKER_EGRESS_PROXY=http://egress:3128。大小写各设一份：不同客户端
+      # 读取口径不一（urllib/getproxies 跳过空值，空串 = 该方向不代理）。
+      - HTTP_PROXY=${WORKER_EGRESS_PROXY:-}
+      - HTTPS_PROXY=${WORKER_EGRESS_PROXY:-}
+      - http_proxy=${WORKER_EGRESS_PROXY:-}
+      - https_proxy=${WORKER_EGRESS_PROXY:-}
+      # 内网目标不走 proxy：compose 服务名 + 回环（Celery/PG/Redis 的连接
+      # 非协议本就不吃 HTTP_PROXY，这里是 api 调用等 HTTP 面的兜底）；
+      # 企业内网域名/私有 OSS 由部署侧在 WORKER_NO_PROXY 追加覆盖
+      - NO_PROXY=${WORKER_NO_PROXY:-localhost,127.0.0.1,::1,api,redis,postgres,executor,egress}
+      - no_proxy=${WORKER_NO_PROXY:-localhost,127.0.0.1,::1,api,redis,postgres,executor,egress}
     # 停止时给 Celery 优雅退出的时间：收到 SIGTERM 后跑完当前任务再退出，
     # 排队中的任务保留在 Redis 队列由新 worker 接手（部署脚本不再清空队列）。
     # W10-3：900s → 7200s，与 celery task_time_limit（单任务最长 2h）对齐——
@@ -200,6 +229,113 @@ services:
     restart: unless-stopped
     networks:
       - ai-evo-net
+
+  # ARCH-1-3：executor 沙箱服务（设计 §2.2 拓扑/§2.3 D1）——compose 内唯一
+  # 挂 docker.sock 的角色。镜像 docker/Dockerfile.executor（python:3.12-slim +
+  # fastapi/uvicorn + docker-cli，USER 10002，ARCH-1-1）。
+  #   - 灰度开关：profile "sandbox"。沙箱面整体上线（executor + egress 同
+  #     profile）；既有部署不设 COMPOSE_PROFILES 时 compose 行为与原来完全
+  #     一致——离线部署机未预载 ai-evo-executor / squid 镜像也不受影响。
+  #   - 凭证边界（设计 D1）：不挂 env_file——.env 里的 DATABASE_URL/Redis
+  #     凭证不进本容器（executor 无凭证、无 DB 依赖）；仅经插值注入
+  #     EXECUTOR_TOKEN（worker↔executor 共享 token，D6 走 .env 不入库）。
+  #     未配置 token = executor fail-closed 拒绝全部沙箱请求（executor/app.py），
+  #     compose 与健康探活不受影响。
+  #   - docker.sock 非 root 访问：宿主 sock 属主 root:docker（0660），靠
+  #     group_add 把部署机 docker 组 gid（.env DOCKER_GROUP_GID，默认 999 为
+  #     Debian 系常见值）加为补充组——数字 gid 不要求容器内存在同名组；
+  #     群晖等自定 gid 的部署机必查（stat -c %g /var/run/docker.sock）。
+  #     sock 只挂这一份、只给这一个角色；worker 永不挂 sock。
+  #   - 仅 compose 内网监听：不发布宿主端口，worker 经 http://executor:8300
+  #     访问（HTTP 驱动接线属条目 1-2，ARCH 注释同批落）。
+  #   - 与 api/worker 共挂同一 uploads 卷（沙箱工作区 stdout/stderr 由监督
+  #     线程落盘到该卷），同样等 volume-init 属主迁移完成再起。
+  executor:
+    image: ai-evo-executor:${EXECUTOR_IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.executor
+      args:
+        - PIP_INDEX_URL=${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+    profiles: ["sandbox"]
+    container_name: ai-evo-executor
+    depends_on:
+      # 工作区日志要写 uploads 卷：等属主迁移到 10002 完成（同 api/worker）
+      volume-init:
+        condition: service_completed_successfully
+    environment:
+      - EXECUTOR_TOKEN=${EXECUTOR_TOKEN:-}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${UPLOADS_VOLUME:-./uploads}:/app/uploads
+    group_add:
+      - "${DOCKER_GROUP_GID:-999}"
+    # ARCH-1-3：与 api/worker 同口径加固。docker CLI 经 unix sock 与 daemon
+    # 通信不需要任何 capability；运行期写面只有 uploads 卷与两个 tmpfs
+    # （审计日志走 stdout，随容器 json-file 日志采集）
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,exec,nosuid,nodev,size=${TMPFS_TMP_SIZE:-1g}
+      - /home/app:rw,exec,nosuid,nodev,uid=10002,gid=10002,mode=0750,size=${TMPFS_HOME_SIZE:-1g}
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    # /health 无鉴权探针（executor/app.py，ARCH-1-1）；镜像内无 curl，用 python
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8300/health', timeout=5)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - ai-evo-net
+
+  # ARCH-1-3：egress 出口代理（squid 域名白名单，设计 D2）——worker 外呼
+  # （模型测连/OSS）与沙箱 egress 档出网的统一出口、SSRF 收口点。
+  #   - 镜像 ubuntu/squid（Canonical 官方维护；squid:alpine 非官方镜像且不
+  #     在内网镜像源白名单内——等价选型为官方镜像，可经 .env EGRESS_IMAGE
+  #     换源/换 tag）
+  #   - 策略只读挂载 docker/egress/squid.conf（默认拒绝 + 域名白名单 +
+  #     内网目的地址拒绝，改配置后 restart egress 生效）；域名清单
+  #     docker/egress/whitelist.txt 是仓库模板，部署侧经 .env
+  #     EGRESS_WHITELIST_FILE 指向自己的清单整体替换。离线 CI 部署目录若
+  #     只同步了 docker-compose.yml，须把 docker/egress/ 一并放过去（见
+  #     docs/build-pipeline.md ARCH-1-3 节）
+  #   - 双网络：ai-evo-net（服务 worker 外呼 + 自身出网）+ aievo-sandbox-egress
+  #     （internal，见底部网络定义）
+  #   - 不发布宿主端口；不套 cap_drop/read_only：镜像内 squid 以 root 起再
+  #     降权 proxy 用户（需 CAP_SETUID/CHOWN 建 spool/pid），只读根会挡
+  #     /run/squid.pid。第三方官方镜像、无凭证无数据卷（只读配置除外），
+  #     安全边界落在「白名单 + internal 网络 + 不对外发布」
+  egress:
+    image: ${EGRESS_IMAGE:-ubuntu/squid:latest}
+    profiles: ["sandbox"]
+    container_name: ai-evo-egress
+    volumes:
+      - ${EGRESS_SQUID_CONF:-./docker/egress/squid.conf}:/etc/squid/squid.conf:ro
+      - ${EGRESS_WHITELIST_FILE:-./docker/egress/whitelist.txt}:/etc/squid/whitelist.txt:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    # 镜像内无 curl/python；用 squid 自带的进程状态检查（对 /run/squid.pid
+    # 发信号 0——PID 文件在且进程活即退出码 0，ARCH-1-3 本机冒烟已验证）
+    healthcheck:
+      test: ["CMD", "squid", "-k", "check"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - ai-evo-net
+      - aievo-sandbox-egress
 
   # anc-hub 插件 sidecar：把 ai-evo 核心能力暴露为 MCP 工具（见 docs/hub-plugin.md）。
   # 与 hub 家族其他插件一致走 host 网络——hub（同机）经回环拨插件 :9500，
@@ -252,3 +388,16 @@ volumes:
 networks:
   ai-evo-net:
     driver: bridge
+  # ARCH-1-3：沙箱 egress 档网络（设计 D2）。两处硬约束：
+  #   - name: 钉死实际网络名——compose 默认会给网络加项目前缀
+  #     （<project>_aievo-sandbox-egress），而 executor 起沙箱容器用的是
+  #     宿主侧 docker CLI 的裸网络名，必须与
+  #     executor/sandbox_params.py NET_PROFILES["egress"] 完全一致
+  #     （单一事实源，tests/unit/test_compose_topology.py 断言同步）；
+  #   - internal: 不装默认网关/NAT——挂进来的沙箱容器没有任何直连出网
+  #     路由，唯一出路是同网段的 egress 代理（域名白名单 + access 审计），
+  #     出网收口在网络层不可绕过。
+  aievo-sandbox-egress:
+    name: aievo-sandbox-egress
+    driver: bridge
+    internal: true

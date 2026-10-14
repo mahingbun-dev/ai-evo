@@ -11,8 +11,10 @@ task.pre_scripts 旧配置。支持 exec_type：
   统一经 app/services/pre_judge_entry.py wrapper 调起（run(stdin) 函数式 /
   __main__ 传统式自动适配），PYTHONPATH 注入项目根（支持
   `from app.db.session import SessionLocal` 等平台侧 import；W15 起 local
-  模式专用——SCRIPT_EXEC_MODE=container 时改走 docker run --rm 容器内
-  隔离执行，不注入 PYTHONPATH，脚本无法 import 平台代码），
+  模式专用——SCRIPT_EXEC_MODE=container 时改经 SandboxDriver 沙箱执行
+  （ARCH-1-2：executor HTTP 驱动或 docker-CLI 驱动，见
+  app/services/script_container.py），不注入 PYTHONPATH，脚本无法 import
+  平台代码），
   cwd 隔离到 uploads/script_runs/{task_id}/{data_id}/{script_id}/，
   标准输入 JSON 走 stdin，取标准输出最后一行 JSON 作为脚本标准输出，
   超时（timeout_seconds）kill，标准输出读取有上限截断
@@ -569,7 +571,8 @@ def _run_step(
         "upstream": upstream,
         "_run_dir": str(run_dir),
     }
-    # W15 任务级网络开关：step.network=true 时容器改用 bridge（仅 container 模式生效）
+    # W15 任务级网络开关 + ARCH-1-2 三档档位：step.network=true 经
+    # resolve_net_profile 归一为 open 档，未声明取 SCRIPT_NET_PROFILE（默认 none）
     network_flag = bool(step.get("network"))
     return execute_script(script, stdin, timeout_seconds=script.get("timeout_seconds"),
                           network=network_flag)
@@ -597,8 +600,10 @@ def execute_script(
     {script_id, name, exec_type, entrypoint, timeout_seconds}。
 
     network（W15 任务级网络开关，仅 container 模式生效）：编排 step 声明
-    ``network: true`` 时容器改用 bridge 网络（脚本要访问被测系统的场景），
-    默认 False → --network none 完全离网；local 模式忽略该开关。
+    ``network: true`` 时按 open 档（docker-CLI 驱动 → 默认 bridge 直出；
+    executor 驱动白名单未放开 open 档，请求即拒并透传错误——见
+    script_container.resolve_net_profile），默认 False → 取 SCRIPT_NET_PROFILE
+    （默认 none 档，完全离网）；local 模式忽略该开关。
     """
     started = time.time()
     script_id = str(script.get("script_id") or script.get("id") or "")
@@ -695,11 +700,12 @@ def _execute_script_subprocess(
     - env 为白名单环境（build_script_env，W1-3）：不继承平台进程全量环境
       变量；PYTHONPATH 注入项目根（M1 保留，local 模式专用——W15 起 container
       模式不注入 PYTHONPATH，脚本无法 import 平台代码）
-    - W15 灰度：SCRIPT_EXEC_MODE=container 时改走 docker run --rm
-      （script_container.execute_script_in_container：非 root、--memory 1g
-      --cpus 0.5 --pids-limit、--read-only + tmpfs、剥离平台 env、默认
-      --network none、挂载仅本次 script_runs 工作目录），前置准备
-      （入口解析/静态扫描/工作区与脚本包副本）与 local 完全共用
+    - W15 灰度 / ARCH-1-2：SCRIPT_EXEC_MODE=container 时分流点按 SandboxDriver
+      驱动选择（executor HTTP 驱动为目标通道，EXECUTOR_URL 未配置回退 W15
+      docker-CLI 驱动；非 root/--memory 1g --cpus 0.5 --pids-limit/
+      --read-only + tmpfs/剥离平台 env/默认离网/挂载仅本次 script_runs 工作
+      目录——隔离参数与 executor 同一事实源），前置准备（入口解析/静态扫描/
+      工作区与脚本包副本）与 local 完全共用
     - cwd 隔离到 uploads/script_runs/{task_id}/{data_id}/{script_id}/
     - 标准输入 JSON 走 stdin（ensure_ascii=False + default=str 容错）
     - stdout/stderr 重定向到 cwd 下文件；stdout 只读尾部 SCRIPT_STDOUT_LIMIT
@@ -769,11 +775,14 @@ def _execute_script_subprocess(
     timed_out = False
     returncode: Optional[int] = None
 
-    # W15 容器化隔离灰度：container 模式改走 docker run --rm（非 root、资源
-    # 限制、只读根文件系统、剥离平台 env、默认离网、挂载仅本次 script_runs
-    # 工作目录；stdin 内宿主工作区路径重写为容器 /workspace 路径）。
-    # 前置准备（入口解析、静态扫描、工作区、脚本包副本）与 local 完全共用，
-    # 返回条目结构与 local 同构。
+    # W15 容器化隔离灰度 / ARCH-1-2 分流点改按 SandboxDriver 驱动选择：
+    # SCRIPT_EXEC_MODE=container 时经 get_sandbox_driver() 解析驱动——
+    # EXECUTOR_URL 已配置 → HttpExecutorDriver（目标通道：worker 与 executor
+    # 之间是 compose 内网 + token 的 HTTP 调用，设计 §2.3 D1）；未配置 →
+    # DockerCliDriver（W15 既有 docker run --rm 单机通道回退）。前置准备
+    # （入口解析、静态扫描、工作区、脚本包副本）与 local 完全共用，
+    # 返回条目结构与 local 同构；local 模式不进本分支（下方 subprocess
+    # 通道原样保留）。
     if script_container.container_mode_enabled():
         return script_container.execute_script_in_container(
             script=script,
@@ -786,6 +795,7 @@ def _execute_script_subprocess(
             started=started,
             static_check=static_check,
             network=network,
+            driver=script_container.get_sandbox_driver(),
         )
 
     env = build_script_env()  # W1-3：白名单环境，替代 os.environ.copy()

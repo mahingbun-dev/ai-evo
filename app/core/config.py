@@ -1,15 +1,56 @@
 from typing import Optional, Dict
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pathlib import Path
 
 import logging
+import re
 from functools import lru_cache
 
 # 项目根目录
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 
 logger = logging.getLogger(__name__)
+
+# SCRIPT_RUNNER_IMAGE 合法引用文法（ARCH-1-5 镜像 digest 钉扎）：
+#   [registry[:port]/]*<name>[:tag][@sha256:<64 位十六进制>]
+# - registry 前缀：0..n 个路径分量，首分量可带 :port（企业 LAN registry 形态，
+#   如 harbor.internal:5000/ai-evo/）；
+# - tag：docker tag 规范子集（与 executor/sandbox_params._IMAGE_TAG_RE 同宽）；
+# - digest 钉扎：仅 sha256、恰好 64 位十六进制——截断/大写/其它算法一律拒绝
+#   （digest 缺一位都是另一镜像，格式错必须 fail-fast 在配置解析层，不带病进容器通道）
+_RUNNER_IMAGE_REF_RE = re.compile(
+    r"^(?:(?:[A-Za-z0-9][A-Za-z0-9._-]*)(?::[0-9]+)?/)*"  # 可选 registry 前缀（可带端口）
+    r"[A-Za-z0-9][A-Za-z0-9._-]*"                          # 镜像基名
+    r"(?::[A-Za-z0-9][A-Za-z0-9._-]{0,127})?"              # 可选 tag
+    r"(?:@sha256:[0-9a-f]{64})?$"                          # 可选 digest 钉扎（ARCH-1-5）
+)
+
+
+def validate_runner_image_ref(image: str) -> str:
+    """SCRIPT_RUNNER_IMAGE 引用格式校验（ARCH-1-5，设计 §3 表 1-5/3-3 行）
+
+    支持两类形态（均为 Settings 层校验，env/.env 同一道闸）：
+    - 浮动引用 ``<base>[:<tag>]``（现状缺省 ai-evo-script-runner:latest）；
+    - digest 钉扎 ``<repo>[@sha256:<64 位十六进制>]``（repo 可带 registry 前缀
+      与 tag）——镜像内容寻址，防「同 tag 被覆盖/缓存投毒」，对应设计 3-3
+      「script-runner 镜像 digest 钉扎进配置」的配置面预置。
+    worker docker-CLI 通道原样把引用交给 docker run（daemon 原生支持 digest
+    拉取校验）；executor 通道白名单（sandbox_params.validate_runner_image）
+    尚未放开 digest（Phase 3-3），放开时两侧同步。
+
+    返回剥离首尾空白后的引用；非法值抛 ValueError（pydantic 转 ValidationError，
+    启动/导入配置即拒绝）。
+    """
+    ref = (image or "").strip()
+    if not _RUNNER_IMAGE_REF_RE.match(ref):
+        raise ValueError(
+            f"SCRIPT_RUNNER_IMAGE 非法镜像引用 {image!r}：支持 <base>[:<tag>] 或 "
+            "<repo>[@sha256:<64 位十六进制>]（digest 钉扎，ARCH-1-5），"
+            "示例 ai-evo-script-runner:latest / "
+            "harbor.internal:5000/ai-evo/script-runner@sha256:<64hex>"
+        )
+    return ref
 
 
 class Settings(BaseSettings):
@@ -66,23 +107,55 @@ class Settings(BaseSettings):
     # 未配置时 db_assert 明确报「未配置只读连接」失败，不回退平台库
     DB_ASSERT_READONLY_DSN: str = ""
 
-    # 前处理脚本执行模式（W15 容器化隔离灰度开关）：
-    #   local     —— 宿主子进程直跑（M1 现状，默认；PYTHONPATH 注入保留）
-    #   container —— docker run --rm 容器内隔离执行（非 root/资源限制/只读根
-    #                文件系统/无网络/仅挂本次 script_runs 工作目录；不注入
-    #                PYTHONPATH，脚本无法 import 平台代码）
-    # 读取优先级：环境变量 SCRIPT_EXEC_MODE > .env/.env_local > 默认 local
+    # 前处理脚本执行模式（W15 容器化隔离灰度开关；ARCH-1-4 缺省切换）：
+    #   local     —— 宿主子进程直跑（M1 现状；ARCH-1-4 起仅限开发机显式 env
+    #                使用，企业部署禁止——同边界风险见 docs/build-pipeline.md
+    #                第九节政策段）
+    #   container —— docker run --rm / executor 沙箱容器内隔离执行（非 root/
+    #                资源限制/只读根文件系统/无网络/仅挂本次 script_runs 工作
+    #                目录；不注入 PYTHONPATH，脚本无法 import 平台代码）——
+    #                ARCH-1-4（设计 §3 Phase 1 表 1-4 行）起为企业部署默认：
+    #                合规态即缺省态，漏配不再落 local；灰度（内测团队 → 全量）
+    #                与回退（改 env 重启）步骤见 docs/build-pipeline.md 第九节
+    # 读取优先级：环境变量 SCRIPT_EXEC_MODE > .env/.env_local > 默认 container
     # （见 app.services.script_container.get_script_exec_mode：环境变量实时读，
-    # 绕过 get_settings 的 lru_cache，dev 灰度切换无需重启）
-    SCRIPT_EXEC_MODE: str = "local"
+    # 绕过 get_settings 的 lru_cache，改 env 重启 worker/api 即切换或回退）
+    SCRIPT_EXEC_MODE: str = "container"
 
     # container 模式 runner 镜像（W15）：ai-evo-script-runner，构建方式见
-    # docker/script-runner/README.md；部署机离线预载属 D-3 运维事项
+    # docker/script-runner/README.md；部署机离线预载属 D-3 运维事项。
+    # ARCH-1-5：支持镜像 digest 钉扎——除 <base>:<tag> 外可填
+    # <repo>@sha256:<64 位十六进制>（repo 可带 registry 前缀），格式校验
+    # 见 validate_runner_image_ref（Settings 解析层 fail-fast）；
+    # worker docker-CLI 通道原样透传给 docker run（daemon 原生 digest 校验）
     SCRIPT_RUNNER_IMAGE: str = "ai-evo-script-runner:latest"
+
+    @field_validator("SCRIPT_RUNNER_IMAGE")
+    @classmethod
+    def _validate_runner_image_ref(cls, v: str) -> str:
+        """镜像引用格式闸（ARCH-1-5）：浮动 tag 与 digest 钉扎之外一律拒绝"""
+        return validate_runner_image_ref(v)
 
     # container 模式容器内运行用户（非 root）：uid:gid。macOS Docker Desktop
     # 的 bind mount 对任意 uid 可写；Linux 部署机需与挂载目录属主匹配或预 chown
     SCRIPT_RUNNER_USER: str = "10001:10001"
+
+    # executor 沙箱服务调用地址（ARCH-1-2，设计 §2.3 D1）：worker → executor 的
+    # compose 内网 HTTP 地址（如 http://executor:8300）。已配置时 container 模式
+    # 走 HttpExecutorDriver（目标通道）；留空回退 docker-CLI 驱动（W15 既有单机
+    # 通道，本机灰度/无 executor 部署形态）。读取同样环境变量实时优先
+    # （见 app.services.script_container.get_sandbox_driver）
+    EXECUTOR_URL: str = ""
+    # executor 调用 token（ARCH-1-2，设计 D6：走 .env，不入库）：executor 侧
+    # fail-closed 校验（未配置拒绝全部沙箱请求），worker 侧缺 token 同样不发起调用
+    EXECUTOR_TOKEN: str = ""
+    # 沙箱网络档位（ARCH-1-2，设计 D2 三档）：none（默认，--network none 完全
+    # 离网）| egress（白名单域名出网，走沙箱出网 bridge，1-3 compose 建）| open
+    # （默认 bridge 直出，超管审批流程属后续条目——executor 通道白名单未放开，
+    # 请求即拒）。编排 step 的 network:true（W15「脚本要访问被测系统」）归一为
+    # open 档。档位 → 容器网络参数映射见 script_container.WORKER_NET_PROFILE_TO_DOCKER
+    # 与 executor/sandbox_params.NET_PROFILES；非法值 fail-safe 回退 none（告警）
+    SCRIPT_NET_PROFILE: str = "none"
 
     # DeepEval 接入平台模型网关（W16，P0-D）：依赖 D-6 技术决策（f1518c1 revert
     # 根因未确认），决策前保守关闭。true 时 safety/agent 等 deepeval 指标判分
