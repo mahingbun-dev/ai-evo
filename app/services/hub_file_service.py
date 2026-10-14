@@ -52,7 +52,7 @@ from sqlalchemy.exc import DBAPIError as sa_DBAPIError
 import urllib3
 
 from app.core.config import get_settings
-from app.utils.path_safety import ensure_within
+from app.utils.path_safety import ensure_within, secure_mkdir
 
 # 内网自签证书跳过校验后的告警噪音只保留在 debug 场景，不刷业务日志
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -384,7 +384,8 @@ def _unpack_zip(zip_path: str, unpack_root: str) -> List[Dict[str, Any]]:
                 raise HubFileError(f"zip 条目路径不安全: {zi.filename!r}，中止解压")
             # 成员名校验之外再做 realpath 越界兜底（symlink/编码变形由 realpath 兜底）
             dest = ensure_within(unpack_root, *rel.split("/"))
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            # ARCH-0-3：解包中间目录显式 0o750 权限创建
+            secure_mkdir(os.path.dirname(dest))
             written = 0
             with zf.open(zi) as src, open(dest, "wb") as out:
                 for block in iter(lambda: src.read(1024 * 1024), b""):
@@ -480,7 +481,8 @@ class HubFileService:
             logger.info(f"[hub_file] 缓存命中，跳过下载: file_id={file_id} path={hit['path']}")
             return hit
 
-        os.makedirs(target_dir, exist_ok=True)
+        # ARCH-0-3：hub_files 缓存目录显式 0o750 权限创建
+        secure_mkdir(target_dir)
         # dest_dir 允许调用方指定，但落盘路径必须仍在该目录内（realpath 兜底）
         tmp_path = ensure_within(target_dir, f".download_{os.getpid()}.part")
 
@@ -646,7 +648,8 @@ class HubFileService:
         unpack_root = os.path.join(target_dir, UNPACK_DIRNAME)
         files = self._read_unpacked_manifest(target_dir, unpack_root)
         if files is None:
-            os.makedirs(unpack_root, exist_ok=True)
+            # ARCH-0-3：解包根目录显式 0o750 权限创建
+            secure_mkdir(unpack_root)
             try:
                 files = _unpack_zip(path, unpack_root)
             except Exception:
@@ -722,7 +725,8 @@ def unpack_zip(zip_path: str, dest_dir: str) -> List[Dict[str, Any]]:
     防护与清单语义同 download_and_extract 的内层解压。dest_dir 需不存在或为空，
     由调用方管理生命周期（如随临时 workdir 一并清理）。
     """
-    os.makedirs(dest_dir, exist_ok=True)
+    # ARCH-0-3：解包目录显式 0o750 权限创建
+    secure_mkdir(dest_dir)
     try:
         files = _unpack_zip(zip_path, dest_dir)
     except Exception:
@@ -989,21 +993,22 @@ def unpack_zip_safely(zip_path: str, dest_dir: str) -> Dict[str, int]:
         for info in zf.infolist():
             _safe_member_name(info.filename)
 
-        os.makedirs(dest_dir, exist_ok=True)
+        # ARCH-0-3：解包根目录（uploads/hub_datasets/{file_id}/）显式 0o750 创建
+        secure_mkdir(dest_dir)
         file_count = 0
         total_size = 0
         for info in zf.infolist():
             rel = _safe_member_name(info.filename)
             if rel.endswith("/"):
                 # 目录成员：建目录即可
-                os.makedirs(ensure_within(dest_dir, *rel.split("/")[:-1]), exist_ok=True)
+                secure_mkdir(ensure_within(dest_dir, *rel.split("/")[:-1]))
                 continue
             parts = [p for p in rel.split("/") if p]
             # 成员名校验之外再做 realpath 越界兜底
             target = ensure_within(dest_dir, *parts) if parts else None
             if target is None:
                 continue
-            os.makedirs(os.path.dirname(target), exist_ok=True)
+            secure_mkdir(os.path.dirname(target))
             with zf.open(info) as src, open(target, "wb") as dst:
                 shutil.copyfileobj(src, dst)
             file_count += 1
@@ -1312,7 +1317,8 @@ def hardlink_tree(src_root: str, dst_root: str) -> Dict[str, int]:
         last_error: Optional[BaseException] = None
         for attempt in (1, 2):
             try:
-                target.parent.mkdir(parents=True, exist_ok=True)
+                # ARCH-0-3：镜像目录逐级显式 0o750 权限创建
+                secure_mkdir(target.parent)
                 os.link(str(path), str(target))
                 linked += 1
                 last_error = None
@@ -1321,7 +1327,7 @@ def hardlink_tree(src_root: str, dst_root: str) -> Dict[str, int]:
                 try:
                     # 硬链接失败（跨卷/不支持）降级复制；复制时父目录被并发删除
                     # 会抛 FileNotFoundError（OSError 子类）→ 下一轮重建后重试
-                    target.parent.mkdir(parents=True, exist_ok=True)
+                    secure_mkdir(target.parent)
                     shutil.copy2(str(path), str(target))
                     copied += 1
                     last_error = None
@@ -1832,7 +1838,8 @@ def add_supplements(
                 # zip：blob 流式落盘（zip 本体无独立上限）→ unpack_zip_safely
                 # 安全解压（自带条目/单文件/总量预检与 zip slip 校验）
                 blob_path = ensure_within(staging, f"blob_{i}.zip")
-                os.makedirs(os.path.dirname(blob_path), exist_ok=True)
+                # ARCH-0-3：staging 目录显式 0o750 权限创建
+                secure_mkdir(os.path.dirname(blob_path))
                 with open(blob_path, "wb") as out:
                     shutil.copyfileobj(fileobj, out, 1024 * 1024)
                 unpack_dir_i = os.path.join(staging, f"unzip_{i}")
@@ -1849,7 +1856,8 @@ def add_supplements(
                 rel = "/".join(target_parts + _clean_supplement_rel(rel_src).split("/"))
                 # 路径清洗之外再做 realpath 越界兜底
                 dest = ensure_within(os.path.join(staging, "loose"), *rel.split("/"))
-                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                # ARCH-0-3：staging 散文件目录显式 0o750 权限创建
+                secure_mkdir(os.path.dirname(dest))
                 written = 0
                 with open(dest, "wb") as out:
                     while True:
@@ -1887,11 +1895,13 @@ def add_supplements(
         )
 
         supplement_dir = _supplement_dir_for(file_id)
-        os.makedirs(supplement_dir, exist_ok=True)
+        # ARCH-0-3：hub_supplements 补传区目录显式 0o750 权限创建
+        secure_mkdir(supplement_dir)
         uploaded_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         for rel, src in sorted(staged.items()):
             dest = os.path.join(supplement_dir, *rel.split("/"))
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            # ARCH-0-3：补传子目录显式 0o750 权限创建
+            secure_mkdir(os.path.dirname(dest))
             os.replace(src, dest)
             entry = _index_entry_for_file(dest, supplement_dir) or {
                 "path": rel, "type": "binary", "size": 0, "is_nested_zip": False,

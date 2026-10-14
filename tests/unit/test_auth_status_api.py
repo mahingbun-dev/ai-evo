@@ -16,9 +16,29 @@ from sqlalchemy.pool import StaticPool
 
 from app.db.session import Base
 from app.models.user_models import User
+from app.services import jwt_service
 from app.services.jwt_service import create_token
 from app.api import user_api
 from app.api.user_api import auth_router
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_jwt_secret(monkeypatch):
+    """固定显式 JWT 密钥，脱离所在机器的 .env（ARCH-0-2）。
+
+    JWT 密钥不再默认从 DATABASE_URL 派生（缺密钥即抛错），本文件多处调真实
+    create_token 签发——CI 干净环境（无 .env）会必红，统一 patch 为显式
+    密钥保持密闭。
+    """
+    from app.core.config import Settings
+    monkeypatch.setattr(
+        jwt_service, "get_settings",
+        lambda: Settings(
+            _env_file=None,
+            DATABASE_URL="postgresql://unit-test",
+            AUTH_JWT_SECRET="unit-test-jwt-secret",
+        ),
+    )
 
 
 @pytest.fixture

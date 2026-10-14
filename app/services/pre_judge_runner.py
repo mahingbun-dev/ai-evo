@@ -70,7 +70,7 @@ from app.core.config import get_settings
 from app.db.session import SessionLocal
 from app.models.pre_judge_models import PreJudgeScript
 from app.services import pre_judge_script_service
-from app.utils.path_safety import ensure_within
+from app.utils.path_safety import PathEscapeError, ensure_within, secure_mkdir
 from app.services import script_container
 from app.services.hub_file_service import (
     HubFileError,
@@ -332,10 +332,13 @@ def build_run_dir(task_id: str, data_id: str) -> Path:
     隔离目录，相对路径会被错误拼到子进程 cwd 下导致产物写丢。
     同时创建工作区直下 outputs/（脚本产物目录，没有则建）——真实任务、
     试跑（debug）共用本函数，脚本侧按规范写 {run_dir}/outputs/ 时目录已就绪。
+    ARCH-0-3：task_id/data_id 来自评测负载，与 build_script_run_dir 同口径走
+    ensure_within 兜底（.. 穿越/symlink 越界一律拒绝建目录）；目录创建统一
+    secure_mkdir（显式 0o750 权限，权限收紧见设计 §3 条目 0-3）。
     """
-    run_dir = (SCRIPT_RUN_BASE / str(task_id) / str(data_id)).absolute()
-    run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / OUTPUTS_DIR_NAME).mkdir(exist_ok=True)
+    run_dir = Path(ensure_within(SCRIPT_RUN_BASE, str(task_id), str(data_id))).absolute()
+    secure_mkdir(run_dir)
+    secure_mkdir(run_dir / OUTPUTS_DIR_NAME)
     return run_dir
 
 
@@ -345,10 +348,11 @@ def build_script_run_dir(task_id: str, data_id: str, script_id: str) -> Path:
     uploads/script_runs/{task_id}/{data_id}/{script_id}/：脚本进程的 cwd，
     其相对路径写盘的文件（含 stdout/stderr 重定向）都落在该目录，随任务清理。
     返回绝对路径（Popen cwd 与日志展示均按绝对路径更稳）。
+    ARCH-0-3：目录创建统一 secure_mkdir（显式 0o750 权限）。
     """
     # task_id/data_id 来自评测负载，realpath 兜底确保运行目录不逃出 SCRIPT_RUN_BASE
     run_dir = Path(ensure_within(SCRIPT_RUN_BASE, str(task_id), str(data_id), _safe_name(script_id))).absolute()
-    run_dir.mkdir(parents=True, exist_ok=True)
+    secure_mkdir(run_dir)
     return run_dir
 
 
@@ -547,6 +551,11 @@ def _run_step(
                 fields[field_name] = value
     except PreScriptInputError as e:
         return _result(script_id, name, "fail", error=str(e), finish_reason="error", started_at=started)
+    except PathEscapeError as e:
+        # ARCH-0-3：运行目录路径越界（.. 穿越/symlink 逃出 SCRIPT_RUN_BASE）
+        # 按该脚本 fail 处理，绝不越出根目录建目录/落盘
+        return _result(script_id, name, "fail", error=f"运行目录路径越界: {e}",
+                       finish_reason="error", started_at=started)
 
     stdin: Dict[str, Any] = {
         "task_id": task_id,
@@ -737,7 +746,8 @@ def _execute_script_subprocess(
             str(stdin.get("data_id") or "item"),
             script_id or name,
         )
-    except OSError as e:
+    except (OSError, PathEscapeError) as e:
+        # ARCH-0-3：含路径越界（PathEscapeError）——绝不越出 SCRIPT_RUN_BASE 建目录
         return _result(script_id, name, "fail", error=f"创建脚本运行目录失败: {e}",
                        finish_reason="error", started_at=started, static_check=static_check)
 
@@ -1055,8 +1065,9 @@ def write_inline_value(field: str, value: Any, run_dir: Path) -> str:
 
     dict/list 写 .json（ensure_ascii=False），其余写 .txt（UTF-8）。
     """
+    # ARCH-0-3：inputs/ 目录显式 0o750 权限创建
     inputs_dir = Path(run_dir) / "inputs"
-    inputs_dir.mkdir(parents=True, exist_ok=True)
+    secure_mkdir(inputs_dir)
     if isinstance(value, (dict, list)):
         target = inputs_dir / f"{_safe_name(field)}.json"
         target.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1077,8 +1088,9 @@ def copy_into_workspace(src: str, run_dir: Path, name: str) -> str:
     inputs/{name}{ext}。拷贝失败抛 OSError，由调用方按该脚本 fail 处理。
     """
     src_path = Path(src).absolute()
+    # ARCH-0-3：inputs/ 目录显式 0o750 权限创建
     inputs_dir = Path(run_dir) / "inputs"
-    inputs_dir.mkdir(parents=True, exist_ok=True)
+    secure_mkdir(inputs_dir)
     base = inputs_dir / _safe_name(name)
     if src_path.is_dir():
         if base.exists():

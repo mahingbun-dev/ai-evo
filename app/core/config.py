@@ -3,10 +3,13 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pathlib import Path
 
+import logging
 from functools import lru_cache
 
 # 项目根目录
 PROJECT_ROOT = Path(__file__).parent.parent.parent
+
+logger = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
@@ -23,9 +26,15 @@ class Settings(BaseSettings):
     REDIS_URL: str = "redis://localhost:6379/0"
 
     # 登录鉴权配置（JWT HS256）
-    # AUTH_JWT_SECRET 为空时将基于 DATABASE_URL 派生稳定密钥（仅适合本地开发），
-    # 生产环境务必在 .env 中显式配置随机高熵密钥
+    # JWT 签名密钥（ARCH-0-2，设计决策 D6）：企业部署必须显式配置——留空且
+    # 未开 AUTH_JWT_ALLOW_DERIVED 时启动 fail-fast（validate_runtime_settings）
+    # 且 auth_jwt_secret 取值直接抛错，杜绝「从 DATABASE_URL 派生密钥」的
+    # 凭证耦合（轮换 DB 口令不应作废全员登录态）
     AUTH_JWT_SECRET: str = ""
+    # 派生回退显式开关（ARCH-0-2）：true 时允许 AUTH_JWT_SECRET 留空、回退
+    # 「基于 DATABASE_URL 派生稳定密钥」——仅限本地开发机在 .env_local 显式
+    # 打开（启动日志会告警留痕）；默认 false，企业部署档缺密钥即拒绝启动
+    AUTH_JWT_ALLOW_DERIVED: bool = False
     # 登录态有效期（小时），默认 7 天
     AUTH_TOKEN_EXPIRE_HOURS: int = 168
     # 注册开关（关闭后仅已建账号可登录，登录页隐藏注册入口）
@@ -96,9 +105,18 @@ class Settings(BaseSettings):
 
     @property
     def auth_jwt_secret(self) -> str:
-        """JWT 签名密钥：未显式配置时基于 DATABASE_URL 派生稳定密钥"""
-        if self.AUTH_JWT_SECRET:
+        """JWT 签名密钥（ARCH-0-2，D6）。
+
+        优先级：显式配置 AUTH_JWT_SECRET > 本地开发派生回退（须显式开
+        AUTH_JWT_ALLOW_DERIVED）。两者皆无时抛 RuntimeError——不再静默从
+        DATABASE_URL 派生，保证企业部署档缺密钥时任何签发/校验入口都
+        fail-fast（含不经应用 lifespan 的进程，如 celery worker）。
+        """
+        if self.AUTH_JWT_SECRET.strip():
             return self.AUTH_JWT_SECRET
+        if not self.AUTH_JWT_ALLOW_DERIVED:
+            raise RuntimeError(_jwt_secret_missing_message())
+        # 本地开发派生回退：与 DATABASE_URL 挂钩的稳定密钥（仅开发语义）
         import hashlib
         return hashlib.sha256(
             f"ai-evo:{self.DATABASE_URL}".encode()
@@ -120,12 +138,28 @@ def get_settings() -> Settings:
     return Settings()
 
 
+def _jwt_secret_missing_message() -> str:
+    """JWT 密钥缺失的统一报错文案（ARCH-0-2）：校验入口与取值入口共用。
+
+    报错信息必须给出可复制的密钥生成示例（沿用 W6-3「报错即修复指引」风格）。
+    """
+    return (
+        "AUTH_JWT_SECRET 未配置：JWT 签名密钥不再从 DATABASE_URL 派生"
+        "（ARCH-0-2，凭证解耦——轮换数据库口令不应作废全员登录态），"
+        "请生成随机高熵密钥后写入部署目录 .env，示例：openssl rand -hex 32；"
+        "仅本地开发机可显式设置 AUTH_JWT_ALLOW_DERIVED=true 保留派生回退"
+        "（启动日志会告警），企业部署严禁开启"
+    )
+
+
 def validate_runtime_settings(settings: Settings) -> None:
-    """运行入口 fail-fast 校验（W6-3）。
+    """运行入口 fail-fast 校验（W6-3；ARCH-0-2 扩展 JWT 密钥校验）。
 
     仅在应用启动入口（app.main 的 lifespan 开头）调用，不得在模块 import 时
     调用——保证 `import app.main` 在无 DATABASE_URL 的环境（如收集单测）仍可
-    完成，导入不等于运行。缺 DATABASE_URL 时抛 RuntimeError 拒绝启动。
+    完成，导入不等于运行。缺 DATABASE_URL 时抛 RuntimeError 拒绝启动；
+    缺 AUTH_JWT_SECRET 时（ARCH-0-2）：企业部署档抛 RuntimeError 拒绝启动，
+    本地开发档（显式开 AUTH_JWT_ALLOW_DERIVED）放行但启动日志告警留痕。
     """
     if not settings.DATABASE_URL.strip():
         raise RuntimeError(
@@ -133,3 +167,13 @@ def validate_runtime_settings(settings: Settings) -> None:
             "请通过环境变量或部署目录 .env 提供，"
             "格式 postgresql://<user>:<password>@<host>:5432/<database>"
         )
+    # ARCH-0-2（D6）：JWT 密钥独立化——企业部署档缺失即拒绝启动
+    if not settings.AUTH_JWT_SECRET.strip():
+        if settings.AUTH_JWT_ALLOW_DERIVED:
+            logger.warning(
+                "AUTH_JWT_SECRET 未配置：当前为本地开发派生回退"
+                "（AUTH_JWT_ALLOW_DERIVED=true，密钥由 DATABASE_URL 派生）——"
+                "仅限开发机使用，企业部署请显式配置随机密钥（openssl rand -hex 32）"
+            )
+        else:
+            raise RuntimeError(_jwt_secret_missing_message())

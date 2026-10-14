@@ -227,8 +227,10 @@ cd /apps/qa-code/ai-evo
 cp -a .env ".env.bak.$(date +%Y%m%d%H%M%S)"          # 先备份
 grep -nE '^[A-Za-z_][A-Za-z0-9_]* +=' .env           # 列出格式有问题的行
 vi .env                                              # 改成 KEY=value；
-                                                     # 确认有 DATABASE_URL 与
+                                                     # 确认有 DATABASE_URL、
                                                      # REDIS_URL=redis://redis:6379/0
+                                                     # 与 AUTH_JWT_SECRET（见下）；
+                                                     # 变量清单见 4.4.1
 chmod 600 .env
 docker compose config >/dev/null && echo ".env 格式校验通过"
 ```
@@ -243,6 +245,12 @@ docker compose config >/dev/null && echo ".env 格式校验通过"
 > 文件，`compose up` 随即失败，而 compose 已经被仓库版本覆盖——等于把正在运行的服务
 > 搞坏。build-service 已加前置校验（`validate_env_file`），缺 `DATABASE_URL` 或
 > `REDIS_URL` 时会在动任何文件之前直接失败。
+>
+> ⚠️ **`AUTH_JWT_SECRET` 必须显式配置（ARCH-0-2）**：JWT 签名密钥已不再从
+> `DATABASE_URL` 派生。`.env` 缺这项时 api 容器启动即 fail-fast（该校验在应用层；
+> build-service 的前置护栏只查 `DATABASE_URL`/`REDIS_URL`，缺密钥会在容器启动阶段
+> 暴露为 crash loop，被部署校验「容器未全部 running」拦截）。生成方式见
+> 下文「JWT 密钥配置与轮换」。
 
 ```bash
 # 5. 启动 build-service
@@ -263,10 +271,74 @@ curl -s http://localhost:8181/api/v1/health
 # 期望: {"status":"ok","time":...}
 ```
 
+### 4.4.1 部署 .env 变量清单（ARCH-0-4）
+
+服务器 `.env` 由部署方维护（不入库、600 权限），compose 经 `env_file` 整体注入
+api/worker 容器。部署相关变量一览（✅ 必填、⛔ 严禁设置；标注 ARCH-* 的条目为
+2026-10 架构改造新增变量或本次收口强调项）：
+
+| 变量 | 必填 | 说明 |
+|---|---|---|
+| `DATABASE_URL` | ✅ | PostgreSQL 连接串（build-service 前置护栏也校验它） |
+| `REDIS_URL` | ✅ | compose 网络内通常为 `redis://redis:6379/0` |
+| `AUTH_JWT_SECRET` | ✅ | JWT 签名密钥（ARCH-0-2）。缺失即拒启，生成与轮换见「JWT 密钥配置与轮换」 |
+| `AUTH_JWT_ALLOW_DERIVED` | ⛔ | **企业部署严禁开启**（ARCH-0-2）。仅开发机 `.env_local` 可显式设 true 保留派生回退 |
+| `SCRIPT_EXEC_MODE` | 见「九」 | 前处理脚本执行模式（ARCH-0-4）：`local` 仅限开发机，企业部署禁止——现状与落地步骤见第九节 |
+| `SCRIPT_RUNNER_IMAGE` | 可选 | `container` 模式 runner 镜像（默认 `ai-evo-script-runner:latest`），离线预载见 `docker/script-runner/README.md` |
+| `SCRIPT_RUNNER_USER` | 可选 | `container` 模式容器内运行用户（默认 `10001:10001`）；Linux 部署机需与挂载目录属主匹配 |
+| `IMAGE_TAG` | 自动 | CI 部署时自动写入当前短 sha；手工回滚即改回旧值 |
+| `TMPFS_TMP_SIZE` / `TMPFS_HOME_SIZE` | 可选 | `/tmp`、`/home/app` 两个 tmpfs 的容量上限（ARCH-0-1，默认各 1g，只按实际写入占内存） |
+| `LOGS_VOLUME` / `UPLOADS_VOLUME` | 可选 | 日志/上传卷形态切换（默认 bind 到 compose 目录下；群晖等经代理工具执行 compose 的场景设为命名卷 `logs` / `uploads`） |
+| `AIEVO_PORT` | 可选 | api 对外端口（默认 8100） |
+| `COMPOSE_PROFILES` | 可选 | 设 `bundled-db` 一并启动内置 PostgreSQL（生产 CI 部署不设） |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` / `POSTGRES_PORT` | 可选 | 仅 `bundled-db` profile 生效 |
+| `BACKUP_DIR` / `RETENTION_DAYS` / `UPLOADS_RETENTION_DAYS` | 可选 | 备份输出与保留策略（见「备份与恢复」） |
+| `REMOTE_DATABASE_URL` / `LOCAL_DATABASE_URL` | 可选 | `scripts/sync_database.py` 手动运维用 |
+| `AIEVO_HUB_ADDR` / `AIEVO_HUB_ADVERTISE_ADDR` / `AIEVO_API_BASE` | 可选 | hub-plugin 拓扑变化时覆盖（同机默认回环直连） |
+| `NODE_IMAGE` / `PY_IMAGE` / `PIP_INDEX_URL` / `NPM_REGISTRY` | 可选 | 自建在线构建（`Dockerfile.online`）的构建期换源参数 |
+
+应用层可选项（`AUTH_TOKEN_EXPIRE_HOURS`、`AUTH_REGISTER_ENABLED`、`OSS_*`、
+`LANGFUSE_*`、`ANC_HUB_MCP_ENDPOINT`、`ANC_HUB_BEARER_TOKEN`、`HUB_SSO_COOKIE_NAME`、
+`UPLOAD_MAX_BYTES`、`DB_ASSERT_READONLY_DSN`、`DEEPEVAL_*` 等）的完整清单见
+`.env.example` 与 `app/core/config.py`。
+
 ### 4.5 首次流水线
 
 在 GitLab 上发起一次 Web 触发（CI/CD → Pipelines → Run pipeline，选 `main` 分支），
 两个 job 手动点击执行。第一次会同步离线快照（数百 MB），耗时较长。
+
+### 4.6 首次部署的卷属主迁移（volume-init，ARCH-0-1）
+
+主镜像以 uid/gid **10002**（app 用户）+ `cap_drop ALL` 运行（设计 0-1），进程自身
+无法 chown；而 `uploads/`、`logs/` 两个写面是运行时挂卷，属主不跟随镜像——
+docker 自动创建的缺失 bind 目录是 root:root，历史部署的卷内容也是 root 写入的。
+因此**无需（也不应）手工 chown**：每次 `docker compose up -d` 时由 compose 的
+`volume-init` 一次性服务在主服务之前自动完成迁移：
+
+- 它以 root 运行但只保留 `CHOWN` / `DAC_OVERRIDE` 两个能力，无网络、根文件系统
+  只读、不挂 `.env`（凭证与本服务无关）——迁移逻辑在 `docker-entrypoint.sh` 的
+  volume-init 分支；
+- 把两个卷的属主递归纠正为 `10002:10002`；已全部是 10002 时只读遍历、零写入秒退
+  （幂等，每次 up 都跑一遍，代价可忽略）；
+- api/worker 通过 `depends_on: service_completed_successfully` 等它成功退出再启动；
+- **`docker compose ps` 里 `ai-evo-volume-init` 显示 `exited(0)` 属正常**，一次性
+  服务本该退出，不是故障、不需要重启它。
+
+历史部署升级到本版本同样自动迁移：旧 root 属主内容会在下一次 `compose up -d` 时
+被纠正；`uploads/` 内容较多时递归 chown 需要时间，建议低峰期执行首次升级。
+
+**SMB/NFS 等禁止 chown 的卷**：volume-init 对 chown 失败只告警不阻断（这类卷按
+挂载 uid 映射本就可能可写）；真实可写性由 api/worker 的启动预检把关——不可写时
+容器立即退出并打印修复命令，而不是起来之后在第一次写日志/上传时抛
+PermissionError。手动修复等价于预检提示的两条命令：
+
+```bash
+# bind 挂载目录（宿主执行）
+chown -R 10002:10002 /apps/qa-code/ai-evo/uploads /apps/qa-code/ai-evo/logs
+
+# 命名卷（经临时容器执行）
+docker run --rm -v <卷名>:/d alpine chown -R 10002:10002 /d
+```
 
 ---
 
@@ -420,6 +492,32 @@ W6-3 已把明文口令从 `alembic.ini`、`alembic_local.ini`（已删除）、
 4. `docker compose up -d` 重启 api/worker，跑一遍冒烟（登录 + 建任务）确认连通；
 5. 通知全组：仓库 git 历史里的两个旧口令已作废，入库残留变为无害字符串。
 
+### JWT 密钥配置与轮换（AUTH_JWT_SECRET，ARCH-0-2）
+
+整改前 JWT 签名密钥在未配置时从 `DATABASE_URL` 派生（config.py 旧逻辑）——数据库
+口令与登录态凭证耦合：轮换 DB 口令会静默作废全员登录态，且拿到 DSN 的任何一方
+都能本地伪造用户 token。现改为**密钥独立、缺失即拒启**：
+
+- **必填**：`.env` 缺 `AUTH_JWT_SECRET` 时 api 启动直接 fail-fast（uvicorn 日志
+  可见「AUTH_JWT_SECRET 未配置」，报错自带生成示例），部署校验拦 crash loop。
+- **生成**（部署机无外网也没关系，openssl 是基础工具）：
+
+  ```bash
+  openssl rand -hex 32   # 输出写入 .env 的 AUTH_JWT_SECRET= 行
+  chmod 600 .env         # .env 含 DB 口令与 JWT 密钥，保持 600
+  docker compose up -d   # 重启生效
+  ```
+
+- **首次升级到本版本前必须先补密钥**，否则升级后服务起不来。步骤：
+  生成 → 写入部署机 `/apps/qa-code/ai-evo/.env` → 再触发部署/重启。
+- **轮换**：换成新生成的值后 `docker compose up -d`。全部已签发 token 立即失效
+  （用户需重新登录，WebSocket 连接同理），worker 在跑的长任务不受影响（任务链路
+  不校验用户 JWT）。建议低峰期执行并提前公告，这与设计验收「轮换演练一次」对应。
+- **本地开发**：开发机可在 `.env_local` 显式设 `AUTH_JWT_ALLOW_DERIVED=true`
+  保留「由 DATABASE_URL 派生」的回退（启动日志会告警留痕）。该开关仅限开发机，
+  企业部署的 `.env` 严禁开启——开启后缺密钥不再拒启，等于退回耦合状态。
+
+
 ### 部署时的任务中断行为
 
 `worker` 服务设置了 `stop_grace_period: 900s`。部署触发 `docker compose up -d` 时：
@@ -549,6 +647,10 @@ docker run --rm --network=none --platform linux/amd64 \
 | 上传快照报 401 | Deploy Token **只认 Basic 鉴权**，用 `PRIVATE-TOKEN` 头会返回 401（实测确认）。脚本已改用 Basic，用户名默认 `gitlab+deploy-token-173`，可用 `GITLAB_UPLOAD_USER` 覆盖。 |
 | 快照解出来文件数翻倍、多出 `._xxx` 文件 | macOS 的 `bsdtar` 默认附带 AppleDouble 元数据。脚本已用 `COPYFILE_DISABLE=1` 关闭，不要绕过脚本手工 `tar` 打包。 |
 | 部署报「部署目录缺少 .env」/「缺少必需变量: DATABASE_URL」 | build-service 的前置护栏拦住了。按第 4.4 节把 `.env` 建好再部署——这是为了不在缺配置时覆盖 compose、把线上服务搞坏。 |
+| api 容器反复退出，日志报「AUTH_JWT_SECRET 未配置」（ARCH-0-2） | JWT 密钥缺失的应用层 fail-fast（build-service 护栏不查这一项）。按「JWT 密钥配置与轮换」一节：`openssl rand -hex 32` 生成后写入 `.env` 的 `AUTH_JWT_SECRET=`，`docker compose up -d` 重启。 |
+| `docker compose ps` 里 `ai-evo-volume-init` 显示 `Exited (0)` | 正常现象：一次性卷属主迁移服务（ARCH-0-1，见 4.6），迁移完成即退出，不是故障、不需要处理。 |
+| api/worker 启动即退出，日志报「以下挂卷目录不可写」（ARCH-0-1） | 卷属主非 10002 且 volume-init 的 chown 失败（SMB/NFS 等禁止 chown 的卷）。按日志提示修复：宿主 `chown -R 10002:10002 <uploads/logs 目录>`，命名卷经 alpine 容器执行，详见 4.6。 |
+| container 模式任务失败，worker 日志报找不到 docker / 连不上 Docker daemon | worker 容器无 docker 执行通道（未挂 docker.sock、镜像内无 docker CLI），container 模式在 CI 部署栈尚不可用（见第九节）；若并非有意开启，检查 `.env` 的 `SCRIPT_EXEC_MODE` 是否误设。 |
 | `docker compose up -d` 卡很久 | worker 正在跑长任务，等它优雅退出。超过 900s 会强杀。 |
 | 部署校验报「容器在 180s 内未全部 running」 | 登录服务器 `docker compose logs <service>` 看启动失败原因。 |
 | 部署校验报「HTTP 探活失败」 | api 容器起来了但接口不通。先看 `docker logs ai-evo-api`。**另一种常见原因**：build-service 没有用 `--network host` 启动——默认 bridge 网络下容器内的 `127.0.0.1:8100` 指向它自己，永远连不上，必须用宿主网络。 |
@@ -582,4 +684,47 @@ Dockerfile 里旧的「apt install curl + 在线跑 install.sh」在服务器必
 - 升级 claude：`./tools/build-claude-bin.sh --upload`（需 `GITLAB_UPLOAD_TOKEN`，
   走代理时加 `PROXY=http://host.docker.internal:7897`）→ 提交更新的
   `claude-bin.json` → 服务器构建自动换新版本。
+
+---
+
+## 九、脚本执行模式：local 仅限开发机，企业部署禁止（ARCH-0-4）
+
+评测前处理脚本是平台内唯一的用户代码执行面，`SCRIPT_EXEC_MODE` 决定其执行通道：
+
+| 维度 | `local`（当前代码默认） | `container`（W15 沙箱） |
+|---|---|---|
+| 运行位置 | worker 容器内子进程直跑 | `docker run --rm` 独立容器 |
+| 运行身份与资源 | 与 worker 同身份：ARCH-0-1 后为 uid 10002 + `cap_drop ALL` + 只读根文件系统，可写面收敛 uploads/logs 两卷与 tmpfs；**无 mem/cpu/pids 上限** | 镜像内独立非 root 用户，mem 1g / cpu 0.5 / pids 128 |
+| 网络 | 继承 worker 网络（compose bridge，可触达内网） | 默认 `--network none` |
+| 平台 import 面 | **PYTHONPATH 注入项目根，脚本可 `import app.*` 拿到平台代码与 DB session**（W1-3 的环境变量白名单只挡 env 泄漏，挡不住 import 面） | 裁剪镜像不含平台代码、无 PYTHONPATH 注入 |
+
+**政策：`SCRIPT_EXEC_MODE=local` 仅限开发机；企业部署禁止以 local 模式执行前处理脚本。**
+理由：local 通道里用户代码与平台控制面在同一进程边界内——恶意或失陷脚本可经
+import 面拿到 DB session、无资源限制地占死 worker、经 worker 网络触达内网。
+ARCH-0-1 的非 root 化收紧了文件系统爆炸半径，但不改变「同边界」这一本质。
+compose 里 worker 段的 ARCH-0-1 注释对 local 的描述（过渡期最低隔离）即指此现状。
+
+**企业部署的落地方式（如实说明现状与前置）**：
+
+1. 合规状态是 `SCRIPT_EXEC_MODE=container`。代码默认值目前仍是 `local`
+   （历史兼容；后续阶段会把 container 设为企业默认、local 改为显式 env 才可用）
+   ——**漏配即落在 local**。container 通道在企业栈就绪后（前置见第 2 点），
+   企业部署的 `.env` 必须显式写 `SCRIPT_EXEC_MODE=container`，不要依赖默认值。
+2. container 模式有两个前置：
+   - **部署机离线预载 runner 镜像**（D-3 运维事项）：开发机
+     `docker build -f docker/script-runner/Dockerfile` + `docker save` 传输 +
+     部署机 `docker load`，步骤见 `docker/script-runner/README.md`「离线预载」；
+     换 tag 经 `SCRIPT_RUNNER_IMAGE` 指向，不必改代码；
+   - **worker 侧 docker 执行通道**：当前 compose 的 worker 容器未挂
+     docker.sock、主镜像内也无 docker CLI——container 模式在 CI 部署栈里
+     **尚不可用**，专职 executor 服务属后续阶段（设计条目 1-1～1-4）。
+3. **过渡期纪律（executor 上线前）**：企业部署不运行前处理脚本类评测——
+   脚本库写权限虽已收口到超管（W1-4），但 local 通道对任何脚本都不设进程
+   边界；需要脚本的评测先在开发机完成，待 container 通道就绪后再进企业栈。
+
+开发机本地开发维持 `local` 默认即可（迭代快，无隔离诉求）；灰度验证 container
+时在启动 worker 的环境显式设 `SCRIPT_EXEC_MODE=container`（环境变量实时读，
+改 `.env_local` 或 shell export 后重启 worker 生效）。W15 门禁
+`tests/integration/test_w15_container_probe.py` 与
+`tests/unit/test_w15_container_isolation.py` 在开发机有 docker 时可复跑验证隔离语义。
 

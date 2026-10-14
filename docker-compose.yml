@@ -38,6 +38,29 @@ services:
     networks:
       - ai-evo-net
 
+  # ARCH-0-1：uploads/logs 卷属主一次性迁移（逻辑在 docker-entrypoint.sh 的
+  # volume-init 分支）。api/worker 以 uid 10002 + cap_drop ALL 运行，容器内无法
+  # 自行 chown；bind 挂载目录由 docker 以 root 创建、历史部署的卷内容也是 root
+  # 属主，故由这个以 root 运行、只保留 CHOWN/DAC_OVERRIDE 两个能力的一次性容器在
+  # 主服务启动前把卷属主纠正为 10002 后退出（已是 10002 时零写入秒退；chown 失败
+  # 只告警不阻断，真实可写性由 api/worker 启动预检把关）。无网络、根文件系统只读、
+  # 不挂 .env（凭证与本服务无关）。`docker compose ps` 里它显示 exited(0) 属正常。
+  volume-init:
+    image: ai-evo:${IMAGE_TAG:-latest}
+    container_name: ai-evo-volume-init
+    user: "0:0"
+    environment:
+      - SERVICE_TYPE=volume-init
+    volumes:
+      - ${LOGS_VOLUME:-./logs}:/app/logs
+      - ${UPLOADS_VOLUME:-./uploads}:/app/uploads
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    network_mode: none
+    restart: "no"
+
   api:
     image: ai-evo:${IMAGE_TAG:-latest}
     build:
@@ -50,7 +73,11 @@ services:
         - NPM_REGISTRY=${NPM_REGISTRY:-https://registry.npmmirror.com}
     container_name: ai-evo-api
     depends_on:
-      - redis
+      redis:
+        condition: service_started
+      # ARCH-0-1：等卷属主迁移完成再起（见上方 volume-init）
+      volume-init:
+        condition: service_completed_successfully
     env_file:
       - .env
     environment:
@@ -69,6 +96,27 @@ services:
       # 重建，丢失后必须重新人工上传，故挂卷持久化（api 与 worker 共享
       # 同一卷；首次部署为空，历史包需重新导入，见部署文档）
       - ${UPLOADS_VOLUME:-./uploads}:/app/uploads
+    # ARCH-0-1：运行期加固（设计 D3）。镜像已 USER 10002，这里再收容器能力面：
+    #   - cap_drop ALL + no-new-privileges：进程拿不到任何 capability，也不能经
+    #     setuid/文件能力再获得（uvicorn :8100 为非特权端口，无需 NET_BIND_SERVICE）
+    #   - read_only：根文件系统只读，代码/依赖/前端产物运行期不可改写；写面只剩
+    #     uploads/logs 两个卷与下面两个 tmpfs
+    #   - tmpfs /tmp：Python tempfile 缺省位（xlsx 导入导出、hub 会话导入工作区、
+    #     DeepSeek harness 一次性 dsh_home/workspace、OSS 媒体落盘前的临时文件，
+    #     均用完即删）
+    #   - tmpfs /home/app：HOME，Claude Code CLI 的 ~/.claude 配置与会话转录在此；
+    #     与此前落容器可写层一样随容器重建清空，区别是 RAM 承载且有上限
+    #   上限可在 .env 用 TMPFS_TMP_SIZE / TMPFS_HOME_SIZE 调整（默认 1g，只按实际
+    #   写入占内存）。不加 noexec：裁判引擎原生运行时（Claude Code 单文件 CLI /
+    #   DeepSeek harness）在 HOME、TMPDIR 下落配置与辅助文件，noexec 是否影响其
+    #   子进程未经实机验证，Phase 0 不赌；nosuid + no-new-privileges + cap_drop ALL
+    #   已封掉提权路径，noexec 对本就能执行任意 Python 的进程增量防护有限。
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,exec,nosuid,nodev,size=${TMPFS_TMP_SIZE:-1g}
+      - /home/app:rw,exec,nosuid,nodev,uid=10002,gid=10002,mode=0750,size=${TMPFS_HOME_SIZE:-1g}
     # W13：日志轮转（json-file 50m×3，防止 docker 日志撑爆部署机磁盘）+
     # healthcheck（真实依赖探测：DB/Redis/迁移版本/uploads 全绿才 healthy）。
     # 探活 URL 在鉴权白名单内，无需 cookie；镜像内无 curl，用 python 探测。
@@ -101,7 +149,11 @@ services:
         - NPM_REGISTRY=${NPM_REGISTRY:-https://registry.npmmirror.com}
     container_name: ai-evo-worker
     depends_on:
-      - redis
+      redis:
+        condition: service_started
+      # ARCH-0-1：等卷属主迁移完成再起（见上方 volume-init）
+      volume-init:
+        condition: service_completed_successfully
     env_file:
       - .env
     environment:
@@ -120,6 +172,18 @@ services:
       # 与 api 共享同一卷（worker 的 Celery 任务也读写 uploads：执行包
       # 解包、评测镜像、脚本运行产物）
       - ${UPLOADS_VOLUME:-./uploads}:/app/uploads
+    # ARCH-0-1：运行期加固，与 api 同一套（理由见 api 段注释）。worker 额外说明：
+    # SCRIPT_EXEC_MODE=local 时前处理脚本是本容器内子进程，同样被非 root +
+    # cap_drop + read_only 约束——脚本只能写 uploads 卷（script_runs 工作区）、/tmp
+    # 与 HOME 两个 tmpfs，这正是 W15 容器化之前过渡期要的最低隔离；裁判引擎
+    # （Claude Code CLI / DeepSeek harness）主要在 worker 跑，/home/app 的 tmpfs
+    # 上限按 .env TMPFS_HOME_SIZE 调整。
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,exec,nosuid,nodev,size=${TMPFS_TMP_SIZE:-1g}
+      - /home/app:rw,exec,nosuid,nodev,uid=10002,gid=10002,mode=0750,size=${TMPFS_HOME_SIZE:-1g}
     # W13：日志轮转 + healthcheck（celery inspect ping 定点问本 worker，
     # 无响应 = 进程僵死/丢注册；Redis 不可达时同样失败）
     logging:
@@ -170,6 +234,14 @@ services:
       start_period: 30s
     restart: unless-stopped
     network_mode: host
+    # ARCH-0-1：cap_drop ALL + no-new-privileges 与 api/worker 同一口径（:9500 为
+    # 非特权端口，host 网络下同样不需要任何 capability）。不加 read_only+tmpfs：
+    # 设计 D3 明确 hub-plugin 形态不变——它是 host 网络 sidecar，与 hub 家族其他
+    # 插件同形；不挂 uploads/logs 卷、不落盘，容器可写层里没有需要保护的持久
+    # 内容，非 root + cap_drop 已拿到主要收益；read_only 只会多一个未经 hub 联调
+    # 验证的故障面（hubkit/gRPC 运行时若有临时写入会直接起不来）。
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
 
 volumes:
   pgdata:
