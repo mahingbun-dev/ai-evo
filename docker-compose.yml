@@ -69,6 +69,22 @@ services:
       # 重建，丢失后必须重新人工上传，故挂卷持久化（api 与 worker 共享
       # 同一卷；首次部署为空，历史包需重新导入，见部署文档）
       - ${UPLOADS_VOLUME:-./uploads}:/app/uploads
+    # W13：日志轮转（json-file 50m×3，防止 docker 日志撑爆部署机磁盘）+
+    # healthcheck（真实依赖探测：DB/Redis/迁移版本/uploads 全绿才 healthy）。
+    # 探活 URL 在鉴权白名单内，无需 cookie；镜像内无 curl，用 python 探测。
+    # 注意：迁移版本探针要求 alembic_version 与迁移 heads 一致——部署新代码
+    # 后若引入了新迁移，需按 docs/build-pipeline.md 执行 alembic upgrade head。
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import sys,urllib.request; r=urllib.request.urlopen('http://127.0.0.1:8100/api/v1/health/deep', timeout=8); sys.exit(0 if r.status==200 else 1)\""]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 90s
     restart: unless-stopped
     networks:
       - ai-evo-net
@@ -94,13 +110,29 @@ services:
       - OPENBLAS_CORETYPE=GENERIC
       - MKL_DEBUG_CPU_TYPE=5
     # 停止时给 Celery 优雅退出的时间：收到 SIGTERM 后跑完当前任务再退出，
-    # 排队中的任务保留在 Redis 队列由新 worker 接手（部署脚本不再清空队列）
-    stop_grace_period: 900s
+    # 排队中的任务保留在 Redis 队列由新 worker 接手（部署脚本不再清空队列）。
+    # W10-3：900s → 7200s，与 celery task_time_limit（单任务最长 2h）对齐——
+    # 900s 窗口内跑不完的长任务会被 docker 强杀（SIGKILL），任务中断且消息
+    # 未 ACK 会被重投。
+    stop_grace_period: 7200s
     volumes:
       - ${LOGS_VOLUME:-./logs}:/app/logs
       # 与 api 共享同一卷（worker 的 Celery 任务也读写 uploads：执行包
       # 解包、评测镜像、脚本运行产物）
       - ${UPLOADS_VOLUME:-./uploads}:/app/uploads
+    # W13：日志轮转 + healthcheck（celery inspect ping 定点问本 worker，
+    # 无响应 = 进程僵死/丢注册；Redis 不可达时同样失败）
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.celery_app inspect ping -d celery@$$HOSTNAME --timeout 10"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+      start_period: 90s
     restart: unless-stopped
     networks:
       - ai-evo-net
@@ -122,6 +154,20 @@ services:
       - HUB_LISTEN_ADDR=:9500
       - HUB_INSTANCE_ID=ai-evo-hub-plugin-1
       - AIEVO_API_BASE=${AIEVO_API_BASE:-http://127.0.0.1:8100}
+    # W13：日志轮转 + healthcheck。hubkit 是 gRPC 服务（非 HTTP），没有可 GET 的
+    # 健康路由，退而求其次做 TCP 端口探活：进程监听 :9500 即视为存活
+    # （host 网络下 127.0.0.1:9500 即宿主回环）。
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import socket; socket.create_connection(('127.0.0.1', 9500), 3).close()\""]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     restart: unless-stopped
     network_mode: host
 

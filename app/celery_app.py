@@ -22,6 +22,12 @@ celery_app.conf.update(
     accept_content=["json"],
     result_serializer="json",
 
+    # W10-1：Redis broker 可见性超时必须 ≥ task_time_limit（7200s）。
+    # 缺省 visibility_timeout 只有 1 小时——acks_late 长任务执行超过 1 小时后，
+    # 消息会被 broker 视为「未消费」重新投递，同任务在两个 worker 并发执行。
+    # 显式 7800s（比 task_time_limit 富余 10 分钟，覆盖 ack 抖动窗口）。
+    broker_transport_options={"visibility_timeout": 7800},
+
     # Worker 配置
     worker_pool="prefork",               # 多进程模式
     worker_concurrency=4,                # 并发 worker 数

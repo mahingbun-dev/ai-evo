@@ -32,6 +32,8 @@ from app.services.pre_judge_script_service import (
     ensure_builtin_scripts_migrated,
 )
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 @pytest.fixture
 def seeded_db(tmp_path, monkeypatch):

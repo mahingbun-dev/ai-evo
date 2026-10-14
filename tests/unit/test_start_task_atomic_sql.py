@@ -12,6 +12,8 @@ from sqlalchemy.orm import sessionmaker
 from app.models.task_models import EvaluationTask
 from app.db.session import Base
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 @pytest.fixture
 def db_session():

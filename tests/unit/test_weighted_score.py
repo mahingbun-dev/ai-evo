@@ -4,6 +4,8 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from app.services.judge_evaluation_engine import JudgeEvaluationEngine, WEIGHT_MAP
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 class TestWeightMap:
     """WEIGHT_MAP 常量测试"""

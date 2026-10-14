@@ -14,6 +14,8 @@ import pytest
 import json
 from unittest.mock import MagicMock, patch
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 class TestDatasetFieldsApi:
     """数据集字段 API 测试 - 验证 viewData 多字段支持"""

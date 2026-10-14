@@ -2,6 +2,8 @@
 import pytest
 from app.services.instruction_builder import InstructionBuilder
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 class TestInstructionBuilderMaxScore:
     """验证 max_score 不再被维度级值覆盖"""

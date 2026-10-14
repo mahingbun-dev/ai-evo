@@ -1,0 +1,4 @@
+idx,success,metrics,repeat_results,error_analysis,user_input,error
+0,True,"{'total_calls': 10, 'successful_calls': 9, 'success_rate': 0.9, 'avg_response_time': 1.23}","[{'success': True, 'result': 'Paris', 'duration': 1.1}, {'success': True, 'result': 'Paris.', 'duration': 1.0}, {'success': False, 'result': '', 'duration': 1.4}]",{'failure_reasons': ['第3次调用返回为空']},法国的首都是哪里？,
+1,True,"{'total_calls': 10, 'successful_calls': 5, 'success_rate': 0.5, 'avg_response_time': 2.05}","[{'success': True, 'result': '42', 'duration': 2.0}, {'success': False, 'result': '', 'duration': 2.1}]",{},6 乘 7 等于多少？,
+2,False,,,,,模型调用失败: 连接被重置

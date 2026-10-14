@@ -25,6 +25,8 @@ import pytest
 from app.services.evaluation_executor import EvaluationExecutor
 from app.services.prompt_builder import PromptBuilder
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 # ---------------- 公共工具 ----------------
 
@@ -290,13 +292,16 @@ class TestMigrateConfigEndpointHappyPath:
     def _run_endpoint(self, summary):
         from app.api.evaluation_task_api import migrate_task_config
 
-        with patch("app.api.evaluation_task_api.EvaluationTaskService") as mock_cls, \
-                patch("app.services.config_migration_service.ConfigMigrationService") as mock_mig:
-            mock_service = MagicMock()
-            mock_cls.return_value = mock_service
-            mock_service.get_task.return_value = MagicMock(id="task_1")
+        # W9：存在性/归属由 ensure_task_access 承担（db 替身返回任务对象），
+        # request 直调替身取超管视角
+        from tests.unit.w9_direct_call import fake_request
+
+        db = MagicMock()
+        db.query.return_value.filter.return_value.first.return_value = MagicMock(
+            id="task_1")
+        with patch("app.services.config_migration_service.ConfigMigrationService") as mock_mig:
             mock_mig.return_value.migrate_task.return_value = summary
-            return migrate_task_config("task_1", MagicMock())
+            return migrate_task_config("task_1", fake_request(), db=db)
 
     def test_migrated_task_returns_summary(self):
         """发生迁移：端点原样返回迁移摘要（含 target_ids 与 changes）"""

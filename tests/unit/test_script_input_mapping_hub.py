@@ -31,6 +31,8 @@ from app.services import pre_judge_runner
 from app.services.hub_file_service import build_file_index, unpack_zip_safely
 from app.services.pre_judge_script_service import PreJudgeScriptService
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 # ---------------- fake 脚本（统一子进程：run(stdin) 函数式，捕获 stdin 契约） ----------------
 
@@ -407,6 +409,16 @@ def make_script_zip_bytes() -> bytes:
 
 
 class TestZipScriptPackageExecution:
+    @pytest.fixture
+    def zip_upload_base(self, tmp_path, monkeypatch):
+        """zip 包解包根指向 SCRIPT_UPLOAD_BASE（W1-2：entrypoint 只在包内解析，
+        运行器按 SCRIPT_UPLOAD_BASE/{script_id}/ 定位脚本目录）"""
+        from app.services import pre_judge_script_service as script_service
+
+        base = tmp_path / "uploads" / "pre_judge_scripts"
+        monkeypatch.setattr(script_service, "SCRIPT_UPLOAD_BASE", base)
+        return base
+
     def _stdin(self, unpack_root, run_dir):
         return {
             "task_id": "task_zip",
@@ -427,13 +439,13 @@ class TestZipScriptPackageExecution:
             "_run_dir": str(run_dir),
         }
 
-    def test_zip_package_entrypoint_executes(self, tmp_path):
-        """zip 脚本包解包到 uploads/pre_judge_scripts/{script_id}/：entrypoint 指向
-        包内 main.py，子进程可执行且包内 import（wms_support）可用"""
+    def test_zip_package_entrypoint_executes(self, tmp_path, zip_upload_base):
+        """zip 脚本包解包到 uploads/pre_judge_scripts/{script_id}/：entrypoint 为
+        包内相对路径 main.py，子进程可执行且包内 import（wms_support）可用"""
         script_id = "pjs_zippkg"
         zip_path = tmp_path / f"{script_id}.zip"
         zip_path.write_bytes(make_script_zip_bytes())
-        pkg_dir = tmp_path / "uploads" / "pre_judge_scripts" / script_id
+        pkg_dir = zip_upload_base / script_id
         unpack_zip_safely(str(zip_path), str(pkg_dir))  # 复用阶段A安全解包
         assert (pkg_dir / "wms_support" / "util.py").is_file()
 
@@ -441,7 +453,7 @@ class TestZipScriptPackageExecution:
         run_dir.mkdir(parents=True)
         script = {
             "script_id": script_id, "name": "zip包脚本", "exec_type": "script",
-            "entrypoint": str(pkg_dir / "main.py"), "timeout_seconds": 60,
+            "entrypoint": "main.py", "timeout_seconds": 60,
         }
         result = pre_judge_runner.execute_script(script, self._stdin(pkg_dir, run_dir),
                                                  timeout_seconds=60)
@@ -450,15 +462,14 @@ class TestZipScriptPackageExecution:
         assert result["output"]["n_files"] == 1      # stdin.fields 传递正确
         assert result["output"]["first_rel"] == "execution-manifest.json"
 
-    def test_relative_entrypoint_resolved_from_cwd(self, tmp_path):
-        """entrypoint 为相对路径（相对主进程 cwd，包形态）→ 兜底转绝对后仍可执行"""
+    def test_relative_entrypoint_resolved_from_cwd(self, tmp_path, zip_upload_base):
+        """W1-2：相对主进程 cwd 的历史兜底分支已删除——cwd 相对 entrypoint 一律拒绝，
+        入口只按 SCRIPT_UPLOAD_BASE/{script_id}/ 包内解析"""
         script_id = "pjs_ziprel"
         zip_path = tmp_path / f"{script_id}.zip"
         zip_path.write_bytes(make_script_zip_bytes())
-        pkg_dir = tmp_path / "uploads" / "pre_judge_scripts" / script_id
+        pkg_dir = zip_upload_base / script_id
         unpack_zip_safely(str(zip_path), str(pkg_dir))
-        # os.path.relpath 允许 .. 跨目录（tmp 与 cwd 常不同树），代码内
-        # (Path.cwd() / script_path).resolve() 兜底转绝对
         rel_entry = os.path.relpath(str(pkg_dir / "main.py"), Path.cwd())
 
         run_dir = tmp_path / "script_runs" / "task_zip" / "data_1"
@@ -469,16 +480,17 @@ class TestZipScriptPackageExecution:
         }
         result = pre_judge_runner.execute_script(script, self._stdin(pkg_dir, run_dir),
                                                  timeout_seconds=60)
-        assert result["status"] == "ok", result
-        assert result["output"]["sum"] == 3
+        assert result["status"] == "fail", "cwd 相对 entrypoint 不应再被执行"
+        # 拒绝文案按形态二选一：含 .. 穿越 → 穿越提示；不含 ..（同为包内子路径字面量）→ 入口不存在
+        assert (".. 穿越" in result["error"]) or ("脚本入口不存在" in result["error"])
 
-    def test_missing_entrypoint_file_fails(self, tmp_path):
-        """entrypoint 指向不存在的包内文件 → fail（错误含路径）"""
+    def test_missing_entrypoint_file_fails(self, tmp_path, zip_upload_base):
+        """包内相对 entrypoint 指向不存在的文件 → fail（错误含路径）"""
         run_dir = tmp_path / "script_runs" / "task_zip" / "data_1"
         run_dir.mkdir(parents=True)
         script = {
             "script_id": "pjs_missing", "name": "缺失入口", "exec_type": "script",
-            "entrypoint": str(tmp_path / "pre_judge_scripts" / "pjs_missing" / "main.py"),
+            "entrypoint": "main.py",
             "timeout_seconds": 30,
         }
         result = pre_judge_runner.execute_script(script, self._stdin(tmp_path, run_dir),

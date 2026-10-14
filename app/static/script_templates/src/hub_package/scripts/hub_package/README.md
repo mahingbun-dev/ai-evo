@@ -18,7 +18,7 @@ anc-hub 执行包在该工作区中的真实层级如下
 （绝对路径都经 stdin 传入，源码里禁止自行拼接）：
 
 ```
-uploads/script_runs/{task_id}/{data_id}/            ← 单条数据工作区（_run_dir，产物只写这里）
+uploads/script_runs/{task_id}/{data_id}/            ← 单条数据工作区（_run_dir）
 ├── scripts/{script_key}/                           ← 脚本包副本（从副本执行）
 │   ├── main.py
 │   ├── model.py
@@ -31,7 +31,8 @@ uploads/script_runs/{task_id}/{data_id}/            ← 单条数据工作区（
 │       ├── reports/allure_results/*-result.json    ← 评测脚本最常消费（附 screenshots/、logs/、allure_html/）
 │       ├── segments/{uuid}/（pytest 产物 + allure-data/ + runtime/）  ← 分段执行产物
 │       └── action-files/（.xlsx 导出） actions/ scripts/ source/ ...
-└── inputs/{字段名}_index.json                       ← 未配 path_pattern 时的索引文件（inputs.index_path）
+├── inputs/{字段名}_index.json                       ← 未配 path_pattern 时的索引文件（inputs.index_path）
+└── outputs/                                        ← 脚本产物目录（文件产物只写这里，平台保证存在）
 ```
 
 > **真实体量提醒**：真实执行包有数百个文件、数十 MB（`reports/allure_results/`
@@ -76,7 +77,7 @@ uploads/script_runs/{task_id}/{data_id}/            ← 单条数据工作区（
 | `session` | object\|null | agent 会话摘要（`session_summary` / `session_stats` / `session_source`） |
 | `params` | object | 任务编排中配置的脚本参数 |
 | `upstream` | object | 前序脚本结果（键为脚本名或 `output_var`） |
-| `_run_dir` | string | 本次运行的产物目录，**脚本自产文件只写这里** |
+| `_run_dir` | string | 本次运行的工作区根（绝对路径），**脚本自产文件只写其下 `outputs/`** |
 
 ## model.py 声明 hub_file 字段
 
@@ -90,7 +91,9 @@ uploads/script_runs/{task_id}/{data_id}/            ← 单条数据工作区（
 
 1. **只用 stdin 传入的路径**：`fields` / `inputs` 携带所有输入路径；源码禁止硬编码
    `/Users/`、`/home/`、`C:\` 等绝对路径与 `uploads/` 等平台内部目录。
-2. **产物只写 `_run_dir`**：平台随任务统一清理，写到别处的文件不会被发现。
+2. **文件产物只写 `{_run_dir}/outputs/`**：平台组装工作区时保证该目录存在（脚本
+   侧仍建议防御式创建，`lib/helpers.py` 的 `ensure_outputs_dir` 即示范）；写到
+   别处的文件平台不保证清理，也不会被发现。
 3. **输出引用文件一律 `rel_path`**：相对 `inputs.root` 的路径；不要把宿主机绝对路径写进输出。
 
 ## 输出契约
@@ -102,7 +105,9 @@ stdout **最后一个非空行**必须是 JSON 对象：
 ```
 
 - `status` ∈ `ok` / `skip` / `fail`；`outputs` 为业务产出（裁判可见）；`message` 为摘要。
-- 平台同时识别 `files`（产物文件映射）/ `summary` / `finish_reason` / `error`；本模板额外回写 `output`/`summary` 与 `outputs`/`message` 同值以兼容旧结果链路。
+- **`files` 为产物文件映射**（`{文件名: 绝对路径}`）：写到 `outputs/` 的文件产物
+  在这里注册，裁判与下游才能发现；`main.py` 演示了落盘 + 注册的完整写法。
+- 平台同时识别 `files` / `summary` / `finish_reason` / `error`；本模板额外回写 `output`/`summary` 与 `outputs`/`message` 同值以兼容旧结果链路。
 
 ## 依赖声明与风险声明（上传时校验）
 

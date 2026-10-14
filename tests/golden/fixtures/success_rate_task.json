@@ -1,0 +1,4 @@
+{
+  "evaluation_type": "success_rate",
+  "success_rate_config": {"repeat_count": 10, "success_criteria": "回答包含正确答案"}
+}

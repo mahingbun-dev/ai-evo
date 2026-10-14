@@ -6,6 +6,8 @@
 import pytest
 from app.services.instruction_builder import InstructionBuilder
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 class TestStepsDerivedFromMetrics:
     """{{steps}} 从 evaluation_metrics 派生"""

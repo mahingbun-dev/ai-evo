@@ -16,6 +16,9 @@ from app.hub_plugin.manifest import (
 )
 from app.hub_plugin.plugin import AievoHubPlugin
 
+import pytest
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 def test_conformance_local_passes():
     """L1 契约自洽：manifest/proto/工具声明全绿（接入中台的第一关）。"""

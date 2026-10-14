@@ -7,8 +7,10 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any
 from sqlalchemy.orm import Session
 from fastapi import UploadFile
+from app.core.config import get_settings
 from app.models.media_models import MediaResource
-from app.utils.path_safety import sanitize_upload_filename
+from app.utils.read_limited import read_limited
+from app.utils.secure_filename import secure_filename
 
 
 class MediaService:
@@ -25,34 +27,39 @@ class MediaService:
         file: UploadFile,
         description: Optional[str] = None,
         uploaded_by: Optional[str] = None,
+        team_code: Optional[str] = None,
     ) -> MediaResource:
-        """上传媒体文件"""
-        # 读取文件内容
-        content = await file.read()
+        """上传媒体文件（W1-1：文件名清洗 + 大小上限；W9：team_code 随用户团队落库）"""
+        # 读取文件内容（超限即抛 413，不整读进内存后才发现）
+        content = await read_limited(file, get_settings().UPLOAD_MAX_BYTES)
         file_size = len(content)
 
         # 生成文件ID
         media_id = f"media_{uuid.uuid4().hex[:12]}"
 
+        # 文件名清洗：剥目录成分/控制字符，防路径穿越写（../../evil.py → evil.py）
+        safe_name = secure_filename(file.filename)
+
         # 获取文件类型和MIME类型
-        file_type = self._get_file_type(file.filename)
+        file_type = self._get_file_type(safe_name)
         mime_type = file.content_type or self._get_mime_type(file_type)
 
-        # 保存文件到磁盘（客户端文件名压成 basename 防穿越）
-        safe_name = sanitize_upload_filename(file.filename)
+        # 保存文件到磁盘
         file_path = os.path.join(self.upload_dir, f"{media_id}_{safe_name}")
-        Path(file_path).write_bytes(content)
+        with open(file_path, "wb") as f:
+            f.write(content)
 
         # 创建数据库记录
         media = MediaResource(
             id=media_id,
-            file_name=file.filename,
+            file_name=safe_name,
             file_type=file_type,
             mime_type=mime_type,
             file_size=file_size,
             file_path=file_path,
             description=description,
             uploaded_by=uploaded_by,
+            team_code=team_code or "DEFAULT",
         )
 
         self.db.add(media)
@@ -70,12 +77,15 @@ class MediaService:
         file_type: Optional[str] = None,
         skip: int = 0,
         limit: int = 100,
+        team_code: Optional[str] = None,
     ) -> List[MediaResource]:
-        """获取媒体资源列表"""
+        """获取媒体资源列表（W9：team_code 非空时只返回该团队，超管传 None 看全部）"""
         query = self.db.query(MediaResource).filter(MediaResource.is_active == True)
 
         if file_type:
             query = query.filter(MediaResource.file_type == file_type)
+        if team_code:
+            query = query.filter(MediaResource.team_code == team_code)
 
         return query.order_by(MediaResource.created_at.desc()).offset(skip).limit(limit).all()
 
@@ -154,81 +164,3 @@ class MediaService:
         }
         return mime_map.get(file_type, "application/octet-stream")
 
-
-class DatasetMediaService:
-    """数据集与媒体关联服务"""
-
-    def __init__(self, db: Session):
-        self.db = db
-
-    def link_media(
-        self,
-        dataset_id: str,
-        media_id: str,
-        question_index: Optional[int] = None,
-        field_name: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """关联媒体文件到数据集"""
-        from app.models.dataset_models import DatasetMediaRelation
-
-        relation_id = f"dmr_{uuid.uuid4().hex[:12]}"
-        relation = DatasetMediaRelation(
-            id=relation_id,
-            dataset_id=dataset_id,
-            media_id=media_id,
-            question_index=question_index,
-            field_name=field_name,
-        )
-
-        self.db.add(relation)
-        self.db.commit()
-
-        return {
-            "relation_id": relation_id,
-            "dataset_id": dataset_id,
-            "media_id": media_id,
-            "question_index": question_index,
-            "field_name": field_name,
-        }
-
-    def unlink_media(self, relation_id: str) -> bool:
-        """取消媒体关联"""
-        from app.models.dataset_models import DatasetMediaRelation
-
-        relation = self.db.query(DatasetMediaRelation).filter(
-            DatasetMediaRelation.id == relation_id
-        ).first()
-
-        if not relation:
-            return False
-
-        self.db.delete(relation)
-        self.db.commit()
-        return True
-
-    def get_dataset_media(self, dataset_id: str) -> List[Dict[str, Any]]:
-        """获取数据集的所有媒体关联"""
-        from app.models.dataset_models import DatasetMediaRelation
-        from app.models.media_models import MediaResource
-
-        relations = self.db.query(DatasetMediaRelation).filter(
-            DatasetMediaRelation.dataset_id == dataset_id
-        ).all()
-
-        result = []
-        for rel in relations:
-            media = self.db.query(MediaResource).filter(
-                MediaResource.id == rel.media_id
-            ).first()
-
-            if media:
-                result.append({
-                    "relation_id": rel.id,
-                    "media_id": media.id,
-                    "file_name": media.file_name,
-                    "file_type": media.file_type,
-                    "question_index": rel.question_index,
-                    "field_name": rel.field_name,
-                })
-
-        return result

@@ -1,0 +1,8 @@
+{
+  "evaluation_type": "judge",
+  "max_score": 10,
+  "evaluation_metrics": [
+    {"name": "准确性", "weight": 2, "description": "回答是否正确"},
+    {"name": "完整性", "weight": 1, "description": "是否覆盖问题要点"}
+  ]
+}

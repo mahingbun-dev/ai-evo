@@ -26,6 +26,8 @@ from app.services.pre_judge_script_service import (
     PreJudgeScriptService,
 )
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 CONTRACT_FIELDS = (
     "name", "description", "exec_type", "entrypoint", "allowed_tools",
     "harness_extra", "input_fields", "output_schema", "timeout_seconds", "is_active",

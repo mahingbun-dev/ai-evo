@@ -24,6 +24,9 @@ from hubkit.run import serve
 
 from app.hub_plugin.plugin import AievoHubPlugin
 
+import pytest
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 def _wait_for_port(addr: str, timeout: float = 10.0):
     """等插件真的开始监听（serve 起来与测试线程拿到控制权之间有窗口）。"""

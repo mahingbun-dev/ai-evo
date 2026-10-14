@@ -8,6 +8,8 @@ from fastapi import WebSocket
 
 from app.api.task_status_api import router, websocket_endpoint
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 class TestWebSocketAPI:
     """WebSocket API 端点测试类"""
@@ -28,8 +30,23 @@ class TestWebSocketAPI:
         )
         return ws
 
+    @pytest.fixture
+    def auth_passthrough(self):
+        """
+        放行鉴权与归属校验（W5 起端点 accept 前统一鉴权）。
+
+        本测试类的意图是验证连接/心跳/断开清理逻辑，
+        鉴权与归属校验本身由独立测试负责（见整改计划 W5 测试设计）。
+        """
+        fake_user = {"user_code": "u1", "org_code": "T1", "super_admin_flag": 0}
+        with patch("app.api.task_status_api.require_ws_user", new_callable=AsyncMock) as m_auth, \
+             patch("app.api.task_status_api._check_task_ownership", new_callable=AsyncMock) as m_owner:
+            m_auth.return_value = fake_user
+            m_owner.return_value = True
+            yield m_auth, m_owner
+
     @pytest.mark.asyncio
-    async def test_websocket_connect(self, mock_websocket):
+    async def test_websocket_connect(self, mock_websocket, auth_passthrough):
         """测试建立 WebSocket 连接，验证连接成功"""
         task_id = "test_task_1"
 
@@ -49,7 +66,7 @@ class TestWebSocketAPI:
             mock_ws_manager.connect.assert_called_once_with(task_id, mock_websocket)
 
     @pytest.mark.asyncio
-    async def test_websocket_heartbeat(self, mock_websocket):
+    async def test_websocket_heartbeat(self, mock_websocket, auth_passthrough):
         """测试发送 ping 后收到 pong 回复"""
         task_id = "test_task_1"
         messages = ["ping", Exception("Disconnect")]
@@ -80,7 +97,7 @@ class TestWebSocketAPI:
             assert mock_websocket.send_json.called
 
     @pytest.mark.asyncio
-    async def test_websocket_disconnect(self, mock_websocket):
+    async def test_websocket_disconnect(self, mock_websocket, auth_passthrough):
         """测试断开连接，验证清理逻辑"""
         task_id = "test_task_disconnect"
 
@@ -100,7 +117,7 @@ class TestWebSocketAPI:
             mock_ws_manager.disconnect.assert_called()
 
     @pytest.mark.asyncio
-    async def test_websocket_invalid_task_id(self, mock_websocket):
+    async def test_websocket_invalid_task_id(self, mock_websocket, auth_passthrough):
         """测试使用无效 task_id 连接，验证错误处理"""
         task_id = ""
 

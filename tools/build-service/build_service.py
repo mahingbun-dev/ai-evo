@@ -84,12 +84,15 @@ ENV_FILE = DEPLOY_DIR / CFG.get("deploy", {}).get("env_file", ".env")
 COMPOSE_FILE = DEPLOY_DIR / CFG.get("deploy", {}).get("compose_file", "docker-compose.yml")
 # 部署期间的存在标记：部署机上有 cron 每 5 分钟跑 ensure_worker.sh，发现
 # ai-evo-worker 不在运行就 `docker compose up -d worker`。而部署时 worker 正是
-# 要优雅退出（最长 900s），容器处于 Stopping、不出现在 `docker ps` 里——cron
-# 会误判为"挂了"并介入，与外层的 compose 撞车。部署期间写这个标记，
-# crontab 侧用 `[ -f <标记> ] ||` 跳过自愈。
+# 要优雅退出（最长 7200s，与 celery task_time_limit 对齐，W10-3），容器处于
+# Stopping、不出现在 `docker ps` 里——cron 会误判为"挂了"并介入，与外层的
+# compose 撞车。部署期间写这个标记，crontab 侧用 `[ -f <标记> ] ||` 跳过自愈。
 DEPLOY_MARKER = DEPLOY_DIR / ".deploy-in-progress"
 DEPLOY_SERVICES = CFG.get("deploy", {}).get("services", ["api", "worker"])
-HEALTH_URL = CFG.get("deploy", {}).get("health_url", "http://127.0.0.1:8100/api/v1/auth/status")
+# W13：探活 URL 由 /api/v1/auth/status（恒 200、不查依赖，形同虚设）切换为
+# /api/v1/health/deep——后者对 DB/Redis/迁移版本/uploads 做真实探测，
+# 依赖异常时返回 503，verify 才能真正拦住「部署成功但服务不可用」。
+HEALTH_URL = CFG.get("deploy", {}).get("health_url", "http://127.0.0.1:8100/api/v1/health/deep")
 # nginx 的前端静态根（宿主机路径）。首次部署实测踩到：用户访问的站点由 nginx
 # 直接托管这个目录，而不是容器里 FastAPI 托管的那份 dist——只更新容器内的
 # dist，用户看到的仍是旧前端。为空则跳过同步。
@@ -118,6 +121,63 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("ai-evo-build-service")
 
 app = FastAPI(title="ai-evo-build-service", docs_url=None, redoc_url=None)
+
+
+# ------------------------------------------------------------------
+# 告警（W13）
+#
+# 与主应用 app/services/alert_service.py 行为对齐（同一 JSON 契约、
+# 同一 ALERT_WEBHOOK_URL 环境变量、落 alerts.log 兜底）；但 build-service
+# 是独立容器（Dockerfile 只 COPY 本文件，不装主应用包），不能 import
+# 主应用代码，故用标准库在此实现同一契约——两边字段保持一致：
+#   {"level", "title", "details", "source", "timestamp"}
+#
+# 离线环境暂无 IM 出口时，告警先落 LOGS_DIR/alerts.log；接入 IM 机器人后
+# 只需给容器加 -e ALERT_WEBHOOK_URL=... 即生效，无需改代码（升级路径见
+# docs/alerts-and-health.md）。
+# ------------------------------------------------------------------
+ALERT_LOG_PATH = LOGS_DIR / "alerts.log"
+
+
+def _alert_webhook_url() -> str:
+    """每次调用时读环境变量，便于运维改动与测试注入"""
+    return os.environ.get("ALERT_WEBHOOK_URL", "").strip()
+
+
+def send_alert(level: str, title: str, details: dict, source: str = "build-service") -> bool:
+    """发一条告警：webhook（若配置）+ alerts.log 兜底；永不抛异常"""
+    payload = {
+        "level": level,
+        "title": title,
+        "details": details,
+        "source": source,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    delivered = False
+    url = _alert_webhook_url()
+    if url:
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                delivered = 200 <= resp.status < 300
+                if not delivered:
+                    log.warning("告警 webhook 返回非 2xx: %s %s", resp.status, url)
+        except Exception as e:  # noqa: BLE001 - 告警失败绝不影响部署主流程
+            log.warning("告警 webhook 发送失败 (%s): %s", url, e)
+    try:
+        ALERT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        record = dict(payload)
+        record["webhook_delivered"] = delivered
+        with open(ALERT_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as e:
+        log.error("告警落盘 %s 失败: %s", ALERT_LOG_PATH, e)
+    return delivered
 
 # ------------------------------------------------------------------
 # 任务状态管理
@@ -648,6 +708,88 @@ def compose(*args: str, timeout: int = 600) -> subprocess.CompletedProcess:
     )
 
 
+# ------------------------------------------------------------------
+# W10-3 发版前队列 drain 提示
+# ------------------------------------------------------------------
+
+def _env_value(env_text: str, key: str) -> Optional[str]:
+    """从 .env 文本取变量值（去引号；不存在返回 None）"""
+    m = re.search(rf"^\s*{re.escape(key)}\s*=\s*(.+?)\s*$", env_text, re.M)
+    if not m:
+        return None
+    return m.group(1).strip().strip('"').strip("'")
+
+
+def collect_running_tasks(database_url: str) -> list[dict]:
+    """查询 running 状态评测任务（id/name，最多列出前 20 条）
+
+    直接 psycopg2 查询（build-service 不依赖 app.* 包）；失败抛异常由调用方兜底。
+    """
+    import psycopg2
+
+    dsn = database_url.strip()
+    if dsn.startswith("postgresql+"):
+        dsn = "postgresql://" + dsn.split("://", 1)[1]
+    conn = psycopg2.connect(dsn, connect_timeout=5)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, name FROM evaluation_tasks "
+                "WHERE status = 'running' ORDER BY created_at LIMIT 21"
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    return [{"id": r[0], "name": r[1]} for r in rows]
+
+
+def collect_queue_depth(redis_url: str) -> int:
+    """Redis celery 默认队列积压深度（排队待执行的消息数）"""
+    import redis as redis_lib
+
+    client = redis_lib.from_url(redis_url, decode_responses=True)
+    try:
+        return int(client.llen("celery") or 0)
+    finally:
+        client.close()
+
+
+def queue_drain_hint(logf, env_file: Optional[Path] = None) -> None:
+    """发版前队列 drain 提示（W10-3）：列出 running 任务数与排队深度
+
+    只提示不拦截——stop_grace_period 已放宽到 7200s，worker 停止时会跑完
+    当前任务再退出；排队中的任务保留在 Redis 队列由新 worker 接手。这里
+    让发版者在日志里看到「此刻有多少任务受本次发版影响」，决定是否等
+    任务跑完再发。查询失败只告警，绝不阻断部署流程。
+    """
+    env_path = env_file or ENV_FILE
+    try:
+        env_text = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
+        database_url = _env_value(env_text, "DATABASE_URL")
+        redis_url = _env_value(env_text, "REDIS_URL")
+
+        running = []
+        if database_url:
+            running = collect_running_tasks(database_url)
+        queued = collect_queue_depth(redis_url) if redis_url else None
+
+        logf.write("[drain] 发版前队列 drain 提示：\n")
+        logf.write(f"[drain]   running 任务数: {len(running)}\n")
+        for t in running[:20]:
+            logf.write(f"[drain]     - {t.get('id')} {t.get('name', '')}\n")
+        if len(running) > 20:
+            logf.write(f"[drain]     ...（其余 {len(running) - 20} 条略）\n")
+        if queued is not None:
+            logf.write(f"[drain]   Redis 队列积压消息数: {queued}\n")
+        if running or (queued or 0) > 0:
+            logf.write(
+                "[drain]   提示: 当前有任务在执行/排队，worker 停止会等待当前任务跑完"
+                "（最长 7200s）；如不希望发版打断，可等任务完成后再发版。\n"
+            )
+    except Exception as e:  # noqa: BLE001 - 提示失败不阻断部署
+        logf.write(f"[drain] 队列状态查询失败（不影响部署）: {e}\n")
+
+
 def verify_deploy(logf) -> None:
     """容器状态 + worker 存活 + HTTP 探活（吸收原 do_deploy.sh 的第 6/7 步）"""
     deadlines = time.time() + 180
@@ -699,6 +841,28 @@ def verify_deploy(logf) -> None:
         raise RuntimeError(f"HTTP 探活失败: {HEALTH_URL}")
 
     logf.write("[verify] 校验通过\n")
+
+
+def verify_deploy_with_alert(logf, job_id: str, tag: str, commit: str = "") -> None:
+    """verify_deploy 的告警包装（W13）：校验失败 → 发告警 → 原样抛出。
+
+    单独拆出来是为了可测：verify 本体依赖 docker/网络，告警逻辑靠
+    monkeypatch verify_deploy 即可验证。
+    """
+    try:
+        verify_deploy(logf)
+    except Exception as e:
+        send_alert(
+            level="error",
+            title="部署 verify 校验失败",
+            details={
+                "job_id": job_id,
+                "tag": tag,
+                "commit": commit,
+                "error": str(e)[:800],
+            },
+        )
+        raise
 
 
 def _write_deploy_marker(job_id: str) -> None:
@@ -781,6 +945,10 @@ def run_deploy_thread(job_id: str, tag: str, commit: str = ""):
                 message="同步 compose 配置...")
 
         with open(job_log_path(job_id), "a") as lf:
+            # 0. 发版前队列 drain 提示（W10-3）：列出 running 任务数与排队深度，
+            #    仅提示不拦截，让发版者决定是否等任务跑完再发
+            queue_drain_hint(lf)
+
             # 1. 从构建工作区同步 compose（保证仓库里的配置变更也能随代码生效）
             src = BUILD_WS / COMPOSE_FILE.name
             if src.exists():
@@ -812,9 +980,9 @@ def run_deploy_thread(job_id: str, tag: str, commit: str = ""):
                 if up.returncode != 0:
                     raise RuntimeError(f"docker compose up -d 失败，退出码 {up.returncode}")
 
-                # 4. 校验
+                # 4. 校验（W13：verify 失败 → 告警 webhook / alerts.log）
                 set_job(job_id, stage="verify", progress=75, message="校验容器与接口...")
-                verify_deploy(lf)
+                verify_deploy_with_alert(lf, job_id, tag, commit)
 
                 # 5. 同步前端到 nginx 静态根
                 #    放在容器起来之后：新前端可见时 API 已经就绪，避免出现

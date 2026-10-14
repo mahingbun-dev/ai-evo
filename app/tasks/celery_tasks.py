@@ -9,7 +9,12 @@ import signal
 from typing import Dict, Any, Optional, Protocol
 
 from app.celery_app import celery_app
-from app.services.redis_stop_signal import EvalTaskLock, RedisStopSignalChecker
+from app.services.redis_stop_signal import (
+    HUB_JOB_LOCK_PREFIX,
+    HUB_JOB_LOCK_TTL,
+    EvalTaskLock,
+    RedisStopSignalChecker,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +46,26 @@ class EvaluationBaseTask(celery_app.Task):
     def on_failure(self, exc, task_id, args, kwargs, einfo):
         """任务失败回调 — 仅当任务状态为 running 时更新为 failed"""
         evaluation_task_id = args[0]
+
+        # W13：任务失败 → 告警（webhook 或 logs/alerts.log 兜底，契约见
+        # app/services/alert_service.py）。告警是旁路能力，自身失败只记日志，
+        # 不影响下面的状态回写。
+        try:
+            from app.services.alert_service import send_alert
+
+            send_alert(
+                level="error",
+                title="评测任务失败",
+                details={
+                    "celery_task_id": task_id,
+                    "evaluation_task_id": evaluation_task_id,
+                    "error": str(exc)[:2000],
+                },
+                source="celery",
+            )
+        except Exception as alert_err:  # noqa: BLE001
+            logger.error(f"任务失败告警发送失败: {alert_err}")
+
         try:
             from app.tasks.evaluation_tasks_async import get_db_session
             from app.services.evaluation_task_service import EvaluationTaskService
@@ -124,6 +149,14 @@ def run_evaluation_task(self, task_id: str) -> Dict[str, Any]:
         )
         return {"status": "duplicate_rejected", "task_id": task_id, "lock_holder": holder}
 
+    # W10-2：接管残留锁以短 TTL（15 分钟）拿锁，任务真正开跑前统一续期到全量
+    # TTL（覆盖 task_time_limit=2h）。续期失败仅告警不阻断——最坏情况回到
+    # 「TTL 过期后可能重复执行」的兜底语义。
+    try:
+        task_lock.renew()
+    except Exception as e:  # noqa: BLE001 - redis 抖动不阻断评测
+        logger.warning(f"任务 {task_id} 互斥锁续期失败（不影响执行）: {e}")
+
     # 使用 Redis 停止信号检查器（替代 threading.Event）
     stop_checker = RedisStopSignalChecker(task_id)
 
@@ -188,6 +221,11 @@ def run_hub_import_job(
     每包完成后向 Redis task_status:{job_id} 发布进度；
     单包失败记入 fail_detail 继续处理，重试只重跑失败项（幂等）。
 
+    job 级互斥锁（W11）：task_acks_late=True 下 worker 崩溃（OOM/SIGKILL）会使
+    未 ACK 消息重投，同一 job 在两个 worker 并发执行会造成数据行重复导入、
+    ref_count 双计。抢锁失败说明已有 worker 在执行同一 job，直接拒绝本次重投
+    （不排队、不重入），日志说明后返回 duplicate_rejected。
+
     datasets_root 仅用于测试注入临时解包根目录，生产调用缺省落
     uploads/hub_datasets/（ensure_unpacked 缺省值）。
 
@@ -198,6 +236,25 @@ def run_hub_import_job(
     from app.services.hub_file_service import HubFileService
     from app.services.hub_import_job_service import process_hub_import_job
     from app.tasks.evaluation_tasks_async import get_db_session
+
+    # job 级互斥锁：抢不到 = 同 job 已在其它 worker 执行，拒绝本次孤儿消息重投执行
+    job_lock = EvalTaskLock(job_id, ttl=HUB_JOB_LOCK_TTL, key_prefix=HUB_JOB_LOCK_PREFIX)
+    lock_acquired = True
+    try:
+        lock_acquired = job_lock.acquire()
+    except Exception as e:  # noqa: BLE001 - redis 抖动不阻断导入（fail-open），互斥为防御性措施
+        logger.warning(f"[hub_import] job {job_id} 互斥锁获取异常（redis 不可用？），放行执行: {e}")
+    if not lock_acquired:
+        holder = None
+        try:
+            holder = job_lock.holder()
+        except Exception:  # noqa: BLE001 - 持锁者查询失败不影响拒绝结论
+            pass
+        logger.error(
+            f"[hub_import] job {job_id} 已有其它 worker 在执行（{HUB_JOB_LOCK_PREFIX} 锁冲突，"
+            f"持锁: {holder}），拒绝本次孤儿消息重投执行"
+        )
+        return {"status": "duplicate_rejected", "job_id": job_id, "lock_holder": holder}
 
     db = get_db_session()
     try:
@@ -210,3 +267,9 @@ def run_hub_import_job(
         raise
     finally:
         db.close()
+        # 释放 job 级互斥锁（正常/异常路径统一；未抢到锁时不误删他人锁）
+        if lock_acquired:
+            try:
+                job_lock.release()
+            except Exception as e:  # noqa: BLE001 - 释放失败靠 TTL 过期兜底
+                logger.warning(f"[hub_import] job {job_id} 互斥锁释放失败（将由 TTL 过期）: {e}")

@@ -13,6 +13,8 @@ from app.services.deepeval_result_transformer import (
     TransformedEvaluationResult,
 )
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 # ============================================================================
 # Mock 数据：模拟 DeepEval 指标结果

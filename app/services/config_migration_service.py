@@ -189,7 +189,9 @@ class ConfigMigrationService:
         from app.services.pre_judge_script_service import ensure_builtin_scripts_migrated
         from app.models.pre_judge_models import PreJudgeScript
 
-        ensure_builtin_scripts_migrated(self.db)
+        # 手动一键迁移：缺失内置脚本一律重建，保证 builtin:<name> 历史引用可解析
+        # （启动补种走缺省 recreate_missing=False，删除即真删，不在此恢复）
+        ensure_builtin_scripts_migrated(self.db, recreate_missing=True)
         lookup: Dict[str, Dict[str, Any]] = {}
         for row in self.db.query(PreJudgeScript).all():
             entry = {

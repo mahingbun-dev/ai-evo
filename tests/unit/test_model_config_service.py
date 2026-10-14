@@ -8,6 +8,8 @@ from app.services.model_config_service import ModelConfigService
 from app.api.model_config_api import ModelResponse, ParseCurlResponse
 from app.api.evaluation_task_api import UpdateTaskRequest
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 class TestParseCurlCommand:
     """parse_curl_command 方法测试"""

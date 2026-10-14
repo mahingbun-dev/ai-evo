@@ -12,6 +12,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
+from celery.exceptions import SoftTimeLimitExceeded
+
 from app.db.session import engine, SessionLocal
 
 logger = logging.getLogger(__name__)
@@ -26,6 +28,8 @@ class EvaluationExecutor:
         task_id: str = None,
         stop_event: threading.Event = None,
         langfuse_host: str = "",
+        execution_number: Optional[int] = None,
+        progress_offset: int = 0,
     ):
         """
         初始化执行器
@@ -35,11 +39,17 @@ class EvaluationExecutor:
             task_id: 任务ID，用于日志和进度更新
             stop_event: 停止信号，设置后执行器在下一个检查点退出
             langfuse_host: LangFuse 服务地址（用于 LangGraph 裁判追踪）
+            execution_number: 本次执行序号（W3 行级落库键）。None 表示
+                非任务执行链路（单测直调等），跳过行级 write-through
+            progress_offset: 进度偏移（W3 断点续跑：本轮已跳过的已完成行数，
+                使续跑进度显示为累计值而非从零回退）
         """
         self.max_workers = min(max_workers, 4)  # 最大并发数为4
         self.task_id = task_id
         self.stop_event = stop_event or threading.Event()
         self.langfuse_host = langfuse_host
+        self.execution_number = execution_number
+        self.progress_offset = progress_offset
 
     def execute_batch(
         self,
@@ -61,14 +71,15 @@ class EvaluationExecutor:
 
         # 创建线程池
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            # 提交所有任务
+            # 提交所有任务（future -> (列表序号, payload)；payload 携带任务链路
+            # 标注的 _orig_idx 数据项原始序号，作为行级落库键）
             future_to_payload = {
                 executor.submit(
                     self._evaluate_single,
                     payload,
                     task,
-                ): idx
-                for idx, payload in enumerate(payloads)
+                ): (pos, payload)
+                for pos, payload in enumerate(payloads)
             }
 
             # 收集结果
@@ -78,7 +89,7 @@ class EvaluationExecutor:
                 if stop_requested:
                     continue
 
-                idx = future_to_payload[future]
+                pos, payload = future_to_payload[future]
                 try:
                     result = future.result()
                     results.append(result)
@@ -86,13 +97,21 @@ class EvaluationExecutor:
                     # 更新进度
                     self._update_progress(len(results), total)
 
+                except SoftTimeLimitExceeded:
+                    # 软超时不得按行失败吞掉（P0-E/W3-4）：立即上抛触发收尾，
+                    # 已落库行保留，由 run_evaluation_async 标记任务失败
+                    raise
                 except Exception as e:
-                    logger.exception(f"评测执行失败 (idx={idx})")
+                    logger.exception(f"评测执行失败 (idx={pos})")
                     results.append({
-                        "idx": idx,
+                        "idx": pos,
                         "error": str(e),
                         "success": False,
                     })
+
+                # 行级 write-through（W3-2）：每行终态（成功/失败）即时幂等落库，
+                # 停止/强杀窗口内已完成行零丢失
+                self._persist_row_result(pos, payload, results[-1])
 
                 # 检查停止信号（每条完成后检查）
                 if self.stop_event.is_set():
@@ -139,21 +158,70 @@ class EvaluationExecutor:
 
         return results
 
+    def _persist_row_result(self, pos: int, payload: Any, result: Dict[str, Any]) -> None:
+        """行级结果 write-through 落库（W3-2/P0-E）
+
+        - execution_number 未提供（单测直调/非任务链路）时跳过；
+        - data_index 以 payload 的 _orig_idx（数据项原始序号，任务链路标注）为准，
+          与 hub 拆分/断点续跑过滤后的列表序号解耦，保证 (task_id, execution_number,
+          data_index) 键在多次执行间稳定；
+        - 落库失败不阻断评测主流程（evaluation_result_service 内部已按进程去重告警）。
+        """
+        if not self.task_id or self.execution_number is None:
+            return
+        if not isinstance(payload, dict):
+            payload = {}
+        data_index = payload.get("_orig_idx", pos)
+        try:
+            from app.services.evaluation_result_service import persist_row_result
+
+            persist_row_result(
+                task_id=self.task_id,
+                execution_number=self.execution_number,
+                data_index=data_index,
+                result=result,
+            )
+        except SoftTimeLimitExceeded:
+            raise
+        except Exception as e:
+            logger.warning(f"[RowPersist] 行级结果落库失败（不影响评测主流程）idx={data_index}: {e}")
+
     @staticmethod
     def _aggregate_judge_scores(result: Dict[str, Any], judge_scores: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """多裁判评分聚合：总分平均、反馈拼接、维度分平均（包含 0 分裁判，与原步骤4逻辑一致）"""
-        if judge_scores:
-            # 所有N位裁判的分数之和取平均（包含0分裁判）
-            total_score = sum(s.get("score", 0) or 0 for s in judge_scores)
-            result["average_score"] = total_score / len(judge_scores)
+        """多裁判评分聚合（W2-2 新口径）
 
-            # 收集所有有反馈的裁判反馈
+        - 失败裁判（judge_failed=True，score 为 None）不再以 0 分计入均分；
+        - 总分与维度分同口径：均只聚合 valid（未失败）裁判；
+        - 全部裁判失败 → average_score=None、row_status="judge_failed"，
+          该行不进任务均分（result_aggregator 对 None 行自动过滤）；
+        - 新增统计字段 judge_count / failed_judge_count / row_status（增量，不删旧字段）；
+        - feedback 拼接保留全部裁判（含失败裁判的错误信息，便于定位失败原因）。
+        """
+        if judge_scores:
+            valid = [r for r in judge_scores if not r.get("judge_failed")]
+            failed_count = len(judge_scores) - len(valid)
+
+            result["judge_count"] = len(judge_scores)
+            result["failed_judge_count"] = failed_count
+
+            if valid:
+                # valid 裁判均分（裁判分为 round2，行级均值精度收敛到 4 位小数）
+                result["average_score"] = round(
+                    sum(r.get("score") or 0 for r in valid) / len(valid), 4
+                )
+                result["row_status"] = "completed"
+            else:
+                # 行级：全部裁判失败 → 该行标记 judge_failed，不进任务均分
+                result["average_score"] = None
+                result["row_status"] = "judge_failed"
+
+            # 收集所有有反馈的裁判反馈（含失败裁判的错误描述）
             feedbacks = [s.get("feedback", "") for s in judge_scores if s.get("feedback")]
             result["feedback"] = "\n---\n".join(feedbacks)
 
-            # 聚合各裁判的维度评分（按维度取平均，包含0分裁判）
+            # 聚合各裁判的维度评分：只吃 valid 裁判（与总分同口径），按维度取平均
             dim_accum: Dict[str, List[float]] = {}
-            for s in judge_scores:
+            for s in valid:
                 for dim_name, dim_score in (s.get("dimension_scores") or {}).items():
                     if isinstance(dim_score, (int, float)):
                         dim_accum.setdefault(dim_name, []).append(float(dim_score))
@@ -293,29 +361,12 @@ class EvaluationExecutor:
             # 构建消息
             messages = [{"role": "user", "content": payload.get("user_input", "")}]
 
-            # 获取 model_config
-            model_config = task.model_config or {}
-            if not model_config and task.model_provider:
-                # 从数据库查询模型配置
-                from app.models.model_config_models import ModelConfig
+            # 获取 model_config：W4 快照优先（口径字段来自创建时快照，凭据
+            # api_key/auth_config 从实时 ModelConfig 解析），快照为空（存量
+            # 任务）回退实时查询
+            from app.services.config_snapshot import resolve_model_call_config
 
-                db = SessionLocal()
-                try:
-                    model_config_obj = db.query(ModelConfig).filter(ModelConfig.id == task.model_provider).first()
-                    if model_config_obj:
-                        model_config = {
-                            "provider": model_config_obj.provider,
-                            "model_type": model_config_obj.model_type,
-                            "endpoint": model_config_obj.endpoint,
-                            "api_key": model_config_obj.api_key,
-                            "auth_type": model_config_obj.auth_type,
-                            "auth_config": model_config_obj.auth_config,
-                            "request_config": model_config_obj.request_config,
-                            "response_parse_config": model_config_obj.response_parse_config,
-                            "model_id": model_config_obj.id,
-                        }
-                finally:
-                    db.close()
+            model_config, _config_source = resolve_model_call_config(task)
 
             # 提取 runtime_variables（从 payload 中提取非消息字段）
             runtime_variables = {}
@@ -427,6 +478,8 @@ class EvaluationExecutor:
             evaluation_targets = getattr(task, 'evaluation_targets', None)
             content_to_validate = model_output
             resolved_targets: Dict[str, Dict[str, Any]] = {}
+            # W12-3：evaluation_targets 中 script_output 行被置空的明细
+            target_script_missing: List[Dict[str, Any]] = []
             if evaluation_targets:
                 try:
                     from app.services.judge_variable_resolver import JudgeVariableResolver, EvaluationTarget
@@ -440,6 +493,7 @@ class EvaluationExecutor:
                     )
                     targets = [EvaluationTarget(**t) for t in evaluation_targets]
                     resolved_targets = resolver.resolve_targets(targets)
+                    target_script_missing = list(resolver.script_output_missing)
 
                     # 拼接所有 required 评测目标的内容作为校验对象
                     required_parts = []
@@ -454,6 +508,28 @@ class EvaluationExecutor:
                     logger.warning(f"[空值校验] 解析 evaluation_targets 失败，回退到 model_output 校验: {e}")
                     resolved_targets = {}
 
+            # W12-3 脚本置空显式化：脚本输出被 evaluation_targets 引用但缺失
+            # （脚本失败 on_fail=continue / 未编排 / 输出为 None）→ 该行标记
+            # pre_script_failed、跳过裁判、不进均分。旧行为下置空内容会走
+            # 空值校验以 0 分进均分（「脚本故障=模型 0 分」）；success=False
+            # 使行级落库派生为 failed（可断点续跑重跑），任务均分自动排除。
+            if target_script_missing:
+                missing_desc = "; ".join(
+                    f"script={m.get('script')!r} output_key={m.get('output_key')!r}"
+                    for m in target_script_missing
+                )
+                logger.warning(
+                    f"[PreScripts] idx={payload.get('idx', 0)} 脚本输出被评测目标引用但缺失: "
+                    f"{missing_desc}，标记 pre_script_failed，跳过裁判"
+                )
+                result["success"] = False
+                result["error"] = f"前处理脚本输出缺失（被评测目标引用）: {missing_desc}"
+                result["row_status"] = "pre_script_failed"
+                result["judge_scores"] = []
+                result["judge_count"] = 0
+                result["failed_judge_count"] = 0
+                return result
+
             if not content_to_validate or not str(content_to_validate).strip():
                 logger.info(f"[空值校验] idx={payload.get('idx', 0)} 待评测内容为空，跳过裁判评测")
                 result["success"] = True
@@ -461,6 +537,11 @@ class EvaluationExecutor:
                 result["judge_scores"] = []
                 result["feedback"] = "待评测内容为空，无法进行有效评估"
                 result["dimension_scores"] = {}
+                # W2-2: 空输入行 0 分口径保留，但显式标记 row_status，
+                # 与真低分（completed）/ 裁判全失败（judge_failed）三种 0 可辨
+                result["row_status"] = "empty_input"
+                result["judge_count"] = 0
+                result["failed_judge_count"] = 0
                 return result
 
             # ========== 新增：添加 input_data 和 model_raw_response ==========
@@ -477,9 +558,31 @@ class EvaluationExecutor:
                 script_outputs=script_outputs,
             )
             judge_payload = variable_injector.build_judge_payload(payload, model_output)
-            if script_files:
-                # 脚本产物文件路径附进裁判 payload（裁判 agent 可用 Read 工具阅读全量明细）
-                judge_payload["script_files"] = script_files
+            # W12-3 脚本置空显式化：裁判变量（judge_variable_config）引用的
+            # script_output 变量被置空 → 同样标记 pre_script_failed、跳过裁判、
+            # 不进均分（口径与 targets 路径一致）
+            if variable_injector.script_output_missing:
+                missing_desc = "; ".join(
+                    f"var={m.get('var')!r} script={m.get('script')!r} output_key={m.get('output_key')!r}"
+                    for m in variable_injector.script_output_missing
+                )
+                logger.warning(
+                    f"[PreScripts] idx={payload.get('idx', 0)} 裁判变量引用的脚本输出缺失: "
+                    f"{missing_desc}，标记 pre_script_failed，跳过裁判"
+                )
+                result["success"] = False
+                result["error"] = f"前处理脚本输出缺失（被裁判变量引用）: {missing_desc}"
+                result["row_status"] = "pre_script_failed"
+                result["judge_scores"] = []
+                result["judge_count"] = 0
+                result["failed_judge_count"] = 0
+                return result
+            # W12-6：不再向 judge_payload 塞 script_files 死键——裁判全链路
+            # （graph 节点 / PromptBuilder / CC Agent）只消费显式声明的
+            # script_output 变量，从不读取 script_files；旧赋值加注释
+            # 「裁判 agent 可用 Read 工具阅读全量明细」从未真实接线，属误导。
+            # script_files 保留自 _run_pre_scripts 的返回结构（产物文件路径），
+            # 真实接线（CC 引擎 Read 产物）列入 M3。
 
             # ========== @ 引用标记统一解析（共享设计契约 v3 §三） ==========
             # 执行链路只解析一次：ctx.targets 用 resolve_targets 全量结果
@@ -674,23 +777,29 @@ class EvaluationExecutor:
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             future_to_idx = {
-                executor.submit(self._evaluate_single_rag, payload, task): idx
-                for idx, payload in enumerate(payloads)
+                executor.submit(self._evaluate_single_rag, payload, task): (pos, payload)
+                for pos, payload in enumerate(payloads)
             }
 
             for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
+                pos, payload = future_to_idx[future]
                 try:
                     result = future.result()
                     results.append(result)
                     self._update_progress(len(results), total)
+                except SoftTimeLimitExceeded:
+                    # 软超时不得按行失败吞掉（P0-E/W3-4）：上抛触发收尾
+                    raise
                 except Exception as e:
-                    logger.exception(f"RAG 评测执行失败 (idx={idx})")
+                    logger.exception(f"RAG 评测执行失败 (idx={pos})")
                     results.append({
-                        "idx": idx,
+                        "idx": pos,
                         "error": str(e),
                         "success": False,
                     })
+
+                # 行级 write-through（W3-2）：每行终态即时幂等落库
+                self._persist_row_result(pos, payload, results[-1])
 
                 if self.stop_event.is_set():
                     logger.info(f"RAG 任务 {self.task_id} 收到停止信号，已完成 {len(results)}/{total}")
@@ -731,6 +840,11 @@ class EvaluationExecutor:
                     expanded_payload["_sample_idx"] = sample_idx  # 追踪原始样本索引
                     expanded_payload["_latency_repeat_idx"] = rep_idx  # 追踪重复次数索引
                     expanded_payloads.append(expanded_payload)
+            # W3 行级落库键改用展开后的全序序号：同一原始样本的多次重复行必须
+            # 唯一（沿用 _orig_idx 样本序号会让同键 upsert 互相覆盖丢行）；
+            # 展开规则由 repeat_count 唯一决定，同配置重跑序号稳定
+            for expanded_pos, expanded_payload in enumerate(expanded_payloads):
+                expanded_payload["_orig_idx"] = expanded_pos
             payloads = expanded_payloads
             logger.info(f"[execute_batch_latency] repeat_count={repeat_count}, 展开后 payloads 数量: {len(payloads)}")
 
@@ -739,23 +853,29 @@ class EvaluationExecutor:
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             future_to_idx = {
-                executor.submit(self._evaluate_single_latency, payload, task): idx
-                for idx, payload in enumerate(payloads)
+                executor.submit(self._evaluate_single_latency, payload, task): (pos, payload)
+                for pos, payload in enumerate(payloads)
             }
 
             for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
+                pos, payload = future_to_idx[future]
                 try:
                     result = future.result()
                     results.append(result)
                     self._update_progress(len(results), total)
+                except SoftTimeLimitExceeded:
+                    # 软超时不得按行失败吞掉（P0-E/W3-4）：上抛触发收尾
+                    raise
                 except Exception as e:
-                    logger.exception(f"耗时评测执行失败 (idx={idx})")
+                    logger.exception(f"耗时评测执行失败 (idx={pos})")
                     results.append({
-                        "idx": idx,
+                        "idx": pos,
                         "error": str(e),
                         "success": False,
                     })
+
+                # 行级 write-through（W3-2）：每行终态即时幂等落库
+                self._persist_row_result(pos, payload, results[-1])
 
                 if self.stop_event.is_set():
                     logger.info(f"耗时任务 {self.task_id} 收到停止信号，已完成 {len(results)}/{total}")
@@ -799,30 +919,11 @@ class EvaluationExecutor:
         result = {"idx": sample_idx if sample_idx is not None else payload.get("idx", 0), "success": False}
 
         try:
-            # 获取模型配置
-            model_config = task.model_config or {}
-            if not model_config and task.model_provider:
-                from app.models.model_config_models import ModelConfig
+            # 获取模型配置：W4 快照优先（口径字段来自创建时快照，凭据实时解析），
+            # 快照为空（存量任务）回退实时查询
+            from app.services.config_snapshot import resolve_model_call_config
 
-                db = SessionLocal()
-                try:
-                    model_config_obj = db.query(ModelConfig).filter(
-                        ModelConfig.id == task.model_provider
-                    ).first()
-                    if model_config_obj:
-                        model_config = {
-                            "provider": model_config_obj.provider,
-                            "model_type": model_config_obj.model_type,
-                            "endpoint": model_config_obj.endpoint,
-                            "api_key": model_config_obj.api_key,
-                            "auth_type": model_config_obj.auth_type,
-                            "auth_config": model_config_obj.auth_config,
-                            "request_config": model_config_obj.request_config,
-                            "response_parse_config": model_config_obj.response_parse_config,
-                            "model_id": model_config_obj.id,
-                        }
-                finally:
-                    db.close()
+            model_config, _config_source = resolve_model_call_config(task)
 
             messages = [{"role": "user", "content": payload.get("user_input", "")}]
 
@@ -974,32 +1075,11 @@ class EvaluationExecutor:
             # ========== 步骤2: 调用被评测模型获取 model_output 和 chain_results ==========
             # 始终调用被评测模型（因为 judge_variable 可能依赖 chain_results）
             messages = [{"role": "user", "content": question}]
-            model_config = task.model_config or {}
-            if not model_config and task.model_provider:
-                try:
-                    from app.models.model_config_models import ModelConfig
+            # W4 快照优先（口径字段来自创建时快照，凭据实时解析），快照为空
+            # （存量任务）回退实时查询
+            from app.services.config_snapshot import resolve_model_call_config
 
-                    db = SessionLocal()
-                    try:
-                        model_config_obj = db.query(ModelConfig).filter(
-                            ModelConfig.id == task.model_provider
-                        ).first()
-                        if model_config_obj:
-                            model_config = {
-                                "provider": model_config_obj.provider,
-                                "model_type": model_config_obj.model_type,
-                                "endpoint": model_config_obj.endpoint,
-                                "api_key": model_config_obj.api_key,
-                                "auth_type": model_config_obj.auth_type,
-                                "auth_config": model_config_obj.auth_config,
-                                "request_config": model_config_obj.request_config,
-                                "response_parse_config": model_config_obj.response_parse_config,
-                                "model_id": model_config_obj.id,
-                            }
-                    finally:
-                        db.close()
-                except Exception as e:
-                    logger.warning(f"加载模型配置失败: {e}")
+            model_config, _config_source = resolve_model_call_config(task)
 
             if not model_config:
                 raise ValueError("RAG 评测未配置 rag_endpoint 且未配置被评测模型，请至少配置一项")
@@ -1222,7 +1302,12 @@ class EvaluationExecutor:
         return json.dumps(input_data, ensure_ascii=False, indent=2)
 
     def _update_progress(self, completed: int, total: int):
-        """更新任务进度"""
+        """更新任务进度（W3 断点续跑：叠加本轮已跳过的已完成行偏移，进度为累计值）
+
+        W10-4：进度推进即一批行完成，同步刷新执行记录心跳（heartbeat_at）——
+        API 启动期收尸 reaper 以心跳区分「正在执行」与「worker 已死」的
+        running 任务，部署重启不再误标。
+        """
         if not self.task_id:
             return
 
@@ -1232,7 +1317,14 @@ class EvaluationExecutor:
             db = SessionLocal()
             try:
                 service = EvaluationTaskService(db)
-                service.update_progress(self.task_id, completed, total)
+                service.update_progress(
+                    self.task_id,
+                    self.progress_offset + completed,
+                    self.progress_offset + total,
+                )
+                # W10-4 执行心跳：与进度同频刷新（本执行链路的 execution_number；
+                # None 表示非任务链路，touch 内部跳过）
+                service.touch_heartbeat(self.task_id, self.execution_number)
             finally:
                 db.close()
 

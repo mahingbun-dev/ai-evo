@@ -7,6 +7,7 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime
 
 from app.services.judge_evaluation_engine import JudgeEvaluationResult
+from app.services.evaluators import evaluator_registry
 
 
 class ResultAggregator:
@@ -116,6 +117,40 @@ class ResultAggregator:
             "fn": fn,
         }
 
+    @staticmethod
+    def aggregate_for_task(task, results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """按任务评测类型分发聚合（W3：complete 聚合与 stop 部分结果共用同一口径）
+
+        与 evaluation_tasks_async._aggregate_results 原分发逻辑逐分支一致，
+        收敛到本单点维护；断点续跑/停止场景从行级表重建的行结果走完全
+        相同的聚合，保证 result JSON 与旧行为同构。
+        """
+        evaluation_type = getattr(task, "evaluation_type", None)
+
+        # W17：类型聚合收敛注册表——已迁移类型由适配器提供聚合钩子，
+        # 未迁移/未知类型（judge/agent 等）沿用下方分支与默认回落，行为不变
+        adapter = evaluator_registry.get(evaluation_type)
+        if adapter is not None:
+            aggregated = adapter.aggregate_task(task, results)
+            if aggregated is not None:
+                return aggregated
+
+        # W17：rag 聚合已迁移注册表（见上方适配器查找）
+
+        # 一致性评测走专用聚合
+        if evaluation_type == "consistency":
+            return ResultAggregator.aggregate_consistency_results(results)
+
+        # W17：success_rate 聚合已迁移注册表（见上方适配器查找）
+
+        # W17：latency 聚合已迁移注册表（threshold 取 task.latency_config 缺省 10.0，
+        # 与本分支一致；见上方适配器查找）
+
+        # W17：binary_classification 聚合已迁移注册表（见上方适配器查找）
+
+        # judge/agent 等默认走任务级聚合
+        return ResultAggregator(task).aggregate(results)
+
     def aggregate(self, results: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
         聚合评测结果（新版本）
@@ -144,9 +179,12 @@ class ResultAggregator:
         success_count = len(successful_results)
         failed_count = len(failed_results)
 
-        # 计算平均分
+        # 计算平均分（行级 average_score 为 None 的 judge_failed 行自动排除，W2-2）
         scores = [r.get("average_score", 0) for r in successful_results if r.get("average_score") is not None]
         average_score = sum(scores) / len(scores) if scores else 0
+
+        # W2-2: 全部裁判失败的行计数（row_status=judge_failed，不进任务均分）
+        failed_judge_rows = sum(1 for r in results if r.get("row_status") == "judge_failed")
 
         # 聚合各维度评分
         dimension_scores = self._aggregate_dimension_scores(successful_results)
@@ -160,6 +198,7 @@ class ResultAggregator:
             "average_score": round(average_score, 2),
             "max_score": self.max_score,
             "dimension_scores": dimension_scores,
+            "failed_judge_rows": failed_judge_rows,
             "items": self._format_items(successful_results),
             "failed_items": self._format_failed_items(failed_results),
             "completed_at": datetime.now().isoformat(),
@@ -267,7 +306,7 @@ class ResultAggregator:
         structured_keys = {
             "idx", "success", "judge_scores", "average_score", "model_output",
             "feedback", "dimension_scores", "input_data", "model_raw_response",
-            "pre_script_results",
+            "pre_script_results", "row_status", "judge_count", "failed_judge_count",
         }
 
         for idx, result in enumerate(results):
@@ -278,7 +317,6 @@ class ResultAggregator:
                 "model_output": result.get("model_output", ""),
                 "model_raw_response": result.get("model_raw_response", ""),
                 "input_data": result.get("input_data", ""),
-                "average_score": result.get("average_score", 0),
                 "judge_count": len(judge_scores),
                 "judge_scores": judge_scores,
                 "judge_details": [
@@ -290,12 +328,23 @@ class ResultAggregator:
                         "evaluation_target_name": js.get("evaluation_target_name") or f"裁判{i+1}",
                         "langfuse_trace_id": js.get("langfuse_trace_id"),
                         "langfuse_trace_url": js.get("langfuse_trace_url"),
+                        # W2-2 增量：失败裁判标记（旧消费方忽略未知字段不受影响）
+                        "judge_failed": bool(js.get("judge_failed")),
+                        "fail_reason": js.get("fail_reason"),
                     }
                     for i, js in enumerate(judge_scores)
                 ] if judge_scores else [],
                 "feedback": result.get("feedback", ""),
                 "dimension_scores": result.get("dimension_scores", {}),
             }
+            # W2-2 增量：行级评分口径字段（completed / judge_failed / empty_input）
+            item["row_status"] = result.get("row_status", "completed")
+            item["failed_judge_count"] = result.get("failed_judge_count", 0)
+            # average_score 为 None（judge_failed 行）时省略该字段：
+            # 前端 Results.vue 对 null 会调 toFixed 抛错，缺 key 走 undefined 分支安全
+            avg_score = result.get("average_score", 0)
+            if avg_score is not None:
+                item["average_score"] = avg_score
             # 前处理脚本结果全量入库（设计文档 §三 结果展示通道 / §六 结果结构），
             # judge 与 agent 两种评测类型均生效
             if "pre_script_results" in result:
@@ -867,24 +916,15 @@ class ResultExporter:
         except ImportError:
             raise ImportError("需要安装 pandas 库来导出 Excel")
 
-        if evaluation_type == "judge":
-            # 裁判评测结果格式 — 动态输入变量列 + 固定指标列
-            input_cols = ResultExporter._collect_input_columns(results)
-            data = []
-            for r in results:
-                row = {"题目序号": r.get("question_index", "")}
-                # 动态输入变量
-                for col in input_cols:
-                    row[col] = str(r.get(col, ""))[:200]
-                # 固定指标
-                row["模型回答"] = str(r.get("model_answer", ""))[:100]
-                row["综合评分"] = r.get("overall_score", "")
-                row["评分详情"] = json.dumps(r.get("scores", {}), ensure_ascii=False)
-                row["评分理由"] = r.get("reasoning", "")
-                data.append(row)
-            df = pd.DataFrame(data)
+        # W17：类型导出收敛注册表——已迁移类型的 excel 构建由适配器提供，
+        # 未迁移/未知类型沿用下方分支与 batch/通用回落，行为不变
+        adapter = evaluator_registry.get(evaluation_type)
+        if adapter is not None:
+            built = adapter.export_excel(results)
+            if built is not None:
+                return built
 
-        elif evaluation_type == "consistency":
+        if evaluation_type == "consistency":
             # 一致性评测结果格式 — 动态输入变量列 + 固定指标列
             input_cols = ResultExporter._collect_input_columns(results)
             data = []
@@ -902,105 +942,6 @@ class ResultExporter:
                 row["结构一致性"] = metrics.get("structure_consistency", "")
                 data.append(row)
             df = pd.DataFrame(data)
-
-        elif evaluation_type == "success_rate":
-            # 成功率评测结果格式 — 动态输入变量列 + 固定指标列
-            input_cols = ResultExporter._collect_input_columns(results)
-            data = []
-            for r in results:
-                metrics = r.get("metrics", {}) or {}
-                row = {"题目序号": r.get("idx", 0) + 1}
-                for col in input_cols:
-                    row[col] = str(r.get(col, ""))[:200]
-                row["总调用次数"] = metrics.get("total_calls", "")
-                row["成功次数"] = metrics.get("successful_calls", "")
-                row["成功率"] = metrics.get("success_rate", "")
-                row["平均响应时间"] = metrics.get("avg_response_time", "")
-                data.append(row)
-            df = pd.DataFrame(data)
-
-        elif evaluation_type == "rag":
-            # RAG 检索质量评测结果格式 — 动态输入变量列 + 固定指标列
-            input_cols = ResultExporter._collect_input_columns(results)
-            data = []
-            for idx, r in enumerate(results):
-                scores = r.get("scores", {})
-                row = {"题目序号": r.get("idx", idx) + 1}
-                # 动态输入变量
-                for col in input_cols:
-                    row[col] = str(r.get(col, ""))[:200]
-                # 固定指标
-                row["上下文精度(Context Precision)"] = scores.get("context_precision", "")
-                row["上下文召回(Context Recall)"] = scores.get("context_recall", "")
-                row["命中率(Hit Rate)"] = scores.get("hit_rate", "")
-                row["平均倒数排名(MRR)"] = scores.get("mrr", "")
-                row["抗噪声能力(Noise Sensitivity)"] = scores.get("noise_sensitivity", "")
-                row["拒绝能力(Negative Rejection)"] = scores.get("negative_rejection", "")
-                row["执行状态"] = "成功" if r.get("success") else f"失败: {r.get('error', '')}"
-                data.append(row)
-            df = pd.DataFrame(data)
-
-        elif evaluation_type == "latency":
-            # 耗时评测结果格式
-            data = []
-            for r in results:
-                records = r.get("records", []) or []
-                for rec in records:
-                    data.append({
-                        "序号": rec.get("index", ""),
-                        "响应时间(秒)": round(rec.get("duration", 0), 3),
-                        "状态": "通过" if rec.get("passed") else "失败",
-                        "输入Token": rec.get("input_tokens") or "",
-                        "输出Token": rec.get("output_tokens") or "",
-                        "时间戳": rec.get("timestamp", ""),
-                    })
-                # 如果没有单条记录（只有聚合结果），直接添加聚合数据
-                if not data:
-                    data.append({
-                        "序号": "",
-                        "响应时间(秒)": "",
-                        "状态": "",
-                        "输入Token": "",
-                        "输出Token": "",
-                        "时间戳": "",
-                    })
-            df = pd.DataFrame(data)
-
-        elif evaluation_type == "binary_classification":
-            # 二分分类评测结果格式 — 统计摘要 + 逐条明细（两个 Sheet）
-            result_data = None
-            for r in results:
-                if "items" in r:
-                    result_data = r
-                    break
-
-            items = result_data.get("items", []) if result_data else []
-            input_cols = ResultExporter._collect_input_columns(items)
-
-            # Sheet 1: 统计摘要
-            summary_data = ResultExporter._build_binary_classification_summary(result_data)
-            df_summary = pd.DataFrame(summary_data)
-
-            # Sheet 2: 逐条明细
-            detail_data = []
-            for idx, item in enumerate(items):
-                row = {"序号": (item.get("idx", idx) if item.get("idx") is not None else idx) + 1}
-                for col in input_cols:
-                    row[col] = str(item.get(col, ""))[:200]
-                row["期望标签"] = item.get("expected_label", "")
-                row["预测标签"] = item.get("predicted_label", "")
-                row["判定结果"] = "正确" if item.get("is_correct") else "错误"
-                row["耗时(秒)"] = round(item.get("duration", 0), 3) if item.get("duration") else ""
-                detail_data.append(row)
-            df_detail = pd.DataFrame(detail_data)
-
-            # 导出到两个 Sheet
-            output = io.BytesIO()
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                df_summary.to_excel(writer, index=False, sheet_name='统计摘要')
-                df_detail.to_excel(writer, index=False, sheet_name='逐条明细')
-
-            return output.getvalue()
 
         elif evaluation_type == "batch":
             # 批量导出格式：支持聚合结果结构，提取 items 进行导出
@@ -1096,20 +1037,15 @@ class ResultExporter:
         except ImportError:
             raise ImportError("需要安装 pandas 库来导出 CSV")
 
-        if evaluation_type == "judge":
-            # 裁判评测 — 动态输入变量列 + 固定指标列
-            input_cols = ResultExporter._collect_input_columns(results)
-            data = []
-            for r in results:
-                row = {"question_index": r.get("question_index", "")}
-                for col in input_cols:
-                    row[col] = str(r.get(col, ""))[:200]
-                row["model_answer"] = str(r.get("model_answer", ""))[:200]
-                row["overall_score"] = r.get("overall_score", "")
-                data.append(row)
-            df = pd.DataFrame(data)
+        # W17：类型导出收敛注册表——已迁移类型的 csv 构建由适配器提供，
+        # 未迁移/未知类型沿用下方分支与 batch/通用回落，行为不变
+        adapter = evaluator_registry.get(evaluation_type)
+        if adapter is not None:
+            built = adapter.export_csv(results)
+            if built is not None:
+                return built
 
-        elif evaluation_type == "batch":
+        if evaluation_type == "batch":
             # 批量导出格式：支持聚合结果结构，提取 items 进行导出
             data = []
             for r in results:
@@ -1150,55 +1086,6 @@ class ResultExporter:
                     elif eval_type == "success_rate":
                         row["success_rate"] = item.get("metrics", {}).get("success_rate", "")
                     data.append(row)
-            df = pd.DataFrame(data)
-        elif evaluation_type == "latency":
-            # 耗时评测结果格式
-            data = []
-            for r in results:
-                records = r.get("records", []) or []
-                for rec in records:
-                    data.append({
-                        "index": rec.get("index", ""),
-                        "duration_seconds": round(rec.get("duration", 0), 3),
-                        "status": "passed" if rec.get("passed") else "failed",
-                        "input_tokens": rec.get("input_tokens") or "",
-                        "output_tokens": rec.get("output_tokens") or "",
-                        "timestamp": rec.get("timestamp", ""),
-                    })
-                if not data:
-                    data.append({
-                        "index": "",
-                        "duration_seconds": "",
-                        "status": "",
-                        "input_tokens": "",
-                        "output_tokens": "",
-                        "timestamp": "",
-                    })
-            df = pd.DataFrame(data)
-        elif evaluation_type == "binary_classification":
-            # 二分分类评测结果格式 — 动态输入变量列
-            data = []
-            for r in results:
-                items = r.get("items", [])
-                input_cols = ResultExporter._collect_input_columns(items)
-                for idx, item in enumerate(items):
-                    row = {"index": (item.get("idx", idx) if item.get("idx") is not None else idx) + 1}
-                    for col in input_cols:
-                        row[col] = str(item.get(col, ""))[:200]
-                    row["expected_label"] = item.get("expected_label", "")
-                    row["predicted_label"] = item.get("predicted_label", "")
-                    row["is_correct"] = item.get("is_correct", "")
-                    row["duration"] = round(item.get("duration", 0), 3) if item.get("duration") else ""
-                    data.append(row)
-                if not data:
-                    cm = r.get("confusion_matrix", {})
-                    data.append({
-                        "index": "",
-                        "expected_label": "",
-                        "predicted_label": "",
-                        "is_correct": f"TP:{cm.get('tp',0)} FP:{cm.get('fp',0)} TN:{cm.get('tn',0)} FN:{cm.get('fn',0)}",
-                        "duration": "",
-                    })
             df = pd.DataFrame(data)
         else:
             df = pd.DataFrame(results)

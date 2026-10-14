@@ -8,6 +8,8 @@ from app.services.binary_classification_evaluator import (
     BinaryClassificationResult
 )
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 class TestResolveField:
     """测试 _resolve_field 方法"""

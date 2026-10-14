@@ -12,6 +12,8 @@ import pytest
 
 from app.services.evaluation_task_service import EvaluationTaskService
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 def _orm_item(data):
     """模拟 get_data_list_v2 的真实返回形态：EvaluationDataV2 ORM 对象（data 为属性）"""

@@ -40,6 +40,8 @@ from app.services.hub_file_service import (
     sanitize_hub_name,
 )
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 SESSION_ID = "sess-test-1"
 ENDPOINT = "http://hub.test/mcp"
 # 最小可解析的 Claude Code 会话 jsonl（供 zip 内层文件使用）

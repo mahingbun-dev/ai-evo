@@ -20,9 +20,10 @@
 - POST   /pre-judge-scripts/{id}/file/rename  重命名/移动文件（main.py 不可改名）
 - POST   /pre-judge-scripts/from-template  从脚手架模板生成脚本（single/folder）
 
-权限（设计决策 #4：管理员可写、普通用户可用）：写操作校验请求用户中的
-is_admin 字段——字段存在且为假则拒绝；字段不存在（当前登录用户无该字段）
-时放行，即管理员语义先简化为「普通用户可用」。
+权限（W1-4 整改）：写操作校验请求用户的超管标志（user.super_admin_flag == 1，
+与前端 Scripts.vue 的 isSuperAdmin 同口径），非超管一律 403（deny by default）；
+查看、导出对所有登录用户开放，试跑（debug）按写操作口径纳入超管校验。
+服务层另有内置脚本（pjs_builtin_*）不可变守卫：内置脚本记录禁编辑/删除/覆盖。
 
 上传阻断校验链（阶段E）：单 .py（upload）与 zip 包（upload-package）上传
 通道共用（语法编译 / 路径规范扫描 / 风险扫描命中必须 risk_acknowledged /
@@ -104,10 +105,15 @@ class PreJudgeScriptTemplatePayload(BaseModel):
 
 
 def _ensure_admin(request: Request) -> None:
-    """写操作管理员校验（简化实现）：用户带 is_admin 字段且为假则 403，否则放行"""
+    """写操作管理员校验（W1-4：真实校验超管标志）
+
+    校验 user.super_admin_flag == 1（字段由 auth_middleware 注入，前端
+    Scripts.vue 的 isSuperAdmin 同口径）；用户缺失（未登录/中间件未注入）
+    或非超管一律 403，deny by default。
+    """
     user = getattr(request.state, "user", None)
-    if isinstance(user, dict) and "is_admin" in user and not user.get("is_admin"):
-        raise HTTPException(status_code=403, detail="仅管理员可修改评测前处理脚本")
+    if not isinstance(user, dict) or user.get("super_admin_flag") != 1:
+        raise HTTPException(status_code=403, detail="仅超级管理员可修改评测前处理脚本")
 
 
 def _service(db: Session) -> PreJudgeScriptService:
@@ -262,12 +268,16 @@ async def upload_script_package(
 
 
 @router.post("/{script_id}/debug", summary="脚本试跑（落盘产物返回路径）")
-async def debug_script(script_id: str, payload: PreJudgeScriptDebugPayload, db: Session = Depends(get_db)):
+async def debug_script(script_id: str, payload: PreJudgeScriptDebugPayload,
+                       request: Request, db: Session = Depends(get_db)):
     """给输入样例试跑一次：字段值为本地路径直用，否则按 inline 内容写临时文件。
 
     产物写入 uploads/script_runs/debug/{script}_{ts}/，返回标准输出与产物绝对路径；
     script 类型附带运行前静态检查提示（static_check，提示级不拦截）。
+    W1-4：试跑与写操作同口径，仅超管可用；W1-3：试跑与生产执行同一
+    环境变量白名单（经 pre_judge_runner.execute_script）。
     """
+    _ensure_admin(request)
     service = _service(db)
     script = service.get_script(script_id)
     if script is None or not script.get("is_active", True):

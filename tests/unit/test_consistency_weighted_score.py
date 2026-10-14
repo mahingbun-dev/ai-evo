@@ -4,6 +4,8 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from app.services.consistency_evaluator import ConsistencyEvaluator
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 class TestConsistencyWeightedScore:
     """验证一致性评测路径中加权计算正确"""

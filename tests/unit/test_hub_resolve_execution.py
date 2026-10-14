@@ -28,6 +28,8 @@ from app.services.hub_file_service import (
     resolve_hub_file_fields,
 )
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 # ---------------------------------------------------------------------------
 # mock 工具：登记表 hub_files 查询链按 file_id 返回记录

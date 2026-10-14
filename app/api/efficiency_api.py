@@ -2,6 +2,7 @@
 import logging
 from typing import Optional
 from fastapi import APIRouter, Depends, Query, HTTPException
+from app.services.access_control import ensure_super_admin
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
 from app.db.session import get_db
@@ -42,14 +43,14 @@ def update_manual_hours(body: UpdateManualHoursRequest, db: Session = Depends(ge
     return result
 
 
-@router.get("/task/{task_id}", response_model=list[TaskEfficiencyItem])
+@router.get("/task/{task_id}", response_model=list[TaskEfficiencyItem], dependencies=[Depends(ensure_super_admin)])
 def get_task_efficiency(task_id: str, db: Session = Depends(get_db)):
     """获取单任务各次执行提效详情"""
     service = EfficiencyService(db)
     return service.get_task_efficiency(task_id)
 
 
-@router.get("/summary", response_model=TotalEfficiencyResponse)
+@router.get("/summary", response_model=TotalEfficiencyResponse, dependencies=[Depends(ensure_super_admin)])
 def get_total_efficiency(
     start_date: Optional[str] = Query(None, description="开始日期 YYYY-MM-DD"),
     end_date: Optional[str] = Query(None, description="结束日期 YYYY-MM-DD"),

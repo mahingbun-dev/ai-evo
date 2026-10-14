@@ -98,10 +98,14 @@ class JudgeLangGraphAgent:
             result_state = self.graph.invoke(state_input, config)
         except Exception as e:
             logger.exception(f"[JudgeAgent] 裁判 {judge_index} 执行失败")
+            # W2-1 失败显式标记：score 置 None + judge_failed=True，
+            # 由 _aggregate_judge_scores 剔除出均分（不再以 0 分拉低均值）
             result = {
-                "score": 0,
+                "score": None,
                 "feedback": f"裁判执行失败: {str(e)}",
                 "dimension_scores": {},
+                "judge_failed": True,
+                "fail_reason": "llm_error",
             }
             if trace_id:
                 result["langfuse_trace_id"] = trace_id
@@ -118,6 +122,10 @@ class JudgeLangGraphAgent:
                 "feedback": result_state.get("final_feedback", ""),
                 "dimension_scores": result_state.get("final_dimension_scores", {}),
             }
+            # W2-1: 维度解析失败经 state 冒泡的失败标记（正常路径由 raw_output 携带）
+            if result_state.get("final_judge_failed"):
+                result["judge_failed"] = True
+                result["fail_reason"] = result_state.get("final_fail_reason") or "parse_failed"
 
         if trace_id:
             result["langfuse_trace_id"] = trace_id
@@ -153,19 +161,40 @@ class JudgeLangGraphAgent:
                     results.append(future.result())
                 except Exception as e:
                     logger.error(f"[JudgeAgent] 并行执行中某个裁判失败: {e}")
+                    # W2-1 失败显式标记（同 run 的异常分支口径）
                     results.append({
-                        "score": 0,
+                        "score": None,
                         "feedback": f"执行失败: {e}",
                         "dimension_scores": {},
+                        "judge_failed": True,
+                        "fail_reason": "llm_error",
                     })
 
+        # W2-1: 失败裁判 score 为 None，日志均值只统计有效分数（与聚合口径一致）
+        valid_scores = [
+            r["score"] for r in results
+            if not r.get("judge_failed") and isinstance(r.get("score"), (int, float))
+        ]
+        avg_text = f"{sum(valid_scores) / len(valid_scores):.2f}" if valid_scores else "N/A"
         logger.info(
             f"[JudgeAgent] {judge_count} 个裁判并行完成，"
-            f"平均分: {sum(r.get('score', 0) for r in results) / len(results):.2f}"
+            f"失败 {len(results) - len(valid_scores)} 个，平均分: {avg_text}"
         )
         return results
 
     @classmethod
-    def clear_cache(cls):
-        """清理 Graph 缓存 (测试用)"""
-        cls._graph_cache.clear()
+    def clear_cache(cls, task_id: Optional[str] = None):
+        """清理 Graph 缓存
+
+        W12-1：图拓扑由 evaluation_metrics 决定并被类级缓存复用，任务编辑
+        改动 evaluation_metrics / judge_prompt 后必须失效，否则重跑仍用
+        旧评分标准的图（修「编辑维度后重跑用旧评分标准」）。
+
+        Args:
+            task_id: 指定任务 id 时仅清除该任务的缓存条目；缺省清空全部
+                （保留无参调用兼容既有测试与兜底场景）
+        """
+        if task_id is None:
+            cls._graph_cache.clear()
+        else:
+            cls._graph_cache.pop(str(task_id), None)

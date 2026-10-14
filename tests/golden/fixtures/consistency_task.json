@@ -1,0 +1,4 @@
+{
+  "evaluation_type": "consistency",
+  "consistency_config": {"repeat_count": 3, "use_judge": true}
+}

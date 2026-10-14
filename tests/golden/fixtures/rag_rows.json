@@ -1,0 +1,51 @@
+[
+  {
+    "idx": 0,
+    "success": true,
+    "question": "什么是 RAG？",
+    "ground_truth": "RAG 是检索增强生成，结合检索与生成回答问题",
+    "model_answer": "RAG（检索增强生成）先检索相关文档再生成回答",
+    "contexts": ["文档1片段：RAG 是一种结合检索与生成的技术", "文档2片段：检索结果作为上下文提供给大模型", "文档3片段：无关内容占位"],
+    "scores": {
+      "context_precision": 0.85,
+      "context_recall": 0.9,
+      "hit_rate": 1.0,
+      "mrr": 0.75,
+      "noise_sensitivity": 0.1,
+      "negative_rejection": 0.2
+    },
+    "reasons": {
+      "context_precision": "前两个检索片段与问题高度相关",
+      "context_recall": "覆盖了标准答案的全部要点"
+    },
+    "user_input": "什么是 RAG？",
+    "retrieval_top_k": 3
+  },
+  {
+    "idx": 1,
+    "success": true,
+    "question": "RAG 有哪些缺点？",
+    "ground_truth": "依赖检索质量，可能被噪声误导",
+    "model_answer": "RAG 的缺点包括对检索质量的依赖……",
+    "contexts": ["文档1片段：RAG 依赖外部知识库的质量"],
+    "scores": {
+      "context_precision": 0.6,
+      "context_recall": 0.5,
+      "hit_rate": 0.0,
+      "mrr": 0.0,
+      "noise_sensitivity": 0.4,
+      "negative_rejection": 0.3
+    },
+    "reasons": {
+      "context_precision": "仅一个相关片段",
+      "context_recall": "未完全覆盖标准答案"
+    },
+    "user_input": "RAG 有哪些缺点？",
+    "retrieval_top_k": 1
+  },
+  {
+    "idx": 2,
+    "success": false,
+    "error": "向量库连接失败"
+  }
+]

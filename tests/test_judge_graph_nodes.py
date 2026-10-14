@@ -3,6 +3,8 @@ import json
 import pytest
 from unittest.mock import patch
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 class TestScoreDimensionNode:
     """Test that the score dimension node factory works correctly"""

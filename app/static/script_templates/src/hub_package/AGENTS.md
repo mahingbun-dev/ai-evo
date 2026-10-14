@@ -41,6 +41,7 @@
 │   ├── segments/{uuid}/（pytest 产物 + allure-data/）             ← 分段执行产物
 │   └── action-files/（.xlsx）  actions/  scripts/  source/  claude-thread.zip
 ├── inputs/hub_pkg_index.json                       ← 索引样例（条目 {path 相对,type,size,is_nested_zip}）
+├── outputs/                                        ← 脚本产物目录（文件产物只写这里，平台保证存在）
 ├── sample_stdin.json                               ← 本地试跑输入（你的脚本直接可用）
 ├── README.md            骨架说明（人读）
 └── AGENTS.md            本文件（不要改动、不要打包）
@@ -54,8 +55,10 @@
 1. **`scripts/hub_package/` 只读**：它是给所有脚本当范本的模板，改动会被下次
    下载覆盖，也不会被上传。你的产出只放 `scripts/{你的脚本名}/`。
 2. **路径三原则**（上传静态扫描强制）：源码禁止硬编码 `/Users/`、`/home/`、`C:\`、
-   `uploads/` 等路径字面量；输入路径只用 stdin 传入的值；产物只写 `_run_dir`；
-   输出引用文件一律用 rel_path（相对 inputs.root）。
+   `uploads/` 等路径字面量；输入路径只用 stdin 传入的值；**文件产物只写
+   `{_run_dir}/outputs/`**（平台组装工作区时保证该目录存在，脚本侧仍建议防御式
+   `mkdir(parents=True, exist_ok=True)`，写法抄 `lib/helpers.py` 的
+   `ensure_outputs_dir`）；输出引用文件一律用 rel_path（相对 inputs.root）。
 3. **不要硬编码 attempt 目录名**：执行包 root 下第一层是 `{execution_id}-attempt-1/`，
    每个包都不同。rel_path 一律带该前缀；按 rel_path 首段推导顶层、按后缀定位文件
    （`lib/helpers.py` 的 `attempt_top_of`/`find_by_suffix` 即示范）。
@@ -69,7 +72,9 @@
    与你 model.py 里声明的名字无关——只有泛化遍历的脚本才能同时通过冒烟和真实任务。
 5. **输出契约**：stdout 最后一个非空行是 JSON，`{status: "ok"|"skip"|"fail",
    outputs: {...}, message: "..."}`；`outputs` 的键须与你 `model.py` 的
-   `PreScriptOutput` 声明一致（平台解析声明回填「输出说明」）。
+   `PreScriptOutput` 声明一致（平台解析声明回填「输出说明」）。落到
+   `outputs/` 的文件产物在 `files` 键注册（`{文件名: 绝对路径}`），裁判与下游
+   才能发现产物——`main.py` 即示范。
 6. **model.py 是契约源**：改输入/输出后必须同步改 `PreScriptInput` /
    `PreScriptOutput`；hub_file 通道字段用 `json_schema_extra={"value_type":
    "hub_file"}` 声明（写法抄 `hub_package/model.py`）。

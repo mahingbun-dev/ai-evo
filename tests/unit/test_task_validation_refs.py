@@ -13,9 +13,13 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+from tests.unit.w9_direct_call import fake_request  # W9: 端点直调适配
 from fastapi import HTTPException
 
 from app.services.evaluation_task_service import EvaluationTaskService
+
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
 
 
 def _service_with_db(script_rows=None, field_metas=None, items=None):
@@ -330,32 +334,31 @@ class TestApiErrorTranslation:
 
             body = UpdateTaskRequest(score_details="标准 {{ref:target:t_ghost|幽灵数据}}")
             with pytest.raises(HTTPException) as excinfo:
-                update_task_endpoint("task_1", body, MagicMock())
+                update_task_endpoint("task_1", body, fake_request(), db=MagicMock())
 
             assert excinfo.value.status_code == 400
             assert "引用标记失效" in excinfo.value.detail
 
     def test_migrate_config_endpoint_translates_value_error_to_400(self):
-        """migrate-config 端点：迁移抛 ValueError → HTTPException 400；任务不存在 → 404"""
+        """migrate-config 端点：迁移抛 ValueError → HTTPException 400；任务不存在 → 404
+
+        W9：存在性/归属由 ensure_task_access 承担（404 不再走 service.get_task），
+        db 替身的查询链按用例返回 None / 任务对象。"""
         from app.api.evaluation_task_api import migrate_task_config
 
-        with patch("app.api.evaluation_task_api.EvaluationTaskService") as mock_cls:
-            mock_service = MagicMock()
-            mock_cls.return_value = mock_service
-            mock_service.get_task.return_value = None
-            with pytest.raises(HTTPException) as excinfo:
-                migrate_task_config("task_missing", MagicMock())
-            assert excinfo.value.status_code == 404
+        missing_db = MagicMock()
+        missing_db.query.return_value.filter.return_value.first.return_value = None
+        with pytest.raises(HTTPException) as excinfo:
+            migrate_task_config("task_missing", fake_request(), db=missing_db)
+        assert excinfo.value.status_code == 404
 
-        with patch("app.api.evaluation_task_api.EvaluationTaskService") as mock_cls, \
-                patch("app.services.config_migration_service.ConfigMigrationService") as mock_mig:
-            mock_service = MagicMock()
-            mock_cls.return_value = mock_service
-            mock_service.get_task.return_value = MagicMock()
+        with patch("app.services.config_migration_service.ConfigMigrationService") as mock_mig:
+            ok_db = MagicMock()
+            ok_db.query.return_value.filter.return_value.first.return_value = MagicMock()
             mock_mig.return_value.migrate_task.side_effect = ValueError("迁移失败")
 
             with pytest.raises(HTTPException) as excinfo:
-                migrate_task_config("task_1", MagicMock())
+                migrate_task_config("task_1", fake_request(), db=ok_db)
             assert excinfo.value.status_code == 400
             assert "迁移失败" in excinfo.value.detail
 

@@ -1,6 +1,7 @@
 """任务执行统计API"""
 import logging
 from fastapi import APIRouter, Depends, Query
+from app.services.access_control import ensure_super_admin
 from sqlalchemy.orm import Session
 from typing import Optional, List
 from pydantic import BaseModel, Field
@@ -10,7 +11,7 @@ from app.services.stats_service import StatsService
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/stats", tags=["统计"])
+router = APIRouter(prefix="/stats", tags=["统计"], dependencies=[Depends(ensure_super_admin)])
 
 
 class RecordItem(BaseModel):

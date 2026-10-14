@@ -7,6 +7,8 @@ RequestChainExecutor.extract_variables 单元测试
 import pytest
 from app.services.request_chain import RequestChainExecutor
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 def _chain(requests):
     """构造最小请求链配置"""

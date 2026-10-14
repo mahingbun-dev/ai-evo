@@ -1,0 +1,5 @@
+{
+  "evaluation_type": "latency",
+  "latency_config": {"threshold": 2.5},
+  "judge_count": 4
+}

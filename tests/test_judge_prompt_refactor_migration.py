@@ -5,6 +5,8 @@ import pytest
 import sys
 import os
 
+pytestmark = pytest.mark.integration  # W8 分类：integration（需本地 PG/Redis）；需真实 PG（settings.DATABASE_URL，本地 5432）
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sqlalchemy import create_engine, inspect

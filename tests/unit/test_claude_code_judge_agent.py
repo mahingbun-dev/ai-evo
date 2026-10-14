@@ -17,6 +17,8 @@ from app.services.claude_code_judge_agent import (
     cleanup_session_files,
 )
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 class TestExtractJsonObject:
     def test_plain_json(self):
@@ -132,7 +134,8 @@ class TestRunParallel:
         assert len(results) == 3
         assert all(r["score"] == 8 for r in results)
 
-    def test_single_failure_returns_zero(self):
+    def test_single_failure_marks_judge_failed(self):
+        """W2-1 新口径：裁判失败 score=None + judge_failed 标记（不再计 0 分入均值）"""
         agent = self._make_agent()
         config = {"model": "m", "timeout_seconds": 5, "max_turns": 2}
         with patch(
@@ -146,7 +149,9 @@ class TestRunParallel:
             ):
                 results = agent.run_parallel("sys", "user", None, 2)
         assert len(results) == 2
-        assert all(r["score"] == 0 for r in results)
+        assert all(r["score"] is None for r in results)
+        assert all(r["judge_failed"] is True for r in results)
+        assert all(r["fail_reason"] == "llm_error" for r in results)
         assert "boom" in results[0]["feedback"]
 
 

@@ -12,6 +12,8 @@ import pytest
 
 from app.services.evaluation_executor import EvaluationExecutor
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 def _make_task(evaluation_type="judge", judge_engine="graph", judge_count=2):
     return type("Task", (), {
@@ -101,6 +103,9 @@ class TestEngineDispatch:
             pb_instance._build_system_prompt.return_value = "system prompt"
             vi_instance = mock_vi.return_value
             vi_instance.build_judge_payload.return_value = {"user_input": "x", "_dataset_item": {}}
+            # W12-3：执行器按该属性判定脚本输出缺失；MagicMock 属性默认 truthy，
+            # 需显式配置为空列表表示「无脚本输出缺失」
+            vi_instance.script_output_missing = []
 
             mock_cc.return_value.run_parallel.return_value = [{"score": 9, "feedback": "ok", "dimension_scores": {}}]
             mock_lg.return_value.run_parallel.return_value = [{"score": 5, "feedback": "graph", "dimension_scores": {}}]

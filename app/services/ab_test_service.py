@@ -26,8 +26,9 @@ class ABTestService:
         duration_a: Optional[float] = None,
         duration_b: Optional[float] = None,
         name: Optional[str] = None,
+        created_by: Optional[str] = None,
     ) -> ABTestSession:
-        """保存一次 A/B 测试记录"""
+        """保存一次 A/B 测试记录（W19：created_by 盖创建人）"""
         session_id = f"abtest_{uuid.uuid4().hex[:12]}"
         session = ABTestSession(
             id=session_id,
@@ -42,6 +43,7 @@ class ABTestService:
             status=status,
             duration_a=duration_a,
             duration_b=duration_b,
+            created_by=created_by,
         )
         self.db.add(session)
         self.db.commit()
@@ -57,11 +59,21 @@ class ABTestService:
         page: int = 1,
         page_size: int = 20,
         keyword: str = "",
+        created_by: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """获取历史记录列表（分页），支持按备注名模糊搜索"""
+        """获取历史记录列表（分页），支持按备注名模糊搜索。
+
+        W19 归属：created_by=None 表示超管/不过滤（看全部）；传 user_code
+        时只看本人创建 + 历史无主行（created_by IS NULL）。
+        """
         query = self.db.query(ABTestSession)
         if keyword:
             query = query.filter(ABTestSession.name.ilike(f"%{keyword}%"))
+        if created_by is not None:
+            query = query.filter(
+                (ABTestSession.created_by == created_by)
+                | (ABTestSession.created_by.is_(None))
+            )
         total = query.count()
         items = (
             query

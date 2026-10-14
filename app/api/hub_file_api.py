@@ -30,6 +30,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
+from app.services.access_control import ensure_dataset_access, ensure_hub_file_access
 from app.services.hub_file_service import (
     HubEndpointNotConfiguredError,
     HubFileError,
@@ -96,14 +97,20 @@ def query_hub_files(body: HubFileQueryRequest, request: Request) -> Dict[str, An
 # 数据集迭代阶段D：文件树 / 预览 / 下载 / 匹配预览
 # ---------------------------------------------------------------------------
 
-def _require_unpacked_record(db: Session, file_id: str):
-    """取登记记录并要求已有解包产物（未登记 404 / 无解包区 404，中文提示）"""
+def _require_unpacked_record(db: Session, file_id: str, request: Optional[Request] = None):
+    """取登记记录并要求已有解包产物（未登记 404 / 无解包区 404，中文提示）
+
+    W9：request 提供时做对象级团队归属校验（补传/下载/预览读取面统一口径）；
+    request=None 仅兼容历史直调（单测）场景。
+    """
     try:
         record = get_hub_record(db, file_id)
     except HubFileError as e:
         raise HTTPException(status_code=400, detail=str(e))
     if record is None:
         raise HTTPException(status_code=404, detail=f"执行包未登记: {file_id}（请先从 anc-hub 导入）")
+    if request is not None:
+        ensure_hub_file_access(db, request.state.user, file_id)
     if record.unpack_status != "unpacked" or not record.unpack_dir or not os.path.isdir(record.unpack_dir):
         raise HTTPException(
             status_code=404,
@@ -135,14 +142,16 @@ def _locate_member(record, path: str) -> str:
 
 
 @router.get("/{file_id}/tree", summary="获取执行包文件树（登记表索引+补传叠加，零文件 IO）")
-def get_hub_file_tree(file_id: str, db: Session = Depends(get_db)) -> Dict[str, Any]:
-    """返回 file_index + supplement_index 叠加视图（补传条目带 is_manual 标记；未登记 404）"""
+def get_hub_file_tree(file_id: str, request: Request, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    """返回 file_index + supplement_index 叠加视图（补传条目带 is_manual 标记；未登记 404；W9：跨团队 403）"""
     try:
         record = get_hub_record(db, file_id)
     except HubFileError as e:
         raise HTTPException(status_code=400, detail=str(e))
     if record is None:
         raise HTTPException(status_code=404, detail=f"执行包未登记: {file_id}（请先从 anc-hub 导入）")
+    # W9：对象级归属校验（按登记记录 team_code，历史空值按 DEFAULT 口径）
+    ensure_hub_file_access(db, request.state.user, file_id)
     return {
         "file_id": file_id,
         "unpack_status": record.unpack_status,
@@ -153,11 +162,12 @@ def get_hub_file_tree(file_id: str, db: Session = Depends(get_db)) -> Dict[str, 
 @router.get("/{file_id}/nested-tree", summary="嵌套 zip 内层清单（只读 zip 目录，不解压）")
 def get_hub_file_nested_tree(
     file_id: str,
+    request: Request,
     path: str = Query(..., description="包内嵌套 zip 的相对路径"),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    """读取嵌套 zip 的 central directory 返回内层清单；path 非嵌套 zip 时 4xx 中文错误"""
-    record = _require_unpacked_record(db, file_id)
+    """读取嵌套 zip 的 central directory 返回内层清单；path 非嵌套 zip 时 4xx 中文错误（W9：归属校验）"""
+    record = _require_unpacked_record(db, file_id, request)
     abs_path = _locate_member(record, path)
     if not os.path.exists(abs_path):
         raise HTTPException(status_code=404, detail=f"包内不存在该文件: {path}")
@@ -179,11 +189,12 @@ def get_hub_file_nested_tree(
 )
 def get_hub_file_content(
     file_id: str,
+    request: Request,
     path: str = Query(..., description="包内文件相对路径"),
     db: Session = Depends(get_db),
 ) -> Union[Dict[str, Any], FileResponse]:
-    """文本类返回 {content(截断2MB), mime, truncated}；图片 FileResponse 内联；二进制 4xx 提示走 download"""
-    record = _require_unpacked_record(db, file_id)
+    """文本类返回 {content(截断2MB), mime, truncated}；图片 FileResponse 内联；二进制 4xx 提示走 download（W9：归属校验）"""
+    record = _require_unpacked_record(db, file_id, request)
     abs_path = _locate_member(record, path)
     if not os.path.isfile(abs_path):
         raise HTTPException(status_code=404, detail=f"包内不存在该文件: {path}")
@@ -213,11 +224,12 @@ def get_hub_file_content(
 @router.get("/{file_id}/download", summary="下载包内任意文件（中文文件名 URL 编码）")
 def download_hub_file(
     file_id: str,
+    request: Request,
     path: str = Query(..., description="包内文件相对路径"),
     db: Session = Depends(get_db),
 ) -> FileResponse:
-    """下载包内任意文件；Content-Disposition 与数据集模板下载同一中文编码模式"""
-    record = _require_unpacked_record(db, file_id)
+    """下载包内任意文件；Content-Disposition 与数据集模板下载同一中文编码模式（W9：跨团队下载拒绝）"""
+    record = _require_unpacked_record(db, file_id, request)
     abs_path = _locate_member(record, path)
     if not os.path.isfile(abs_path):
         raise HTTPException(status_code=404, detail=f"包内不存在该文件: {path}")
@@ -244,11 +256,13 @@ class HubMatchPreviewRequest(BaseModel):
 
 
 @router.post("/match-preview", summary="匹配预览（与执行时同一 match_files 语义）")
-def match_preview(body: HubMatchPreviewRequest, db: Session = Depends(get_db)) -> Dict[str, Any]:
-    """取数据集首条含该 hub_file 字段样本的登记索引试匹配 pattern
+def match_preview(body: HubMatchPreviewRequest, request: Request, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    """取数据集首条含该 hub_file 字段样本的登记索引试匹配 pattern（W9：数据集归属校验）
 
     无样本数据时返回可展示的空态（matched_count=0、sample_data_index=None）。
     """
+    # W9：匹配预览的入口资源是数据集——先过团队归属，再取样本索引
+    ensure_dataset_access(db, request.state.user, body.dataset_id)
     try:
         return hub_match_preview(db, body.dataset_id, body.field_name, body.pattern)
     except HubRecordMissingError as e:
@@ -283,11 +297,11 @@ def upload_supplements(
     target_dir: Annotated[str, Form(description="散文件目标子目录（缺省包根；zip 按内部结构落盘不受影响）")] = "",
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    """向执行包人工补传文件（同名覆盖并返回覆盖明细；未登记/未解包 404）
+    """向执行包人工补传文件（同名覆盖并返回覆盖明细；未登记/未解包 404；W9：跨团队补传 403）
 
     同步端点：大文件流式落盘走 FastAPI 线程池，不阻塞事件循环。
     """
-    _require_unpacked_record(db, file_id)
+    _require_unpacked_record(db, file_id, request)
     file_items = [(f.filename or f"file_{i}", f.file) for i, f in enumerate(files)]
     try:
         return add_supplements(
@@ -305,10 +319,13 @@ def upload_supplements(
 @router.delete("/{file_id}/supplements", summary="删除人工补传文件（原始包文件只读）")
 def delete_supplement_endpoint(
     file_id: str,
+    request: Request,
     path: str = Query(..., description="补传文件相对路径"),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    """删除单个人工补传文件（索引与实体同步清理；原始执行包内容 400 拒绝）"""
+    """删除单个人工补传文件（索引与实体同步清理；原始执行包内容 400 拒绝；W9：归属校验）"""
+    # W9：补传区写操作先过团队归属（计划：补传区校验归属）
+    ensure_hub_file_access(db, request.state.user, file_id)
     try:
         return delete_supplement(db, file_id, path)
     except HubFileError as e:

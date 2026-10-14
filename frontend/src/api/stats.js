@@ -1,4 +1,4 @@
-import request from './index'
+import request from './index.js'
 
 export const statsApi = {
   getRecords(params) {

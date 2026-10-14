@@ -6,6 +6,9 @@ import sys
 import os
 import json
 
+import pytest
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 # 将项目根目录添加到 sys.path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

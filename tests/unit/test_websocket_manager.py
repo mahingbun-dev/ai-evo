@@ -9,6 +9,8 @@ from fastapi import WebSocket
 
 from app.api.websocket_manager import WebSocketManager
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 class TestWebSocketManager:
     """WebSocket Manager 测试类"""

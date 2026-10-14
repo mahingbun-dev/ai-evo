@@ -1,0 +1,10 @@
+{
+  "evaluation_type": "binary_classification",
+  "binary_metrics_config": [],
+  "binary_metrics_config_detail": {
+    "expected_label": {"source": "dataset_field", "source_config": {"field": "is_valid"}},
+    "predicted_label": {"source": "model_output", "source_config": {"field": "prediction"}},
+    "positive_value": "true",
+    "label_type": "boolean"
+  }
+}

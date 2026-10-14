@@ -15,6 +15,8 @@ from hubkit.proto.hubv1 import envelope_pb2
 
 from app.hub_plugin.plugin import AievoHubPlugin
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 def make_env(payload: dict, meta: dict | None = None) -> envelope_pb2.Envelope:
     env = hubkit.with_payload_json(None, payload)
@@ -403,3 +405,33 @@ def test_handle_task_get_without_result_key_no_injection():
     env = make_env({"task_id": "t1"}, {"hub.tool": "task_get", "hub.mas_token": "tok"})
     out = payload_of(plugin.handle(None, env))
     assert "result" not in out["data"]
+
+
+def test_handle_import_hub_files_script_id_passthrough():
+    """script_id（清洗脚本 id/名称）必须透传给导入端点。
+
+    平台据此逐包执行清洗脚本、把脚本产出行作为数据集行；不传时只登记执行包引用，
+    数据行停在 hub_file_id/hub_summary、清洗内容不展开。
+    """
+    fake = FakeClient(status=200, data={"id": "job-2", "status": "pending"})
+    plugin = make_plugin(fake)
+    env = make_env(
+        {"file_ids": ["f1"], "name": "ds", "script_id": "anc_hub_row_passthrough"},
+        {"hub.tool": "dataset_import_hub_files", "hub.mas_token": "tok"},
+    )
+    out = payload_of(plugin.handle(None, env))
+    assert out["success"] is True
+    assert fake.calls[0]["json_body"] == {
+        "file_ids": ["f1"],
+        "name": "ds",
+        "script_id": "anc_hub_row_passthrough",
+    }
+
+
+def test_manifest_declares_hub_import_script_id():
+    """工具 schema 必须声明 script_id，否则 MCP 客户端按契约传不了该参数。"""
+    from app.hub_plugin.manifest import TOOL_ROUTES
+
+    props = TOOL_ROUTES["dataset_import_hub_files"]["schema"]["properties"]
+    assert "script_id" in props
+    assert props["script_id"]["type"] == "string"

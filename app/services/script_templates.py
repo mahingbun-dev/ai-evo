@@ -17,14 +17,14 @@ SINGLE_MAIN_PY = '''"""评测前处理脚本（单文件模板）
                         （inline 值由平台写临时文件后传路径）
     params              任务编排传入的脚本参数 dict
     upstream            前序脚本的标准输出 {脚本名: result}
-    _run_dir            本次运行的产物目录（绝对路径）——
-                        输出文件请写到该目录，并把路径注册进 files
+    _run_dir            本次运行的工作区根（绝对路径）——输出文件统一写到
+                        该目录下的 outputs/，并把路径注册进 files
 
 标准输出（run 返回的 dict，经 stdout 最后一行 JSON 回传）：
     {
       "status": "ok" | "skip" | "fail",     # 执行结论
       "output": {...},                      # 结构化硬事实（供裁判/下游消费）
-      "files": {"文件名": "绝对路径"},        # 产物文件注册（写 _run_dir 下）
+      "files": {"文件名": "绝对路径"},        # 产物文件注册（写 _run_dir/outputs/ 下）
       "summary": "人类可读摘要",
       "finish_reason": "completed",
       "error": None,                        # status=fail 时给可读原因
@@ -50,8 +50,11 @@ def run(stdin: dict) -> dict:
     if upper:
         note = note.upper()
 
-    # 示例：输出文件写到 _run_dir 并注册进 files
-    out_file = run_dir / "result.json"
+    # 示例：文件产物统一写 {_run_dir}/outputs/（平台保证该目录存在，防御式再兜
+    # 一次底）并注册进 files，裁判与下游靠 files 发现产物
+    outputs_dir = run_dir / "outputs"
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+    out_file = outputs_dir / "result.json"
     out_file.write_text(json.dumps({"note": note}, ensure_ascii=False), encoding="utf-8")
 
     return {
@@ -72,10 +75,10 @@ SINGLE_README_MD = '''# 评测前处理脚本（single 模板）
 - 标准输入 `stdin` 键：`task_id` / `data_id` / `fields`（字段名 → 本地文件路径）/
   `inputs`（hub 执行包通道：配 path_pattern → `{root, files:[{path,rel_path,size,type}]}`；
   未配 → `{root, index_path}`）/
-  `params` / `upstream`（前序脚本输出）/ `_run_dir`（产物目录）
+  `params` / `upstream`（前序脚本输出）/ `_run_dir`（工作区根，产物写其下 `outputs/`）
 - 标准输出（run 返回值）：`{status: ok|skip|fail, output, files, summary,
   finish_reason, error}`
-- 产物文件写 `_run_dir` 下，并把绝对路径注册进 `files`
+- 产物文件写 `{_run_dir}/outputs/` 下，并把绝对路径注册进 `files`
 
 ## 运行时工作区目录结构（每条数据评完即清）
 
@@ -83,14 +86,15 @@ SINGLE_README_MD = '''# 评测前处理脚本（single 模板）
 stdin 传入，源码里禁止自行拼接）：
 
 ```
-uploads/script_runs/{task_id}/{data_id}/            ← 单条数据工作区（_run_dir，产物只写这里）
+uploads/script_runs/{task_id}/{data_id}/            ← 单条数据工作区（_run_dir）
 ├── scripts/{script_key}/                           ← 脚本包副本（从副本执行；cwd 为工作区直下 {script_id}/，stdout/stderr 落 cwd）
 ├── inputs/{字段名}.{ext}                            ← inline/local 字段副本（fields 值即此路径）
 ├── inputs/{字段名}/                                 ← hub 执行包整目录副本（inputs.root 即此目录）
 │   └── {execution_id}-attempt-1/                   ← zip 原始最外层，平台原样保留
 │       ├── execution-manifest.json
 │       └── reports/ logs/ ...
-└── inputs/{字段名}_index.json                       ← 未配 path_pattern 时的索引文件
+├── inputs/{字段名}_index.json                       ← 未配 path_pattern 时的索引文件
+└── outputs/                                        ← 脚本产物目录（文件产物只写这里，平台保证存在）
 ```
 
 要点：`inputs.root` 是解包根（attempt 目录的上一级），`rel_path` 一律带
@@ -173,7 +177,11 @@ def run(stdin: dict) -> dict:
     # 标准输出按 PreScriptOutput 声明构造（声明即使用，防止声明与实现漂移）
     output = PreScriptOutput(text=text, **stats).model_dump()
 
-    out_file = run_dir / "result.json"
+    # 文件产物统一写 {_run_dir}/outputs/（平台保证该目录存在，防御式再兜一次底）
+    # 并注册进 files，裁判与下游靠 files 发现产物
+    outputs_dir = run_dir / "outputs"
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+    out_file = outputs_dir / "result.json"
     out_file.write_text(json.dumps(output, ensure_ascii=False), encoding="utf-8")
 
     return {
@@ -225,7 +233,7 @@ FOLDER_README_MD = '''# 评测前处理脚本（folder 模板）
   未配 → `{root, index_path}`）/
   `params` / `upstream` / `_run_dir`（产物目录）
 - 标准输出：`{status: ok|skip|fail, output, files, summary, finish_reason, error}`
-- 产物文件写 `_run_dir` 下，并把绝对路径注册进 `files`
+- 产物文件写 `{_run_dir}/outputs/` 下，并把绝对路径注册进 `files`
 
 ## 运行时工作区目录结构（每条数据评完即清）
 

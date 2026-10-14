@@ -96,6 +96,14 @@ def main() -> int:
     message = f"消费 {len(fields_report)} 个输入字段共 {total} 个文件"
     if manifest_summary:
         message += f"；manifest 摘要 case_total={manifest_summary.get('case_total', 'N/A')}"
+
+    # 文件产物统一落盘 {_run_dir}/outputs/（路径三原则②；平台保证目录存在，
+    # ensure_outputs_dir 防御式兜底），落盘后在 files 键注册绝对路径——
+    # 裁判与下游靠 files 发现产物；本模板把摘要存为 manifest_summary.json 示范
+    summary_file = helpers.ensure_outputs_dir(payload.get("_run_dir") or ".") / "manifest_summary.json"
+    summary_file.write_text(json.dumps(outputs, ensure_ascii=False, indent=2), encoding="utf-8")
+    produced_files = {"manifest_summary.json": str(summary_file)}
+
     print(json.dumps({
         "status": "ok",
         "outputs": outputs,
@@ -103,7 +111,7 @@ def main() -> int:
         # 平台旧链路兼容字段：裁判与结果页读 output/summary
         "output": outputs,
         "summary": f"fields={len(fields_report)}, files={total}",
-        "files": {},
+        "files": produced_files,
         "finish_reason": "completed",
         "error": None,
     }, ensure_ascii=False))

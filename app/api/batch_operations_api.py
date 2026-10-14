@@ -1,7 +1,10 @@
 """
 批量操作API
+
+W9：批量端点逐任务做对象级归属校验（ensure_task_access）——跨团队任务
+不整单 403，而是逐项记入 details（status=failed），其余合法任务继续执行。
 """
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
 from typing import List
@@ -9,6 +12,7 @@ from pydantic import BaseModel, Field
 from datetime import datetime
 
 from app.db.session import get_db
+from app.services.access_control import ensure_task_access
 from app.services.evaluation_task_service import EvaluationTaskService
 from app.services.result_aggregator import ResultExporter
 
@@ -49,9 +53,10 @@ router = APIRouter(prefix="/evaluation/tasks", tags=["批量操作"])
 @router.post("/batch-run", response_model=BatchOperationResponse, summary="批量执行任务")
 def batch_run_tasks(
     body: BatchRunRequest,
+    request: Request,
     db: Session = Depends(get_db),
 ):
-    """批量执行多个评测任务"""
+    """批量执行多个评测任务（W9：逐任务归属校验，跨团队任务逐项失败）"""
     service = EvaluationTaskService(db)
 
     results = []
@@ -60,9 +65,11 @@ def batch_run_tasks(
 
     for task_id in body.task_ids:
         try:
-            task = service.get_task(task_id)
-            if not task:
-                results.append({"task_id": task_id, "status": "failed", "error": "任务不存在"})
+            try:
+                task = ensure_task_access(db, request.state.user, task_id)
+            except HTTPException as e:
+                # 404/403 均按逐项失败处理（不中断同批其余任务）
+                results.append({"task_id": task_id, "status": "failed", "error": e.detail})
                 failed_count += 1
                 continue
 
@@ -105,9 +112,10 @@ def batch_run_tasks(
 @router.post("/batch-delete", response_model=BatchOperationResponse, summary="批量删除任务")
 def batch_delete_tasks(
     body: BatchDeleteRequest,
+    request: Request,
     db: Session = Depends(get_db),
 ):
-    """批量删除多个评测任务"""
+    """批量删除多个评测任务（W9：逐任务归属校验，跨团队任务逐项失败）"""
     service = EvaluationTaskService(db)
 
     results = []
@@ -116,6 +124,13 @@ def batch_delete_tasks(
 
     for task_id in body.task_ids:
         try:
+            try:
+                ensure_task_access(db, request.state.user, task_id)
+            except HTTPException as e:
+                results.append({"task_id": task_id, "status": "failed", "error": e.detail})
+                failed_count += 1
+                continue
+
             success = service.delete_task(task_id)
             if success:
                 results.append({"task_id": task_id, "status": "success"})
@@ -139,9 +154,10 @@ def batch_delete_tasks(
 @router.post("/batch-stop", response_model=BatchOperationResponse, summary="批量停止任务")
 def batch_stop_tasks(
     body: BatchStopRequest,
+    request: Request,
     db: Session = Depends(get_db),
 ):
-    """批量停止多个正在执行的评测任务"""
+    """批量停止多个正在执行的评测任务（W9：逐任务归属校验，跨团队任务逐项失败）"""
     service = EvaluationTaskService(db)
 
     results = []
@@ -150,9 +166,10 @@ def batch_stop_tasks(
 
     for task_id in body.task_ids:
         try:
-            task = service.get_task(task_id)
-            if not task:
-                results.append({"task_id": task_id, "status": "failed", "error": "任务不存在"})
+            try:
+                task = ensure_task_access(db, request.state.user, task_id)
+            except HTTPException as e:
+                results.append({"task_id": task_id, "status": "failed", "error": e.detail})
                 failed_count += 1
                 continue
 
@@ -187,9 +204,10 @@ export_router = APIRouter(prefix="/evaluation/results", tags=["结果导出"])
 @export_router.post("/batch-export", summary="批量导出结果")
 def batch_export_results(
     body: BatchExportRequest,
+    request: Request,
     db: Session = Depends(get_db),
 ):
-    """批量导出多个任务的评测结果"""
+    """批量导出多个任务的评测结果（W9：逐任务归属校验，跨团队任务逐项失败）"""
     task_service = EvaluationTaskService(db)
 
     results = []
@@ -198,9 +216,10 @@ def batch_export_results(
 
     for task_id in body.task_ids:
         try:
-            task = task_service.get_task(task_id)
-            if not task:
-                results.append({"task_id": task_id, "status": "failed", "error": "任务不存在"})
+            try:
+                task = ensure_task_access(db, request.state.user, task_id)
+            except HTTPException as e:
+                results.append({"task_id": task_id, "status": "failed", "error": e.detail})
                 failed_count += 1
                 continue
 

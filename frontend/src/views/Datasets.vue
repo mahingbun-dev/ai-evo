@@ -59,7 +59,7 @@
     >
       <div
         v-loading="uploadLoading || importLoading || sessionPreviewLoading || sessionImportLoading || hubQueryLoading || hubImportLoading"
-        :element-loading-text="uploadLoading ? '文件上传中...' : (sessionPreviewLoading ? '会话解析中...' : (hubQueryLoading ? '远端文件查询中...' : (hubImportLoading ? '正在从 anc-hub 拉取并解析会话文件...' : ((importLoading || sessionImportLoading) ? '导入中...' : ''))))"
+        :element-loading-text="uploadLoading ? '文件上传中...' : (sessionPreviewLoading ? '会话解析中...' : (hubQueryLoading ? '远端文件查询中...' : (hubImportLoading ? '正在创建 anc-hub 导入任务...' : ((importLoading || sessionImportLoading) ? '导入中...' : ''))))"
       >
       <el-form :model="form" :rules="rules" ref="formRef" label-width="100px">
         <el-form-item label="数据集名称" prop="name">
@@ -189,9 +189,49 @@
                 @size-change="handleHubPageSizeChange"
                 style="margin-top: 8px; display: flex; justify-content: flex-end"
               />
-              <el-alert v-if="hubImportError" type="error" :closable="false" style="margin-top: 8px" :title="`anc-hub 会话导入失败：${hubImportError}`" />
+              <el-alert v-if="hubImportError" type="error" :closable="false" style="margin-top: 8px" :title="`anc-hub 导入失败：${hubImportError}`" />
+              <!-- 执行包导入 job 进度面板（W14：复活 F1 面板样式；WS 推送 + 轮询兜底） -->
+              <div v-if="hubJob" class="hub-job-panel">
+                <div class="hub-job-status-line">
+                  <el-icon v-if="hubJobRunning" class="is-loading"><Loading /></el-icon>
+                  <el-icon v-else-if="hubJob.status === 'completed'" class="hub-job-ok"><CircleCheck /></el-icon>
+                  <el-icon v-else-if="hubJob.status === 'failed'" class="hub-job-bad"><CircleClose /></el-icon>
+                  <span class="hub-job-count">
+                    导入任务 {{ hubJobShortId }}：成功 <span class="hub-job-ok">{{ hubJob.success_count || 0 }}</span> / 共 {{ hubJob.total_count || hubSelection.length }}
+                    <template v-if="hubJob.fail_count">，失败 <span class="hub-job-bad">{{ hubJob.fail_count }}</span></template>
+                    <template v-if="hubJob.status === 'pending'">（排队中…）</template>
+                  </span>
+                  <el-button
+                    v-if="hubJob.status === 'failed'"
+                    size="small"
+                    type="warning"
+                    :loading="hubJobRetrying"
+                    @click="retryHubJobFailed"
+                  >重试失败项</el-button>
+                </div>
+                <el-progress
+                  v-if="hubJob.total_count"
+                  :percentage="hubJobPercent"
+                  :status="hubJobProgressStatus"
+                  :stroke-width="8"
+                  style="margin-top: 6px"
+                />
+                <div v-if="hubJobFailEntries.length" class="hub-job-fails">
+                  <div v-for="[fid, msg] in hubJobFailEntries" :key="fid" class="hub-job-fail-item">
+                    <span class="hub-job-bad">{{ fid }}</span>：{{ msg }}
+                  </div>
+                </div>
+              </div>
+              <el-form-item label="清洗脚本" style="margin-top: 12px; margin-bottom: 0">
+                <el-select v-model="hubCleanScriptId" clearable filterable placeholder="不清洗（执行包原样入行）" style="width: 100%">
+                  <el-option v-for="s in hubCleanScripts" :key="s.id" :label="s.name" :value="s.id" />
+                </el-select>
+                <div style="color: #909399; font-size: 12px; margin-top: 4px">
+                  选择清洗脚本后，导入任务将逐包执行脚本并以脚本产出的行内容作为数据集数据（推荐使用脚本库中的 hub_exec_clean 清洗脚本套件）
+                </div>
+              </el-form-item>
               <div style="margin-top: 8px; color: #909399; font-size: 12px">
-                已勾选 {{ hubSelection.length }} 个文件；点击「拉取并导入」后平台将从 anc-hub 下载解包并解析其中的 jsonl 会话（每条会话自动记录原始 file_id，执行包自动登记供抽屉预览与评测引用）
+                已勾选 {{ hubSelection.length }} 个文件；「拉取并导入」创建异步导入任务：从 anc-hub 下载解包、逐包写入数据行（每包一行、自动登记原始 file_id 供抽屉预览与评测引用），进度在下方面板实时展示，失败项可一键重试
               </div>
             </div>
           </el-form-item>
@@ -342,7 +382,7 @@
     </el-dialog>
 
     <!-- 添加/编辑数据对话框 -->
-    <el-dialog v-model="dataFormVisible" :title="isDataEdit ? '编辑数据' : '添加数据'" width="700px" @close="handleDataFormClose">
+    <el-dialog v-model="dataFormVisible" :title="isDataEdit ? '编辑数据' : '添加数据'" width="1000px" @close="handleDataFormClose">
       <el-form :model="dataForm" label-width="100px">
         <!-- 统一动态字段渲染：所有字段（包括user_input和answer）都通过dataForm[field.name]绑定 -->
         <template v-for="field in dataFormFields.filter(f => !f.name.endsWith('_is_media'))" :key="field.name">
@@ -400,10 +440,11 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { datasetApi, ossApi, hubApi } from '@/api'
-import { Document, Download, Upload, CircleCheck, CircleClose, Warning, Box } from '@element-plus/icons-vue'
+import { datasetApi, ossApi, hubApi, preJudgeScriptApi, hubImportApi } from '@/api'
+import { useTaskWebSocket } from '@/composables/useTaskWebSocket'
+import { Document, Download, Upload, CircleCheck, CircleClose, Warning, Box, Loading } from '@element-plus/icons-vue'
 import { formatTime } from '@/utils/time'
 import HubFileDrawer from '@/components/HubFileDrawer.vue'
 
@@ -466,9 +507,21 @@ const hubImportError = ref('')  // 拉取导入错误
 const hubFiles = ref([])        // 规范化后的远端文件列表
 const hubTotal = ref(0)
 const hubQuery = ref({ name_like: '', uploader: '', dateRange: null })  // dateRange: ['YYYY-MM-DD', 'YYYY-MM-DD']
+// 导入形态（W14 起固定为异步执行包 job 链路）：每包一行，可选挂载脚本库清洗脚本
+// ——脚本产出的行内容即数据集数据；原「会话数据」同步 jsonl 解析链路已废弃
+const hubCleanScripts = ref([])   // 可选清洗脚本（脚本库 exec_type=script 且启用）
+const hubCleanScriptId = ref('')  // 选中的清洗脚本 ID（空=不清洗）
 const hubPage = ref(1)
 const hubPageSize = ref(10)
 const hubSelection = ref([])    // 勾选行（跨页保留）
+
+// ==================== 执行包导入 job 进度（W14：WS 推送 + 轮询兜底） ====================
+const hubJob = ref(null)            // 当前关注的导入 job（进度面板数据源，GET/WS 共用形状）
+const hubJobRetrying = ref(false)   // 失败项重试进行中
+let hubJobWatchStartedAt = 0        // 本次关注起算时间（兜底轮询超时用）
+let hubJobPollTimer = null          // WS 不可用时的轮询兜底定时器
+const HUB_JOB_FALLBACK_POLL_MS = 3000          // 兜底轮询间隔
+const HUB_JOB_WATCH_TIMEOUT_MS = 15 * 60 * 1000 // 关注时长上限（job 仍在后台执行，仅停止关注）
 
 // ==================== 执行包「文件」抽屉（F2/F3） ====================
 const hubDrawerVisible = ref(false)
@@ -749,6 +802,9 @@ const loadDatasets = async () => {
 const openDialog = (row = null) => {
   // 清空上传组件的文件列表
   uploadRef.value?.clearFiles()
+
+  // 重置上一次导入 job 的进度面板与关注态（新导入从干净面板开始）
+  resetHubJobWatch()
 
   // 重置预览数据
   previewData.value = []
@@ -1163,6 +1219,7 @@ const handleImportMethodChange = (val) => {
     clearSessionImportState()
     clearHubImportState()
     loadHubFiles()
+    loadHubCleanScripts()
   } else {
     // 切到 Excel 模式：清空会话与 anc-hub 导入状态
     clearSessionImportState()
@@ -1351,6 +1408,8 @@ const handleHubSelectionChange = (rows) => {
 }
 
 // 清空 anc-hub 导入状态（弹窗关闭 / 切换导入方式时调用）
+// 注意：只清浏览/勾选/表单态——进行中的导入 job 关注不中断（面板数据源 hubJob
+// 保留，关闭弹窗后完成/失败仍会提示并刷新列表），新弹窗打开时由 showDialog 重置
 const clearHubImportState = () => {
   hubFiles.value = []
   hubTotal.value = 0
@@ -1358,11 +1417,34 @@ const clearHubImportState = () => {
   hubSelection.value = []
   hubQueryError.value = ''
   hubImportError.value = ''
+  hubCleanScriptId.value = ''
   hubQuery.value = { name_like: '', uploader: '', dateRange: null }
   hubTableRef.value?.clearSelection?.()
 }
 
-// anc-hub 导入核心：按勾选 file_id 拉取解析并落库（成功后关闭弹窗并刷新列表）
+// 重置导入 job 关注态（打开新弹窗 / 卸载时调用）
+const resetHubJobWatch = () => {
+  stopHubJobWatch()
+  hubJob.value = null
+  hubJobRetrying.value = false
+}
+
+// 加载可选清洗脚本（脚本库 exec_type=script 且启用），执行包导入形态的下拉数据源
+const loadHubCleanScripts = async () => {
+  try {
+    const res = await preJudgeScriptApi.list({ page: 1, page_size: 200 })
+    const items = res?.items || res?.scripts || res || []
+    hubCleanScripts.value = (Array.isArray(items) ? items : [])
+      .filter(s => (s.exec_type || 'script') === 'script' && s.is_active !== false)
+  } catch (e) {
+    // 脚本列表拉取失败不阻断导入：下拉置空，用户仍可原样导入
+    hubCleanScripts.value = []
+  }
+}
+
+// anc-hub 导入核心（W14）：创建异步导入 job 后交给 WS/兜底轮询推进，
+// 弹窗不再被长任务阻塞；原「会话数据」同步链路（importSessionsFromHub，
+// 10 分钟超时）已废弃，统一走本链路
 const doHubImport = async () => {
   hubImportLoading.value = true
   hubImportError.value = ''
@@ -1373,20 +1455,167 @@ const doHubImport = async () => {
       description: form.value.description || ''
     }
     if (isEdit.value) {
-      // 编辑态追加模式：传入真实数据集 ID（与会话导入确认一致）
+      // 编辑态追加模式：传入真实数据集 ID
       payload.real_dataset_id = form.value.id
     }
-    const res = await datasetApi.importSessionsFromHub(payload)
-    ElMessage.success(res?.message || '导入成功')
-    dialogVisible.value = false
-    loadDatasets()
+    if (hubCleanScriptId.value) {
+      payload.script_id = hubCleanScriptId.value
+    }
+    const job = await hubImportApi.createJob(payload)
+    const jobId = job?.id
+    if (!jobId) throw new Error('创建导入任务失败：未返回任务 ID')
+
+    // 进入进度面板 + 订阅推送（WS 失联自动降级兜底轮询）
+    stopHubJobWatch()
+    hubJob.value = { fail_detail: {}, ...job }
+    hubJobWatchStartedAt = Date.now()
+    startHubJobWebSocket(jobId)
+    ElMessage.success(`导入任务已创建（共 ${job.total_count ?? hubSelection.value.length} 个执行包），进度见下方面板`)
   } catch (e) {
-    hubImportError.value = e.message || 'anc-hub 会话导入失败'
+    hubImportError.value = e.message || '执行包导入失败'
     ElMessage.error(hubImportError.value)
   } finally {
     hubImportLoading.value = false
   }
 }
+
+// 合并一次进度（WS 推送与兜底轮询共用）：status/计数/进度全覆盖
+const applyHubJobProgress = (patch) => {
+  if (!hubJob.value || !patch) return
+  hubJob.value = { ...hubJob.value, ...patch }
+}
+
+// job 到达终端状态：停关注、提示、刷新列表；失败时保留面板供重试
+const finalizeHubJobWatch = async (status) => {
+  stopHubJobWatch()
+  const job = hubJob.value
+  if (!job) return
+  if (status === 'completed') {
+    ElMessage.success(`执行包导入完成（成功 ${job.success_count ?? 0}/${job.total_count ?? 0}）`)
+  } else if (status === 'failed') {
+    // WS 推送不带 fail_detail：拉一次完整 job 补齐失败明细
+    try {
+      const info = await hubImportApi.getJob(job.id)
+      if (info) hubJob.value = { ...hubJob.value, ...info }
+    } catch (e) {
+      console.warn('拉取导入失败明细失败:', e)
+    }
+    ElMessage.error(`执行包导入存在失败项（成功 ${hubJob.value.success_count ?? 0}/${hubJob.value.total_count ?? 0}），可在面板中重试失败项`)
+  }
+  loadDatasets()
+}
+
+// WS 推送回调：仅处理 hub_import_progress 消息，推进面板；终端状态收敛到 finalize
+const handleHubJobWsMessage = (channelId, data) => {
+  if (!data || data.type !== 'hub_import_progress') return
+  applyHubJobProgress({
+    status: data.status,
+    success_count: data.success_count,
+    fail_count: data.fail_count,
+    total_count: data.total
+  })
+  if (data.status === 'completed' || data.status === 'failed') {
+    finalizeHubJobWatch(data.status)
+  }
+}
+
+// WS 通道（/ws/task/{job_id}，频道 task_status:{job_id}）；重连 3 次失败 → 兜底轮询
+const { startWebSocket, stopWebSocket } = useTaskWebSocket({
+  onStatusUpdate: handleHubJobWsMessage,
+  onFallback: (jobId) => {
+    console.warn(`导入任务 WS 不可用，降级轮询: ${jobId}`)
+    startHubJobFallbackPolling(jobId)
+  }
+})
+
+const startHubJobWebSocket = (jobId) => {
+  stopHubJobFallbackPolling()
+  startWebSocket(jobId)
+}
+
+// 兜底轮询（WS 不可用/被 4404 拒时启用；轻量 GET，3s 一次，15 分钟上限）
+const startHubJobFallbackPolling = (jobId) => {
+  stopHubJobFallbackPolling()
+  hubJobPollTimer = setInterval(async () => {
+    if (Date.now() - hubJobWatchStartedAt > HUB_JOB_WATCH_TIMEOUT_MS) {
+      stopHubJobWatch()
+      ElMessage.warning(`导入任务 ${jobId} 长时间未完成，已停止关注；任务仍在后台执行，可稍后刷新数据集列表查看`)
+      return
+    }
+    try {
+      const info = await hubImportApi.getJob(jobId)
+      applyHubJobProgress({
+        status: info?.status,
+        success_count: info?.success_count,
+        fail_count: info?.fail_count,
+        total_count: info?.total_count,
+        fail_detail: info?.fail_detail
+      })
+      if (info?.status === 'completed' || info?.status === 'failed') {
+        finalizeHubJobWatch(info.status)
+      }
+    } catch (e) {
+      // 单次查询失败忽略，下个周期重试
+      console.warn('导入任务轮询失败:', e)
+    }
+  }, HUB_JOB_FALLBACK_POLL_MS)
+}
+
+const stopHubJobFallbackPolling = () => {
+  if (hubJobPollTimer) {
+    clearInterval(hubJobPollTimer)
+    hubJobPollTimer = null
+  }
+}
+
+const stopHubJobWatch = () => {
+  if (hubJob.value?.id) {
+    stopWebSocket(hubJob.value.id)
+  }
+  stopHubJobFallbackPolling()
+}
+
+// 失败项重试：只重跑失败包（已成功包幂等跳过），重挂 WS 关注
+const retryHubJobFailed = async () => {
+  const jobId = hubJob.value?.id
+  if (!jobId) return
+  hubJobRetrying.value = true
+  try {
+    const job = await hubImportApi.retryJob(jobId)
+    hubJob.value = { ...(hubJob.value || {}), ...(job || {}) }
+    hubJobWatchStartedAt = Date.now()
+    startHubJobWebSocket(jobId)
+    ElMessage.success('已提交失败项重试')
+  } catch (e) {
+    ElMessage.error(e.message || '重试失败项失败')
+  } finally {
+    hubJobRetrying.value = false
+  }
+}
+
+// 组件卸载：停 WS 与兜底轮询（useTaskWebSocket 自身也会清理）
+onUnmounted(() => {
+  stopHubJobWatch()
+})
+
+// 进度面板派生态
+const hubJobRunning = computed(() => ['pending', 'running'].includes(hubJob.value?.status))
+const hubJobShortId = computed(() => {
+  const id = hubJob.value?.id || ''
+  return id.length > 14 ? `${id.slice(0, 14)}…` : id
+})
+const hubJobPercent = computed(() => {
+  const job = hubJob.value
+  if (!job?.total_count) return 0
+  const done = (job.success_count || 0) + (job.fail_count || 0)
+  return Math.min(100, Math.round((done * 100) / job.total_count))
+})
+const hubJobProgressStatus = computed(() => {
+  if (hubJob.value?.status === 'completed') return 'success'
+  if (hubJob.value?.status === 'failed') return 'exception'
+  return undefined
+})
+const hubJobFailEntries = computed(() => Object.entries(hubJob.value?.fail_detail || {}))
 
 // anc-hub 模式：确认导入（编辑态先保存基本信息，再提交导入）
 const confirmHubImportAction = async () => {
@@ -2087,9 +2316,14 @@ onMounted(() => {
   margin-bottom: 8px;
 }
 
-/* 执行包导入 job 进度面板（F1） */
+/* 执行包导入 job 进度面板（F1，W14 复活：WS 推送 + 轮询兜底共用此面板） */
 .hub-job-panel {
   width: 100%;
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px solid #E5E7EB;
+  border-radius: 6px;
+  background: #FAFAFA;
 }
 
 .hub-job-status-line {
@@ -2105,6 +2339,20 @@ onMounted(() => {
 
 .hub-job-ok { color: #67c23a; }
 .hub-job-bad { color: #f56c6c; }
+
+/* 失败明细列表（W14）：失败项可逐条定位，配合「重试失败项」按钮 */
+.hub-job-fails {
+  margin-top: 6px;
+  max-height: 96px;
+  overflow-y: auto;
+}
+
+.hub-job-fail-item {
+  color: #909399;
+  font-size: 12px;
+  line-height: 1.8;
+  word-break: break-all;
+}
 
 /* hub_file 字段单元格：图标 + 截断 file_id + 「文件」按钮（F2） */
 .hub-file-cell {

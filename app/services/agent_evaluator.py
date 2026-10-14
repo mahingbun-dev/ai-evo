@@ -212,11 +212,13 @@ class AgentEvaluator:
         # 处理 task_completion 结果
         if isinstance(tc_result, Exception):
             logger.error("任务完成度评测失败: %s", tc_result)
+            # W16：适配失败标 metric_unavailable，不再伪装 score=0
             results["task_completion"] = TransformedMetricResult(
                 metric_key="task_completion",
                 metric_name="任务完成度",
-                score=0.0,
+                score=None,
                 success=False,
+                metric_unavailable=True,
                 error=str(tc_result),
             )
         else:
@@ -228,8 +230,9 @@ class AgentEvaluator:
             results["tool_correctness"] = TransformedMetricResult(
                 metric_key="tool_correctness",
                 metric_name="工具正确性",
-                score=0.0,
+                score=None,
                 success=False,
+                metric_unavailable=True,
                 error=str(tool_result),
             )
         else:
@@ -241,8 +244,9 @@ class AgentEvaluator:
             results["step_efficiency"] = TransformedMetricResult(
                 metric_key="step_efficiency",
                 metric_name="步骤效率",
-                score=0.0,
+                score=None,
                 success=False,
+                metric_unavailable=True,
                 error=str(step_result),
             )
         else:
@@ -306,12 +310,14 @@ class AgentEvaluator:
         for i, result in enumerate(results):
             if isinstance(result, Exception):
                 logger.error("批量任务完成度评测任务 %d 异常: %s", i, result)
+                # W16：适配失败标 metric_unavailable，不再伪装 score=0
                 final_results.append(
                     TransformedMetricResult(
                         metric_key="task_completion",
                         metric_name="任务完成度",
-                        score=0.0,
+                        score=None,
                         success=False,
+                        metric_unavailable=True,
                         error=str(result),
                     )
                 )

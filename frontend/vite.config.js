@@ -20,6 +20,13 @@ export default defineConfig({
         target: process.env.VITE_PROXY_TARGET || 'http://localhost:8100',
         changeOrigin: true,
         ws: true
+      },
+      '/ws': {
+        // 任务状态/导入进度 WebSocket（/ws/task/{id}）；dev 下经 vite 代理到后端，
+        // 生产由网关路由，不受此配置影响
+        target: process.env.VITE_PROXY_TARGET || 'http://localhost:8100',
+        changeOrigin: true,
+        ws: true
       }
     }
   }

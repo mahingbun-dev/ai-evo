@@ -17,6 +17,8 @@ from app.services.reference_mark_resolver import (
     resolve_task_ref_overrides,
 )
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 def _make_ctx():
     """构造标准解析上下文：1 个目标 + 2 个变量"""

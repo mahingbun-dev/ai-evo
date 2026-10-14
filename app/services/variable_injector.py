@@ -13,6 +13,7 @@ def resolve_script_output_value(
     config: Dict[str, Any],
     var_name: str,
     allow_top_level_key: bool = True,
+    missing_out: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """从 pre_judge_runner 的脚本输出中按 {script, key} 取变量值（设计文档 §三 输出消费三通道）
 
@@ -24,11 +25,25 @@ def resolve_script_output_value(
     key 缺省时整体取该脚本的 output（整体取，见设计文档 §三）。
     缺值置空并记录警告，不阻断裁判评测。
 
+    W12-3：missing_out 非 None 时，每个置空分支向其追加置空明细
+    {var, script, output_key, reason}，供执行链路把「脚本输出缺失且被
+    evaluation_targets/裁判变量引用」的行显式标记 pre_script_failed
+    （跳过裁判、不进均分），替代静默置空。
+
     Returns:
         变量值（dict/list 序列化为 JSON 字符串，bool 转小写，None 置空）
     """
     import logging
     logger = logging.getLogger(__name__)
+
+    def _note_missing(reason: str, script: Optional[str], output_key: Optional[str]) -> None:
+        if missing_out is not None:
+            missing_out.append({
+                "var": var_name,
+                "script": script,
+                "output_key": output_key,
+                "reason": reason,
+            })
 
     source_config = config.get("source_config") or {}
     script_from_source = source_config.get("script")
@@ -42,10 +57,12 @@ def resolve_script_output_value(
 
     if not script_name:
         logger.warning(f"[script_output] 变量 {var_name} 未配置 script（输出键名），置空")
+        _note_missing("script_not_configured", None, output_key)
         return ""
     script_output = (script_outputs or {}).get(script_name)
     if script_output is None:
         logger.warning(f"[script_output] 变量 {var_name} 引用的脚本输出 {script_name} 不存在（脚本失败或未编排），置空")
+        _note_missing("script_output_missing", script_name, output_key)
         return ""
     if output_key in (None, ""):
         value = script_output  # 整体取
@@ -53,6 +70,7 @@ def resolve_script_output_value(
         value = script_output[output_key]
     else:
         logger.warning(f"[script_output] 脚本输出 {script_name} 缺少键 {output_key}，变量 {var_name} 置空")
+        _note_missing("output_key_missing", script_name, output_key)
         return ""
 
     if isinstance(value, (dict, list)):
@@ -99,6 +117,10 @@ class VariableInjector:
         self.chain_results = chain_results or []
         self.all_variables = all_variables or {}
         self.script_outputs = script_outputs or {}
+        # W12-3：build_judge_payload 解析 script_output 变量时被置空的明细
+        # （resolve_script_output_value 的 missing_out 收集），供执行链路
+        # 判定「脚本输出缺失且被裁判变量引用」→ 行级 pre_script_failed
+        self.script_output_missing: List[Dict[str, Any]] = []
 
         # V2 字段映射配置（支持自由数据集字段）
         self.input_field = getattr(task, 'input_field', 'user_input') or 'user_input'
@@ -697,6 +719,7 @@ class VariableInjector:
                     elif source == "script_output":
                         judge_payload[var_name] = resolve_script_output_value(
                             self.script_outputs, config, var_name,
+                            missing_out=self.script_output_missing,
                         )
                     else:
                         # 使用 resolver 解析其他来源的变量
@@ -723,6 +746,7 @@ class VariableInjector:
                     elif source == "script_output":
                         judge_payload[var_key] = resolve_script_output_value(
                             self.script_outputs, item, var_key, allow_top_level_key=False,
+                            missing_out=self.script_output_missing,
                         )
                     else:
                         # 使用 resolver 解析其他来源的变量

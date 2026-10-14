@@ -33,6 +33,8 @@ from app.services.pre_judge_script_service import (
     PreJudgeScriptService,
 )
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 # ---------------- 工具 ----------------
 
@@ -215,7 +217,7 @@ class FakeResult:
 
 
 class FakeSession:
-    """最小 DB 会话替身：按 SQL 文本回配行；error_on 命中时抛异常"""
+    """最小 DB 连接替身：按 SQL 文本回配行；error_on 命中时抛异常"""
 
     def __init__(self, rows_by_sql=None, error_on=None):
         self.executed: list = []
@@ -234,6 +236,20 @@ class FakeSession:
         if self._error_on and self._error_on in sql:
             raise RuntimeError("db boom")
         return FakeResult(self._rows_by_sql.get(sql, []))
+
+
+class FakeEngine:
+    """engine 替身：connect() 返回连接替身（FakeSession 同接口）"""
+
+    def __init__(self, conn):
+        self._conn = conn
+        self.disposed = False
+
+    def connect(self):
+        return self._conn
+
+    def dispose(self):
+        self.disposed = True
 
 
 class TestValidateReadonlySql:
@@ -270,12 +286,14 @@ class TestDbAssertRun:
         return _write(tmp_path, "assertions.json", json.dumps({"assertions": assertions}, ensure_ascii=False))
 
     def _stdin(self, tmp_path, assertions, params=None):
+        # W1-3：只读 DSN 由平台经 stdin 注入（db_dsn），脚本自建 engine
         return {"fields": {"assertions": self._assertions_file(tmp_path, assertions)},
-                "params": params or {}}
+                "db_dsn": "sqlite:///:memory:", "params": params or {}}
 
     def _patched(self, rows_by_sql=None, error_on=None):
         session = FakeSession(rows_by_sql=rows_by_sql, error_on=error_on)
-        return session, patch.object(db_assert, "SessionLocal", lambda: session)
+        engine = FakeEngine(session)
+        return session, patch.object(db_assert, "_create_engine", lambda dsn: engine)
 
     def test_row_count_assert(self, tmp_path):
         sql = "SELECT id FROM orders WHERE status = 'failed'"
@@ -381,6 +399,14 @@ class TestDbAssertRun:
         out3 = db_assert_run({"fields": {"assertions": no_sql}, "params": {}})
         assert out3["status"] == "fail" and "缺少 sql" in out3["error"]
 
+    def test_missing_db_dsn_fails_clearly(self, tmp_path):
+        """W1-3：断言清单合法但未注入 db_dsn（只读账号未配置）→ 明确报错，不回退平台库"""
+        assertions = self._assertions_file(tmp_path, [
+            {"name": "行数", "sql": "SELECT 1", "expected": {"row_count": 1}}])
+        out = db_assert_run({"fields": {"assertions": assertions}, "params": {}})
+        assert out["status"] == "fail"
+        assert "db_dsn" in out["error"] and "DB_ASSERT_READONLY_DSN" in out["error"]
+
     def test_registered_in_defs(self):
         assert "db_assert" in BUILTIN_SCRIPT_DEFS
         assert BUILTIN_SCRIPT_DEFS["db_assert"]["exec_type"] == "script"
@@ -388,10 +414,15 @@ class TestDbAssertRun:
 
 class TestDbAssertViaPipeline:
     def test_inline_assertions_via_runner_subprocess(self, tmp_path, monkeypatch):
-        """集成（真实子进程）：inline 断言 JSON 落地为本地路径后由 db_assert 消费；
-        PYTHONPATH 注入项目根使子进程可 `from app.db.session import SessionLocal`，
-        DATABASE_URL 指向 sqlite 临时库验证平台侧 DB 通道端到端可用"""
+        """集成（真实子进程）：inline 断言 JSON 落地为本地路径后由 db_assert 消费。
+
+        W1-3：子进程环境变量白名单（无 DATABASE_URL），只读 DSN 由平台经
+        stdin.db_dsn 注入（Settings.DB_ASSERT_READONLY_DSN → sqlite 临时库），
+        db_assert 自建 engine 执行——端到端验证 DSN 定向注入链路可用。
+        """
         import sqlite3
+        from types import SimpleNamespace as _NS
+
         from sqlalchemy import create_engine
         from sqlalchemy.orm import sessionmaker
         from sqlalchemy.pool import StaticPool
@@ -404,14 +435,15 @@ class TestDbAssertViaPipeline:
         monkeypatch.setattr(script_service, "SCRIPT_UPLOAD_BASE", upload_base)
         monkeypatch.setattr(pre_judge_runner, "SCRIPT_RUN_BASE", tmp_path / "script_runs")
 
-        # 子进程的 SessionLocal：sqlite 临时库（真实环境变量优先于 .env）
+        # 断言目标库：sqlite 临时文件库（子进程经 stdin.db_dsn 自建 engine 访问）
         db_file = tmp_path / "assert_db.sqlite"
         conn = sqlite3.connect(db_file)
         conn.execute("CREATE TABLE t (id INTEGER, ok INTEGER)")
         conn.execute("INSERT INTO t VALUES (7, 0)")
         conn.commit()
         conn.close()
-        monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_file}")
+        monkeypatch.setattr(pre_judge_runner, "get_settings",
+                            lambda: _NS(DB_ASSERT_READONLY_DSN=f"sqlite:///{db_file}"))
 
         # 主进程侧 runner.SessionLocal：内存库放迁移后的脚本记录
         engine = create_engine("sqlite:///:memory:", poolclass=StaticPool,

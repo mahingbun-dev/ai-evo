@@ -20,6 +20,8 @@ from app.services.harness_adapter import (
     run_sync_with_timeout,
 )
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 class FakeAdapter(HarnessAdapter):
     """测试用假适配器：按脚本依次返回 (原始回复, finish_reason)"""

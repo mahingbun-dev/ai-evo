@@ -9,9 +9,10 @@
 import psycopg2
 from psycopg2 import sql
 from psycopg2.extras import Json
-from psycopg2.extensions import register_adapter
+from psycopg2.extensions import register_adapter, parse_dsn
 from typing import Set, List, Dict, Any
 import logging
+import os
 
 # 注册 JSON/JSONB 适配器，避免 psycopg2 对 dict/list 的警告
 register_adapter(dict, Json)
@@ -24,22 +25,28 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# 数据库连接配置
-REMOTE_DB_CONFIG = {
-    "host": "db.example.com",
-    "port": 5432,
-    "database": "ai_evo",
-    "user": "db_user",
-    "password": "password"
-}
 
-LOCAL_DB_CONFIG = {
-    "host": "127.0.0.1",
-    "port": 5432,
-    "database": "ai_evo",
-    "user": "db_user",
-    "password": "password"
-}
+def _db_config_from_env(var_name: str) -> Dict[str, str]:
+    """从环境变量解析 PostgreSQL 连接配置（W6-3：禁止在代码中硬编码口令）。
+
+    接受标准连接串，如 postgresql://user:password@host:5432/dbname
+    缺失时 fail-fast 退出并提示注入方式。
+    """
+    dsn = os.environ.get(var_name, "").strip()
+    if not dsn:
+        raise SystemExit(
+            f"缺少环境变量 {var_name}：请以 PostgreSQL 连接串注入后再运行本脚本，"
+            f"例如 {var_name}='postgresql://<user>:<password>@<host>:5432/<database>'"
+        )
+    try:
+        return parse_dsn(dsn)
+    except Exception as e:
+        raise SystemExit(f"环境变量 {var_name} 不是合法的 PostgreSQL 连接串: {e}")
+
+
+# 数据库连接配置（远程=数据源，本地=被覆盖方；均从环境变量注入）
+REMOTE_DB_CONFIG = _db_config_from_env("REMOTE_DATABASE_URL")
+LOCAL_DB_CONFIG = _db_config_from_env("LOCAL_DATABASE_URL")
 
 # 需要排除的表名模式（alembic 相关）
 EXCLUDED_PATTERNS = ["alembic", "pg_toast", "pg_catalog"]

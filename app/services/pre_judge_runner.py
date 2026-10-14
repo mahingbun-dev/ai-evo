@@ -10,7 +10,9 @@ task.pre_scripts 旧配置。支持 exec_type：
   解释器用项目 .venv python（环境变量 PRE_JUDGE_SCRIPT_PYTHON 可覆盖），
   统一经 app/services/pre_judge_entry.py wrapper 调起（run(stdin) 函数式 /
   __main__ 传统式自动适配），PYTHONPATH 注入项目根（支持
-  `from app.db.session import SessionLocal` 等平台侧 import），
+  `from app.db.session import SessionLocal` 等平台侧 import；W15 起 local
+  模式专用——SCRIPT_EXEC_MODE=container 时改走 docker run --rm 容器内
+  隔离执行，不注入 PYTHONPATH，脚本无法 import 平台代码），
   cwd 隔离到 uploads/script_runs/{task_id}/{data_id}/{script_id}/，
   标准输入 JSON 走 stdin，取标准输出最后一行 JSON 作为脚本标准输出，
   超时（timeout_seconds）kill，标准输出读取有上限截断
@@ -56,16 +58,20 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from app.core.config import get_settings
 from app.db.session import SessionLocal
 from app.models.pre_judge_models import PreJudgeScript
 from app.services import pre_judge_script_service
 from app.utils.path_safety import ensure_within
+from app.services import script_container
 from app.services.hub_file_service import (
     HubFileError,
     build_file_index,
@@ -75,7 +81,6 @@ from app.services.pre_judge_script_service import (
     EXTENSION_POINT_PRE_JUDGE,
     EXTENSION_POINT_RESULT,
     scan_script_dir_risks,
-    scan_script_risks,
 )
 from app.scripts_builtin import result_observers as _result_observers
 
@@ -100,6 +105,63 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_STDOUT_LIMIT = 1024 * 1024
 # 错误诊断用 stderr 读取上限（字节）
 SCRIPT_STDERR_LIMIT = 4 * 1024
+# W10-6：stdin 写入独立线程的超时（秒）。脚本不消费 stdin 且 payload 超过管道
+# 缓冲区（Linux 默认 64KB）时，proc.stdin.write 会永久阻塞主线程——写线程 +
+# join 超时保证执行器在有限时间内返回（超时即终止进程组）。
+SCRIPT_STDIN_WRITE_TIMEOUT = 10.0
+# W10-6：stdin payload 大小上限（字节）。合法 stdin 注入的是工作区文件路径与
+# 参数，超过 8MB 的 payload 属异常输入——超限直接判 fail，不发起子进程。
+SCRIPT_STDIN_PAYLOAD_LIMIT = 8 * 1024 * 1024
+
+# ---------------- 脚本子进程环境白名单（W1-3） ----------------
+
+# 只透传脚本运行必需的基础环境变量；平台敏感配置（DATABASE_URL / REDIS_URL /
+# SSO / LANGFUSE 密钥等）一律不可见——子进程不再继承 os.environ 全量拷贝。
+# 冒烟（run_smoke_test）与 debug 试跑同口径（统一走 build_script_env）。
+SCRIPT_ENV_WHITELIST = {
+    "PATH", "HOME", "LANG", "LC_ALL", "PYTHONIOENCODING",
+    "TMPDIR", "OPENBLAS_CORETYPE", "MKL_DEBUG_CPU_TYPE",
+    "NO_PROXY", "http_proxy", "https_proxy",
+}
+
+# 内置 db_assert 脚本记录 id（W1-3：只读 DSN 仅注入该记录，见 _inject_builtin_db_dsn）
+_DB_ASSERT_BUILTIN_ID = "pjs_builtin_db_assert"
+
+
+def build_script_env() -> Dict[str, str]:
+    """构造脚本子进程环境：白名单变量 + PYTHONPATH 注入项目根
+
+    PYTHONPATH 注入 M1 保留（模板脚本依赖平台 import 面，如
+    `from app.db.session import ...`），W15 容器化隔离时移除。
+    """
+    env = {k: v for k in SCRIPT_ENV_WHITELIST if (v := os.environ.get(k))}
+    env["PYTHONPATH"] = str(PROJECT_ROOT)
+    return env
+
+
+def _builtin_db_dsn() -> Optional[str]:
+    """内置 db_assert 的只读连接串（Settings.DB_ASSERT_READONLY_DSN，依赖 D-5）
+
+    未配置返回 None（db_assert 将明确报「未配置只读连接」失败，不回退平台库）。
+    """
+    return str(get_settings().DB_ASSERT_READONLY_DSN or "").strip() or None
+
+
+def _inject_builtin_db_dsn(script: Dict[str, Any], stdin: Dict[str, Any]) -> Dict[str, Any]:
+    """编排内置 db_assert 时注入只读 DSN（W1-3，仅对 is_builtin 脚本记录生效）
+
+    - 身份判定用记录 id（pjs_builtin_db_assert）：用户无法创建该前缀的记录，
+      同名自建脚本（builtin 记录被删后用户占用该名）不注入；
+    - DSN 只进该子进程的 stdin payload，不落日志、不落盘、不进环境变量；
+    - 未配置时注入空缺，由脚本侧明确报错（D-5 只读账号未到位期间临时禁用语义）。
+    """
+    script_id = str(script.get("script_id") or script.get("id") or "")
+    if script_id != _DB_ASSERT_BUILTIN_ID:
+        return stdin
+    dsn = _builtin_db_dsn()
+    if not dsn:
+        return stdin
+    return {**stdin, "db_dsn": dsn}
 
 _OUTPUT_KEYS = ("status", "output", "files", "summary", "finish_reason", "error")
 
@@ -110,10 +172,12 @@ __all__ = [
     "PROJECT_ROOT",
     "RESULT_OBSERVER_REGISTRY",
     "PreScriptInputError",
+    "SCRIPT_ENV_WHITELIST",
     "SCRIPT_PYTHON",
     "SCRIPT_RUN_BASE",
     "SCRIPT_STDOUT_LIMIT",
     "build_run_dir",
+    "build_script_env",
     "build_script_run_dir",
     "cleanup_item_run_files",
     "cleanup_script_run_files",
@@ -256,14 +320,22 @@ def _observer_entry(
     }
 
 
+# 工作区内脚本产物目录名（_run_dir/outputs/）：脚本输出的文件产物统一写这里，
+# 平台组装工作区时保证该目录存在；脚手架模板与在线模板的开发规范同口径
+OUTPUTS_DIR_NAME = "outputs"
+
+
 def build_run_dir(task_id: str, data_id: str) -> Path:
     """创建并返回产物目录 uploads/script_runs/{task_id}/{data_id}/
 
     一律返回绝对路径：该值会以 stdin._run_dir 传给子进程，子进程 cwd 是
     隔离目录，相对路径会被错误拼到子进程 cwd 下导致产物写丢。
+    同时创建工作区直下 outputs/（脚本产物目录，没有则建）——真实任务、
+    试跑（debug）共用本函数，脚本侧按规范写 {run_dir}/outputs/ 时目录已就绪。
     """
     run_dir = (SCRIPT_RUN_BASE / str(task_id) / str(data_id)).absolute()
     run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / OUTPUTS_DIR_NAME).mkdir(exist_ok=True)
     return run_dir
 
 
@@ -488,7 +560,10 @@ def _run_step(
         "upstream": upstream,
         "_run_dir": str(run_dir),
     }
-    return execute_script(script, stdin, timeout_seconds=script.get("timeout_seconds"))
+    # W15 任务级网络开关：step.network=true 时容器改用 bridge（仅 container 模式生效）
+    network_flag = bool(step.get("network"))
+    return execute_script(script, stdin, timeout_seconds=script.get("timeout_seconds"),
+                          network=network_flag)
 
 
 def _is_hub_file_mapping(mapping: Any) -> bool:
@@ -504,12 +579,17 @@ def execute_script(
     script: Dict[str, Any],
     stdin: Dict[str, Any],
     timeout_seconds: Optional[int] = None,
+    network: bool = False,
 ) -> Dict[str, Any]:
     """执行单个脚本（统一子进程执行），返回标准输出
     + {script_id, script_name, duration_ms}
 
     供 run_pre_scripts 编排与 debug 端点复用。script 形如
     {script_id, name, exec_type, entrypoint, timeout_seconds}。
+
+    network（W15 任务级网络开关，仅 container 模式生效）：编排 step 声明
+    ``network: true`` 时容器改用 bridge 网络（脚本要访问被测系统的场景），
+    默认 False → --network none 完全离网；local 模式忽略该开关。
     """
     started = time.time()
     script_id = str(script.get("script_id") or script.get("id") or "")
@@ -518,7 +598,9 @@ def execute_script(
     timeout = float(timeout_seconds or script.get("timeout_seconds") or 120)
 
     if exec_type == "script":
-        return _execute_script_subprocess(script, stdin, timeout, started)
+        # W1-3：内置 db_assert 编排时注入只读 DSN（仅 pjs_builtin_db_assert 记录生效）
+        stdin = _inject_builtin_db_dsn(script, stdin)
+        return _execute_script_subprocess(script, stdin, timeout, started, network=network)
 
     return _result(
         script_id, name, "fail",
@@ -564,14 +646,14 @@ def _normalize_stdout(
 def _resolve_script_entry(script_id: str, entrypoint: str) -> Tuple[Optional[Path], Optional[Path]]:
     """解析 script 类型的脚本目录与入口文件，返回 (script_dir, entry_file)
 
-    解析顺序（目录式优先，历史形态兼容）：
-    1. entrypoint 为空 → (None, None)（未上传）
-    2. 目录内相对路径（新语义，默认 main.py）：
-       SCRIPT_UPLOAD_BASE/{script_id}/{entrypoint}（BASE 相对时按主进程 cwd 补全）
-    3. 历史绝对路径 entrypoint：文件存在则直接用（其父目录作为脚本目录，
-       兄弟模块 import 与静态扫描按该目录口径）
-    4. 历史相对路径（相对主进程 cwd，即项目根）：cwd 转绝对后存在则用
-    文件不存在时返回最近候选路径（script_dir 非 None，供错误信息展示）
+    W1-2 安全口径：只接受脚本包内相对路径（服务层 validate_entrypoint 已在
+    save/update/import 收敛；此处为运行器侧兜底防线）——
+    - entrypoint 为空 → (None, None)（未上传）
+    - 绝对路径 / 含 .. 穿越 → (script_dir, None)：调用方按「脚本入口不存在」
+      拒绝执行，绝不解析到脚本包之外的位置
+    - 合法相对路径 → (script_dir, script_dir / entrypoint)，
+      文件不存在同样由调用方拒绝
+    （历史绝对路径 entrypoint 直执与 cwd 相对路径兼容分支已按 W1 整改删除）
     """
     if not entrypoint:
         return None, None
@@ -582,20 +664,9 @@ def _resolve_script_entry(script_id: str, entrypoint: str) -> Tuple[Optional[Pat
         base = Path.cwd() / base
     script_dir = base / str(script_id or "_")
 
-    if not rel.is_absolute():
-        # 目录内相对路径（新语义）
-        entry_in_dir = script_dir / rel
-        if entry_in_dir.is_file():
-            return script_dir, entry_in_dir
-        # 历史相对路径（相对主进程 cwd）：转绝对再判（二期 API 联测缺陷①兼容）
-        abs_candidate = (Path.cwd() / rel).resolve()
-        if abs_candidate.is_file():
-            return abs_candidate.parent, abs_candidate
-        return script_dir, entry_in_dir
-
-    if rel.is_file():
-        return rel.parent, rel
-    return None, rel
+    if rel.is_absolute() or ".." in rel.parts:
+        return script_dir, None
+    return script_dir, script_dir / rel
 
 
 def _execute_script_subprocess(
@@ -603,24 +674,35 @@ def _execute_script_subprocess(
     stdin: Dict[str, Any],
     timeout: float,
     started: float,
+    network: bool = False,
 ) -> Dict[str, Any]:
     """exec_type=script：经 wrapper 子进程执行脚本包
 
     - 命令 [SCRIPT_PYTHON, app/services/pre_judge_entry.py, <script_dir>, <entry>]：
       wrapper 自动适配 run(stdin) 函数式 / __main__ 传统式脚本（入口缺省
-      main.py；历史绝对路径 entrypoint 以其文件名直执），
-      文件夹兄弟模块 import 由脚本目录 sys.path[0] 支持
+      main.py），文件夹兄弟模块 import 由脚本目录 sys.path[0] 支持
     - 严格拷贝语义：脚本包先拷进该条工作区 scripts/ 下（_stage_script_package），
       子进程按副本执行——脚本对自身包目录的写操作只影响本条工作区
-    - env 注入 PYTHONPATH（项目根前置，保留已有值）：脚本可 import 平台侧模块
-      （如 from app.db.session import SessionLocal）
+    - env 为白名单环境（build_script_env，W1-3）：不继承平台进程全量环境
+      变量；PYTHONPATH 注入项目根（M1 保留，local 模式专用——W15 起 container
+      模式不注入 PYTHONPATH，脚本无法 import 平台代码）
+    - W15 灰度：SCRIPT_EXEC_MODE=container 时改走 docker run --rm
+      （script_container.execute_script_in_container：非 root、--memory 1g
+      --cpus 0.5 --pids-limit、--read-only + tmpfs、剥离平台 env、默认
+      --network none、挂载仅本次 script_runs 工作目录），前置准备
+      （入口解析/静态扫描/工作区与脚本包副本）与 local 完全共用
     - cwd 隔离到 uploads/script_runs/{task_id}/{data_id}/{script_id}/
     - 标准输入 JSON 走 stdin（ensure_ascii=False + default=str 容错）
     - stdout/stderr 重定向到 cwd 下文件；stdout 只读尾部 SCRIPT_STDOUT_LIMIT
       字节，取最后一个非空行解析 JSON 作为脚本标准输出
     - 超时（timeout 秒）kill 进程；退出码非 0 按 fail（附 stderr 尾部）
+    - W10-6：Popen start_new_session=True（独立进程组），超时/死锁终止用
+      os.killpg 连孙进程一并收割；stdin 写入独立线程 + 短超时（
+      SCRIPT_STDIN_WRITE_TIMEOUT），payload 超 SCRIPT_STDIN_PAYLOAD_LIMIT
+      前置拒绝——消除「脚本不读 stdin 大 payload 写管道永久阻塞」死锁
     - 运行前静态风险扫描整个脚本目录的 .py（提示级）：结果写入返回条目
-      static_check 并记日志（脚本目录不在存储基座内时仅扫入口文件）
+      static_check 并记日志
+    - W1-2：入口只解析包内相对路径（绝对路径/.. 穿越一律「脚本入口不存在」）
     """
     script_id = str(script.get("script_id") or script.get("id") or "")
     name = script.get("name") or script_id
@@ -632,25 +714,20 @@ def _execute_script_subprocess(
                        finish_reason="error", started_at=started)
     script_dir, entry_file = _resolve_script_entry(script_id, entrypoint)
     if script_dir is None or entry_file is None or not entry_file.is_file():
+        reason = ("entrypoint 含绝对路径或 .. 穿越，仅接受脚本包内相对路径"
+                  if entry_file is None else "脚本入口不存在")
         return _result(script_id, name, "fail",
-                       error=f"脚本入口不存在: {entry_file or entrypoint}",
+                       error=f"{reason}: {entrypoint}",
                        finish_reason="error", started_at=started)
 
-    # 入口相对脚本目录的路径（wrapper 第二参数；历史绝对路径形态退化为文件名）
+    # 入口相对脚本目录的路径（wrapper 第二参数；包内相对路径恒可推导）
     try:
         entry_rel = entry_file.resolve().relative_to(script_dir.resolve()).as_posix()
     except ValueError:
         entry_rel = entry_file.name
 
-    # 运行前静态检查（提示级，不拦截）：脚本目录在存储基座内则扫描全部 .py
-    # （文件夹包整体视角），否则（历史绝对路径）仅扫描入口文件，避免误扫项目根
-    base = Path(pre_judge_script_service.SCRIPT_UPLOAD_BASE)
-    if not base.is_absolute():
-        base = Path.cwd() / base
-    if script_dir.resolve().is_relative_to(base.resolve()):
-        static_check = scan_script_dir_risks(script_dir)
-    else:
-        static_check = scan_script_risks(entry_file.read_text(encoding="utf-8", errors="replace"))
+    # 运行前静态检查（提示级，不拦截）：扫描脚本目录内全部 .py（文件夹包整体视角）
+    static_check = scan_script_dir_risks(script_dir)
     for warning in static_check:
         logger.warning(f"[PreScripts] 脚本 {name} 静态检查提示: {warning}")
 
@@ -664,20 +741,16 @@ def _execute_script_subprocess(
         return _result(script_id, name, "fail", error=f"创建脚本运行目录失败: {e}",
                        finish_reason="error", started_at=started, static_check=static_check)
 
-    # 严格拷贝语义：存储基座内的标准脚本包拷进该条工作区后从副本执行
-    # （脚本对自身包目录的写操作只影响本条副本）；基座外的历史绝对路径
-    # 兼容形态（非脚本包目录）保持原位执行，避免整树拷贝
-    if script_dir.resolve().is_relative_to(base.resolve()):
-        # _run_dir 缺省（如 debug 直调 execute_script）时退回 cwd 的父目录
-        run_dir_value = stdin.get("_run_dir")
-        run_dir = Path(str(run_dir_value)) if run_dir_value else Path(cwd).parent
-        try:
-            staged_dir = _stage_script_package(script_dir, run_dir, script_id or name)
-        except OSError as e:
-            return _result(script_id, name, "fail", error=f"脚本包拷贝进工作区失败: {e}",
-                           finish_reason="error", started_at=started, static_check=static_check)
-    else:
-        staged_dir = script_dir
+    # 严格拷贝语义：脚本包拷进该条工作区后从副本执行
+    # （脚本对自身包目录的写操作只影响本条副本，评完即清）
+    # _run_dir 缺省（如 debug 直调 execute_script）时退回 cwd 的父目录
+    run_dir_value = stdin.get("_run_dir")
+    run_dir = Path(str(run_dir_value)) if run_dir_value else Path(cwd).parent
+    try:
+        staged_dir = _stage_script_package(script_dir, run_dir, script_id or name)
+    except OSError as e:
+        return _result(script_id, name, "fail", error=f"脚本包拷贝进工作区失败: {e}",
+                       finish_reason="error", started_at=started, static_check=static_check)
 
     stdin_payload = json.dumps(stdin, ensure_ascii=False, default=str).encode("utf-8")
     # cwd 由 build_script_run_dir 创建并经 realpath 兜底，重定向文件同样走 within 校验
@@ -685,12 +758,37 @@ def _execute_script_subprocess(
     stderr_file = Path(ensure_within(str(cwd), "stderr.log"))
     timed_out = False
     returncode: Optional[int] = None
-    env = os.environ.copy()
-    existing_pythonpath = env.get("PYTHONPATH")
-    env["PYTHONPATH"] = (
-        f"{PROJECT_ROOT}{os.pathsep}{existing_pythonpath}"
-        if existing_pythonpath else str(PROJECT_ROOT)
-    )
+
+    # W15 容器化隔离灰度：container 模式改走 docker run --rm（非 root、资源
+    # 限制、只读根文件系统、剥离平台 env、默认离网、挂载仅本次 script_runs
+    # 工作目录；stdin 内宿主工作区路径重写为容器 /workspace 路径）。
+    # 前置准备（入口解析、静态扫描、工作区、脚本包副本）与 local 完全共用，
+    # 返回条目结构与 local 同构。
+    if script_container.container_mode_enabled():
+        return script_container.execute_script_in_container(
+            script=script,
+            staged_dir_host=staged_dir,
+            entry_rel=entry_rel,
+            run_dir_host=run_dir,
+            cwd_host=Path(cwd),
+            stdin=stdin,
+            timeout=timeout,
+            started=started,
+            static_check=static_check,
+            network=network,
+        )
+
+    env = build_script_env()  # W1-3：白名单环境，替代 os.environ.copy()
+
+    # W10-6：payload 大小前置校验——超限直接判 fail（不发起子进程/写入）
+    if len(stdin_payload) > SCRIPT_STDIN_PAYLOAD_LIMIT:
+        return _result(
+            script_id, name, "fail",
+            error=(f"脚本标准输入 payload 超限（{len(stdin_payload)} > "
+                   f"{SCRIPT_STDIN_PAYLOAD_LIMIT} 字节），已拒绝执行"),
+            finish_reason="error", started_at=started, static_check=static_check,
+        )
+
     try:
         with open(stdout_file, "wb") as out_f, open(stderr_file, "wb") as err_f:
             proc = subprocess.Popen(
@@ -700,17 +798,28 @@ def _execute_script_subprocess(
                 stdout=out_f,
                 stderr=err_f,
                 env=env,
+                # W10-6：独立会话/进程组（子进程为组长，pgid==pid），超时
+                # 终止用 killpg 连孙进程一并收割，不再遗留孤儿孙进程
+                start_new_session=True,
             )
-            try:
-                proc.stdin.write(stdin_payload)
-                proc.stdin.close()
-            except (BrokenPipeError, OSError):
-                pass  # 脚本未读完 stdin 即退出，按其退出码/输出处理
+            # W10-6：stdin 写入放独立线程 + 短超时——脚本不消费 stdin 且
+            # payload 超过管道缓冲时 write 会永久阻塞（死锁），超时即终止
+            # 进程组并判 fail，保证执行器有限时间返回
+            stdin_error = _write_stdin_with_timeout(
+                proc, stdin_payload, SCRIPT_STDIN_WRITE_TIMEOUT
+            )
+            if stdin_error:
+                _kill_process_tree(proc)
+                returncode = proc.wait()
+                return _result(script_id, name, "fail",
+                               error=stdin_error,
+                               finish_reason="timeout", started_at=started,
+                               static_check=static_check)
             try:
                 returncode = proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
                 timed_out = True
-                proc.kill()
+                _kill_process_tree(proc)  # W10-6：进程组整体终止
                 returncode = proc.wait()
     except OSError as e:
         return _result(script_id, name, "fail", error=f"脚本子进程启动失败: {e}",
@@ -736,6 +845,53 @@ def _execute_script_subprocess(
                        finish_reason="error", started_at=started, static_check=static_check)
 
     return _normalize_stdout(script_id, name, stdout, started, static_check=static_check)
+
+
+def _write_stdin_with_timeout(proc: subprocess.Popen, payload: bytes, timeout: float) -> Optional[str]:
+    """独立线程写 stdin + 短超时（W10-6，消除 stdin 死锁）
+
+    脚本不消费 stdin 且 payload 超过管道缓冲区时，proc.stdin.write 会永久
+    阻塞——改为独立线程写入、join(timeout) 限时；超时返回错误说明（调用方
+    终止进程组，阻塞中的写线程随管道断开自行退出，daemon 线程不阻退出）。
+
+    Returns:
+        None 表示写入完成；否则返回面向用户的错误说明。
+    """
+
+    def _write():
+        try:
+            proc.stdin.write(payload)
+            proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass  # 脚本未读完 stdin 即退出，按其退出码/输出处理
+        except Exception as e:  # noqa: BLE001 - 写线程异常不外溢
+            logger.warning(f"脚本 stdin 写入线程异常: {e}")
+
+    writer = threading.Thread(
+        target=_write, daemon=True, name=f"script-stdin-writer-{proc.pid}"
+    )
+    writer.start()
+    writer.join(timeout)
+    if writer.is_alive():
+        return (
+            f"脚本 {timeout:.0f} 秒内未消费标准输入（payload {len(payload)} 字节），"
+            "判定 stdin 死锁，已终止脚本进程组"
+        )
+    return None
+
+
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    """进程组级 SIGKILL（W10-6）：Popen 以 start_new_session=True 启动，子进程
+    即会话/进程组长（pgid==pid），孙进程同组——killpg 连孙进程一并收割，
+    不再遗留孤儿孙进程。进程组已不存在（成员全部退出）时退回单进程 kill 兜底。
+    """
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
 
 
 def _parse_last_json_line(stdout_text: str) -> Any:

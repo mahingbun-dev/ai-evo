@@ -14,13 +14,17 @@ from app.models.user_models import User
 logger = logging.getLogger(__name__)
 
 # 配置中间件专用 logger，确保输出到文件
+# （W13：DEBUG 降 INFO，与 main.py 的统一日志配置对齐，避免每请求刷 SSO 明细）
 middleware_logger = logging.getLogger("app.middleware.auth_middleware")
-middleware_logger.setLevel(logging.DEBUG)
+middleware_logger.setLevel(logging.INFO)
 
 # 白名单路径前缀（无需鉴权）
 # 注意：不能放 "/" 作为前缀，因为它会匹配所有路径，应该精确匹配根路径
+# W13：/api/v1/health（深健康检查）入白名单——探活请求不带业务凭证，
+# build-service 部署校验与 compose healthcheck 都依赖匿名可达
 WHITELIST_PREFIXES = [
     "/health", "/docs", "/api-docs", "/openapi.json", "/assets",
+    "/api/v1/health",
     "/api/v1/auth/login", "/api/v1/auth/register", "/api/v1/auth/logout",
     "/api/v1/auth/status",
 ]
@@ -71,12 +75,22 @@ class AuthMiddleware(BaseHTTPMiddleware):
         with SessionLocal() as db:
             user = db.get(User, payload.get("sub"))
 
-            if not user or not user.is_active:
+            if not user:
                 middleware_logger.warning(
-                    f"[AUTH] 401 - 用户不存在或已禁用: {payload.get('sub')}，请求路径: {path}")
+                    f"[AUTH] 401 - 用户不存在: {payload.get('sub')}，请求路径: {path}")
                 return JSONResponse(
                     {"code": 401, "message": "登录已失效，请重新登录"},
                     status_code=401
+                )
+
+            # W19：本地禁用的账号直接拒绝（403 与未认证 401 区分，
+            # 否则团队管理页的「禁用成员」对 API 访问完全无效）
+            if not user.is_active:
+                middleware_logger.warning(
+                    f"[AUTH] 403 - 账号已被禁用，请求路径: {path}, user_code={user.user_code}")
+                return JSONResponse(
+                    {"code": 403, "message": "账号已被禁用，请联系管理员"},
+                    status_code=403
                 )
 
             user_dict = {

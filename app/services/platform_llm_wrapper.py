@@ -151,9 +151,10 @@ class PlatformLLMWrapper(DeepEvalBaseLLM):
 
             headers = {"Content-Type": "application/json"}
 
-            # 添加认证信息
+            # 添加认证信息（W16 复核修复：显式 None 视同未配置，
+            # dict.get 默认值不覆盖 key 存在但值为 None 的情况）
             auth_type = self.model_config.get("auth_type", "none")
-            auth_config = self.model_config.get("auth_config", {})
+            auth_config = self.model_config.get("auth_config", {}) or {}
 
             if auth_type in ("bearer", "api_key"):
                 api_key = self.model_config.get("api_key")
@@ -165,7 +166,7 @@ class PlatformLLMWrapper(DeepEvalBaseLLM):
                 headers[custom_header_name] = custom_header_value
 
             # 构建请求
-            request_config = self.model_config.get("request_config", {})
+            request_config = self.model_config.get("request_config", {}) or {}
             request_template = request_config.get("template")
 
             if request_template:
@@ -234,13 +235,13 @@ class PlatformLLMWrapper(DeepEvalBaseLLM):
     async def a_generate_with_schema(self, *args, schema=None, **kwargs):
         """
         DeepEval 接口：异步生成带 schema 的文本
+
+        W16 接入 deepeval 指标（G-Eval 系）路径：与 DeepEvalBaseLLM 基类契约
+        一致，返回 a_generate 的原始字符串，由 deepeval 的 trimAndLoadJson
+        统一解析。此前实现返回 json.loads 后的 dict，会触发
+        "'dict' object has no attribute 'find'"，导致所有 G-Eval 指标不可用。
         """
-        result = await self.a_generate(*args, **kwargs)
-        # 尝试解析 JSON
-        try:
-            return json.loads(result)
-        except json.JSONDecodeError:
-            return result
+        return await self.a_generate(*args, **kwargs)
 
     def get_model_name(self) -> str:
         """获取模型名称"""

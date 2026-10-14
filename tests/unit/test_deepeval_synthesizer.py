@@ -10,6 +10,8 @@ import pytest
 from unittest.mock import patch, MagicMock, AsyncMock
 from deepeval.dataset import Golden
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 # ============================================================
 # 辅助工具

@@ -31,6 +31,8 @@ from app.services.pre_judge_script_service import (
 from app.services.pre_judge_runner import SCRIPT_PYTHON
 from app.api.pre_judge_script_api import download_template, list_templates
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 TEMPLATE_NAMES = ("hub_package",)
 SAMPLE_ATTEMPT_DIR = "62ed5009-2f58-40bd-9e43-8bac7a9eacbf-attempt-1"
 
@@ -122,6 +124,8 @@ class TestTemplateStructure:
         assert list((attempt / "action-files").glob("*.xlsx"))
 
         assert (root / "inputs" / "hub_pkg_index.json").is_file()
+        assert (root / "outputs").is_dir(), "骨架必须含 outputs/（脚本产物目录）"
+        assert (root / "outputs" / "README.md").is_file()
         assert (root / "sample_stdin.json").is_file()
         assert (root / "README.md").is_file()
         assert "运行时工作区骨架" in (root / "README.md").read_text(encoding="utf-8")
@@ -235,6 +239,13 @@ class TestLocalSampleRun:
             assert info["file_count"] == 32
         assert result["outputs"]["manifest_summary"]["case_total"] == 3
         assert result["outputs"]["manifest_summary"]["case_passed"] == 2
+        # 产物规范：文件产物落解压根 outputs/（_run_dir="."，files 为相对路径）
+        # 并在 files 注册；真实运行时 _run_dir 是绝对路径，files 亦为绝对路径
+        summary = Path(result["files"]["manifest_summary.json"])
+        if not summary.is_absolute():
+            summary = root / summary
+        assert summary.is_file()
+        assert summary == (root / "outputs" / "manifest_summary.json")
 
     def test_smoke_stdin_runs(self, tmp_path):
         """平台冒烟样例（root/files 模式）同样跑通：泛化消费不写死字段名"""
@@ -248,6 +259,8 @@ class TestLocalSampleRun:
         assert result["outputs"]["fields"]["hub_pkg"]["file_count"] == 4
         assert result["outputs"]["fields"]["hub_pkg"]["attempt_tops"] == [SMOKE_ATTEMPT_DIR]
         assert result["outputs"]["manifest_summary"]["case_total"] == 2
+        # 冒烟 run_dir 的 outputs/ 由 build_smoke_stdin 保证创建，产物真实落盘
+        assert (smoke_run_dir / "outputs" / "manifest_summary.json").is_file()
 
     def test_renamed_field_consumed(self, tmp_path):
         """字段名不是 hub_pkg 时（编排映射改名场景）泛化消费照样工作"""

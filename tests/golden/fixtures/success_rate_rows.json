@@ -1,0 +1,40 @@
+[
+  {
+    "idx": 0,
+    "success": true,
+    "metrics": {
+      "total_calls": 10,
+      "successful_calls": 9,
+      "success_rate": 0.9,
+      "avg_response_time": 1.23
+    },
+    "repeat_results": [
+      {"success": true, "result": "Paris", "duration": 1.1},
+      {"success": true, "result": "Paris.", "duration": 1.0},
+      {"success": false, "result": "", "duration": 1.4}
+    ],
+    "error_analysis": {"failure_reasons": ["第3次调用返回为空"]},
+    "user_input": "法国的首都是哪里？"
+  },
+  {
+    "idx": 1,
+    "success": true,
+    "metrics": {
+      "total_calls": 10,
+      "successful_calls": 5,
+      "success_rate": 0.5,
+      "avg_response_time": 2.05
+    },
+    "repeat_results": [
+      {"success": true, "result": "42", "duration": 2.0},
+      {"success": false, "result": "", "duration": 2.1}
+    ],
+    "error_analysis": {},
+    "user_input": "6 乘 7 等于多少？"
+  },
+  {
+    "idx": 2,
+    "success": false,
+    "error": "模型调用失败: 连接被重置"
+  }
+]

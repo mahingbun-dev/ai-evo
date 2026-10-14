@@ -1,0 +1,46 @@
+[
+  {
+    "idx": 0,
+    "success": true,
+    "expected_label": true,
+    "predicted_label": true,
+    "is_correct": true,
+    "duration": 1.234,
+    "error": "",
+    "model_output": "true",
+    "question": "该评论「服务很好」是正面评价吗？",
+    "is_valid": true,
+    "prediction": true
+  },
+  {
+    "idx": 1,
+    "success": true,
+    "expected_label": true,
+    "predicted_label": false,
+    "is_correct": false,
+    "duration": 0.987,
+    "error": "",
+    "model_output": "false",
+    "question": "该评论「环境脏乱」是正面评价吗？",
+    "is_valid": true,
+    "prediction": false
+  },
+  {
+    "idx": 2,
+    "success": true,
+    "expected_label": false,
+    "predicted_label": false,
+    "is_correct": true,
+    "duration": 1.001,
+    "error": "",
+    "model_output": "false",
+    "question": "该评论「价格昂贵」是正面评价吗？",
+    "is_valid": false,
+    "prediction": false
+  },
+  {
+    "idx": 3,
+    "success": false,
+    "error": "模型调用失败: 429 Too Many Requests"
+  }
+]

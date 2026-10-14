@@ -31,4 +31,8 @@ class ABTestSession(Base):
     duration_a = Column(Float, nullable=True, comment="模型A耗时（秒）")
     duration_b = Column(Float, nullable=True, comment="模型B耗时（秒）")
 
+    # W19 归属：创建人 user_code。历史行为 NULL——读对所有登录用户可见，
+    # 删除仅创建人或超管（与 access_control 团队口径互补的轻量归属）。
+    created_by = Column(String, nullable=True, comment="创建人 user_code（历史行为 NULL）")
+
     created_at = Column(DateTime, server_default=func.now(), comment="创建时间")

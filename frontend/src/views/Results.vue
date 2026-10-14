@@ -2554,7 +2554,9 @@ const { startPolling, stopPolling, stopAll } = useTaskPolling({
       // 如果任务完成或失败，重新加载结果
       if (['completed', 'failed', 'stopped'].includes(updatedTask.status)) {
         stopPolling(taskId)
-        ElMessage.success(`任务 "${updatedTask.name}" 已${updatedTask.status === 'completed' ? '完成' : '结束'}`)
+        // W14 轮询走轻端点，载荷不含任务名：从列表行补齐
+        const rowName = allTasks.value.find(t => t.id === taskId)?.name
+        ElMessage.success(`任务 "${rowName}" 已${updatedTask.status === 'completed' ? '完成' : '结束'}`)
         // 刷新历史版本
         resultApi.history(taskId, { limit: 50 }).then(versions => {
           executionVersions.value = Array.isArray(versions) ? versions : []
@@ -2564,12 +2566,15 @@ const { startPolling, stopPolling, stopAll } = useTaskPolling({
   },
   onTaskComplete: (taskId, task) => {
     if (taskId === selectedTaskId.value) {
-      ElMessage.success(`任务 "${task.name}" 已完成`)
+      // W14 轮询走轻端点，载荷不含任务名：从列表行补齐
+      const rowName = allTasks.value.find(t => t.id === taskId)?.name
+      ElMessage.success(`任务 "${rowName}" 已完成`)
     }
   },
   onTaskFailed: (taskId, task) => {
     if (taskId === selectedTaskId.value) {
-      ElMessage.error(`任务 "${task.name}" 执行失败`)
+      const rowName = allTasks.value.find(t => t.id === taskId)?.name
+      ElMessage.error(`任务 "${rowName}" 执行失败`)
     }
   }
 })

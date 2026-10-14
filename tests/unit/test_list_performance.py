@@ -18,6 +18,8 @@ import pytest
 from app.services.dataset_service import DatasetService, DatasetDataService
 from app.services.evaluation_task_service import EvaluationTaskService
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 def make_dataset(ds_id, name="ds"):
     return SimpleNamespace(id=ds_id, name=name, question_count=0, has_media=False)

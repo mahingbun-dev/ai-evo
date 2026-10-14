@@ -16,6 +16,7 @@ from app.db.session import get_db, SessionLocal
 from app.models.user_models import User
 from app.services.jwt_service import create_token, decode_token
 from app.services.password_service import hash_password, verify_password
+from app.services.access_control import ensure_super_admin
 
 
 # ==================== Response Models ====================
@@ -76,12 +77,14 @@ async def get_current_user(request: Request):
 
 @router.get("/", response_model=UserListResponse, summary="获取用户列表")
 async def list_users(
+    request: Request,
     page: int = Query(1, ge=1, description="页码"),
     page_size: int = Query(20, ge=1, le=100, description="每页数量"),
     keyword: Optional[str] = Query(None, description="关键词搜索"),
     db: Session = Depends(get_db),
 ):
-    """分页获取用户列表"""
+    """分页获取用户列表（W19：仅超管——用户目录含全员邮箱/组织等目录信息）"""
+    ensure_super_admin(request)
     query = db.query(User)
 
     if keyword:
@@ -100,11 +103,14 @@ async def list_users(
 
 
 @router.get("/{user_code}", response_model=UserResponse, summary="获取指定用户信息")
-async def get_user(user_code: str, request: Request, db: Session = Depends(get_db)):
-    """根据 user_code 获取用户详情（仅本人或超级管理员：响应含邮箱等联系方式）"""
-    caller = getattr(request.state, "user", None) or {}
-    if caller.get("super_admin_flag") != 1 and caller.get("user_code") != user_code:
-        raise HTTPException(status_code=403, detail="仅可查看本人信息（管理员除外）")
+async def get_user(
+    request: Request,
+    user_code: str,
+    db: Session = Depends(get_db),
+):
+    """根据 user_code 获取用户详情（W19：仅超管）"""
+    ensure_super_admin(request)
+
     user = db.get(User, user_code)
     if not user:
         raise HTTPException(status_code=404, detail="用户不存在")
@@ -215,12 +221,16 @@ async def login(body: LoginRequest, db: Session = Depends(get_db)):
 
 @auth_router.get("/status", summary="检查登录状态")
 async def check_auth_status(request: Request):
-    """检查当前登录状态（此接口不拦截，自查 Bearer token）"""
+    """检查当前登录状态（此接口不拦截，自查 Bearer token；W13 如实化）
+
+    未登录/凭证无效时返回 401 并带 message——调用方（前端路由守卫、部署冒烟）
+    才能据状态码区分「已登录」与「登录态不可用」。is_authenticated 字段保持向后兼容。
+    """
     user_dict = _auth_user_dict(request)
     if not user_dict:
         return JSONResponse(
-            content={"is_authenticated": False, "user": None},
-            status_code=200
+            content={"is_authenticated": False, "user": None, "message": "未提供认证信息或登录已失效"},
+            status_code=401
         )
     return {"is_authenticated": True, "user": user_dict}
 

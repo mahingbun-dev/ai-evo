@@ -4,6 +4,8 @@
 import pytest
 from app.services.result_aggregator import ResultAggregator
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 class TestAggregateBinaryClassificationResults:
     """测试 aggregate_binary_classification_results 方法"""

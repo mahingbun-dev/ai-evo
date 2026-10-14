@@ -15,6 +15,7 @@ redis.from_url(settings.REDIS_URL) → publish task_status:{id}，best-effort �
 import logging
 import uuid
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,83 @@ HUB_IMPORT_FIELD_METADATA = [
 
 # 允许重试的状态（failed 才有失败项可重跑）
 RETRYABLE_STATUS = "failed"
+
+# running 状态卡死判定阈值（W11）：updated_at 超过该时长未推进即认为 worker 已死。
+# process_hub_import_job 逐包 commit（status/计数/幂等键）会持续刷新 updated_at，
+# 正常执行中不会超过该阈值；worker 崩溃（OOM/SIGKILL）后 updated_at 停止推进。
+HUB_JOB_STUCK_AFTER_SECONDS = 30 * 60
+
+
+def _job_stale_seconds(job) -> Optional[float]:
+    """running job 的 updated_at 距今秒数；缺失/非时间值返回 None（无法判定）。
+
+    时区兼容：Postgres timestamptz 返回带时区值；SQLite CURRENT_TIMESTAMP 等
+    返回 naive 值按 UTC 解释（与 server_default func.now() 的 UTC 语义一致）。
+    """
+    updated_at = getattr(job, "updated_at", None)
+    if not isinstance(updated_at, datetime):
+        return None
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=timezone.utc)
+    return (beijing_now() - updated_at).total_seconds()
+
+
+def release_job_lock(job_id: str) -> bool:
+    """清除 hub 导入 job 互斥锁（retry 接管卡死任务时调用，best-effort）
+
+    卡死任务的 worker 已判定死亡，但其残留锁（hubjob:{job_id}）在 TTL（3h）内
+    仍在——不清除的话，重试新投递的 worker 会被 SETNX 拒绝，任务永远停在
+    pending。清除失败（redis 不可用等）只记日志，由 TTL 过期兜底。
+    """
+    try:
+        from app.services.redis_stop_signal import HUB_JOB_LOCK_PREFIX, HUB_JOB_LOCK_TTL, EvalTaskLock
+
+        EvalTaskLock(job_id, ttl=HUB_JOB_LOCK_TTL, key_prefix=HUB_JOB_LOCK_PREFIX).release()
+        logger.info(f"[hub_import] 已清除 job 互斥锁（卡死接管）: job_id={job_id}")
+        return True
+    except Exception as e:  # noqa: BLE001 - 锁清除失败不阻断重试主流程
+        logger.warning(f"[hub_import] 清除 job 互斥锁失败（将由 TTL 过期兜底）: job_id={job_id} 错误: {e}")
+        return False
+
+
+# 清洗导入（job.script_id 非空）的数据行字段元数据：清洗脚本产出的行内容字段
+# + hub_file 引用。字段名与脚本包 hub_exec_clean 的行内容 schema
+# （hub_exec_cleaned_v1）一致——ai-evo 会话固定字段（与 session_dataset_service
+# 的 SESSION_FIELD_METADATA 同名同义）+ 三层清洗结构。
+CLEANSED_FIELD_METADATA = [
+    {"name": HUB_FILE_ID_FIELD, "label": "执行包 file_id（anc-hub 源文件回链）", "type": "hub_file",
+     "is_media": False, "is_media_field": None, "is_required": False, "position": 0},
+    {"name": "schema_version", "label": "清洗 schema 版本（hub_exec_cleaned_v1）", "type": "string",
+     "is_media": False, "is_media_field": None, "is_required": False, "position": 1},
+    {"name": "session_id", "label": "会话 ID（claude-thread 解析）", "type": "string",
+     "is_media": False, "is_media_field": None, "is_required": False, "position": 2},
+    {"name": "source", "label": "会话来源（当前固定 claude_code）", "type": "string",
+     "is_media": False, "is_media_field": None, "is_required": False, "position": 3},
+    {"name": "user_input", "label": "用户输入（评测输入=用户首条消息摘要）", "type": "string",
+     "is_media": False, "is_media_field": None, "is_required": False, "position": 4},
+    {"name": "session_summary", "label": "会话摘要（首条用户输入，≤120 字）", "type": "string",
+     "is_media": False, "is_media_field": None, "is_required": False, "position": 5},
+    {"name": "session_stats", "label": "会话统计（轮数/消息数/工具调用数/时长秒）", "type": "json",
+     "is_media": False, "is_media_field": None, "is_required": False, "position": 6},
+    {"name": "session_metadata", "label": "会话元信息（工作目录/客户端版本/git 分支）", "type": "json",
+     "is_media": False, "is_media_field": None, "is_required": False, "position": 7},
+    {"name": "session_messages", "label": "会话内容（SessionRecord 整包 JSON，勿手改）", "type": "json",
+     "is_media": False, "is_media_field": None, "is_required": False, "position": 8},
+    {"name": "exec_meta", "label": "执行包元信息（执行 ID/模式/状态/起止/环境仓库上下文）", "type": "json",
+     "is_media": False, "is_media_field": None, "is_required": False, "position": 9},
+    {"name": "thread_events", "label": "会话事件时间线（用户消息/澄清问答/用例调度/脚本编辑）", "type": "json",
+     "is_media": False, "is_media_field": None, "is_required": False, "position": 10},
+    {"name": "metrics_registry", "label": "指标适用性注册表（逐指标 name/applicable/reason/口径）", "type": "json",
+     "is_media": False, "is_media_field": None, "is_required": False, "position": 11},
+    {"name": "cases_evidence", "label": "逐用例对齐证据（定义/allure 摘要/三指标对齐记录/会话旁证）", "type": "json",
+     "is_media": False, "is_media_field": None, "is_required": False, "position": 12},
+    {"name": "review_material", "label": "用例执行对照材料（裁判主输入，markdown 逐用例对照）", "type": "string",
+     "is_media": False, "is_media_field": None, "is_required": False, "position": 13},
+    {"name": "clean_summary", "label": "清洗统计（分母/通过/需复核/失败清单与状态分布）", "type": "json",
+     "is_media": False, "is_media_field": None, "is_required": False, "position": 14},
+    {"name": "field_descriptions", "label": "字段说明（本行各字段含嵌套键的中文含义对照表）", "type": "json",
+     "is_media": False, "is_media_field": None, "is_required": False, "position": 15},
+]
 
 
 def _publish_job_progress(job) -> None:
@@ -101,18 +179,116 @@ def _merge_field_metadata(existing: List[Dict[str, Any]], base: List[Dict[str, A
     return merged
 
 
-def _register_field_metadata(db, dataset_id: str) -> None:
-    """注册执行包导入的字段元数据（幂等，保留数据集已有字段；失败不阻断导入）"""
+def _register_field_metadata(db, dataset_id: str, script_id: Optional[str] = None) -> None:
+    """注册导入字段元数据（幂等，保留数据集已有字段；失败不阻断导入）
+
+    挂载清洗脚本时注册 CLEANSED_FIELD_METADATA（清洗行字段），否则注册
+    HUB_IMPORT_FIELD_METADATA（原样导入字段）。
+    """
     from app.services.dataset_field_service import DatasetFieldService
 
+    base_meta = CLEANSED_FIELD_METADATA if script_id else HUB_IMPORT_FIELD_METADATA
     try:
         field_service = DatasetFieldService(db)
         merged = _merge_field_metadata(
-            field_service.get_field_metadata(dataset_id), HUB_IMPORT_FIELD_METADATA
+            field_service.get_field_metadata(dataset_id), base_meta
         )
         field_service.save_field_metadata(dataset_id, merged)
     except Exception as e:  # noqa: BLE001 - 元数据注册失败只记日志，不阻断数据行导入
         logger.warning(f"[hub_import] 保存执行包字段元数据失败: dataset_id={dataset_id} 错误: {e}")
+
+
+def validate_clean_script(db, script_id: str) -> str:
+    """校验清洗脚本可用并返回规范化的 script_id
+
+    要求：脚本库中存在、启用、exec_type=script（claude_agent/deepseek_agent
+    类型由评测 Harness 消费，导入清洗需要确定性的子进程脚本）。
+
+    Raises:
+        ValueError: 脚本不存在 / 未启用 / 类型不支持（中文消息）
+    """
+    from app.models.pre_judge_models import PreJudgeScript
+
+    sid = str(script_id or "").strip()
+    if not sid:
+        return ""
+    row = db.query(PreJudgeScript).filter(PreJudgeScript.id == sid).first()
+    if row is None:
+        # 与评测编排一致：允许按名称引用（_load_script 的兼容语义）
+        row = db.query(PreJudgeScript).filter(PreJudgeScript.name == sid).first()
+    if row is None:
+        raise ValueError(f"清洗脚本不存在: {script_id}")
+    if not row.is_active:
+        raise ValueError(f"清洗脚本已停用: {row.name}")
+    if (row.exec_type or "script") != "script":
+        raise ValueError(f"清洗脚本类型不支持: {row.name}（exec_type={row.exec_type}，仅支持 script）")
+    return row.id
+
+
+def _run_clean_script(unpack_dir: str, file_index: list, file_id: str, script_def: dict) -> dict:
+    """对单个执行包运行清洗脚本，返回数据集行内容 dict
+
+    工作区隔离复用评测脚本基建：build_run_dir("hub_import", file_id) 建工作区，
+    copy_into_workspace 拷包副本（严格拷贝语义，不触碰持久解包区），stdin.inputs
+    用 files 模式（文件对象数组由 file_index 还原；索引缺失时脚本会扫根兜底）。
+    脚本产出的行内容从 stdout.files 登记的产物文件读取（避免超过 stdout 上限），
+    兜底取 output。失败抛异常，由调用方记入 fail_detail。
+
+    Raises:
+        RuntimeError: 脚本执行失败 / 产物不可读（中文消息）
+    """
+    import json as _json
+
+    from app.services import pre_judge_runner
+
+    run_dir = pre_judge_runner.build_run_dir("hub_import", file_id)
+    pkg_copy = pre_judge_runner.copy_into_workspace(unpack_dir, run_dir, "hub_pkg")
+
+    files_array = []
+    for entry in file_index or []:
+        rel = str(entry.get("path") or "")
+        if not rel:
+            continue
+        files_array.append({
+            "path": str(Path(pkg_copy) / rel),
+            "rel_path": rel,
+            "size": entry.get("size", 0),
+            "type": entry.get("type", ""),
+        })
+    inputs = {"hub_pkg": {"root": pkg_copy}}
+    if files_array:
+        inputs["hub_pkg"]["files"] = files_array
+
+    stdin = {
+        "task_id": "hub_import",
+        "data_id": file_id,
+        "fields": {},
+        "inputs": inputs,
+        "model_output": None,
+        "session": None,
+        "params": {},
+        "upstream": {},
+        "_run_dir": str(run_dir),
+    }
+    result = pre_judge_runner.execute_script(script_def, stdin,
+                                             timeout_seconds=script_def.get("timeout_seconds"))
+    if result.get("status") != "ok":
+        error = result.get("error") or result.get("summary") or "未知错误"
+        raise RuntimeError(f"清洗脚本执行失败: {error}")
+
+    # 行内容从产物文件读取（stdout 只携带摘要）；兜底 output
+    for name, path in (result.get("files") or {}).items():
+        if name.endswith(".json") and Path(path).is_file():
+            try:
+                row = _json.loads(Path(path).read_text(encoding="utf-8"))
+            except (OSError, _json.JSONDecodeError) as e:
+                raise RuntimeError(f"清洗产物不可读: {name}（{e}）")
+            if isinstance(row, dict):
+                return row
+    output = result.get("output")
+    if isinstance(output, dict) and output:
+        return output
+    raise RuntimeError("清洗脚本未产出可用的行内容（产物文件与 output 均为空）")
 
 
 def create_import_job(
@@ -122,6 +298,8 @@ def create_import_job(
     description: str = "",
     real_dataset_id: str = "",
     created_by: Optional[str] = None,
+    script_id: Optional[str] = None,
+    team_code: Optional[str] = None,
 ):
     """创建批量导入任务：解析目标数据集并落 pending 状态的 job 行
 
@@ -129,8 +307,14 @@ def create_import_job(
     （校验存在），否则按 name 新建。新建在 API 侧同步完成，worker 只追加数据行，
     保证 job.dataset_id 恒有值（retry 幂等的落点）。
 
+    script_id 非空时校验清洗脚本可用（存在/启用/exec_type=script）并把规范化
+    后的脚本 ID 落到 job 行——worker 逐包执行清洗脚本，以脚本产出的行内容落库。
+
+    team_code：W9 新建数据集时落用户团队（归属锚点，hub_files.team_code 从
+    它继承）；追加模式忽略（沿用目标数据集的团队）。
+
     Raises:
-        ValueError: file_ids 为空 / 追加目标不存在 / 新建缺名称（中文消息）
+        ValueError: file_ids 为空 / 追加目标不存在 / 新建缺名称 / 清洗脚本不可用（中文消息）
     """
     from app.models.hub_file_models import HubImportJob
     from app.services.dataset_service import DatasetService
@@ -138,6 +322,10 @@ def create_import_job(
     ids = _normalize_file_ids(file_ids)
     if not ids:
         raise ValueError("请至少提供一个 anc-hub file_id")
+
+    normalized_script_id = ""
+    if script_id and str(script_id).strip():
+        normalized_script_id = validate_clean_script(db, script_id)
 
     dataset_service = DatasetService(db)
     if real_dataset_id:
@@ -151,12 +339,14 @@ def create_import_job(
             name=name.strip(),
             description=description or "由 anc-hub 执行包导入",
             created_by=created_by,
+            team_code=team_code,
         )
 
     job = HubImportJob(
         id=_new_job_id(),
         dataset_id=dataset.id,
         file_ids=ids,
+        script_id=normalized_script_id or None,
         status="pending",
         total_count=len(ids),
         success_count=0,
@@ -167,7 +357,8 @@ def create_import_job(
     )
     db.add(job)
     db.commit()
-    logger.info(f"[hub_import] 导入任务已创建: job_id={job.id} dataset_id={job.dataset_id} 包数={len(ids)}")
+    logger.info(f"[hub_import] 导入任务已创建: job_id={job.id} dataset_id={job.dataset_id} "
+                f"包数={len(ids)} 清洗脚本={normalized_script_id or '无'}")
     return job
 
 
@@ -181,20 +372,33 @@ def get_job(db, job_id: str):
 def retry_job(db, job_id: str):
     """重置失败任务为 pending（只重跑失败项由 process 的 succeeded_file_ids 幂等保证）
 
+    卡死自愈（W11）：running 状态且 updated_at 超过 HUB_JOB_STUCK_AFTER_SECONDS
+    未推进的任务视为 worker 已死，允许接管重跑——此时不要求存在失败项（可能
+    尚未产生任何失败），重跑的幂等由 succeeded_file_ids 保证；接管同时清除
+    残留的 job 互斥锁（否则新投递的 worker 会被 SETNX 拒绝）。
+
     Raises:
-        ValueError: 任务仍在进行中 / 已全部完成 / 没有可重试的失败项（中文消息）
+        ValueError: 任务仍在进行中（未卡死）/ 排队中 / 已全部完成 /
+                    没有可重试的失败项（中文消息）
     """
     job = get_job(db, job_id)
     if job is None:
         return None
 
     if job.status == "running":
-        raise ValueError("导入任务仍在进行中，无法重试")
-    if job.status == "pending":
+        stale_seconds = _job_stale_seconds(job)
+        if stale_seconds is None or stale_seconds < HUB_JOB_STUCK_AFTER_SECONDS:
+            raise ValueError("导入任务仍在进行中，无法重试")
+        logger.warning(
+            f"[hub_import] 接管卡死的导入任务: job_id={job_id} "
+            f"updated_at 距今 {int(stale_seconds)} 秒（> {HUB_JOB_STUCK_AFTER_SECONDS}），重置重跑"
+        )
+        release_job_lock(job_id)
+    elif job.status == "pending":
         raise ValueError("导入任务排队中，请等待执行完成后再重试")
-    if job.status == "completed":
+    elif job.status == "completed":
         raise ValueError("导入任务已全部完成，无需重试")
-    if not (job.fail_detail or {}):
+    elif not (job.fail_detail or {}):
         raise ValueError("没有可重试的失败项")
 
     job.status = "pending"
@@ -212,9 +416,11 @@ def process_hub_import_job(
 ) -> Dict[str, Any]:
     """逐包处理导入任务（Celery worker 入口的核心逻辑）
 
-    每包流程（设计文档阶段C）：
+    每包流程（设计文档阶段C；挂载清洗脚本时插入清洗步骤）：
         ensure_unpacked（幂等，登记表命中零下载）→ acquire_ref →
-        写 EvaluationDataV2 数据行（data = {hub_file_id: file_id, hub_summary: {...}}）
+        [script_id 非空] 运行清洗脚本（工作区隔离拷包），以脚本产出的行内容为
+        数据行 data → 否则 data = {hub_file_id: file_id, hub_summary: {...}} →
+        写 EvaluationDataV2 数据行
     每包完成后更新计数并 publish 进度；单包失败记入 fail_detail 继续处理其余包，
     全部处理完按 fail_detail 是否为空落 completed / failed。
 
@@ -234,8 +440,25 @@ def process_hub_import_job(
     db.commit()
     _publish_job_progress(job)
 
+    # W9：目标数据集团队（hub_files.team_code 继承写入的来源锚点）
+    from app.models.dataset_models import EvaluationDataset
+
+    dataset_row = (
+        db.query(EvaluationDataset).filter(EvaluationDataset.id == job.dataset_id).first()
+    )
+    job_team_code = dataset_row.team_code if dataset_row is not None else None
+
+    # 清洗脚本定义（job.script_id 非空时逐包执行清洗；加载失败按整体失败处理）
+    script_def = None
+    if job.script_id:
+        from app.services.pre_judge_runner import _load_script
+
+        script_def = _load_script(job.script_id)
+        if script_def is None:
+            raise ValueError(f"清洗脚本不可用（不存在或已删除）: {job.script_id}")
+
     # 注册字段元数据（幂等；数据集已有字段不会被覆盖删除）
-    _register_field_metadata(db, job.dataset_id)
+    _register_field_metadata(db, job.dataset_id, job.script_id)
 
     succeeded = list(job.succeeded_file_ids or [])
     fail_detail = dict(job.fail_detail or {})
@@ -245,14 +468,27 @@ def process_hub_import_job(
     for fid in to_run:
         acquired = False
         try:
-            info = ensure_unpacked(db, fid, datasets_root=datasets_root, service=hub_service)
+            # W9：team_code 传入——新建登记时从目标数据集继承团队归属
+            info = ensure_unpacked(
+                db, fid, datasets_root=datasets_root, service=hub_service,
+                team_code=job_team_code,
+            )
             # 先持引用再写数据行：数据行写失败时在 except 分支补偿释放
             acquire_ref(db, fid)
             acquired = True
-            data = {
-                HUB_FILE_ID_FIELD: fid,
-                "hub_summary": info.get("summary") or {},
-            }
+            if script_def is not None:
+                row = _run_clean_script(
+                    info.get("unpack_dir") or "",
+                    info.get("file_index") or [],
+                    fid,
+                    script_def,
+                )
+                data = {**row, HUB_FILE_ID_FIELD: fid}
+            else:
+                data = {
+                    HUB_FILE_ID_FIELD: fid,
+                    "hub_summary": info.get("summary") or {},
+                }
             data_service.add_data_v2(job.dataset_id, data)
             succeeded.append(fid)
             fail_detail.pop(fid, None)

@@ -1,0 +1,4 @@
+index,duration_seconds,status,input_tokens,output_tokens,timestamp
+1,1.234,passed,128,256,2026-01-01T12:00:00
+2,2.499,passed,96,512,2026-01-01T12:00:00
+3,3.87,failed,210,64,2026-01-01T12:00:00

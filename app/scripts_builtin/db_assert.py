@@ -1,15 +1,22 @@
 """内置预判脚本：db_assert
 
 SQL 查询 + 期望断言 JSON 的只读比对（设计：docs/design/pre-judge-scripts.md
-§四 builtin 类型 / §十二 二期预置清单）：复用项目现有 DB 连接
-（app.db.session.SessionLocal）执行查询，与期望断言逐条比对，输出通过率与
+§四 builtin 类型 / §十二 二期预置清单）：按平台注入的只读连接串
+（stdin.db_dsn ← Settings.DB_ASSERT_READONLY_DSN，仅内置脚本记录获得）
+自建 SQLAlchemy engine 执行查询，与期望断言逐条比对，输出通过率与
 差异明细硬事实供裁判判断。
+
+W1-3 整改：不再 import 平台 SessionLocal（脚本子进程环境变量白名单后
+拿不到平台 DATABASE_URL，平台凭据也绝不下发）；数据库访问凭据只经
+stdin 定向注入本脚本进程。
 
 标准输入（stdin）：
     fields.assertions  断言清单 JSON 文件本地路径：
                         {"assertions": [
                           {"name": "订单落库", "sql": "SELECT ...", "expected": {...}},
                         ]}
+    db_dsn             平台注入的只读数据库连接串（内置记录编排时注入；
+                        缺失即明确报错，不回退平台库）
     params.fail_fast   可选，默认 false：首条断言失败后停止后续断言
     params.max_rows    可选，默认 1000：单条查询最多取回的行数（防全表拉爆）
 
@@ -23,7 +30,8 @@ SQL 查询 + 期望断言 JSON 的只读比对（设计：docs/design/pre-judge-
 1. SQL 白名单校验：仅允许单条 SELECT / WITH 开头语句；分号后还有内容
    （多语句）直接拒绝；
 2. 只读事务：连接上尽力 SET TRANSACTION READ ONLY（PG/MySQL 支持，
-   不支持的平台跳过）——主防线是上面的 SQL 校验；
+   不支持的平台跳过）——主防线是上面的 SQL 校验；连接串本身应为只读账号
+   （平台 DB_ASSERT_READONLY_DSN）；
 3. 行数上限 max_rows，超限行丢弃（只影响 row_count 类断言的准确性，防拖库）。
 
 标准输出：{status, output, files, summary, finish_reason, error}
@@ -36,8 +44,6 @@ import re
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-
-from app.db.session import SessionLocal
 
 _MAX_ROWS_DEFAULT = 1000
 
@@ -64,6 +70,14 @@ def run(stdin: Dict[str, Any]) -> Dict[str, Any]:
     if not assertions:
         return _fail("断言清单为空（未解析到任何断言）")
 
+    # W1-3：只读连接串由平台经 stdin 注入（未注入即明确失败，不回退平台库）
+    dsn = str(stdin.get("db_dsn") or "").strip()
+    if not dsn:
+        return _fail(
+            "缺少只读数据库连接（db_dsn）：平台未配置 DB_ASSERT_READONLY_DSN，"
+            "或本脚本不是内置脚本记录（只读凭据仅注入内置 db_assert）"
+        )
+
     fail_fast = bool(params.get("fail_fast", False))
     try:
         max_rows = max(1, int(params.get("max_rows") or _MAX_ROWS_DEFAULT))
@@ -71,11 +85,15 @@ def run(stdin: Dict[str, Any]) -> Dict[str, Any]:
         max_rows = _MAX_ROWS_DEFAULT
 
     results: List[Dict[str, Any]] = []
-    for assertion in assertions:
-        entry = _run_assertion(assertion, max_rows)
-        results.append(entry)
-        if fail_fast and not entry["passed"]:
-            break
+    engine = _create_engine(dsn)
+    try:
+        for assertion in assertions:
+            entry = _run_assertion(assertion, max_rows, engine)
+            results.append(entry)
+            if fail_fast and not entry["passed"]:
+                break
+    finally:
+        engine.dispose()
 
     total = len(results)
     passed = sum(1 for r in results if r["passed"])
@@ -173,7 +191,15 @@ def _rows_from_result(result: Any, max_rows: int) -> Tuple[List[Dict[str, Any]],
 
 # ==================== 断言执行 ====================
 
-def _run_assertion(assertion: Dict[str, Any], max_rows: int) -> Dict[str, Any]:
+def _create_engine(dsn: str) -> Any:
+    """按 stdin.db_dsn 自建 SQLAlchemy engine（W1-3：凭据来自 stdin 定向注入，
+    不再 import 平台 SessionLocal；延迟导入便于测试替换执行通道）"""
+    from sqlalchemy import create_engine
+
+    return create_engine(dsn)
+
+
+def _run_assertion(assertion: Dict[str, Any], max_rows: int, engine: Any) -> Dict[str, Any]:
     """执行单条断言：校验 SQL → 只读执行 → 比对期望"""
     name = assertion["name"]
     sql = assertion["sql"]
@@ -191,9 +217,9 @@ def _run_assertion(assertion: Dict[str, Any], max_rows: int) -> Dict[str, Any]:
                 "error": f"不支持的断言键: {unknown_keys}（支持 {', '.join(_EXPECTED_KEYS)}）"}
 
     try:
-        with SessionLocal() as db:
-            _begin_readonly_transaction(db)
-            result = db.execute(_text(sql))
+        with engine.connect() as conn:
+            _begin_readonly_transaction(conn)
+            result = conn.execute(_text(sql))
             rows, truncated = _rows_from_result(result, max_rows)
     except Exception as e:  # noqa: BLE001 - 断言边界：DB 异常转该条失败
         return {"name": name, "sql": sql, "passed": False,
@@ -222,10 +248,10 @@ def _text(sql: str):
     return sa_text(sql)
 
 
-def _begin_readonly_transaction(db: Any) -> None:
+def _begin_readonly_transaction(conn: Any) -> None:
     """尽力开启只读事务（PG/MySQL 支持；不支持的平台静默跳过）"""
     try:
-        db.execute(_text("SET TRANSACTION READ ONLY"))
+        conn.execute(_text("SET TRANSACTION READ ONLY"))
     except Exception:  # noqa: BLE001 - 平台不支持只读事务时跳过（主防线是 SQL 白名单）
         pass
 

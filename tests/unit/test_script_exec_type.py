@@ -21,6 +21,7 @@ import asyncio
 import io
 import json
 import logging
+import os
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
@@ -45,6 +46,8 @@ from app.api.pre_judge_script_api import (
     debug_script,
     upload_script_file,
 )
+
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
 
 
 # ---------------- 脚本样例 ----------------
@@ -117,6 +120,16 @@ def _write_script(tmp_path, source, name="script_under_test.py") -> str:
     return str(target)
 
 
+def _write_pkg_script(source, script_id="pjs_scriptcase", name="main.py") -> str:
+    """把脚本源码写进脚本包目录（W1-2：entrypoint 只接受包内相对路径），
+    返回包内相对入口路径"""
+    base = Path(pre_judge_script_service.SCRIPT_UPLOAD_BASE)
+    pkg = base / script_id
+    pkg.mkdir(parents=True, exist_ok=True)
+    (pkg / name).write_text(source, encoding="utf-8")
+    return name
+
+
 def _script_def(entrypoint, timeout_seconds=30, script_id="pjs_scriptcase"):
     return {"script_id": script_id, "name": "script_case", "exec_type": "script",
             "entrypoint": entrypoint, "timeout_seconds": timeout_seconds}
@@ -153,12 +166,17 @@ def service(db_session):
 
 
 def _request(user=None):
-    """构造最小 Request，模拟鉴权中间件写入的 request.state.user（仓库既有模式）"""
+    """构造最小 Request，模拟鉴权中间件写入的 request.state.user（仓库既有模式）。
+
+    W1-4 起写操作校验 super_admin_flag == 1：缺省注入超管用户；
+    非 403 语义测试用 user 显式传普通用户/无标志用户。
+    """
     from starlette.requests import Request
 
     request = Request({"type": "http", "method": "POST", "path": "/", "headers": [], "query_string": b""})
-    if user is not None:
-        request.state.user = user
+    if user is None:
+        user = {"user_code": "u_admin", "super_admin_flag": 1}
+    request.state.user = user
     return request
 
 
@@ -186,7 +204,7 @@ def _upload_file(source: str, filename: str = "echo.py") -> UploadFile:
 class TestScriptSubprocess:
     def test_echo_script_via_real_subprocess(self, tmp_path):
         """真子进程跑 echo 样例：stdin JSON 注入、噪声行容错、最后一行 JSON 解析"""
-        entrypoint = _write_script(tmp_path, ECHO_SCRIPT)
+        entrypoint = _write_pkg_script(ECHO_SCRIPT)
         fields = pre_judge_runner.write_inline_value("msg", "hello", tmp_path)
         result = pre_judge_runner.execute_script(
             _script_def(entrypoint), _stdin(fields={"msg": fields}, params={"strict": True}))
@@ -201,7 +219,7 @@ class TestScriptSubprocess:
 
     def test_cwd_isolated_to_script_dir(self, tmp_path, run_base):
         """cwd 隔离：脚本相对路径写盘落在 uploads/script_runs/{task}/{data}/{script_id}/"""
-        entrypoint = _write_script(tmp_path, CWD_MARKER_SCRIPT)
+        entrypoint = _write_pkg_script(CWD_MARKER_SCRIPT)
         result = pre_judge_runner.execute_script(_script_def(entrypoint), _stdin())
 
         assert result["status"] == "ok"
@@ -211,34 +229,47 @@ class TestScriptSubprocess:
         # stdout/stderr 重定向文件也在该目录
         assert (script_cwd / "stdout.log").is_file()
 
-    def test_relative_entrypoint_resolved_before_subprocess(self, tmp_path, monkeypatch, run_base):
-        """回归（二期 API 联测缺陷①冒烟链路复现）：历史上传曾把相对路径写入
-        entrypoint（相对主进程 cwd），主进程下 is_file() 通过，但子进程 cwd 切到
-        script_runs 运行目录后解析失败（退出码 2: can't open file .../run_dir/uploads/...）。
-        修复：Popen 前相对 entrypoint 按主进程 cwd 转绝对路径。"""
+    def test_absolute_entrypoint_rejected(self, tmp_path, monkeypatch):
+        """W1-2：绝对路径 entrypoint 一律拒绝执行（历史上传曾可指向服务器任意 .py）"""
+        entry_abs = _write_script(tmp_path, CWD_MARKER_SCRIPT)
+        result = pre_judge_runner.execute_script(_script_def(entry_abs), _stdin())
+        assert result["status"] == "fail"
+        assert "绝对路径" in result["error"]
+        assert "脚本入口不存在" not in result["error"]
+
+    def test_cwd_relative_entrypoint_rejected(self, tmp_path, monkeypatch):
+        """W1-2：相对主进程 cwd 的历史兼容分支已删除——entrypoint 只在脚本包内解析"""
         script_dir = tmp_path / "uploads_pre_judge_scripts"
         script_dir.mkdir(parents=True, exist_ok=True)
         (script_dir / "rel_case.py").write_text(CWD_MARKER_SCRIPT, encoding="utf-8")
-        monkeypatch.chdir(tmp_path)  # 模拟主进程 cwd（真实部署为项目根）
+        monkeypatch.chdir(tmp_path)  # 历史缺陷①形态：cwd 下该相对路径确实存在
 
         result = pre_judge_runner.execute_script(
             _script_def("uploads_pre_judge_scripts/rel_case.py"), _stdin())
+        assert result["status"] == "fail", "cwd 相对 entrypoint 不应再被执行"
+        assert "脚本入口不存在" in (result["error"] or "")
+        # 入口校验失败在建运行目录之前发生：隔离目录未被创建（脚本根本没跑）
+        assert not (tmp_path / "script_runs" / "task_script_x").exists()
 
-        assert result["status"] == "ok", f"相对 entrypoint 应可执行: {result}"
-        assert result["finish_reason"] == "completed"
-        assert result["output"] == {"done": True}
-        # 子进程 cwd 仍正确隔离到运行目录
-        script_cwd = run_base / "task_script_x" / "data_1" / "pjs_scriptcase"
-        assert (script_cwd / "cwd_marker.txt").is_file()
+    def test_traversal_entrypoint_rejected(self, tmp_path, monkeypatch):
+        """W1-2：含 .. 穿越的 entrypoint 一律拒绝（不得解析到脚本包之外）"""
+        base = Path(pre_judge_script_service.SCRIPT_UPLOAD_BASE)
+        outside = base.parent / "outside_dir"
+        outside.mkdir(parents=True, exist_ok=True)
+        (outside / "evil.py").write_text(CWD_MARKER_SCRIPT, encoding="utf-8")
+        evil_rel = os.path.relpath(outside / "evil.py", base / "pjs_scriptcase")
 
-    def test_relative_entrypoint_missing_file_reports_absolute(self, tmp_path, monkeypatch):
-        """相对 entrypoint 指向不存在的文件时报错信息含解析后的绝对路径（便于定位）"""
+        result = pre_judge_runner.execute_script(_script_def(evil_rel), _stdin())
+        assert result["status"] == "fail"
+        assert ".. 穿越" in result["error"] or "绝对路径" in result["error"]
+
+    def test_package_entrypoint_missing_file_fails(self, tmp_path, monkeypatch):
+        """包内相对 entrypoint 指向不存在的文件 → fail（入口不存在）"""
         monkeypatch.chdir(tmp_path)
         result = pre_judge_runner.execute_script(
             _script_def("uploads_pre_judge_scripts/ghost.py"), _stdin())
         assert result["status"] == "fail"
-        assert "脚本入口不存在" in (result["error"] or "")
-        assert str(tmp_path) in result["error"]
+        assert "脚本入口不存在" in result["error"]
 
     def test_stdout_truncated_but_last_line_parsed(self, tmp_path, monkeypatch):
         """stdout 上限截断：大量噪声输出只读尾部，最后一行 JSON 仍可解析"""
@@ -246,7 +277,7 @@ class TestScriptSubprocess:
         noisy = ECHO_SCRIPT.replace('print("loading input ...")',
                                     '\n'.join(f'print("noise-line-{i:04d}-' + "x" * 32 + '")'
                                               for i in range(2000)))
-        entrypoint = _write_script(tmp_path, noisy)
+        entrypoint = _write_pkg_script(noisy)
         result = pre_judge_runner.execute_script(_script_def(entrypoint), _stdin())
         assert result["status"] == "ok"
         assert result["output"]["echo"] == ""
@@ -268,7 +299,7 @@ class TestScriptSubprocess:
 class TestTimeoutAndIllegalOutput:
     def test_timeout_kills_script(self, tmp_path):
         """超时 kill：timeout_seconds 到点终止脚本，返回 fail/timeout"""
-        entrypoint = _write_script(tmp_path, SLEEP_SCRIPT)
+        entrypoint = _write_pkg_script(SLEEP_SCRIPT)
         result = pre_judge_runner.execute_script(
             _script_def(entrypoint, timeout_seconds=0.5), _stdin())
 
@@ -280,7 +311,7 @@ class TestTimeoutAndIllegalOutput:
     def test_illegal_output_not_json(self, tmp_path):
         """非法输出：最后一行不是 JSON → fail"""
         bad = CWD_MARKER_SCRIPT.split("print(json.dumps")[0] + 'print("definitely not json")\n'
-        entrypoint = _write_script(tmp_path, bad)
+        entrypoint = _write_pkg_script(bad)
         result = pre_judge_runner.execute_script(_script_def(entrypoint), _stdin())
         assert result["status"] == "fail"
         assert "最后一行不是合法 JSON" in result["error"]
@@ -289,7 +320,7 @@ class TestTimeoutAndIllegalOutput:
     def test_illegal_output_not_json_object(self, tmp_path):
         """非法输出：最后一行是 JSON 数组（非对象）→ fail"""
         bad = CWD_MARKER_SCRIPT.split("payload = json.load")[0] + 'print(json.dumps([1, 2]))\n'
-        entrypoint = _write_script(tmp_path, bad)
+        entrypoint = _write_pkg_script(bad)
         result = pre_judge_runner.execute_script(_script_def(entrypoint), _stdin())
         assert result["status"] == "fail"
         assert "JSON 对象" in result["error"]
@@ -297,7 +328,7 @@ class TestTimeoutAndIllegalOutput:
     def test_illegal_status_normalized_to_fail(self, tmp_path):
         """非法输出：status 值不在 ok/skip/fail → 归一为 fail"""
         bad = CWD_MARKER_SCRIPT.replace('"status": "ok"', '"status": "weird"')
-        entrypoint = _write_script(tmp_path, bad)
+        entrypoint = _write_pkg_script(bad)
         result = pre_judge_runner.execute_script(_script_def(entrypoint), _stdin())
         assert result["status"] == "fail"
         assert "非法 status 值" in result["error"]
@@ -305,7 +336,7 @@ class TestTimeoutAndIllegalOutput:
     def test_nonzero_exit_code_fails_with_stderr(self, tmp_path):
         """非零退出码：fail 且错误信息带退出码与 stderr 片段"""
         bad = 'import sys\nsys.stderr.write("boom-detail")\nsys.exit(3)\n'
-        entrypoint = _write_script(tmp_path, bad)
+        entrypoint = _write_pkg_script(bad)
         result = pre_judge_runner.execute_script(_script_def(entrypoint), _stdin())
         assert result["status"] == "fail"
         assert "3" in result["error"]
@@ -313,7 +344,7 @@ class TestTimeoutAndIllegalOutput:
 
     def test_empty_stdout_fails(self, tmp_path):
         """无输出：fail（未找到最后一行 JSON）"""
-        entrypoint = _write_script(tmp_path, "print()\n")
+        entrypoint = _write_pkg_script("print()\n")
         result = pre_judge_runner.execute_script(_script_def(entrypoint), _stdin())
         assert result["status"] == "fail"
         assert "标准输出为空" in result["error"]
@@ -324,7 +355,7 @@ class TestTimeoutAndIllegalOutput:
 class TestStaticCheck:
     def test_risky_script_executes_with_warnings(self, tmp_path, caplog):
         """静态检查提示级：风险脚本仍正常执行，提示写入 static_check 并记日志"""
-        entrypoint = _write_script(tmp_path, RISKY_OK_SCRIPT)
+        entrypoint = _write_pkg_script(RISKY_OK_SCRIPT)
         with caplog.at_level(logging.WARNING, logger="app.services.pre_judge_runner"):
             result = pre_judge_runner.execute_script(_script_def(entrypoint), _stdin())
 
@@ -472,7 +503,7 @@ class TestScriptUploadApi:
 
         body = asyncio.run(debug_script(
             created["id"], PreJudgeScriptDebugPayload(fields={"msg": "inline-content"}),
-            db=db_session))
+            request=_request(), db=db_session))
         assert body["result"]["status"] == "ok"
         assert body["result"]["output"]["echo"] == "inline-content"
         assert body["static_check"] == []
@@ -484,12 +515,17 @@ class TestScriptUploadApi:
                 created["id"], request=_request(), file=_upload_file("x", "evil.sh"), db=db_session))
         assert exc.value.status_code == 400
 
-    def test_upload_admin_gate(self, db_session):
-        """管理员语义校验（与既有写操作一致）：is_admin=False → 403"""
+    @pytest.mark.parametrize("user", [
+        {"user_code": "u_normal", "super_admin_flag": 0},
+        {"user_code": "u_plain"},  # 无超管标志（deny by default）
+        {"user_code": "u_wrong", "super_admin_flag": 2},
+    ])
+    def test_upload_admin_gate(self, db_session, user):
+        """W1-4：非超管（flag=0/缺失/非 1）调写操作一律 403"""
         created = self._create_script_row(db_session)
         with pytest.raises(HTTPException) as exc:
             asyncio.run(upload_script_file(
-                created["id"], request=_request(user={"user_code": "u_normal", "is_admin": False}),
+                created["id"], request=_request(user=user),
                 file=_upload_file(ECHO_SCRIPT), db=db_session))
         assert exc.value.status_code == 403
 
@@ -511,10 +547,20 @@ class TestScriptUploadApi:
     def test_upload_with_admin_user_ok(self, db_session):
         created = self._create_script_row(db_session)
         saved = asyncio.run(upload_script_file(
-            created["id"], request=_request(user={"user_code": "u_admin", "is_admin": True}),
+            created["id"], request=_request(user={"user_code": "u_admin", "super_admin_flag": 1}),
             file=_upload_file(ECHO_SCRIPT),
             risk_acknowledged=None, declared_requirements=None, db=db_session))
         assert saved["entrypoint"].endswith(".py")
+
+    def test_debug_requires_admin(self, db_session):
+        """W1-4：debug 试跑与写操作同口径，非超管 403"""
+        created = self._create_script_row(db_session)
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(debug_script(
+                created["id"], PreJudgeScriptDebugPayload(fields={}),
+                request=_request(user={"user_code": "u_normal", "super_admin_flag": 0}),
+                db=db_session))
+        assert exc.value.status_code == 403
 
 
 # ---------------- 编排集成：DB 脚本行 + 脚本串联 ----------------
@@ -549,9 +595,9 @@ class TestPipelineIntegration:
 
     def test_db_script_row_runs_in_pipeline(self, pg_session_factory, monkeypatch, tmp_path):
         """DB 记录 exec_type=script：编排走子进程分支，echo 输出进 script_outputs"""
-        entrypoint = _write_script(tmp_path, ECHO_SCRIPT)
+        _write_pkg_script(ECHO_SCRIPT, script_id="pjs_e2e_script")
         pg_session_factory.add(PreJudgeScript(id="pjs_e2e_script", name="echo_script",
-                                              exec_type="script", entrypoint=entrypoint,
+                                              exec_type="script", entrypoint="main.py",
                                               timeout_seconds=30))
         pg_session_factory.commit()
         monkeypatch.setattr(pre_judge_runner, "SessionLocal", lambda: pg_session_factory)
@@ -567,9 +613,9 @@ class TestPipelineIntegration:
 
     def test_script_then_script_upstream_chain(self, pg_session_factory, monkeypatch, tmp_path):
         """脚本间串联：前序脚本的标准输出注入后序脚本的 stdin.upstream"""
-        entrypoint = _write_script(tmp_path, ECHO_SCRIPT)
+        _write_pkg_script(ECHO_SCRIPT, script_id="pjs_e2e_chain")
         pg_session_factory.add(PreJudgeScript(id="pjs_e2e_chain", name="echo_script",
-                                              exec_type="script", entrypoint=entrypoint,
+                                              exec_type="script", entrypoint="main.py",
                                               timeout_seconds=30))
         self._add_probe_script(pg_session_factory, tmp_path)
         pg_session_factory.commit()
@@ -585,9 +631,9 @@ class TestPipelineIntegration:
 
     def test_script_fail_continue_keeps_pipeline(self, pg_session_factory, monkeypatch, tmp_path):
         """script 失败（默认 continue）：记录 fail，后续脚本仍执行"""
-        bad_entrypoint = _write_script(tmp_path, "import sys\nsys.exit(2)\n")
+        _write_pkg_script("import sys\nsys.exit(2)\n", script_id="pjs_e2e_bad")
         pg_session_factory.add(PreJudgeScript(id="pjs_e2e_bad", name="bad_script",
-                                              exec_type="script", entrypoint=bad_entrypoint,
+                                              exec_type="script", entrypoint="main.py",
                                               timeout_seconds=30))
         self._add_probe_script(pg_session_factory, tmp_path)
         pg_session_factory.commit()

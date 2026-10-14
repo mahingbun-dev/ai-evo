@@ -7,6 +7,8 @@ import pytest
 from app.services.result_aggregator import ResultAggregator
 from app.services.judge_evaluation_engine import JudgeEvaluationResult
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 class TestCalculateOverallMetrics:
     """calculate_overall_metrics 方法测试"""

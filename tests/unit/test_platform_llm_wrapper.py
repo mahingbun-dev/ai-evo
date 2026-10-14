@@ -7,6 +7,8 @@ import json
 
 from app.services.platform_llm_wrapper import PlatformLLMWrapper, create_platform_llm
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 class TestPlatformLLMWrapper:
     """PlatformLLMWrapper 测试类"""

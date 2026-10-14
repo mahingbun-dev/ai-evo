@@ -1,0 +1,67 @@
+{
+  "total_count": 4,
+  "confusion_matrix": {
+    "tp": 1,
+    "fp": 0,
+    "tn": 2,
+    "fn": 1
+  },
+  "accuracy": 0.75,
+  "specificity": 1.0,
+  "sensitivity": 0.5,
+  "precision": 1.0,
+  "f1_score": 0.6667,
+  "f2_score": 0.5556,
+  "f05_score": 0.8333,
+  "mcc": 0.5774,
+  "npv": 0.6667,
+  "error_rate": 0.25,
+  "prevalence": 0.5,
+  "youden_index": 0.5,
+  "items": [
+    {
+      "idx": 0,
+      "success": true,
+      "expected_label": true,
+      "predicted_label": true,
+      "is_correct": true,
+      "duration": 1.234,
+      "error": "",
+      "model_output": "true",
+      "question": "该评论「服务很好」是正面评价吗？",
+      "is_valid": true,
+      "prediction": true
+    },
+    {
+      "idx": 1,
+      "success": true,
+      "expected_label": true,
+      "predicted_label": false,
+      "is_correct": false,
+      "duration": 0.987,
+      "error": "",
+      "model_output": "false",
+      "question": "该评论「环境脏乱」是正面评价吗？",
+      "is_valid": true,
+      "prediction": false
+    },
+    {
+      "idx": 2,
+      "success": true,
+      "expected_label": false,
+      "predicted_label": false,
+      "is_correct": true,
+      "duration": 1.001,
+      "error": "",
+      "model_output": "false",
+      "question": "该评论「价格昂贵」是正面评价吗？",
+      "is_valid": false,
+      "prediction": false
+    },
+    {
+      "idx": 3,
+      "success": false,
+      "error": "模型调用失败: 429 Too Many Requests"
+    }
+  ]
+}

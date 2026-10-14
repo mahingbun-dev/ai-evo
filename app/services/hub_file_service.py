@@ -37,6 +37,7 @@ import logging
 import os
 import re
 import shutil
+import time
 import uuid
 import zipfile
 from datetime import datetime
@@ -44,6 +45,10 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+from sqlalchemy import delete as sa_delete
+from sqlalchemy import select as sa_select
+from sqlalchemy import update as sa_update
+from sqlalchemy.exc import DBAPIError as sa_DBAPIError
 import urllib3
 
 from app.core.config import get_settings
@@ -1218,21 +1223,41 @@ def match_files(unpack_root: str, pattern: str) -> List[str]:
         raise HubFileError(f"文件匹配模式不允许 .. 穿越: {pattern}")
     if not root.is_dir():
         return []
-    matched = sorted(
-        p.relative_to(root).as_posix()
-        for p in root.glob(pat)
-        if p.is_file()
-    )
+
+    def _fs_match(parts: List[str], raw: str) -> List[str]:
+        """文件系统侧匹配：与索引版 _parts_match 同一套部件匹配器
+
+        pathlib.Path.glob 的裸 '**'（模式以 '**' 结尾）在 Python 3.12 不匹配
+        文件、3.13 起才包含文件——生产运行 3.12 时 '**' 类模式会漏配，且违背
+        与 match_files_in_index 的「同语义」承诺（等价性测试在 CI 3.12 下实测
+        抓到）。因此 '**' 结尾的模式统一走 walk + _parts_match（三方同语义：
+        fs / index / 各 Python 版本），其余模式仍走原始模式串的 pathlib glob
+        （保留尾随 '/' 等原生语义，各 Python 版本行为一致）。
+        """
+        if not parts or parts[-1] != "**":
+            return sorted(
+                p.relative_to(root).as_posix()
+                for p in root.glob(raw)
+                if p.is_file()
+            )
+        return sorted(
+            p.relative_to(root).as_posix()
+            for p in root.rglob("*")
+            if p.is_file() and _parts_match(p.relative_to(root).parts, parts)
+        )
+
+    pat_parts = [p for p in pat.split("/") if p and p != "."]
+    if pat_parts and pat_parts[-1] == "**" and pat.endswith("/"):
+        # 与索引版同口径：尾随 '/' 在 pathlib 中只匹配目录，仅文件结果恒为空
+        return []
+
+    matched = _fs_match(pat_parts, pat)
     if matched:
         return matched
     # 原始 pattern 未命中：尝试单顶层目录自动拼接（与预览侧 match_files_in_index 同源）
     top = _sole_top_dir_of_root(root)
     if top and PurePosixPath(pat).parts and PurePosixPath(pat).parts[0] != top:
-        retried = sorted(
-            p.relative_to(root).as_posix()
-            for p in root.glob(f"{top}/{pat}")
-            if p.is_file()
-        )
+        retried = _fs_match([top] + pat_parts, f"{top}/{pat}")
         if retried:
             return retried
     return matched
@@ -1326,6 +1351,81 @@ def _query_record(db, file_id: str):
     return db.query(HubFileRecord).filter(HubFileRecord.file_id == file_id).first()
 
 
+def _atomic_ref_update_stmt(file_id: str, delta: int):
+    """ref_count 原子 ±1 语句（W11）：SQL 端单语句更新，消除读改写竞态丢更新
+
+    并发场景（acks_late 重投 / 两个 job 导入同一包 / 删除联动释放与执行持引
+    并发）：两 worker 同时读到旧值再各自回写会互相覆盖；改为
+    `UPDATE hub_files SET ref_count = ref_count ± 1` 由行锁串行化，计数精确。
+    自减用 CASE 下限 0，对齐原 max(0, ...) 语义；自增列本身 NOT NULL，无需
+    COALESCE。synchronize_session=False：不走会话内对象同步（权威值由调用方
+    回读 DB 取得，避免把过期值写回）。
+    """
+    from sqlalchemy import case as sa_case
+
+    from app.models.hub_file_models import HubFileRecord
+
+    if delta >= 0:
+        expr = HubFileRecord.ref_count + delta
+    else:
+        expr = sa_case(
+            (HubFileRecord.ref_count > 0, HubFileRecord.ref_count + delta), else_=0
+        )
+    return (
+        sa_update(HubFileRecord)
+        .where(HubFileRecord.file_id == file_id)
+        .values(ref_count=expr)
+        .execution_options(synchronize_session=False)
+    )
+
+
+def _zero_ref_delete_stmt(file_id: str):
+    """归零条件删除语句（W11）：仅当 ref_count 仍为 0 才删，防与并发 acquire 竞态
+    误清理他人刚持有的包（acquire 先于本删除发生时 ref_count 已 >0，删除不命中）"""
+    from app.models.hub_file_models import HubFileRecord
+
+    return (
+        sa_delete(HubFileRecord)
+        .where(HubFileRecord.file_id == file_id, HubFileRecord.ref_count == 0)
+        .execution_options(synchronize_session=False)
+    )
+
+
+def _read_ref_count(db, file_id: str) -> int:
+    """权威回读 ref_count（Core SELECT 绕过会话身份映射，取 DB 当前值）"""
+    from app.models.hub_file_models import HubFileRecord
+
+    value = db.execute(
+        sa_select(HubFileRecord.ref_count).where(HubFileRecord.file_id == file_id)
+    ).scalar()
+    return int(value or 0)
+
+
+def _execute_ref_stmt_with_retry(db, stmt, attempts: int = 3):
+    """执行原子 ref 语句；瞬时 DBAPI 错误（连接抖动/死锁牺牲品）回滚后有限重试
+
+    单语句事务在 READ COMMITTED 下无丢失更新，重试只覆盖连接类瞬时失败；
+    语句可重入（重试前事务已整体回滚，不存在半提交导致的重复计数）。
+    """
+    last_err: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return db.execute(stmt)
+        except sa_DBAPIError as e:  # noqa: BLE001 - SQLAlchemy 包装的 DBAPI 瞬时错误
+            last_err = e
+            try:
+                db.rollback()
+            except Exception:  # noqa: BLE001 - 回滚失败以原始异常为准
+                pass
+            logger.warning(
+                f"[hub_file] ref 原子更新第 {attempt}/{attempts} 次执行失败"
+                f"（已回滚，{'重试' if attempt < attempts else '放弃'}）: {e}"
+            )
+            if attempt < attempts:
+                time.sleep(0.05 * attempt)
+    raise last_err
+
+
 def _mark_failed(db, record, file_id: str, unpack_dir: str, message: str) -> None:
     """best-effort 登记失败状态（失败信息写入 unpack_error，不向调用方抛出）"""
     from app.models.hub_file_models import HubFileRecord
@@ -1353,6 +1453,7 @@ def ensure_unpacked(
     *,
     datasets_root: Optional[str] = None,
     service: Optional["HubFileService"] = None,
+    team_code: Optional[str] = None,
 ) -> Dict[str, Any]:
     """幂等物化执行包：登记表 unpacked 命中直接返回（零下载），未命中走完整流程
 
@@ -1364,6 +1465,9 @@ def ensure_unpacked(
         file_id: anc-hub file-store 文件 ID
         datasets_root: 解包根目录（缺省 uploads/hub_datasets/，测试注入临时目录）
         service: HubFileService 实例（缺省按端点配置新建，测试可注入 mock 端点）
+        team_code: W9 团队归属——仅在**新建登记记录**时写入（导入时从目标
+                   数据集继承）；已有记录幂等命中不覆盖（保持首次导入团队的归属，
+                   避免后导入团队改写他人正在引用的资源的归属）
 
     Returns:
         {file_id, unpack_dir, file_index, summary, cached, record_id}
@@ -1412,6 +1516,9 @@ def ensure_unpacked(
 
     if record is None:
         record = HubFileRecord(id=_new_record_id(), file_id=file_id)
+        # W9：归属锚点——新建登记时从目标数据集团队继承（None 落 DEFAULT 口径）
+        if team_code and str(team_code).strip():
+            record.team_code = str(team_code).strip()
         db.add(record)
     record.filename = info.get("filename")
     record.size = info.get("size")
@@ -1441,8 +1548,12 @@ def ensure_unpacked(
 def acquire_ref(db, file_id: str) -> int:
     """执行包引用计数 +1（执行/预览开始持有时调用）
 
+    W11 原子化：UPDATE ... SET ref_count = ref_count + 1（SQL 端单语句），
+    多 worker 并发持有同一包时不再发生读改写丢更新；预检查仅用于给出
+    「未登记」的明确错误，真正的存在性以 UPDATE 影响行数为准（TOCTOU 兜底）。
+
     Returns:
-        加一后的引用计数
+        加一后的引用计数（并发下为 DB 权威回读值，可能高于本地旧值+1）
 
     Raises:
         HubFileError: file_id 为空或未登记（需先 ensure_unpacked）
@@ -1453,9 +1564,13 @@ def acquire_ref(db, file_id: str) -> int:
     record = _query_record(db, file_id)
     if record is None:
         raise HubFileError(f"执行包未登记（file_id={file_id}），请先导入解包后再引用")
-    record.ref_count = int(record.ref_count or 0) + 1
+    result = _execute_ref_stmt_with_retry(db, _atomic_ref_update_stmt(file_id, +1))
+    if getattr(result, "rowcount", 0) == 0:
+        # 预检查后记录被并发归零清理（TOCTOU 兜底）
+        db.rollback()
+        raise HubFileError(f"执行包未登记（file_id={file_id}），请先导入解包后再引用")
     db.commit()
-    return record.ref_count
+    return _read_ref_count(db, file_id)
 
 
 def _hub_files_cache_root(cache_root: Optional[str] = None) -> str:
@@ -1466,13 +1581,17 @@ def _hub_files_cache_root(cache_root: Optional[str] = None) -> str:
 def release_ref(db, file_id: str) -> int:
     """执行包引用计数 -1；归零时清理解包目录、下载缓存目录与登记表记录
 
+    W11 原子化：减一为 SQL 端单语句 UPDATE（下限 0），消除读改写竞态；归零
+    清理改为「条件删除」（DELETE ... WHERE ref_count = 0）先行——并发 acquire
+    抢先持有引用时删除不命中，跳过目录清理，避免误删他人刚持有的包。
+
     归零联动（小项1）：除解包目录 uploads/hub_datasets/{file_id}/ 外，
     同时清理下载缓存目录 uploads/hub_files/{file_id}/（导入时 download_to_file
     落盘的原始 zip 与 meta.json）。该目录此前无清理方（任务级清理只删
     uploads/hub_files/{task_id}/ 任务子目录），登记删除后永久残留。
 
     Returns:
-        归还后的剩余引用计数（0 表示已清理）
+        归还后的剩余引用计数（0 表示已清理或已被并发方清理）
 
     Raises:
         HubFileError: file_id 为空或未登记
@@ -1483,12 +1602,28 @@ def release_ref(db, file_id: str) -> int:
     record = _query_record(db, file_id)
     if record is None:
         raise HubFileError(f"执行包未登记（file_id={file_id}），无法释放引用")
-    remaining = max(0, int(record.ref_count or 0) - 1)
-    if remaining == 0:
-        # 归零：清理解包目录与登记记录
-        if record.unpack_dir and os.path.isdir(record.unpack_dir):
-            shutil.rmtree(record.unpack_dir, ignore_errors=True)
-            logger.info(f"[hub_file] 引用归零，已清理解包目录: {record.unpack_dir}")
+    # unpack_dir 在任何 commit 前取值：expire_on_commit 下实例过期，条件删除
+    # 落库后再访问属性会触发刷新并抛 ObjectDeletedError（行已删）
+    unpack_dir = record.unpack_dir
+    result = _execute_ref_stmt_with_retry(db, _atomic_ref_update_stmt(file_id, -1))
+    if getattr(result, "rowcount", 0) == 0:
+        # 预检查后记录被并发归零清理（TOCTOU 兜底）
+        db.rollback()
+        raise HubFileError(f"执行包未登记（file_id={file_id}），无法释放引用")
+    db.commit()
+    remaining = _read_ref_count(db, file_id)
+    if remaining > 0:
+        return remaining
+    # 归零：条件删除（仅当 ref_count 仍为 0 才删）→ 删除命中才清理解包目录、
+    # 下载缓存目录与人工补传目录（补传内容跟包走，包被彻底清理时一并删除）
+    deleted = getattr(
+        db.execute(_zero_ref_delete_stmt(file_id)), "rowcount", 0
+    )
+    db.commit()
+    if deleted:
+        if unpack_dir and os.path.isdir(unpack_dir):
+            shutil.rmtree(unpack_dir, ignore_errors=True)
+            logger.info(f"[hub_file] 引用归零，已清理解包目录: {unpack_dir}")
         # 归零联动清理下载缓存目录（原始 zip 落盘处，见类 docstring 小项1说明）
         cache_dir = os.path.join(
             _hub_files_cache_root(), sanitize_hub_name(file_id, fallback="hub_file")
@@ -1496,18 +1631,11 @@ def release_ref(db, file_id: str) -> int:
         if os.path.isdir(cache_dir):
             shutil.rmtree(cache_dir, ignore_errors=True)
             logger.info(f"[hub_file] 引用归零，已清理下载缓存目录: {cache_dir}")
-        # 归零联动清理人工补传目录（uploads/hub_supplements/{file_id}/）：
-        # 补传内容跟包走，包被彻底清理时一并删除，不产生孤儿数据
         supplement_dir = _supplement_dir_for(file_id)
         if os.path.isdir(supplement_dir):
             shutil.rmtree(supplement_dir, ignore_errors=True)
             logger.info(f"[hub_file] 引用归零，已清理人工补传目录: {supplement_dir}")
-        db.delete(record)
-        db.commit()
-        return 0
-    record.ref_count = remaining
-    db.commit()
-    return remaining
+    return 0
 
 
 def collect_row_hub_file_ids(data: Dict[str, Any], field_names: List[str]) -> List[str]:
@@ -1603,16 +1731,34 @@ def _clean_supplement_rel(rel_path: str) -> str:
 
 
 def merged_index(record) -> List[Dict[str, Any]]:
-    """原始解包索引 + 人工补传索引的叠加视图（补传条目打 is_manual=True）
+    """原始解包索引 + 人工补传索引的合并视图（补传条目打 is_manual=True）
 
     树 / 匹配预览等读取面统一走本函数：file_index 落库保持纯原始（重导重建
-    索引后无需同步补传条目），补传条目在读取时叠加。
+    索引后无需同步补传条目），补传条目在读取时合并。
+
+    W9 优先级统一（计划：预览视图 =「合并后视图 + 补传条目打 is_manual 标记」）：
+    同名 path 的补传条目**替换**原始条目（保留原始条目位置），而非简单追加——
+    与执行镜像 resolve_hub_file_fields 的合并语义（解包区先、补传区后，
+    同名以补传版为准）严格一致，保证「所见即所评」：补传覆盖后的文件在
+    树/匹配预览中只出现一条（is_manual=True），matched_count 与执行时
+    镜像内实际文件数一致（旧实现同名双条目会让预览计数虚高）。
     """
     base = list(getattr(record, "file_index", None) or [])
     supplements = getattr(record, "supplement_index", None) or []
     if not supplements:
         return base
-    merged = list(base)
+    manual_paths = {
+        item.get("path")
+        for item in supplements
+        if isinstance(item, dict) and item.get("path")
+    }
+    merged: List[Dict[str, Any]] = []
+    for item in base:
+        path = item.get("path") if isinstance(item, dict) else None
+        if path is not None and path in manual_paths:
+            # 同名补传条目在后面追加（替换视图：原始条目让位）
+            continue
+        merged.append(item)
     for item in supplements:
         entry = dict(item)
         entry["is_manual"] = True

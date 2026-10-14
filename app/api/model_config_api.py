@@ -1,7 +1,7 @@
 """
 模型配置API
 """
-from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.websockets import WebSocketState
 import json
 import re
@@ -13,6 +13,13 @@ from pydantic import BaseModel, Field, field_serializer
 from datetime import datetime
 from app.db.session import get_db
 from app.services.model_config_service import ModelConfigService, PresetModelService
+from app.services.ws_auth import require_ws_user
+from app.services.access_control import (
+    AccessDeniedError,
+    check_team_access,
+    ensure_model_access,
+    user_team_code,
+)
 
 # 配置日志
 logger = logging.getLogger(__name__)
@@ -113,12 +120,13 @@ class ModelDetailResponse(ModelResponse):
 
     @field_serializer('api_key')
     def mask_api_key(self, value: Optional[str]) -> Optional[str]:
-        """对 API Key 做脱敏处理，只保留前3位和后3位"""
-        if not value:
-            return value
-        if len(value) <= 8:
-            return '*' * len(value)
-        return value[:3] + '*' * (len(value) - 6) + value[-3:]
+        """对 API Key 做脱敏处理，只保留前3位和后3位
+
+        W4 起掩码逻辑单一来源收敛在 config_snapshot.mask_api_key
+        （创建任务配置快照复用同一实现），此处仅委托。
+        """
+        from app.services.config_snapshot import mask_api_key as _mask_api_key
+        return _mask_api_key(value)
 
 
 class JudgeModelResponse(BaseModel):
@@ -177,10 +185,11 @@ router = APIRouter(prefix="/models", tags=["模型配置"])
 
 @router.post("", response_model=ModelResponse, summary="创建模型配置")
 def create_model(
+    request: Request,
     body: CreateModelRequest,
     db: Session = Depends(get_db),
 ):
-    """创建新的模型配置"""
+    """创建新的模型配置（W19：team_code 盖创建人团队，空 org_code 按 DEFAULT）"""
     service = ModelConfigService(db)
     model = service.create_model(
         name=body.name,
@@ -197,6 +206,7 @@ def create_model(
         multimodal_config=body.multimodal_config,
         description=body.description,
         created_by=body.created_by,
+        team_code=user_team_code(request.state.user),
     )
     return model
 
@@ -220,23 +230,23 @@ def get_models(
 @router.get("/{model_id}", response_model=ModelDetailResponse, summary="获取模型详情")
 def get_model(
     model_id: str,
+    request: Request,
     db: Session = Depends(get_db),
 ):
-    """获取模型配置详情"""
-    service = ModelConfigService(db)
-    model = service.get_model(model_id)
-    if not model:
-        raise HTTPException(status_code=404, detail="模型不存在")
+    """获取模型配置详情（W19：团队收口——详情含 auth_config 等凭据载体）"""
+    model = ensure_model_access(db, request.state.user, model_id)
     return model
 
 
 @router.put("/{model_id}", response_model=ModelResponse, summary="更新模型配置")
 def update_model(
     model_id: str,
+    request: Request,
     body: UpdateModelRequest,
     db: Session = Depends(get_db),
 ):
-    """更新模型配置"""
+    """更新模型配置（W19：团队收口）"""
+    ensure_model_access(db, request.state.user, model_id)
     update_data = body.model_dump(exclude_unset=True)
     # 如果 api_key 为空或包含脱敏字符 '*'，说明用户未修改，不更新
     if 'api_key' in update_data:
@@ -253,9 +263,11 @@ def update_model(
 @router.delete("/{model_id}", summary="删除模型配置")
 def delete_model(
     model_id: str,
+    request: Request,
     db: Session = Depends(get_db),
 ):
-    """删除模型配置"""
+    """删除模型配置（W19：团队收口）"""
+    ensure_model_access(db, request.state.user, model_id)
     service = ModelConfigService(db)
     try:
         success = service.delete_model(model_id)
@@ -291,10 +303,12 @@ def get_model_variables(
 @router.post("/{model_id}/test", response_model=TestConnectionResponse, summary="测试模型连接")
 async def test_model_connection(
     model_id: str,
+    request: Request,
     body: Optional[TestConnectionWithVariablesRequest] = None,
     db: Session = Depends(get_db),
 ):
-    """测试模型连接是否正常，支持传入运行时变量"""
+    """测试模型连接是否正常，支持传入运行时变量（W19：团队收口，防凭据被探）"""
+    ensure_model_access(db, request.state.user, model_id)
     service = ModelConfigService(db)
     # 正确处理可选 body 参数
     runtime_vars = None
@@ -335,10 +349,11 @@ router_judge = APIRouter(prefix="/judge-models", tags=["裁判模型"])
 
 @router_judge.post("", response_model=ModelResponse, summary="创建裁判模型配置")
 def create_judge_model(
+    request: Request,
     body: CreateModelRequest,
     db: Session = Depends(get_db),
 ):
-    """创建裁判模型配置（使用ModelConfig表，model_role设为judge）"""
+    """创建裁判模型配置（使用ModelConfig表，model_role设为judge；W19：盖创建人团队）"""
     service = ModelConfigService(db)
     judge = service.create_model(
         name=body.name,
@@ -355,6 +370,7 @@ def create_judge_model(
         multimodal_config=body.multimodal_config,
         description=body.description,
         created_by=body.created_by,
+        team_code=user_team_code(request.state.user),
     )
     return judge
 
@@ -373,23 +389,23 @@ def get_judge_models(
 @router_judge.get("/{judge_id}", response_model=ModelDetailResponse, summary="获取裁判模型详情")
 def get_judge_model(
     judge_id: str,
+    request: Request,
     db: Session = Depends(get_db),
 ):
-    """获取裁判模型详情"""
-    service = ModelConfigService(db)
-    judge = service.get_model(judge_id)
-    if not judge:
-        raise HTTPException(status_code=404, detail="裁判模型不存在")
+    """获取裁判模型详情（W19：团队收口）"""
+    judge = ensure_model_access(db, request.state.user, judge_id)
     return judge
 
 
 @router_judge.put("/{judge_id}", response_model=ModelResponse, summary="更新裁判模型配置")
 def update_judge_model(
     judge_id: str,
+    request: Request,
     body: UpdateModelRequest,
     db: Session = Depends(get_db),
 ):
-    """更新裁判模型配置"""
+    """更新裁判模型配置（W19：团队收口）"""
+    ensure_model_access(db, request.state.user, judge_id)
     service = ModelConfigService(db)
     # 强制确保 model_role 为 judge
     update_data = body.model_dump(exclude_unset=True)
@@ -408,9 +424,11 @@ def update_judge_model(
 @router_judge.delete("/{judge_id}", summary="删除裁判模型配置")
 def delete_judge_model(
     judge_id: str,
+    request: Request,
     db: Session = Depends(get_db),
 ):
-    """删除裁判模型配置"""
+    """删除裁判模型配置（W19：团队收口）"""
+    ensure_model_access(db, request.state.user, judge_id)
     service = ModelConfigService(db)
     try:
         success = service.delete_model(judge_id)
@@ -432,11 +450,35 @@ async def websocket_test_model(
     """
     WebSocket 测试模型连接
     支持流式和非流式输出，通过 WebSocket 实时推送结果
+
+    鉴权：accept 之前完成 SSO Cookie 验证，未认证一律 close(4401)。
+    W19：补模型归属校验（4404 不存在 / 4403 跨团队）——测连会用模型
+    凭据发起真实请求，不允许跨团队探测。
     """
-    from app.services.jwt_service import decode_token
-    if not decode_token(websocket.query_params.get("token") or ""):
-        await websocket.close(code=4401)
+    # 鉴权（必须在 accept 之前）：失败时 require_ws_user 已发送 close(4401)
+    user = await require_ws_user(websocket)
+    if user is None:
         return
+
+    # W19：模型归属校验（与 HTTP 侧 ensure_model_access 同一判定内核）
+    from app.models.model_config_models import ModelConfig
+    from app.db.session import SessionLocal
+
+    with SessionLocal() as db:
+        model = db.query(ModelConfig).filter(ModelConfig.id == model_id).first()
+    if model is None:
+        await websocket.close(code=4404)
+        return
+    try:
+        check_team_access(user, model.team_code)
+    except AccessDeniedError:
+        logger.warning(
+            f"[WS] 4403 - 跨团队模型测连被拒: model_id={model_id}, "
+            f"model_team={model.team_code}, user_team={user.get('org_code')}"
+        )
+        await websocket.close(code=4403)
+        return
+
     await websocket.accept()
 
     try:

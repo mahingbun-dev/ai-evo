@@ -8,6 +8,8 @@ import pandas as pd
 
 from app.api.dataset_api import download_template
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 class TestDownloadTemplate:
     """download_template 函数测试"""

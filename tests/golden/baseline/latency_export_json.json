@@ -1,0 +1,48 @@
+{
+  "evaluation_type": "latency",
+  "export_time": "2026-01-01T12:00:00",
+  "total": 1,
+  "results": [
+    {
+      "total_count": 3,
+      "passed_count": 2,
+      "failed_count": 1,
+      "pass_rate": 0.6666666666666666,
+      "avg_duration": 2.5343333333333335,
+      "min_duration": 1.234,
+      "max_duration": 3.87,
+      "p50_duration": 2.499,
+      "p90_duration": 3.87,
+      "p99_duration": 3.87,
+      "score": 99.31333333333333,
+      "threshold": 2.5,
+      "records": [
+        {
+          "index": 1,
+          "duration": 1.234,
+          "timestamp": "2026-01-01T12:00:00",
+          "passed": true,
+          "input_tokens": 128,
+          "output_tokens": 256
+        },
+        {
+          "index": 2,
+          "duration": 2.499,
+          "timestamp": "2026-01-01T12:00:00",
+          "passed": true,
+          "input_tokens": 96,
+          "output_tokens": 512
+        },
+        {
+          "index": 3,
+          "duration": 3.87,
+          "timestamp": "2026-01-01T12:00:00",
+          "passed": false,
+          "input_tokens": 210,
+          "output_tokens": 64
+        }
+      ],
+      "evaluation_type": "latency"
+    }
+  ]
+}

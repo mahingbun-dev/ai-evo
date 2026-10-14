@@ -12,6 +12,8 @@ import pytest
 
 from app.services.dataset_field_service import DatasetFieldService, HUB_FIELD_TYPE
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 def write_excel(tmp_path, df, name="fields.xlsx"):
     path = tmp_path / name

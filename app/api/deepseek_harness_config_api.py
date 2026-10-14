@@ -17,7 +17,8 @@ import tempfile
 from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
+from app.services.access_control import ensure_super_admin
 from pydantic import BaseModel, Field
 
 from app.services.deepseek_adapter import is_native_deepseek_protocol
@@ -25,7 +26,7 @@ from app.services.deepseek_harness_config_service import DeepSeekHarnessConfigSe
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/deepseek-harness-config")
+router = APIRouter(prefix="/deepseek-harness-config", dependencies=[Depends(ensure_super_admin)])
 
 VALID_PROTOCOLS = ("deepseek", "openai", "anthropic")
 

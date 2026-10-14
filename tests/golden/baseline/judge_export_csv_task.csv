@@ -1,0 +1,2 @@
+question_index,total,success_count,failed_count,success_rate,max_score,failed_judge_rows,items,failed_items,completed_at,evaluation_type,model_answer,overall_score
+,4,3,1,0.75,10,1,"[{'idx': 0, 'success': True, 'model_output': '使用哈希表一次遍历，时间复杂度 O(n)', 'model_raw_response': '思路：遍历数组，用字典记录已出现的数值与下标……', 'input_data': '', 'judge_count': 2, 'judge_scores': [{'score': 8.5, 'feedback': '","[{'idx': 3, 'success': False, 'error': '模型调用超时'}]",2026-01-01T12:00:00,judge,,

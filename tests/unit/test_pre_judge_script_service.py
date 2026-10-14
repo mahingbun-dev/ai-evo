@@ -42,6 +42,8 @@ from app.api.pre_judge_script_api import (
 )
 from fastapi import HTTPException
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 @pytest.fixture
 def db_session():
@@ -67,10 +69,14 @@ def service(db_session):
 
 
 def _request(user=None) -> Request:
-    """构造最小 Request，模拟鉴权中间件写入的 request.state.user（dict）"""
+    """构造最小 Request，模拟鉴权中间件写入的 request.state.user（dict）。
+
+    W1-4 起写操作校验 super_admin_flag == 1：缺省注入超管用户。
+    """
     request = Request({"type": "http", "method": "GET", "path": "/", "headers": [], "query_string": b""})
-    if user is not None:
-        request.state.user = user
+    if user is None:
+        user = {"user_code": "u_admin", "super_admin_flag": 1}
+    request.state.user = user
     return request
 
 
@@ -130,6 +136,44 @@ class TestBuiltinMigration:
         assert migrated["xml_diff"] == "pjs_builtin_xml_diff"
         row = db_session.query(PreJudgeScript).filter_by(name="xml_diff").first()
         assert row.exec_type == "script" and row.entrypoint == "main.py"
+
+    def test_deleted_builtin_not_recreated_on_restart(self, db_session):
+        """表非空时缺失的内置脚本不补种（用户删除即真删，重启/部署不再复活）"""
+        ensure_builtin_scripts_migrated(db_session)
+        victim = db_session.query(PreJudgeScript).filter_by(name="log_grep").first()
+        db_session.delete(victim)
+        db_session.commit()
+
+        migrated = ensure_builtin_scripts_migrated(db_session)
+        assert "log_grep" not in migrated
+        remaining = {r.name for r in db_session.query(PreJudgeScript).all()}
+        assert "log_grep" not in remaining
+        assert set(migrated) == set(BUILTIN_SCRIPT_DEFS) - {"log_grep"}
+
+    def test_recreate_missing_explicit_keeps_manual_migration_semantics(self, db_session):
+        """recreate_missing=True（手动一键迁移入口）：缺失内置脚本重建"""
+        ensure_builtin_scripts_migrated(db_session)
+        victim = db_session.query(PreJudgeScript).filter_by(name="log_grep").first()
+        db_session.delete(victim)
+        db_session.commit()
+
+        migrated = ensure_builtin_scripts_migrated(db_session, recreate_missing=True)
+        assert migrated["log_grep"] == "pjs_builtin_log_grep"
+        row = db_session.query(PreJudgeScript).filter_by(name="log_grep").first()
+        assert row is not None and row.exec_type == "script" and row.is_active is True
+
+    def test_nonempty_table_migrates_legacy_but_skips_missing(self, db_session):
+        """表非空组合场景：legacy builtin 行仍迁移，缺失的其它内置不重建"""
+        db_session.add(PreJudgeScript(id="pjs_builtin_xml_diff", name="xml_diff",
+                                      exec_type="builtin", entrypoint="xml_diff", is_active=True))
+        db_session.commit()
+        migrated = ensure_builtin_scripts_migrated(db_session)
+        assert migrated["xml_diff"] == "pjs_builtin_xml_diff"
+        row = db_session.query(PreJudgeScript).filter_by(name="xml_diff").first()
+        assert row.exec_type == "script"
+        # 其余内置脚本缺失（表非空）→ 不补种
+        assert db_session.query(PreJudgeScript).count() == 1
+        assert set(migrated) == {"xml_diff"}
 
     def test_migration_keeps_user_edits(self, db_session):
         """同名已存在（含用户编辑过的记录）迁移不覆盖元数据（仅补文件）"""
@@ -239,12 +283,12 @@ class TestCrud:
 
     def test_list_db_only_after_migration(self, service, db_session):
         """统一落库：列表仅 DB 记录；迁移后内置脚本以普通 script 记录出现（无 is_builtin 字段）"""
-        service.create_script({"name": "mine", "exec_type": "script"})
-        # 未迁移：仅自建记录
-        assert [i["name"] for i in service.list_scripts()] == ["mine"]
+        # 空表迁移：4 个内置脚本落库为普通记录（启动语义），再混入自建脚本
         ensure_builtin_scripts_migrated(db_session)
+        service.create_script({"name": "mine", "exec_type": "script"})
         names = [i["name"] for i in service.list_scripts()]
         assert "allure_vs_cases" in names and "mine" in names
+        assert len(names) == len(BUILTIN_SCRIPT_DEFS) + 1
         builtin_item = next(i for i in service.list_scripts() if i["name"] == "allure_vs_cases")
         assert "is_builtin" not in builtin_item
         assert builtin_item["id"] == "pjs_builtin_allure_vs_cases"
@@ -389,25 +433,76 @@ class TestApi:
             asyncio.run(create_script(payload, request=_request(), db=db_session))
         assert exc.value.status_code == 400
 
-    def test_write_rejected_when_is_admin_false(self, db_session):
-        """管理员简化校验：用户字典带 is_admin=False 时写操作 403"""
-        user = {"user_code": "u_normal", "is_admin": False}
+    @pytest.mark.parametrize("user", [
+        {"user_code": "u_normal", "super_admin_flag": 0},
+        {"user_code": "u_plain"},  # 无超管标志（deny by default）
+        {"user_code": "u_legacy", "is_admin": False},  # 旧 is_admin 字段不再是放行依据
+    ])
+    def test_write_rejected_for_non_super_admin(self, db_session, user):
+        """W1-4：非超管（super_admin_flag != 1）写操作一律 403"""
         with pytest.raises(HTTPException) as exc:
             asyncio.run(create_script(_payload(), request=_request(user=user), db=db_session))
         assert exc.value.status_code == 403
         with pytest.raises(HTTPException):
             asyncio.run(delete_script("pjs_any", request=_request(user=user), db=db_session))
 
-    def test_write_allowed_without_is_admin_field(self, db_session):
-        """简化管理员语义：当前 SSO 用户无 is_admin 字段 → 普通用户可用"""
-        user = {"user_code": "u_plain"}
-        created = asyncio.run(create_script(_payload(), request=_request(user=user), db=db_session))
-        assert created["created_by"] == "u_plain"
+    def test_write_rejected_without_user(self, db_session):
+        """W1-4：未注入 user（未登录语义）写操作 403（deny by default）"""
+        request = Request({"type": "http", "method": "POST", "path": "/",
+                           "headers": [], "query_string": b""})
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(create_script(_payload(), request=request, db=db_session))
+        assert exc.value.status_code == 403
 
-    def test_write_allowed_when_is_admin_true(self, db_session):
+    def test_write_allowed_when_super_admin_flag_1(self, db_session):
+        """W1-4：super_admin_flag == 1 放行（与前端 Scripts.vue isSuperAdmin 同口径）"""
         created = asyncio.run(create_script(
-            _payload(), request=_request(user={"user_code": "u_admin", "is_admin": True}), db=db_session))
+            _payload(),
+            request=_request(user={"user_code": "u_admin", "super_admin_flag": 1}),
+            db=db_session))
         assert created["id"].startswith("pjs_")
+
+    def test_builtin_script_immutable(self, db_session):
+        """W1-3：内置脚本记录不可编辑/删除（service 层守卫）"""
+        ensure_builtin_scripts_migrated(db_session)
+        service = PreJudgeScriptService(db_session)
+        builtin_id = "pjs_builtin_db_assert"
+        with pytest.raises(ValueError, match="不可编辑"):
+            service.update_script(builtin_id, {"timeout_seconds": 60})
+        with pytest.raises(ValueError, match="不可删除"):
+            service.delete_script(builtin_id)
+        with pytest.raises(ValueError, match="不可上传覆盖"):
+            service.save_script_file(builtin_id, b"print('hijack')\n")
+
+    def test_builtin_script_files_immutable(self, db_session):
+        """W1-3：内置脚本目录文件不可在线增删改（403）"""
+        from app.services.pre_judge_script_service import PreJudgeFileError
+
+        ensure_builtin_scripts_migrated(db_session)
+        service = PreJudgeScriptService(db_session)
+        builtin_id = "pjs_builtin_db_assert"
+        with pytest.raises(PreJudgeFileError) as exc:
+            service.update_script_file(builtin_id, "main.py", "print('hijack')\n", None)
+        assert exc.value.status_code == 403
+        with pytest.raises(PreJudgeFileError) as exc:
+            service.create_script_file(builtin_id, "evil.py", "print('hi')\n")
+        assert exc.value.status_code == 403
+        with pytest.raises(PreJudgeFileError) as exc:
+            service.delete_script_file(builtin_id, "main.py")
+        assert exc.value.status_code == 403
+
+    def test_entrypoint_validation_on_update(self, service):
+        """W1-2：update_script 的 entrypoint 走包内相对路径校验"""
+        script = service.create_script({"name": "entry_upd", "exec_type": "script"})
+        script_dir = script_service.SCRIPT_UPLOAD_BASE / script["id"]
+        script_dir.mkdir(parents=True, exist_ok=True)
+        (script_dir / "main.py").write_text("print('x')\n", encoding="utf-8")
+
+        ok = service.update_script(script["id"], {"entrypoint": "main.py"})
+        assert ok["entrypoint"] == "main.py"
+        for evil in ("../outside.py", "/etc/hosts.py", "..\\evil.py", "ghost.py"):
+            with pytest.raises(ValueError, match="entrypoint"):
+                service.update_script(script["id"], {"entrypoint": evil})
 
     def test_debug_builtin_script(self, db_session, sample_files):
         """debug 端点：给输入样例试跑一次（子进程执行），产物落盘返回路径"""
@@ -416,7 +511,7 @@ class TestApi:
             "builtin:allure_vs_cases",
             PreJudgeScriptDebugPayload(fields={"cases_file": sample_files["cases_file"],
                                                "allure_results": sample_files["results_dir"]}),
-            db=db_session))
+            request=_request(), db=db_session))
         assert body["result"]["status"] == "ok"
         assert body["result"]["output"]["consistency_rate"] == 0.3333
         assert os.path.isfile(body["result"]["files"]["per_case_full.json"])
@@ -430,10 +525,11 @@ class TestApi:
             "builtin:allure_vs_cases",
             PreJudgeScriptDebugPayload(fields={"cases_file": cases_text,
                                                "allure_results": sample_files["results_dir"]}),
-            db=db_session))
+            request=_request(), db=db_session))
         assert body["result"]["status"] == "ok"
 
     def test_debug_unknown_script_404(self, db_session):
         with pytest.raises(HTTPException) as exc:
-            asyncio.run(debug_script("pjs_none", PreJudgeScriptDebugPayload(), db=db_session))
+            asyncio.run(debug_script("pjs_none", PreJudgeScriptDebugPayload(),
+                                     request=_request(), db=db_session))
         assert exc.value.status_code == 404

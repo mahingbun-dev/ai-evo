@@ -84,6 +84,10 @@ class JudgeVariableResolver:
         self.model_result = model_result or {}
         self.chain_results = chain_results or []
         self.script_outputs = script_outputs or {}
+        # W12-3：evaluation_targets 的 script_output 行被置空的明细
+        # （脚本失败 on_fail=continue / 未编排 / 输出缺失），供执行链路
+        # 把该行显式标记 pre_script_failed（跳过裁判、不进均分）
+        self.script_output_missing: List[Dict[str, Any]] = []
 
         # 获取配置，不再使用 DEFAULT_CONFIG 作为回退
         # 当 judge_variable_config 未配置时，使用空配置
@@ -278,17 +282,27 @@ class JudgeVariableResolver:
           整体 JSON 序列化兜底
         - 取到：dict/list 序列化为 JSON 文本，其余复用 _safe_string 风格转换
         - 键不存在或输出为 None（脚本失败 on_fail=continue 等场景）：返回空串，
-          走既有空值校验逻辑
+          走既有空值校验逻辑；置空明细记入 self.script_output_missing（W12-3）
         """
         script_id = source_config.get("script_id")
         output_var = source_config.get("output_var")
         # script_outputs 键与 run_pre_scripts 收集口径一致：output_var 或脚本名
         output_key_in_ctx = output_var or script_id
         if not output_key_in_ctx or output_key_in_ctx not in self.script_outputs:
+            self.script_output_missing.append({
+                "script": output_key_in_ctx,
+                "output_key": source_config.get("output_key"),
+                "reason": "script_output_missing",
+            })
             return ""
 
         output = self.script_outputs.get(output_key_in_ctx)
         if output is None:
+            self.script_output_missing.append({
+                "script": output_key_in_ctx,
+                "output_key": source_config.get("output_key"),
+                "reason": "script_output_none",
+            })
             return ""
 
         output_key = source_config.get("output_key")

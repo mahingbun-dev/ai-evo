@@ -15,6 +15,8 @@ import pytest
 
 from app.services.deepeval_result_transformer import TransformedMetricResult
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 # ============================================================
 # evaluate_task_completion 测试

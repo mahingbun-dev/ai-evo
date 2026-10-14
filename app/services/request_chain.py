@@ -512,11 +512,15 @@ class RequestChainExecutor:
         # 获取超时配置：SSE流式响应需要更长的超时时间
         response_type = request_config.get("response_type", "json")
         if response_type == "sse":
-            # SSE流式响应默认5分钟超时
-            timeout = request_config.get("timeout", 3000)
+            # SSE流式响应默认300秒（5分钟）超时
+            # W10-7：原默认 3000 秒（50 分钟）远超实际需要，异常请求会占死
+            # 执行线程整整 50 分钟，少量并发即拖垮评测 worker
+            timeout = request_config.get("timeout", 300)
         else:
             # 普通请求默认60秒超时
-            timeout = request_config.get("timeout", 600)
+            # W10-7：原默认 600 秒（10 分钟）过长；确有长耗时需求的请求
+            # 应在请求配置里显式声明 timeout
+            timeout = request_config.get("timeout", 60)
 
         # 2. 发送请求（带重试机制）
         response = None
@@ -1047,30 +1051,39 @@ class RequestChainExecutor:
         return result
 
     def _interpolate(self, template: str) -> str:
-        """变量替换 - 支持 {{variable_name}} 和 [[variable_name]] 语法"""
+        """变量替换 - 支持 {{variable_name}} 和 [[variable_name]] 语法
+
+        W12-4 凭据安全顺序：先替换 {{var}}（内部变量，含 api_key/cookie 等
+        凭据性 builtin），后注入 [[var]]（外部内容，如数据集字段）。旧顺序
+        （先 [[var]] 后 {{var}}）下，外部内容中的 `{{api_key}}` 字样会被随后的
+        凭据扫描替换成真实密钥带出（数据集行即成凭据外泄通道）。外部值中的
+        `{{` 一并转义为全角 `｛｛`，防止注入内容被任何后续模板处理二次展开。
+        """
         if not isinstance(template, str):
             return str(template)
 
         result = template
 
-        # 处理 [[variable]] 格式（外部变量）
-        external_pattern = r'\[\[(\w+)\]\]'
-        for var_name in re.findall(external_pattern, result):
-            value = self.variables.get(var_name)
-            if value is not None:
-                result = result.replace(f'[[{var_name}]]', str(value))
-            else:
-                # 变量值为 None 或不存在，替换为空字符串并记录警告
-                logger.warning(f"[RequestChain] 变量 {var_name} 的值为 None 或不存在，替换为空字符串")
-                result = result.replace(f'[[{var_name}]]', "")
-
-        # 处理 {{variable}} 格式（内部变量）
+        # 1. 先处理 {{variable}} 格式（内部变量，含凭据）——此刻模板中尚无外部内容
         for key, value in self.variables.get_all().items():
             # 替换 {{key}}
             placeholder = f"{{{{{key}}}}}"
             if placeholder in result:
                 str_value = str(value)
                 result = result.replace(placeholder, str_value)
+
+        # 2. 后注入 [[variable]] 格式（外部内容）——注入值中的 {{ 转义，阻断凭据扫描
+        external_pattern = r'\[\[(\w+)\]\]'
+        for var_name in re.findall(external_pattern, result):
+            value = self.variables.get(var_name)
+            if value is not None:
+                # W12-4：外部值不允许携带 {{var}} 语法进入请求体（{{ 转义为全角 ｛｛）
+                safe_value = str(value).replace("{{", "｛｛")
+                result = result.replace(f'[[{var_name}]]', safe_value)
+            else:
+                # 变量值为 None 或不存在，替换为空字符串并记录警告
+                logger.warning(f"[RequestChain] 变量 {var_name} 的值为 None 或不存在，替换为空字符串")
+                result = result.replace(f'[[{var_name}]]', "")
 
         return result
 

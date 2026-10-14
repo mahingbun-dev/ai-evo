@@ -16,6 +16,9 @@ from app.models.task_models import EvaluationTask
 from app.models.template_models import EvaluationTemplate
 from app.services.config_migration_service import ConfigMigrationService
 
+import pytest
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 def _migration_db(script_rows=None, tasks=None, templates=None):
     """构造 mock DB：PreJudgeScript 全量查询返回 script_rows（.all()），

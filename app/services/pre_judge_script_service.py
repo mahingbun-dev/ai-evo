@@ -17,12 +17,17 @@ anc-hub 执行包脚本文件契约）：
 - 任务编排 pre_scripts 配置校验（input_mapping 的 path_pattern/required
   与 hub_file 目标字段校验，阶段B）
 - script 类型上传脚本运行前静态风险扫描（提示级，不拦截）
+- W1 安全收敛：entrypoint 必须为包内相对路径（validate_entrypoint：
+  拒绝绝对路径/.. 穿越/不存在文件，save/update/import 全走校验）；
+  内置脚本记录（pjs_builtin_*）不可变（禁编辑/删除/覆盖/在线改文件，
+  源码随部署强制同步），防止篡改脚本窃取注入的数据库凭据
 """
 import ast
 import copy
 import io
 import json
 import logging
+import posixpath
 import re
 import shutil
 import subprocess
@@ -289,6 +294,10 @@ def build_smoke_stdin(run_dir: Path) -> Dict[str, Any]:
     note_file = inputs_dir / "note.txt"
     note_file.write_text("平台上传校验：契约冒烟样例输入", encoding="utf-8")
 
+    # 脚本产物目录（_run_dir/outputs/）：与生产 build_run_dir 同口径，冒烟环境
+    # 也保证存在——按规范写产物的脚本在契约冒烟中即可真实落盘验证
+    (run_dir / "outputs").mkdir(exist_ok=True)
+
     pkg_dir = run_dir / "hub_pkg"
     attempt_dir = pkg_dir / SMOKE_ATTEMPT_DIR
     attempt_dir.mkdir(parents=True, exist_ok=True)
@@ -357,16 +366,25 @@ def run_smoke_test(entry_path: Path, timeout: Optional[float] = None) -> Dict[st
       pre_judge_entry.py 调起（run(stdin) 函数式 / __main__ 传统式自动适配，
       与生产执行 _execute_script_subprocess 完全同路径），cwd 隔离到临时目录
       （样例文件也落在该目录，_run_dir 指向它，跑完即清理）
+    - W15 灰度：SCRIPT_EXEC_MODE=container 时冒烟改走 docker run --rm 容器
+      （与生产执行同通道同镜像同隔离边界；入口包先拷进临时工作区 scripts/
+      smoke/ 从副本执行——上传目录不进挂载面，仍符合「挂载仅本次工作区」）
     - 超时（默认 SMOKE_TIMEOUT_SECONDS=10s）kill 并抛中文错误
     - 退出码非 0 / stdout 最后一个非空行非 JSON / 非对象 → 抛 ValueError，
       错误信息回显 stdout/stderr 尾部输出，便于上传者定位
     - 通过则返回解析出的标准输出 JSON 对象
     """
     # 懒加载 pre_judge_runner（其模块顶层 import 本模块，顶层互引会循环）
-    from app.services.pre_judge_runner import ENTRY_WRAPPER, SCRIPT_PYTHON
+    from app.services import script_container
+    from app.services.pre_judge_runner import ENTRY_WRAPPER, SCRIPT_PYTHON, build_script_env
 
     limit = SMOKE_TIMEOUT_SECONDS if timeout is None else float(timeout)
     entry = Path(entry_path)
+
+    # W15：container 模式冒烟与生产执行同通道（docker run --rm，镜像内 wrapper）
+    if script_container.container_mode_enabled():
+        return _run_smoke_test_in_container(entry, limit)
+
     # wrapper 形态：[SCRIPT_PYTHON, wrapper, script_dir, entry_rel]（与生产一致）
     script_dir = entry.parent
     entry_rel = entry.name
@@ -381,6 +399,7 @@ def run_smoke_test(entry_path: Path, timeout: Optional[float] = None) -> Dict[st
                 capture_output=True,
                 cwd=str(run_dir),
                 timeout=limit,
+                env=build_script_env(),  # W1-3：与生产执行同一白名单环境（不继承 API 进程 env）
             )
         except subprocess.TimeoutExpired:
             raise ValueError(
@@ -392,31 +411,96 @@ def run_smoke_test(entry_path: Path, timeout: Optional[float] = None) -> Dict[st
 
         stdout_text = proc.stdout.decode("utf-8", errors="replace")
         stderr_text = proc.stderr.decode("utf-8", errors="replace")
+        _smoke_assert_returncode(proc.returncode, stdout_text, stderr_text)
+        return _smoke_parse_stdout(stdout_text, stderr_text)
+
+
+def _run_smoke_test_in_container(entry: Path, limit: float) -> Dict[str, Any]:
+    """契约冒烟的 container 通道（W15）：docker run --rm 跑入口，与生产同构
+
+    与 local 冒烟的差异：
+    - 入口包先拷进临时工作区 scripts/smoke/ 副本（上传目录不进容器挂载面）；
+    - stdin 内工作区路径重写为容器 /workspace 路径后经 -i 传入；
+    - 镜像不可用等启动失败给出运维提示（预载属 D-3）。
+    结果解析与 local 完全同一套断言（_smoke_assert_returncode/_smoke_parse_stdout）。
+    """
+    from app.services import script_container
+
+    script_dir = entry.parent
+    entry_rel = entry.name
+    with tempfile.TemporaryDirectory(prefix="pjs_smoke_") as tmp:
+        run_dir = Path(tmp).absolute()
+        staged = run_dir / "scripts" / "smoke"
+        shutil.copytree(script_dir, staged, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+
+        stdin = script_container.rewrite_stdin_paths(build_smoke_stdin(run_dir), str(run_dir))
+        payload = json.dumps(stdin, ensure_ascii=False, default=str).encode("utf-8")
+        paths = script_container.build_container_paths(run_dir, run_dir, staged)
+        args = [
+            script_container.docker_binary(),
+            *script_container.build_docker_run_args(
+                image=script_container.runner_image(),
+                user=script_container.runner_user(),
+                paths=paths,
+                entry_rel=entry_rel,
+                container_name=script_container._new_container_name("smoke"),
+                network=False,
+            ),
+        ]
+        try:
+            proc = subprocess.run(args, input=payload, capture_output=True,
+                                  timeout=limit, cwd=str(run_dir))
+        except subprocess.TimeoutExpired:
+            raise ValueError(
+                f"契约冒烟未通过：入口执行超时（>{limit:.0f} 秒）。"
+                "请检查脚本是否阻塞等待输入或存在死循环"
+            )
+        except OSError as e:
+            raise ValueError(f"契约冒烟执行失败（无法启动 docker run）: {e}")
+
+        stdout_text = proc.stdout.decode("utf-8", errors="replace")
+        stderr_text = proc.stderr.decode("utf-8", errors="replace")
         if proc.returncode != 0:
+            tail = _smoke_tail(stdout_text, stderr_text)
+            hint = script_container._docker_failure_hint(proc.returncode, stderr_text,
+                                                         script_container.runner_image())
             raise ValueError(
                 "契约冒烟未通过：入口脚本退出码 "
-                f"{proc.returncode}。尾部输出：\n{_smoke_tail(stdout_text, stderr_text)}"
+                f"{proc.returncode}。尾部输出：\n{tail}{hint}"
             )
+        return _smoke_parse_stdout(stdout_text, stderr_text)
 
-        lines = [line.strip() for line in stdout_text.splitlines() if line.strip()]
-        if not lines:
-            raise ValueError(
-                "契约冒烟未通过：标准输出为空（未输出契约 JSON）。"
-                f"尾部输出：\n{_smoke_tail(stdout_text, stderr_text)}"
-            )
-        try:
-            stdout = json.loads(lines[-1])
-        except json.JSONDecodeError as e:
-            raise ValueError(
-                f"契约冒烟未通过：标准输出最后一个非空行不是合法 JSON（{e.msg}）。"
-                f"尾部输出：\n{_smoke_tail(stdout_text, stderr_text)}"
-            )
-        if not isinstance(stdout, dict):
-            raise ValueError(
-                "契约冒烟未通过：标准输出最后一行 JSON 必须是对象"
-                f"（{type(stdout).__name__}）。尾部输出：\n{_smoke_tail(stdout_text, stderr_text)}"
-            )
-        return stdout
+
+def _smoke_assert_returncode(returncode: int, stdout_text: str, stderr_text: str) -> None:
+    """冒烟退出码断言（local/container 共用）：非 0 抛中文 ValueError 并回显尾部"""
+    if returncode != 0:
+        raise ValueError(
+            "契约冒烟未通过：入口脚本退出码 "
+            f"{returncode}。尾部输出：\n{_smoke_tail(stdout_text, stderr_text)}"
+        )
+
+
+def _smoke_parse_stdout(stdout_text: str, stderr_text: str) -> Dict[str, Any]:
+    """冒烟标准输出解析（local/container 共用）：最后一行必须是 JSON 对象"""
+    lines = [line.strip() for line in stdout_text.splitlines() if line.strip()]
+    if not lines:
+        raise ValueError(
+            "契约冒烟未通过：标准输出为空（未输出契约 JSON）。"
+            f"尾部输出：\n{_smoke_tail(stdout_text, stderr_text)}"
+        )
+    try:
+        stdout = json.loads(lines[-1])
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"契约冒烟未通过：标准输出最后一个非空行不是合法 JSON（{e.msg}）。"
+            f"尾部输出：\n{_smoke_tail(stdout_text, stderr_text)}"
+        )
+    if not isinstance(stdout, dict):
+        raise ValueError(
+            "契约冒烟未通过：标准输出最后一行 JSON 必须是对象"
+            f"（{type(stdout).__name__}）。尾部输出：\n{_smoke_tail(stdout_text, stderr_text)}"
+        )
+    return stdout
 
 
 def _smoke_tail(stdout_text: str, stderr_text: str) -> str:
@@ -464,13 +548,33 @@ def _requirement_base_name(requirement: str) -> str:
 
 
 def check_declared_requirements(requirements: List[str]) -> None:
-    """依赖声明逐包校验（E4）：在执行 venv（SCRIPT_PYTHON）中查 importlib.metadata
+    """依赖声明逐包校验（E4；W15 起按执行模式分流）
 
-    缺失任一包即抛 ValueError，附缺失清单与完整 pip install 命令提示；
-    平台不自动安装（评测 venv 与生产环境一致，需管理员评估后安装）。
+    - local 模式（SCRIPT_EXEC_MODE=local，默认）：在执行 venv（SCRIPT_PYTHON）
+      中查 importlib.metadata——缺失任一包即抛 ValueError，附缺失清单与完整
+      pip install 命令提示；平台不自动安装（评测 venv 与生产环境一致，需管理
+      员评估后安装）。
+    - container 模式（SCRIPT_EXEC_MODE=container）：对照 runner 镜像「已装
+      集合」静态清单（script_container.RUNNER_IMAGE_PACKAGES，与
+      docker/script-runner/packages.txt 同步）纯内存校验，不再子进程探测——
+      镜像不可变（--read-only + 离线预载），缺失只能扩展 packages.txt 重建
+      镜像（D-3），无运行时 pip install 路径。
     """
     if not requirements:
         return
+    from app.services import script_container
+    if script_container.container_mode_enabled():
+        missing = script_container.check_requirements_against_runner(list(requirements))
+        if missing:
+            raise ValueError(
+                f"以下依赖在 runner 镜像（ai-evo-script-runner）内未安装: {', '.join(missing)}。"
+                "容器模式下镜像不可变、无运行时安装路径："
+                "请调整脚本改用镜像内已装依赖，或运维扩展 docker/script-runner/packages.txt "
+                "重建镜像（镜像离线预载见其 README，属 D-3 运维事项）。"
+                f"镜像内已装集合: {', '.join(sorted(script_container.runner_package_base_names()))}"
+            )
+        return
+
     names = [_requirement_base_name(item) for item in requirements]
     checker = (
         "import importlib.metadata, json, sys\n"
@@ -700,7 +804,7 @@ BUILTIN_SCRIPT_DEFS: Dict[str, Dict[str, Any]] = {
     "db_assert": {
         "id": "builtin:db_assert",
         "name": "db_assert",
-        "description": "SQL 查询 + 期望断言 JSON 只读比对：复用平台 DB 连接仅执行 SELECT，输出通过率与差异明细",
+        "description": "SQL 查询 + 期望断言 JSON 只读比对：按平台注入的只读连接串（stdin.db_dsn，配置 DB_ASSERT_READONLY_DSN）自建 engine 仅执行 SELECT，输出通过率与差异明细",
         "exec_type": "script",
         "entrypoint": "main.py",
         "allowed_tools": None,
@@ -727,6 +831,69 @@ def get_builtin_def(name: str) -> Optional[Dict[str, Any]]:
     return copy.deepcopy(definition) if definition else None
 
 
+# ---------------- entrypoint 校验与内置脚本不可变保护（W1-2 / W1-3） ----------------
+
+# 内置脚本记录 id 前缀（ensure_builtin_scripts_migrated 落库约定）：
+# 平台种子记录专用；用户经 API 创建的记录 id 一律为服务端生成的 pjs_{uuid}，
+# 无法伪造该前缀，作为 is_builtin 身份的判定依据
+BUILTIN_SCRIPT_ID_PREFIX = "pjs_builtin_"
+
+
+def is_builtin_script_id(script_id: str) -> bool:
+    """判断脚本记录 id 是否为平台内置脚本记录（不可变保护与 DSN 注入的口径）"""
+    return str(script_id or "").startswith(BUILTIN_SCRIPT_ID_PREFIX)
+
+
+def validate_entrypoint(entrypoint: Any, package_dir: Optional[Path] = None) -> Optional[str]:
+    """校验 script 类型 entrypoint 必须为脚本包内相对路径（W1-2）
+
+    规则：
+    - None / 空串 → 合法（表示尚未上传脚本文件），返回 None；
+    - 必须为字符串：posixpath 归一后不得以 / 开头（绝对路径）、不得含 ..
+      穿越、不得含反斜杠或 Windows 盘符，且必须以 .py 结尾；
+    - package_dir 存在时，入口文件必须真实存在于包内（不存在即拒绝）；
+      包目录尚未创建（先建记录后上传的正常流程）时仅做结构校验，
+      由上传链路与运行器（_resolve_script_entry 只认包内相对路径）兜底。
+
+    校验通过返回归一化后的 posix 相对路径（入库统一形态）；
+    不合法抛 ValueError（中文，API 层映射 400）。
+    """
+    if entrypoint is None or str(entrypoint).strip() == "":
+        return None
+    raw = str(entrypoint).strip()
+    if "\\" in raw:
+        raise ValueError(f"entrypoint 不允许包含反斜杠路径分隔符: {entrypoint}")
+    if re.match(r"^[A-Za-z]:", raw):
+        raise ValueError(f"entrypoint 不允许 Windows 盘符绝对路径: {entrypoint}")
+    normalized = posixpath.normpath(raw)
+    if normalized.startswith("/"):
+        raise ValueError(f"entrypoint 必须是脚本包内相对路径（不允许绝对路径）: {entrypoint}")
+    if normalized == ".." or normalized.startswith("../"):
+        raise ValueError(f"entrypoint 不允许 .. 穿越: {entrypoint}")
+    if not normalized.endswith(".py"):
+        raise ValueError(f"entrypoint 必须以 .py 结尾: {entrypoint}")
+    if package_dir is not None and Path(package_dir).is_dir():
+        if not (Path(package_dir) / normalized).is_file():
+            raise ValueError(
+                f"entrypoint 在脚本包内不存在: {entrypoint}（包目录: {package_dir}）"
+            )
+    return normalized
+
+
+def _ensure_mutable_script(row: PreJudgeScript, action: str) -> None:
+    """内置脚本记录不可变守卫（W1-3）：禁止编辑/删除/覆盖平台种子记录
+
+    内置 db_assert 等脚本由平台注入数据库凭据（stdin.db_dsn），记录一旦可被
+    篡改（改代码回显 DSN / 换 entrypoint 指向自建脚本）凭据即被窃取——
+    服务层守卫 + API 层超管校验双防线。
+    """
+    if is_builtin_script_id(row.id):
+        raise ValueError(
+            f"内置脚本「{row.name}」为平台预置，不可{action}"
+            "（内置脚本受保护，防止篡改脚本窃取注入的数据库凭据）"
+        )
+
+
 # ---------------- 目录式存储：布局与旧布局迁移 ----------------
 
 def script_dir_for(script_id: str) -> Path:
@@ -734,19 +901,25 @@ def script_dir_for(script_id: str) -> Path:
     return Path(SCRIPT_UPLOAD_BASE) / str(script_id)
 
 
-def _copy_builtin_script_file(name: str, script_id: str) -> None:
-    """把 app/scripts_builtin/{name}.py 拷贝为脚本目录 main.py（目标缺失才拷）"""
+def _copy_builtin_script_file(name: str, script_id: str, force: bool = False) -> None:
+    """把 app/scripts_builtin/{name}.py 拷贝为脚本目录 main.py
+
+    force=True（平台种子记录 pjs_builtin_{name}）：始终覆盖——内置脚本记录
+    不可变（W1-3），源码文件由平台管理，代码更新随部署/迁移即时生效；
+    force=False（同名非种子记录，如用户自建的同名脚本）：目标缺失才拷，
+    不覆盖用户内容。
+    """
     source = _BUILTIN_SOURCE_DIR / f"{name}.py"
     if not source.is_file():
         logger.warning(f"[PreJudgeScript] 内置脚本源码缺失: {source}")
         return
     target_dir = script_dir_for(script_id)
     target = target_dir / DEFAULT_ENTRYPOINT
-    if target.is_file():
+    if target.is_file() and not force:
         return
     target_dir.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(source, target)
-    logger.info(f"[PreJudgeScript] 内置脚本文件就位 {script_id} <- {source}")
+    logger.info(f"[PreJudgeScript] 内置脚本文件就位 {script_id} <- {source}（force={force}）")
 
 
 def ensure_script_layout(db, row: PreJudgeScript) -> Path:
@@ -787,23 +960,37 @@ def ensure_script_layout(db, row: PreJudgeScript) -> Path:
     return target_dir
 
 
-def ensure_builtin_scripts_migrated(db) -> Dict[str, str]:
+def ensure_builtin_scripts_migrated(db, recreate_missing: bool = False) -> Dict[str, str]:
     """内置脚本统一迁移为子进程 script 记录（幂等）
 
-    - 无记录：按 BUILTIN_SCRIPT_DEFS 建 script 记录（id=pjs_builtin_<name>，
-      entrypoint=main.py）+ 拷贝源码到 SCRIPT_UPLOAD_BASE/pjs_builtin_<name>/
+    - recreate_missing=False（缺省，启动语义）：仅当表完全为空时才按
+      BUILTIN_SCRIPT_DEFS 全量补种（保障新环境开箱可用）；表非空时不重建
+      缺失记录——用户删除即真删，重启/重新部署不再复活。已存在的记录
+      仍做 exec_type=builtin 历史形态迁移与文件同步
+    - recreate_missing=True（手动迁移入口，如 v3 一键迁移）：缺失的内置
+      脚本一律重建，保证 builtin:<name> 历史引用可解析
     - 记录存在且 exec_type=builtin（历史落库形态）：更新为 script、
       entrypoint=main.py，目标文件缺失时补拷
-    - 已是 script：仅确保文件在（缺失补拷，不覆盖用户编辑）
+    - 文件同步口径（W1-3）：平台种子记录（pjs_builtin_*）源码始终同步为
+      app/scripts_builtin 最新版（内置脚本不可变，代码更新随部署生效）；
+      同名非种子记录（用户自建同名脚本）仅目标缺失时补拷，不覆盖用户内容
 
-    返回 {name: script_id}。单个脚本迁移失败仅告警，不阻断其余条目。
+    返回 {name: script_id}（仅含实际落库/存在的脚本）。单个脚本迁移失败
+    仅告警，不阻断其余条目。
     """
     migrated: Dict[str, str] = {}
+    table_has_rows = db.query(PreJudgeScript.id).first() is not None
+    allow_recreate = bool(recreate_missing) or not table_has_rows
     for name, def_ in BUILTIN_SCRIPT_DEFS.items():
         script_id = f"pjs_builtin_{name}"
         try:
             existing = db.query(PreJudgeScript).filter(PreJudgeScript.name == name).first()
             if existing is None:
+                if not allow_recreate:
+                    logger.info(
+                        f"[PreJudgeScript] 内置脚本 {name} 无记录且脚本表非空，跳过补种（删除即真删）"
+                    )
+                    continue
                 row = PreJudgeScript(
                     id=script_id,
                     name=name,
@@ -828,7 +1015,9 @@ def ensure_builtin_scripts_migrated(db) -> Dict[str, str]:
                     existing.exec_type = "script"
                     existing.entrypoint = DEFAULT_ENTRYPOINT
                     logger.info(f"[PreJudgeScript] 内置脚本记录迁移 builtin -> script: {existing.id}")
-            _copy_builtin_script_file(name, script_id)
+            # 平台种子记录（pjs_builtin_*）源码始终同步为最新（不可变，用户不可编辑）；
+            # 同名非种子记录保持「缺失才补拷」，不覆盖用户内容
+            _copy_builtin_script_file(name, script_id, force=(script_id == f"pjs_builtin_{name}"))
         except Exception as e:  # noqa: BLE001 - 单条迁移失败不阻断启动
             try:
                 db.rollback()
@@ -1026,6 +1215,12 @@ class PreJudgeScriptService:
             # 同名已停用：复活语义（更新字段并重新启用），避免唯一约束冲突
             return self.update_script(existing.id, {**payload, "is_active": True})
 
+        # W1-2：script 类型 entrypoint 在创建时即做结构校验（包目录尚未创建，
+        # 不校验存在性；后续由上传链路与运行器兜底）
+        if exec_type == "script":
+            payload = dict(payload)
+            payload["entrypoint"] = validate_entrypoint(payload.get("entrypoint"))
+
         row = PreJudgeScript(
             id=f"pjs_{uuid.uuid4().hex[:12]}",
             name=name,
@@ -1049,10 +1244,15 @@ class PreJudgeScriptService:
         return self._row_to_dict(row)
 
     def update_script(self, script_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """更新脚本（部分字段更新；exec_type=builtin 一律拒绝）"""
+        """更新脚本（部分字段更新；exec_type=builtin 一律拒绝）
+
+        W1-2：script 类型 entrypoint 走 validate_entrypoint 校验（包内相对
+        路径，拒绝绝对路径/.. 穿越/不存在的文件）；W1-3：内置脚本记录不可变。
+        """
         row = self._get_row(script_id)
         if row is None:
             raise ValueError(f"脚本不存在: {script_id}")
+        _ensure_mutable_script(row, "编辑")
 
         if "name" in payload:
             new_name = (payload.get("name") or "").strip()
@@ -1075,7 +1275,12 @@ class PreJudgeScriptService:
                 raise ValueError(f"不支持的执行类型: {exec_type}，可选值: {', '.join(VALID_EXEC_TYPES)}")
             row.exec_type = exec_type
         if "entrypoint" in payload:
-            row.entrypoint = payload.get("entrypoint")
+            # agent 类型 entrypoint 是指令文本，不参与路径校验
+            if row.exec_type == "script":
+                row.entrypoint = validate_entrypoint(
+                    payload.get("entrypoint"), script_dir_for(script_id))
+            else:
+                row.entrypoint = payload.get("entrypoint")
         for field in ("description", "allowed_tools", "harness_extra", "input_fields", "output_schema"):
             if field in payload:
                 setattr(row, field, payload.get(field))
@@ -1100,11 +1305,12 @@ class PreJudgeScriptService:
         source_config.script_id，含 builtin:<name> 历史形态）：被未删除任务引用
         时拒绝删除（ValueError 中文提示，引导先解除关联），历史任务编排的引用
         可追溯性由「引用存在即不可删」保证；停用语义由「停用」操作承担，
-        删除不再等同停用。
+        删除不再等同停用。W1-3：内置脚本记录不可删除（不可变保护）。
         """
         row = self._get_row(script_id)
         if row is None:
             return False
+        _ensure_mutable_script(row, "删除")
         ref_task_names = self._find_referencing_tasks(script_id, row.name)
         if ref_task_names:
             names = "、".join(f"「{name}」" for name in ref_task_names)
@@ -1180,6 +1386,7 @@ class PreJudgeScriptService:
         row = self._get_row(script_id)
         if row is None:
             raise ValueError(f"脚本不存在: {script_id}")
+        _ensure_mutable_script(row, "上传覆盖")
         if row.exec_type != "script":
             raise ValueError(f"仅 exec_type=script 的脚本支持上传文件（当前: {row.exec_type}）")
         if len(content) > MAX_SCRIPT_FILE_SIZE:
@@ -1208,7 +1415,8 @@ class PreJudgeScriptService:
         script_dir.mkdir(parents=True, exist_ok=True)
         target = script_dir / DEFAULT_ENTRYPOINT
         target.write_bytes(content)
-        row.entrypoint = DEFAULT_ENTRYPOINT
+        # W1-2：落盘后校验入口（与 save_script_package / import_package 同口径）
+        row.entrypoint = validate_entrypoint(DEFAULT_ENTRYPOINT, script_dir)
         row.declared_requirements = requirements or None
         row.risk_acknowledged = (risk_acknowledged or "").strip() or None
         self.db.commit()
@@ -1255,6 +1463,7 @@ class PreJudgeScriptService:
         row = self._get_row(script_id)
         if row is None:
             raise ValueError(f"脚本不存在: {script_id}")
+        _ensure_mutable_script(row, "上传覆盖")
         if row.exec_type != "script":
             raise ValueError(f"仅 exec_type=script 的脚本支持上传脚本包（当前: {row.exec_type}）")
         if len(zip_content) > MAX_PACKAGE_ZIP_SIZE:
@@ -1287,6 +1496,8 @@ class PreJudgeScriptService:
             package_root.rename(final_dir)
             # 历史单文件形态被包覆盖时清理孤儿文件
             (base / f"{script_id}.py").unlink(missing_ok=True)
+            # W1-2：入口必须真实存在于包内（与 update_script / import_package 同口径）
+            validate_entrypoint(DEFAULT_ENTRYPOINT, final_dir)
         finally:
             zip_tmp.unlink(missing_ok=True)
             shutil.rmtree(staging, ignore_errors=True)
@@ -1490,6 +1701,8 @@ class PreJudgeScriptService:
             target = script_dir / rel
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(content)
+        # W1-2：入口必须真实存在于包内（与 save_script_package / update_script 同口径）
+        validate_entrypoint(DEFAULT_ENTRYPOINT, script_dir)
         logger.info(f"[PreJudgeScript] 导入脚本包 {script['id']} name={script.get('name')} "
                     f"files={len(files_map)} overwrite={overwrite}")
 
@@ -1628,9 +1841,10 @@ class PreJudgeScriptService:
         """在线编辑保存（乐观锁：updated_at 与 DB 记录不一致 → 409 冲突）
 
         仅允许修改已存在的文本文件；成功后 bump 记录 updated_at 并重跑
-        风险扫描（warnings 随响应返回）。
+        风险扫描（warnings 随响应返回）。W1-3：内置脚本文件不可在线编辑。
         """
         row = self._require_script_type(script_id)
+        self._require_mutable_file_target(row)
         target = self._resolve_safe_path(row, rel_path)
         if not target.is_file():
             raise PreJudgeFileError(f"文件不存在: {rel_path}（仅允许编辑已存在文件）", status_code=404)
@@ -1670,6 +1884,7 @@ class PreJudgeScriptService:
     def create_script_file(self, script_id: str, rel_path: str, content: str = "") -> Dict[str, Any]:
         """新建文本文件（默认空内容；已存在 409；path 必须合法且在白名单内）"""
         row = self._require_script_type(script_id)
+        self._require_mutable_file_target(row)
         if _reject_member_path(rel_path):
             raise PreJudgeFileError(f"非法文件路径: {rel_path}")
         if not is_text_file(rel_path):
@@ -1687,8 +1902,9 @@ class PreJudgeScriptService:
                 "updated_at": self._row_to_dict(row)["updated_at"]}
 
     def delete_script_file(self, script_id: str, rel_path: str) -> Dict[str, Any]:
-        """删除脚本目录内文件（main.py 不可删）"""
+        """删除脚本目录内文件（main.py 不可删；内置脚本文件不可删）"""
         row = self._require_script_type(script_id)
+        self._require_mutable_file_target(row)
         if str(rel_path).replace("\\", "/") == DEFAULT_ENTRYPOINT:
             raise PreJudgeFileError(f"入口文件 {DEFAULT_ENTRYPOINT} 不可删除")
         target = self._resolve_safe_path(row, rel_path)
@@ -1700,8 +1916,9 @@ class PreJudgeScriptService:
         return {"path": str(rel_path), "deleted": True}
 
     def rename_script_file(self, script_id: str, rel_path: str, new_path: str) -> Dict[str, Any]:
-        """重命名/移动脚本目录内文件（main.py 不可改名；目标存在 409）"""
+        """重命名/移动脚本目录内文件（main.py 不可改名；目标存在 409；内置脚本文件不可改名）"""
         row = self._require_script_type(script_id)
+        self._require_mutable_file_target(row)
         if str(rel_path).replace("\\", "/") == DEFAULT_ENTRYPOINT:
             raise PreJudgeFileError(f"入口文件 {DEFAULT_ENTRYPOINT} 不可改名")
         if _reject_member_path(new_path):
@@ -1782,6 +1999,18 @@ class PreJudgeScriptService:
             raise PreJudgeFileError(f"仅 exec_type=script 的脚本支持文件管理（当前: {row.exec_type}）")
         self._ensure_layout(row)
         return row
+
+    def _require_mutable_file_target(self, row: PreJudgeScript) -> None:
+        """文件级写操作守卫（W1-3）：内置脚本目录文件不可在线增删改
+
+        内置脚本源码由平台管理（迁移/启动时强制同步 app/scripts_builtin），
+        在线改动会被下次同步覆盖且可能被用于窃取注入的数据库凭据。
+        """
+        if is_builtin_script_id(row.id):
+            raise PreJudgeFileError(
+                f"内置脚本「{row.name}」的文件由平台管理，不可在线新建/编辑/删除/改名（不可变保护）",
+                status_code=403,
+            )
 
     def _resolve_safe_path(self, row: PreJudgeScript, rel_path: str) -> Path:
         """把目录内相对路径解析为绝对路径（防穿越：必须落在脚本目录内）"""
@@ -1921,7 +2150,8 @@ SCRIPT_TEMPLATE_DEFS: Dict[str, Dict[str, Any]] = {
         "description": "下载即脚本运行时的真实目录世界：scripts/{script_key}/ 是脚本包本体"
                        "（main.py+model.py+lib），inputs/{字段}/{execution_id}-attempt-1/ 是"
                        " anc-hub 执行包样例（manifest/acceptance-map/嵌套 zip 等）+ 索引文件，"
-                       "附本地试跑样例 stdin；三步上手：本地试跑→开发→打包 scripts 内文件上传",
+                       "附本地试跑样例 stdin；三步上手：本地试跑→开发→打包 scripts 内文件上传；"
+                       "文件产物统一写工作区 outputs/ 目录（平台保证存在，范本含完整示范）",
     },
 }
 

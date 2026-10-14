@@ -5,6 +5,8 @@ import pytest
 import sys
 import os
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fastapi import FastAPI
@@ -13,9 +15,11 @@ from app.api.judge_config_api import router as judge_config_router
 
 
 # 创建独立的测试 app，不含鉴权中间件
-# 路由自身已带 /judge-config 前缀（与 main.py 的挂载方式一致：
-# include_router(judge_config_router, prefix=API_V1_STR + "/evaluation")），
-# 这里只补外层 /api/v1/evaluation，避免路径出现双重 /judge-config
+# W8 修复：router 自带 prefix="/judge-config"（app/api/judge_config_api.py:19），
+# 生产挂载为 app.include_router(router, prefix=API_V1_STR + "/evaluation")
+# （app/main.py:201），最终路径 /api/v1/evaluation/judge-config/*。
+# 原测试又叠了一层 judge-config 前缀导致全部 404——旧「零执行」时代未暴露，
+# W8 首次全量运行抓到；此处对齐生产挂载形态。
 test_app = FastAPI()
 test_app.include_router(judge_config_router, prefix="/api/v1/evaluation")
 client = TestClient(test_app)
@@ -34,7 +38,13 @@ class TestJudgeConfigApi:
         assert "evaluation_targets" in data
 
     def test_preview_renders_jinja2_template(self):
-        """测试 POST preview 正确渲染：系统模板渲染 targets，用户提示词由 judge_variable_config 组装"""
+        """测试 POST preview 正确渲染 user prompt（judge_variable_config 驱动）
+
+        W8 修复对齐现行契约：裁判 prompt 重构后 user prompt 不再取请求里的
+        user_prompt_template 模板字段（该字段当前被端点接受但不参与渲染，
+        见 concerns），而是渲染 judge_variable_config 中 prompt_type="user"
+        的变量（与 tests/unit/test_prompt_builder_from_config.py 的契约一致）。
+        """
         response = client.post(
             "/api/v1/evaluation/judge-config/preview",
             json={
@@ -51,17 +61,9 @@ class TestJudgeConfigApi:
                 ],
                 "dataset_item": {},
                 "model_result": {"content": "模型输出内容"},
-                # 用户提示词由 prompt_type=user 的裁判变量组装（现行契约，
-                # 与前端 Tasks.vue 发送的结构一致），格式为【变量名】值
                 "judge_variable_config": [
-                    {
-                        "key": "model_output",
-                        "name": "模型输出",
-                        "source": "model_output",
-                        "source_config": {},
-                        "prompt_type": "user"
-                    }
-                ]
+                    {"key": "model_out", "name": "模型输出", "source": "model_output", "prompt_type": "user"},
+                ],
             }
         )
         assert response.status_code == 200
@@ -69,6 +71,7 @@ class TestJudgeConfigApi:
         assert "rendered_system_prompt" in data
         assert "rendered_user_prompt" in data
         assert "模型输出" in data["rendered_system_prompt"]
+        assert "模型输出" in data["rendered_user_prompt"]
         assert "模型输出内容" in data["rendered_user_prompt"]
 
     def test_preview_with_empty_target_returns_validation_error(self):

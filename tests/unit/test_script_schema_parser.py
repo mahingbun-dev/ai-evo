@@ -24,6 +24,8 @@ from app.services.script_schema_parser import (
 )
 from app.services.script_templates import FOLDER_MODEL_PY, SCRIPT_TEMPLATES
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 STANDARD_MODEL = '''
 from pydantic import BaseModel, Field
 

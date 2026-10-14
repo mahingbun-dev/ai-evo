@@ -37,6 +37,8 @@ from app.services.pre_judge_script_service import (
 )
 from app.api.pre_judge_script_api import upload_script_package
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 # ---------------- 契约合法/非法脚本样例 ----------------
 
@@ -120,9 +122,11 @@ def _create_script_row(service, name=None) -> str:
 def _request(user=None):
     from starlette.requests import Request
 
+    """构造最小 Request；W1-4 起写端点校验 super_admin_flag == 1，缺省注入超管"""
     request = Request({"type": "http", "method": "POST", "path": "/", "headers": [], "query_string": b""})
-    if user is not None:
-        request.state.user = user
+    if user is None:
+        user = {"user_code": "u_admin", "super_admin_flag": 1}
+    request.state.user = user
     return request
 
 
@@ -535,10 +539,11 @@ class TestUploadPackageApi:
         assert "zip" in str(exc.value.detail)
 
     def test_api_admin_gate(self, db_session):
+        """W1-4：非超管（super_admin_flag != 1）上传脚本包 403"""
         script_id = self._create_script_row(db_session)
         with pytest.raises(HTTPException) as exc:
             asyncio.run(upload_script_package(
-                script_id, request=_request(user={"user_code": "u", "is_admin": False}),
+                script_id, request=_request(user={"user_code": "u", "super_admin_flag": 0}),
                 file=_upload_zip(good_package()), db=db_session))
         assert exc.value.status_code == 403
 

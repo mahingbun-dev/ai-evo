@@ -1,0 +1,4 @@
+{
+  "evaluation_type": "rag",
+  "rag_config": {"top_k": 3, "metrics": ["context_precision", "context_recall", "hit_rate", "mrr"]}
+}

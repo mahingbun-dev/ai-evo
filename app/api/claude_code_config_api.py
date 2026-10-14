@@ -6,14 +6,15 @@ import asyncio
 import logging
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
+from app.services.access_control import ensure_super_admin
 from pydantic import BaseModel, Field
 
 from app.services.claude_code_config_service import ClaudeCodeConfigService
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/claude-code-config")
+router = APIRouter(prefix="/claude-code-config", dependencies=[Depends(ensure_super_admin)])
 
 
 class ClaudeCodeConfigPayload(BaseModel):

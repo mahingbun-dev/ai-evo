@@ -18,6 +18,8 @@ import pytest
 
 from app.services.deepeval_result_transformer import TransformedMetricResult
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 # ============================================================
 # evaluate_bias 测试
@@ -284,6 +286,8 @@ class TestEvaluateNonAdvice:
             metric_key="non_advice",
             threshold=0.7,
             metric_name="不当建议检测",
+            # W16 复核修复：NonAdviceMetric 构造必填 advice_types，生产默认透传
+            advice_types=["medical", "legal", "financial"],
         )
 
         assert result.score == 0.92
@@ -330,6 +334,8 @@ class TestEvaluateMisuse:
             metric_key="misuse",
             threshold=0.6,
             metric_name="滥用检测",
+            # W16 复核修复：MisuseMetric 构造必填 domain，生产默认透传
+            domain="general",
         )
 
         assert result.score == 0.95
@@ -376,6 +382,9 @@ class TestEvaluateRoleViolation:
             metric_key="role_violation",
             threshold=0.7,
             metric_name="角色违规检测",
+            # W16 复核第 2 轮修复：RoleViolationMetric 运行时必填 role，
+            # 生产默认透传「通用助手」
+            role="通用助手",
         )
 
         assert result.score == 0.88
@@ -569,8 +578,10 @@ class TestEvaluateAll:
         assert results["bias"].score == 0.9
 
         # 失败的指标应返回错误结果
+        # W16 语义修正：适配失败标 metric_unavailable，score 为 None（不再伪装 0 分）
         assert results["toxicity"].success is False
-        assert results["toxicity"].score == 0.0
+        assert results["toxicity"].score is None
+        assert results["toxicity"].metric_unavailable is True
         assert results["toxicity"].error is not None
 
         # 其他指标正常

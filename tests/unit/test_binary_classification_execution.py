@@ -5,6 +5,8 @@ import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
 from app.tasks.evaluation_tasks_async import _execute_evaluation, _execute_binary_classification_evaluation
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 class MockTask:
     """模拟评测任务对象"""

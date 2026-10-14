@@ -137,6 +137,7 @@ class SafetyEvaluator:
         input_text: str,
         actual_output: str,
         threshold: float = DEFAULT_THRESHOLD,
+        advice_types: Optional[List[str]] = None,
     ) -> TransformedMetricResult:
         """
         评测不当建议。
@@ -147,10 +148,16 @@ class SafetyEvaluator:
             input_text: 用户输入文本
             actual_output: 模型的实际输出
             threshold: 评测阈值，默认 0.5
+            advice_types: 建议类型列表（NonAdviceMetric 构造必填，W16 复核
+                修复补齐透传），未传时使用通用默认，避免构造即 TypeError
+                导致该指标恒不可用
 
         Returns:
             TransformedMetricResult: 评测结果
         """
+        if advice_types is None:
+            advice_types = ["medical", "legal", "financial"]
+
         test_case = deepeval_adapter.create_test_case(
             input_text=input_text,
             actual_output=actual_output,
@@ -161,6 +168,7 @@ class SafetyEvaluator:
             metric_key="non_advice",
             threshold=threshold,
             metric_name="不当建议检测",
+            advice_types=advice_types,
         )
 
     @staticmethod
@@ -168,6 +176,7 @@ class SafetyEvaluator:
         input_text: str,
         actual_output: str,
         threshold: float = DEFAULT_THRESHOLD,
+        domain: str = "general",
     ) -> TransformedMetricResult:
         """
         评测滥用。
@@ -178,6 +187,9 @@ class SafetyEvaluator:
             input_text: 用户输入文本
             actual_output: 模型的实际输出
             threshold: 评测阈值，默认 0.5
+            domain: 业务领域描述（MisuseMetric 构造必填，W16 复核修复补齐
+                透传），默认 "general"，避免构造即 TypeError 导致该指标恒
+                不可用；调用方可按业务场景传入如 "code_generation"
 
         Returns:
             TransformedMetricResult: 评测结果
@@ -192,6 +204,7 @@ class SafetyEvaluator:
             metric_key="misuse",
             threshold=threshold,
             metric_name="滥用检测",
+            domain=domain,
         )
 
     @staticmethod
@@ -199,6 +212,7 @@ class SafetyEvaluator:
         input_text: str,
         actual_output: str,
         threshold: float = DEFAULT_THRESHOLD,
+        role: Optional[str] = None,
     ) -> TransformedMetricResult:
         """
         评测角色违规。
@@ -209,10 +223,16 @@ class SafetyEvaluator:
             input_text: 用户输入文本
             actual_output: 模型的实际输出
             threshold: 评测阈值，默认 0.5
+            role: 预设角色描述。RoleViolationMetric 构造函数内部运行时必填
+                （签名默认 None 但 None 即抛 ValueError，W16 复核第 2 轮修复：
+                inspect 不可见的运行时校验），未传时使用生产默认「通用助手」，
+                避免构造即 ValueError 导致该指标恒不可用
 
         Returns:
             TransformedMetricResult: 评测结果
         """
+        role = role or "通用助手"
+
         test_case = deepeval_adapter.create_test_case(
             input_text=input_text,
             actual_output=actual_output,
@@ -223,6 +243,7 @@ class SafetyEvaluator:
             metric_key="role_violation",
             threshold=threshold,
             metric_name="角色违规检测",
+            role=role,
         )
 
     @staticmethod
@@ -312,11 +333,13 @@ class SafetyEvaluator:
         for key, name in _SAFETY_METRICS.items():
             if key not in results:
                 logger.error("安全评测指标 %s 缺失结果，返回错误兜底", key)
+                # W16：适配失败标 metric_unavailable，不再伪装 score=0
                 results[key] = TransformedMetricResult(
                     metric_key=key,
                     metric_name=name,
-                    score=0.0,
+                    score=None,
                     success=False,
+                    metric_unavailable=True,
                     error=f"评测指标 {key} 未返回结果",
                 )
 
@@ -383,12 +406,14 @@ class SafetyEvaluator:
         for i, result in enumerate(results):
             if isinstance(result, Exception):
                 logger.error("批量安全评测任务 %d 异常 [%s]: %s", i, metric_key, result)
+                # W16：适配失败标 metric_unavailable，不再伪装 score=0
                 final_results.append(
                     TransformedMetricResult(
                         metric_key=metric_key,
                         metric_name=metric_name,
-                        score=0.0,
+                        score=None,
                         success=False,
+                        metric_unavailable=True,
                         error=str(result),
                     )
                 )

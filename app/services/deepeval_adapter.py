@@ -7,6 +7,13 @@ DeepEval 适配器核心
 - create_test_case: 创建 DeepEval 测试用例
 - evaluate: 执行单个指标评测
 - evaluate_batch: 批量执行指标评测（支持并发控制）
+
+W16（P0-D）：
+- DEEPEVAL_USE_PLATFORM_LLM 开启时，经 PlatformLLMWrapper 将平台模型配置
+  （model_configs）注入各指标创建路径，判分走平台模型网关出真实分；
+  该接线依赖 D-6 技术决策，默认关闭（行为与未接线一致）。
+- 异常语义修正（不受 flag 控制）：适配失败标 metric_unavailable、score=None，
+  不再伪装 score=0, success=False。
 """
 import asyncio
 import logging
@@ -14,6 +21,7 @@ from typing import Any, Dict, List, Optional
 
 from deepeval.test_case import LLMTestCase, ToolCall
 
+from app.core.config import get_settings
 from app.services.deepeval_metric_registry import (
     DeepEvalMetricRegistry,
     MetricNotFoundError,
@@ -22,8 +30,80 @@ from app.services.deepeval_result_transformer import (
     DeepEvalResultTransformer,
     TransformedMetricResult,
 )
+from app.services.platform_llm_wrapper import PlatformLLMWrapper
 
 logger = logging.getLogger(__name__)
+
+
+def _platform_llm_enabled() -> bool:
+    """
+    读取 W16 feature flag：deepeval 判分是否走平台模型网关。
+
+    默认 False（D-6 技术决策前保守关闭）。集中成模块级函数便于测试替换。
+    """
+    try:
+        return bool(get_settings().DEEPEVAL_USE_PLATFORM_LLM)
+    except Exception:
+        logger.exception("读取 DEEPEVAL_USE_PLATFORM_LLM 配置失败，按关闭处理")
+        return False
+
+
+def _resolve_platform_model_config() -> Optional[Dict[str, Any]]:
+    """
+    解析 deepeval 判分使用的平台模型网关配置（W16）。
+
+    优先级：
+    1. Settings.DEEPEVAL_PLATFORM_MODEL_ID 指定的 model_configs 记录；
+    2. 未指定时取最新的启用中 evaluation 角色模型。
+
+    字段集与 ModelConfigService.test_connection 构建的配置字典保持一致，
+    即 PlatformLLMWrapper 约定的 model_config 结构。
+
+    Returns:
+        模型配置字典；解析失败（无库连接/无可用模型等）返回 None，
+        由调用方落 metric_unavailable 语义，不做静默回退。
+    """
+    # 延迟导入：避免模块加载链在收集单测时触发 DB 引擎构建
+    from app.db.session import SessionLocal
+    from app.models.model_config_models import ModelConfig
+
+    try:
+        with SessionLocal() as db:
+            query = db.query(ModelConfig).filter(ModelConfig.is_active == True)  # noqa: E712
+            model_id = get_settings().DEEPEVAL_PLATFORM_MODEL_ID
+            if model_id:
+                config = query.filter(ModelConfig.id == model_id).first()
+                if config is None:
+                    logger.error(
+                        "DEEPEVAL_PLATFORM_MODEL_ID=%s 未找到对应模型配置", model_id
+                    )
+                    return None
+            else:
+                config = (
+                    query.filter(ModelConfig.model_role == "evaluation")
+                    .order_by(ModelConfig.created_at.desc())
+                    .first()
+                )
+                if config is None:
+                    logger.error("未找到启用中的 evaluation 角色模型配置")
+                    return None
+
+            return {
+                "provider": config.provider,
+                "model_type": config.model_type,
+                "api_key": config.api_key,
+                "endpoint": config.endpoint,
+                "auth_type": config.auth_type,
+                # W16 复核修复：DB NULL 的 JSON 列归一为空 dict——
+                # PlatformLLMWrapper 对 None 做 .get() 链会 AttributeError
+                # （dict.get 的默认值不覆盖显式 None）
+                "auth_config": config.auth_config or {},
+                "request_config": config.request_config or {},
+                "model_id": config.id,
+            }
+    except Exception as e:
+        logger.error("解析平台网关模型配置失败: %s", e, exc_info=True)
+        return None
 
 
 def _convert_to_tool_call(tool_data: Dict[str, Any]) -> ToolCall:
@@ -105,11 +185,34 @@ def create_test_case(
     )
 
 
+def _unavailable_result(
+    metric_key: str,
+    metric_name: str,
+    error: str,
+) -> TransformedMetricResult:
+    """
+    构造「指标不可用」结果（W16 异常语义修正）。
+
+    适配失败（指标不存在、网关异常、配置解析失败等）时统一返回：
+    score=None（无分数，不再伪装 0.0）、success=False、metric_unavailable=True。
+    该语义不受 DEEPEVAL_USE_PLATFORM_LLM flag 控制。
+    """
+    return TransformedMetricResult(
+        metric_key=metric_key,
+        metric_name=metric_name,
+        score=None,
+        success=False,
+        metric_unavailable=True,
+        error=error,
+    )
+
+
 def evaluate(
     test_case: LLMTestCase,
     metric_key: str,
     threshold: float = 0.5,
     metric_name: Optional[str] = None,
+    model_config: Optional[Dict[str, Any]] = None,
     **kwargs: Any,
 ) -> TransformedMetricResult:
     """
@@ -117,6 +220,8 @@ def evaluate(
 
     流程：
     1. 通过 DeepEvalMetricRegistry 创建指标实例
+       （DEEPEVAL_USE_PLATFORM_LLM 开启时注入 PlatformLLMWrapper 作为 model，
+       判分经平台模型网关；W16）
     2. 调用指标的 measure 方法执行评测
     3. 使用 DeepEvalResultTransformer 转换结果
 
@@ -125,16 +230,38 @@ def evaluate(
         metric_key: 指标标识符（如 'answer_relevancy', 'faithfulness'）
         threshold: 指标阈值，默认 0.5
         metric_name: 指标显示名称，默认使用 metric_key
+        model_config: 平台网关模型配置（W16，可选）。flag 开启时优先使用；
+            未传则经 _resolve_platform_model_config 从平台模型配置解析。
+            flag 关闭时忽略该参数（行为与未接线一致）。
         **kwargs: 传递给指标构造函数的额外参数
 
     Returns:
-        TransformedMetricResult: 转换后的指标评测结果
+        TransformedMetricResult: 转换后的指标评测结果。适配失败时
+        metric_unavailable=True 且 score=None（W16 异常语义修正）。
     """
     if metric_name is None:
         metric_name = metric_key
 
     try:
-        # 1. 创建指标实例
+        # 1. 创建指标实例；flag 开启时注入平台网关模型（W16）
+        if _platform_llm_enabled():
+            resolved_config = (
+                model_config
+                if model_config is not None
+                else _resolve_platform_model_config()
+            )
+            if resolved_config is None:
+                error = (
+                    "DEEPEVAL_USE_PLATFORM_LLM 已开启但未解析到可用的平台网关"
+                    "模型配置（DEEPEVAL_PLATFORM_MODEL_ID 或启用中的 "
+                    "evaluation 角色模型）"
+                )
+                logger.error("[%s] %s", metric_key, error)
+                return _unavailable_result(metric_key, metric_name, error)
+
+            # 显式传入的 model 优先，注入不覆盖
+            kwargs.setdefault("model", PlatformLLMWrapper(model_config=resolved_config))
+
         metric = DeepEvalMetricRegistry.create_metric(
             metric_key, threshold=threshold, **kwargs
         )
@@ -151,23 +278,11 @@ def evaluate(
 
     except MetricNotFoundError as e:
         logger.error("指标不存在: %s", e)
-        return TransformedMetricResult(
-            metric_key=metric_key,
-            metric_name=metric_name,
-            score=0.0,
-            success=False,
-            error=str(e),
-        )
+        return _unavailable_result(metric_key, metric_name, str(e))
 
     except Exception as e:
         logger.error("评测执行失败 [%s]: %s", metric_key, e, exc_info=True)
-        return TransformedMetricResult(
-            metric_key=metric_key,
-            metric_name=metric_name,
-            score=0.0,
-            success=False,
-            error=str(e),
-        )
+        return _unavailable_result(metric_key, metric_name, str(e))
 
 
 async def evaluate_batch(
@@ -242,12 +357,11 @@ async def evaluate_batch(
             logger.error(
                 "批量评测任务 %d 异常 [%s]: %s", i, config["key"], result
             )
+            # W16：适配失败标 metric_unavailable，不再伪装 score=0
             final_results.append(
-                TransformedMetricResult(
+                _unavailable_result(
                     metric_key=config["key"],
                     metric_name=config.get("name", config["key"]),
-                    score=0.0,
-                    success=False,
                     error=str(result),
                 )
             )

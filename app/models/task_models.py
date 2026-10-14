@@ -1,7 +1,7 @@
 """
 评测任务数据模型
 """
-from sqlalchemy import Column, Integer, String, DateTime, JSON, Boolean, Text, Float, ForeignKey
+from sqlalchemy import Column, Integer, String, DateTime, JSON, Boolean, Text, Float, ForeignKey, BigInteger, UniqueConstraint
 from sqlalchemy.sql import func
 from app.db.session import Base
 
@@ -56,6 +56,10 @@ class EvaluationTask(Base):
 
     # 裁判数量配置
     judge_count = Column(Integer, default=6, comment="裁判数量")
+
+    # 裁判模型配置快照（W4，P0-C：创建时对 task.judge_model 指向的 ModelConfig
+    # 深拷贝快照，口径字段+掩码凭据，严禁明文 api_key；执行时快照优先）
+    judge_model_config = Column(JSON, nullable=True, comment="裁判模型配置快照（W4 创建时写入，仅掩码凭据）")
 
     # 多裁判配置
     multi_judge_config = Column(JSON, nullable=True, comment="多裁判配置")
@@ -153,3 +157,49 @@ class TaskExecutionRecord(Base):
     evaluation_target_name = Column(String, nullable=True, comment="评测目标名称")
     validation_message = Column(Text, nullable=True, comment="空值校验信息")
     estimated_manual_hours = Column(Float, nullable=True, comment="人工执行预计耗时（小时）")
+
+    # W3-1 迁移新增（expand-only，一次迁移减少次数）：
+    # config_snapshot 供 W4（配置快照归因锚点），heartbeat_at 供 W10（部署期收尸 reaper）
+    config_snapshot = Column(JSON, nullable=True, comment="本次执行使用的模型/裁判配置快照（W4 写入，禁止落明文 api_key）")
+    heartbeat_at = Column(DateTime(timezone=True), nullable=True, comment="执行心跳时间（W10 收尸 reaper 判断依据）")
+
+
+class EvaluationResult(Base):
+    """评测行级结果表（W3 行级结果落库，P0-E）
+
+    逐行 write-through：每行评测终态（成功/失败/跳过）即时幂等 upsert 入本表，
+    任务停止/worker 强杀/软超时后已完成行零丢失；断点续跑按
+    (task_id, execution_number) 的 completed/judge_failed 行跳过。
+
+    列语义（W3-1，库列为 JSONB，ORM 用通用 JSON 保持 SQLite 单测可建表）：
+    - status: completed/judge_failed/failed/skipped/pending
+    - input_data: 行输入侧平铺字段（查询投影，事实源为 row_result）
+    - judge_results: 裁判明细（judge_scores）
+    - aggregate: 行聚合分（average_score/feedback/dimension_scores/success）
+    - row_result: 全量行结果原文——聚合/续跑重建 result JSON 的事实源
+      （计划 DDL 之外的增列：无它则 result JSON 无法与旧行为同构重建）
+    """
+    __tablename__ = "evaluation_results"
+
+    id = Column(
+        BigInteger().with_variant(Integer(), "sqlite"),
+        primary_key=True,
+        autoincrement=True,
+    )
+    task_id = Column(String, ForeignKey("evaluation_tasks.id"), nullable=False)
+    execution_number = Column(Integer, nullable=False, comment="第几次执行，与 task_execution_records.execution_number 同口径")
+    data_index = Column(Integer, nullable=False, comment="数据项在本次执行数据集中的原始序号")
+    status = Column(String, nullable=False, comment="状态：completed/judge_failed/failed/skipped/pending")
+    input_data = Column(JSON, nullable=True, comment="行输入侧平铺字段（查询投影）")
+    model_output = Column(Text, nullable=True, comment="被评测模型输出")
+    model_raw_response = Column(Text, nullable=True, comment="模型原始响应")
+    judge_results = Column(JSON, nullable=True, comment="裁判明细（judge_scores）")
+    aggregate = Column(JSON, nullable=True, comment="行聚合分")
+    row_result = Column(JSON, nullable=True, comment="全量行结果原文（聚合/续跑重建事实源）")
+    error = Column(Text, nullable=True, comment="行执行错误信息")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("task_id", "execution_number", "data_index", name="uq_eval_results_task_exec_data"),
+    )

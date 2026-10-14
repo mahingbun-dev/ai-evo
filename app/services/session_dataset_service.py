@@ -153,6 +153,7 @@ def import_sessions(
     real_dataset_id: Optional[str] = None,
     created_by: Optional[str] = None,
     file_extra: Optional[Dict[str, Dict[str, Any]]] = None,
+    team_code: Optional[str] = None,
 ) -> Dict[str, Any]:
     """会话文件导入数据集（新建或追加）
 
@@ -207,6 +208,9 @@ def import_sessions(
             name=name.strip(),
             description=description or "由 Agent 会话文件导入",
             created_by=created_by,
+            # W19b：随调用者团队落库（缺省 None 时由 create_dataset 兜底
+            # DEFAULT）；否则非 DEFAULT 团队用户导入后自己看不见
+            team_code=team_code,
         )
 
     data_service = DatasetDataService(db)

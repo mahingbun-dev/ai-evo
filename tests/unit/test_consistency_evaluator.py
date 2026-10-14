@@ -6,6 +6,8 @@ import pytest
 from unittest.mock import MagicMock, AsyncMock
 from app.services.consistency_evaluator import ConsistencyEvaluator
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 class TestConsistencyEvaluator:
     """ConsistencyEvaluator 测试类"""

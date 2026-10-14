@@ -13,6 +13,8 @@ from app.services.claude_code_config_service import (
     mask_token,
 )
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 SAMPLE_CONFIG = {
     "id": "ccc_test000001",

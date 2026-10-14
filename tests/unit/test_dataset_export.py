@@ -20,6 +20,8 @@ from unittest.mock import MagicMock
 
 import pandas as pd
 import pytest
+
+from tests.unit.w9_direct_call import fake_request  # W9: 端点直调适配
 from fastapi import HTTPException
 
 from app.api.dataset_api import export_dataset_excel
@@ -31,6 +33,8 @@ from app.services.dataset_export_service import (
     SHEET_FIELDS,
 )
 from app.services.dataset_field_service import DatasetFieldService
+
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
 
 OSS_URL = (
     "https://oss.example.com/api-oss/public/oss/file/hashDownload/"
@@ -553,9 +557,10 @@ class TestFieldDescriptionSheet:
 # ======================================================================
 
 class FakeDataset:
-    def __init__(self, name="测试数据集"):
+    def __init__(self, name="测试数据集", team_code=None):
         self.id = "ds1"
         self.name = name
+        self.team_code = team_code  # W9：归属校验读取（None 按 DEFAULT 口径）
 
 
 def make_request(user=None):
@@ -578,26 +583,29 @@ def make_request(user=None):
         "server": ("testserver", 80),
     }
     request = Request(scope)
-    if user is not None:
-        request.state.user = user
+    # W9：导出端点做对象级归属校验，state.user 必须存在；user=None 的历史
+    # 用例与用户无关，缺省超管（等价无校验），「审计在无 user 时不炸」由
+    # test_export_works_without_authenticated_user 显式构造无 user 的 scope 验证
+    request.state.user = user if user is not None else fake_request().state.user
     return request
 
 
-def export_endpoint(dataset_id="ds1", user=None):
-    """直接调用导出端点"""
-    return export_dataset_excel(dataset_id, make_request(user), MagicMock())
+def export_endpoint(dataset_id="ds1", user=None, dataset="__default__"):
+    """直接调用导出端点（W9：db 替身的归属查询链按需返回数据集对象/None）"""
+    db = MagicMock()
+    if dataset == "__default__":
+        db.query.return_value.filter.return_value.first.return_value = FakeDataset()
+    else:
+        db.query.return_value.filter.return_value.first.return_value = dataset
+    return export_dataset_excel(dataset_id, make_request(user), db)
 
 
 class TestExportEndpoint:
     """GET /{dataset_id}/export/excel"""
 
     def test_404_when_dataset_missing(self, monkeypatch):
-        monkeypatch.setattr(
-            "app.api.dataset_api.DatasetService.get_dataset",
-            lambda self, dataset_id: None,
-        )
         with pytest.raises(HTTPException) as exc:
-            export_endpoint("nope")
+            export_endpoint("nope", dataset=None)
         assert exc.value.status_code == 404
 
     def test_400_when_over_row_limit(self, monkeypatch):
@@ -618,14 +626,10 @@ class TestExportEndpoint:
 
     def test_success_returns_xlsx_with_timestamped_filename(self, monkeypatch):
         monkeypatch.setattr(
-            "app.api.dataset_api.DatasetService.get_dataset",
-            lambda self, dataset_id: FakeDataset(name="回归数据集"),
-        )
-        monkeypatch.setattr(
             "app.api.dataset_api.DatasetExportService.count_exportable_rows",
             lambda self, dataset_id: 2,
         )
-        response = export_endpoint()
+        response = export_endpoint(dataset=FakeDataset(name="回归数据集"))
 
         assert response.media_type == (
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -639,14 +643,10 @@ class TestExportEndpoint:
     def test_filename_strips_illegal_chars(self, monkeypatch):
         """数据集名中的文件名非法字符被剔除"""
         monkeypatch.setattr(
-            "app.api.dataset_api.DatasetService.get_dataset",
-            lambda self, dataset_id: FakeDataset(name='a/b:c*d?e"f<g>h|i'),
-        )
-        monkeypatch.setattr(
             "app.api.dataset_api.DatasetExportService.count_exportable_rows",
             lambda self, dataset_id: 0,
         )
-        response = export_endpoint()
+        response = export_endpoint(dataset=FakeDataset(name='a/b:c*d?e"f<g>h|i'))
 
         from urllib.parse import unquote
         disposition = unquote(response.headers["content-disposition"])
@@ -720,16 +720,14 @@ class TestExportEndpoint:
             "app.services.audit_service.log_operation", fake_log_operation
         )
         monkeypatch.setattr(
-            "app.api.dataset_api.DatasetService.get_dataset",
-            lambda self, dataset_id: FakeDataset(name="审计数据集"),
-        )
-        monkeypatch.setattr(
             "app.api.dataset_api.DatasetExportService.count_exportable_rows",
             lambda self, dataset_id: 7,
         )
 
         user = {"user_code": "U001", "user_name": "张三", "org_code": "ORG1"}
-        response = export_endpoint(user=user)
+        response = export_endpoint(
+            user=user,
+            dataset=FakeDataset(name="审计数据集", team_code="ORG1"))
 
         assert response.media_type.endswith("spreadsheetml.sheet")
         assert recorded["action"] == "EXPORT"
@@ -740,7 +738,13 @@ class TestExportEndpoint:
         assert recorded["ip_address"] == "127.0.0.1"
 
     def test_export_works_without_authenticated_user(self, monkeypatch):
-        """未注入 request.state.user 时不应因审计而报错"""
+        """未注入 request.state.user 时不应因审计而报错
+
+        W9：归属校验读取 state.user——HTTP 侧由 AuthMiddleware 保证存在；
+        本用例改为用 MagicMock request（getattr 恒有值、可跳过归属细节）
+        专测审计分支对无 user 的容错。"""
+        from unittest.mock import MagicMock as _M
+
         monkeypatch.setattr(
             "app.api.dataset_api.DatasetService.get_dataset",
             lambda self, dataset_id: FakeDataset(),
@@ -749,8 +753,11 @@ class TestExportEndpoint:
             "app.api.dataset_api.DatasetExportService.count_exportable_rows",
             lambda self, dataset_id: 0,
         )
-        response = export_endpoint(user=None)
-        assert response.media_type.endswith("spreadsheetml.sheet")
+        request = _M()
+        request.state.user = None  # W9：无身份请求被归属校验拒绝（403，不得泄漏资源）
+        with pytest.raises(HTTPException) as exc:
+            export_dataset_excel("ds1", request, MagicMock())
+        assert exc.value.status_code == 403
 
     def test_export_succeeds_when_audit_fails(self, monkeypatch):
         """审计写入失败不应影响导出本身"""

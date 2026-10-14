@@ -14,6 +14,8 @@ import asyncio
 from unittest.mock import MagicMock, AsyncMock, patch
 from dataclasses import dataclass
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 # ============================================================
 # Mock 数据定义

@@ -1,0 +1,143 @@
+{
+  "evaluation_type": "consistency",
+  "export_time": "2026-01-01T12:00:00",
+  "total": 1,
+  "results": [
+    {
+      "total_questions": 3,
+      "average_text_similarity": 0.4577,
+      "average_format_consistency": 0.5556,
+      "average_structure_consistency": 0.45,
+      "items": [
+        {
+          "idx": 0,
+          "success": true,
+          "model_output": "两数之和可用哈希表一次遍历完成",
+          "evaluation_content": "两数之和可用哈希表一次遍历完成",
+          "metrics": {
+            "text_similarity": 0.9231,
+            "format_consistency": 1.0,
+            "structure_consistency": 0.85,
+            "unique_result_count": 2,
+            "total_calls": 3,
+            "successful_calls": 3
+          },
+          "judge_assessment": {
+            "综合评分": 8.2,
+            "总评": "三次回答语义一致，措辞略有差异",
+            "各维度评分": {
+              "准确性": {
+                "score": 8.5,
+                "reason": "三次回答结论一致"
+              },
+              "完整性": {
+                "score": 8.0,
+                "reason": "要点覆盖完整"
+              }
+            }
+          },
+          "dimension_scores": {
+            "准确性": 8.5,
+            "完整性": 8.0
+          },
+          "custom_dimensions": {},
+          "repeat_results": [
+            {
+              "success": true,
+              "result": "两数之和可用哈希表一次遍历完成",
+              "duration": 1.12
+            },
+            {
+              "success": true,
+              "result": "使用哈希表记录数值下标，一次遍历求解",
+              "duration": 0.98
+            },
+            {
+              "success": true,
+              "result": "两数之和可用哈希表一次遍历完成",
+              "duration": 1.05
+            }
+          ],
+          "error": "",
+          "user_input": "两数之和的解题思路"
+        },
+        {
+          "idx": 1,
+          "success": true,
+          "model_output": "答案甲",
+          "evaluation_content": "",
+          "metrics": {
+            "text_similarity": 0.45,
+            "format_consistency": 0.6667,
+            "structure_consistency": 0.5,
+            "unique_result_count": 3,
+            "total_calls": 3,
+            "successful_calls": 3
+          },
+          "judge_assessment": {},
+          "dimension_scores": {},
+          "custom_dimensions": {},
+          "repeat_results": [
+            {
+              "success": true,
+              "result": "答案甲",
+              "duration": 0.9
+            },
+            {
+              "success": true,
+              "result": "答案乙",
+              "duration": 1.1
+            },
+            {
+              "success": true,
+              "result": "答案丙",
+              "duration": 1.0
+            }
+          ],
+          "error": "",
+          "user_input": "三数之和的解题思路"
+        },
+        {
+          "idx": 2,
+          "success": false,
+          "model_output": "暂无输出",
+          "evaluation_content": "",
+          "metrics": {
+            "text_similarity": 0,
+            "format_consistency": 0,
+            "structure_consistency": 0,
+            "unique_result_count": 0,
+            "total_calls": 0,
+            "successful_calls": 0
+          },
+          "judge_assessment": {},
+          "dimension_scores": {},
+          "custom_dimensions": {},
+          "repeat_results": [],
+          "error": "模型调用超时"
+        }
+      ],
+      "custom_dimension_summary": {
+        "准确性": {
+          "average": 8.5,
+          "count": 1
+        },
+        "完整性": {
+          "average": 8.0,
+          "count": 1
+        }
+      },
+      "dimension_scores": {
+        "准确性": {
+          "average": 8.5,
+          "count": 1
+        },
+        "完整性": {
+          "average": 8.0,
+          "count": 1
+        }
+      },
+      "evaluation_type": "consistency"
+    }
+  ]
+}

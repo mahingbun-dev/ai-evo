@@ -12,6 +12,8 @@ from app.hub_plugin.client import (
     AievoClient,
 )
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 def _resp(status=200, json_data=None, text=""):
     resp = MagicMock()

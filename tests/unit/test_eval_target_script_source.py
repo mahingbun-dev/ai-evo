@@ -14,6 +14,8 @@ import pytest
 
 from app.services.judge_variable_resolver import EvaluationTarget, JudgeVariableResolver
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 def _resolver(script_outputs=None):
     """构造带脚本输出上下文的解析器"""

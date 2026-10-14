@@ -4,6 +4,8 @@ from unittest.mock import MagicMock
 from app.services.prompt_builder import PromptBuilder
 from app.services.judge_variable_resolver import EvaluationTarget
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 class TestPromptBuilderFromConfig:
     """PromptBuilder.from_config 测试"""

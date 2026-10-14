@@ -10,6 +10,8 @@ import json
 import pytest
 from unittest.mock import patch
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）；名称含 integration 但 LLM 全 mock，按依赖归 unit
+
 
 class TestJudgeGraphIntegration:
     """Verify full pipeline: config -> state -> graph -> raw_output"""

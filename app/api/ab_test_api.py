@@ -9,7 +9,7 @@ import time
 import logging
 from typing import Optional, Dict, Any, List
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException, Query, Depends
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException, Query, Depends, Request
 from fastapi.websockets import WebSocketState
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
@@ -17,6 +17,8 @@ from pydantic import BaseModel
 from app.db.session import get_db, SessionLocal
 from app.services.ab_test_service import ABTestService
 from app.services.model_config_service import ModelConfigService
+from app.services.ws_auth import require_ws_user
+from app.services.access_control import AccessDeniedError, check_team_access, is_super_admin
 # 复用现有序列化工具
 from app.api.model_config_api import _serialize_vars, _serialize_response
 
@@ -258,11 +260,14 @@ async def websocket_ab_test(websocket: WebSocket):
     """
     A/B 测试核心 WebSocket 端点。
     并行调用两个模型，通过 side 字段区分 A/B 消息，前端左右分列渲染。
+
+    鉴权：accept 之前完成 SSO Cookie 验证，未认证一律 close(4401)。
     """
-    from app.services.jwt_service import decode_token
-    if not decode_token(websocket.query_params.get("token") or ""):
-        await websocket.close(code=4401)
+    # 鉴权（必须在 accept 之前）：失败时 require_ws_user 已发送 close(4401)
+    user = await require_ws_user(websocket)
+    if user is None:
         return
+
     await websocket.accept()
 
     db = None
@@ -281,6 +286,25 @@ async def websocket_ab_test(websocket: WebSocket):
 
         processed_vars = _process_runtime_vars(runtime_vars)
         db = SessionLocal()
+
+        # W19：A/B 两侧模型归属校验（与模型 WS 测连同口径——测连/试跑会
+        # 用模型凭据发起真实请求，不允许跨团队探测）。4404 不存在 / 4403 跨团队。
+        from app.models.model_config_models import ModelConfig
+
+        for side, mid in (("A", model_a_id), ("B", model_b_id)):
+            model = db.query(ModelConfig).filter(ModelConfig.id == mid).first()
+            if model is None:
+                await websocket.send_json({"type": "error", "content": f"模型{side}不存在: {mid}"})
+                await websocket.close(code=4404)
+                return
+            try:
+                check_team_access(user, model.team_code)
+            except AccessDeniedError:
+                await websocket.send_json(
+                    {"type": "error", "content": f"无权使用模型{side}（跨团队操作被拒绝）: {mid}"}
+                )
+                await websocket.close(code=4403)
+                return
 
         # ws_lock 保证并发 send_json 串行化，避免 WebSocket 帧交织
         ws_lock = asyncio.Lock()
@@ -323,36 +347,56 @@ async def websocket_ab_test(websocket: WebSocket):
 
 # ==================== HTTP 历史记录管理 ====================
 
+def _session_readable(session, user: dict) -> bool:
+    """W19 归属：本人创建 / 历史无主行 / 超管 可读"""
+    if is_super_admin(user):
+        return True
+    creator = getattr(session, "created_by", None)
+    return creator is None or creator == user.get("user_code")
+
+
+def _session_deletable(session, user: dict) -> bool:
+    """W19 归属：本人创建或超管可删；历史无主行（created_by=NULL）仅超管可删"""
+    if is_super_admin(user):
+        return True
+    creator = getattr(session, "created_by", None)
+    return bool(creator) and creator == user.get("user_code")
+
+
 @router.post("/sessions", summary="保存 A/B 测试记录")
-async def save_session(request: SaveSessionRequest, db: Session = Depends(get_db)):
-    """保存一次 A/B 测试历史记录"""
+async def save_session(request: Request, body: SaveSessionRequest, db: Session = Depends(get_db)):
+    """保存一次 A/B 测试历史记录（W19：created_by 盖创建人）"""
     service = ABTestService(db)
     session = service.create_session(
-        model_a_id=request.model_a_id,
-        model_b_id=request.model_b_id,
-        model_a_name=request.model_a_name,
-        model_b_name=request.model_b_name,
-        variables=request.variables,
-        result_a=request.result_a,
-        result_b=request.result_b,
-        status=request.status,
-        duration_a=request.duration_a,
-        duration_b=request.duration_b,
-        name=request.name,
+        model_a_id=body.model_a_id,
+        model_b_id=body.model_b_id,
+        model_a_name=body.model_a_name,
+        model_b_name=body.model_b_name,
+        variables=body.variables,
+        result_a=body.result_a,
+        result_b=body.result_b,
+        status=body.status,
+        duration_a=body.duration_a,
+        duration_b=body.duration_b,
+        name=body.name,
+        created_by=(request.state.user or {}).get("user_code"),
     )
     return _session_to_dict(session)
 
 
 @router.get("/sessions", summary="获取 A/B 测试历史列表")
 async def list_sessions(
+    request: Request,
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     keyword: str = Query("", description="按备注名模糊搜索"),
     db: Session = Depends(get_db),
 ):
-    """获取历史 A/B 测试记录列表（分页，按创建时间降序）"""
+    """获取历史 A/B 测试记录列表（分页，按创建时间降序；W19：超管看全部，普通用户看本人+历史无主行）"""
+    user = request.state.user or {}
+    viewer = None if is_super_admin(user) else user.get("user_code")
     service = ABTestService(db)
-    result = service.list_sessions(page=page, page_size=page_size, keyword=keyword)
+    result = service.list_sessions(page=page, page_size=page_size, keyword=keyword, created_by=viewer)
     return {
         "total": result["total"],
         "page": result["page"],
@@ -362,22 +406,29 @@ async def list_sessions(
 
 
 @router.get("/sessions/{session_id}", summary="获取 A/B 测试记录详情")
-async def get_session(session_id: str, db: Session = Depends(get_db)):
-    """获取单条 A/B 测试记录（含完整结果）"""
+async def get_session(session_id: str, request: Request, db: Session = Depends(get_db)):
+    """获取单条 A/B 测试记录（含完整结果；W19：归属校验 404/403）"""
+    user = request.state.user or {}
     service = ABTestService(db)
     session = service.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="记录不存在")
+    if not _session_readable(session, user):
+        raise HTTPException(status_code=403, detail="无权访问该 A/B 测试记录（跨用户操作被拒绝）")
     return _session_to_dict(session, include_results=True)
 
 
 @router.delete("/sessions/{session_id}", summary="删除 A/B 测试记录")
-async def delete_session(session_id: str, db: Session = Depends(get_db)):
-    """删除历史记录"""
+async def delete_session(session_id: str, request: Request, db: Session = Depends(get_db)):
+    """删除历史记录（W19：仅创建人或超管；历史无主行仅超管可删）"""
+    user = request.state.user or {}
     service = ABTestService(db)
-    success = service.delete_session(session_id)
-    if not success:
+    session = service.get_session(session_id)
+    if not session:
         raise HTTPException(status_code=404, detail="记录不存在")
+    if not _session_deletable(session, user):
+        raise HTTPException(status_code=403, detail="仅创建人或超级管理员可删除该记录")
+    service.delete_session(session_id)
     return {"message": "删除成功"}
 
 
@@ -388,6 +439,7 @@ def _session_to_dict(session, include_results: bool = True) -> Dict[str, Any]:
     d: Dict[str, Any] = {
         "id": session.id,
         "name": session.name,
+        "created_by": getattr(session, "created_by", None),
         "model_a_id": session.model_a_id,
         "model_b_id": session.model_b_id,
         "model_a_name": session.model_a_name,

@@ -9,6 +9,19 @@ import json
 from pathlib import Path
 
 
+def ensure_outputs_dir(run_dir) -> Path:
+    """产物目录防御式创建：{_run_dir}/outputs/，返回其绝对路径
+
+    脚本输出的**文件产物**（导出表格、报告、整理后的中间文件等）统一写这里。
+    平台组装工作区时保证该目录存在；本地试跑/直接调用 stdin 缺 `_run_dir` 时
+    再兜一次底，保证脚本在任何入口下都能落盘。落盘后在 stdout 的 `files`
+    键注册 `{文件名: 绝对路径}`，裁判与下游才能发现产物（main.py 即示范）。
+    """
+    outputs = Path(str(run_dir or ".")) / "outputs"
+    outputs.mkdir(parents=True, exist_ok=True)
+    return outputs
+
+
 def attempt_top_of(rel_path: str) -> str:
     """取 rel_path 的第一段作为执行包顶层目录名（即 {execution_id}-attempt-1）"""
     parts = Path(str(rel_path or "")).parts

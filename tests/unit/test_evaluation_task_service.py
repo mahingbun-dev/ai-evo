@@ -6,12 +6,28 @@ import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
 from datetime import datetime
 
+import app.services.evaluation_task_service as evaluation_task_service_module
 from app.services.evaluation_task_service import EvaluationTaskService
 from app.models.task_models import EvaluationTask
+
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
 
 
 class TestEvaluationTaskServicePublish:
     """EvaluationTaskService 状态发布测试类"""
+
+    @pytest.fixture(autouse=True)
+    def reset_redis_publisher(self):
+        """
+        每用例前后重置模块级 Redis 发布单例。
+
+        W5 起 _publish_status_update 改用模块级连接（进程内复用连接池，
+        不再每次 publish 都新建连接），本类用例通过 patch redis.from_url
+        断言发布行为，必须每用例重置单例才能让 patch 生效。
+        """
+        evaluation_task_service_module._redis_publisher = None
+        yield
+        evaluation_task_service_module._redis_publisher = None
 
     @pytest.fixture
     def mock_db(self):

@@ -47,6 +47,10 @@ class JudgeAgentState(TypedDict):
     final_score: float
     final_feedback: str
     final_dimension_scores: Dict[str, float]
+    # W2-1 失败显式标记：任一维度解析失败时该裁判整体标记失败，
+    # 由 format_output 写入 raw_output，行级聚合据此剔除该裁判
+    final_judge_failed: bool
+    final_fail_reason: str
     raw_output: str
 
 
@@ -104,6 +108,8 @@ def build_state_input(
         "final_score": 0.0,
         "final_feedback": "",
         "final_dimension_scores": {},
+        "final_judge_failed": False,
+        "final_fail_reason": "",
         "raw_output": "",
     }
 
@@ -169,46 +175,17 @@ def _extract_dependencies(metrics: List[Dict]) -> Dict[str, List[DimensionDepend
 
 
 def _load_judge_model_config(task) -> Dict[str, Any]:
-    """从 task 中加载裁判模型配置
+    """从 task 中加载裁判模型配置（W4 快照优先，实时回退）
 
-    优先使用全局 Claude Code 配置（软退场：裁判模型统一由 CC 配置驱动），
-    未配置 CC 时回落 task.judge_model 对应的 ModelConfig（保证历史任务可复跑），
-    最后尝试 task.judge_model_config 缓存。
+    优先级（由 config_snapshot.resolve_judge_call_config 统一实现，与执行
+    记录归因摘要共用同一解析链）：
+    1. task.judge_model_config 创建时快照（口径字段来自快照，凭据 api_key/
+       auth_config 从实时 ModelConfig 解析——快照只存掩码，严禁明文）；
+    2. 全局 Claude Code 配置（软退场：裁判模型统一由 CC 配置驱动）；
+    3. task.judge_model 对应的实时 ModelConfig（历史任务可复跑）；
+    4. consistency_config.judge_config（一致性评测历史兜底）。
     """
-    judge_config = getattr(task, "judge_model_config", {}) or {}
-    judge_model_id = getattr(task, "judge_model", None)
+    from app.services.config_snapshot import resolve_judge_call_config
 
-    if not judge_config:
-        try:
-            from app.services.claude_code_config_service import ClaudeCodeConfigService
-
-            judge_config = ClaudeCodeConfigService.get_judge_llm_config() or {}
-        except Exception:
-            logger.warning("加载 Claude Code 全局配置失败")
-
-    if not judge_config and judge_model_id:
-        try:
-            from app.db.session import SessionLocal
-            from app.models.model_config_models import ModelConfig
-
-            db = SessionLocal()
-            try:
-                obj = db.query(ModelConfig).filter(ModelConfig.id == judge_model_id).first()
-                if obj:
-                    judge_config = {
-                        "provider": obj.provider,
-                        "model_type": obj.model_type,
-                        "endpoint": obj.endpoint,
-                        "api_key": obj.api_key,
-                        "auth_type": obj.auth_type,
-                        "auth_config": obj.auth_config,
-                        "request_config": obj.request_config,
-                        "response_parse_config": obj.response_parse_config,
-                        "model_id": obj.id,
-                    }
-            finally:
-                db.close()
-        except Exception:
-            logger.warning(f"从数据库加载裁判模型配置失败: judge_model={judge_model_id}")
-
+    judge_config, _source = resolve_judge_call_config(task)
     return judge_config

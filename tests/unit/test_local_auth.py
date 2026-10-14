@@ -25,6 +25,8 @@ from app.services.password_service import hash_password, verify_password
 from app.api.user_api import RegisterRequest, LoginRequest, login, register
 from app.middleware.auth_middleware import AuthMiddleware
 
+pytestmark = pytest.mark.unit  # W8 分类门禁：补打标
+
 
 # ---------------------------------------------------------------------------
 # password_service
@@ -281,11 +283,11 @@ class TestAuthMiddleware:
         resp = client.get("/api/v1/protected", headers={"Authorization": f"Basic {token}"})
         assert resp.status_code == 401
 
-    def test_inactive_user_401(self, client_factory):
+    def test_inactive_user_403(self, client_factory):
         client = client_factory(users=[_active_user(active=False)])
         token = jwt_service.create_token("u_alice", "alice")
         resp = client.get("/api/v1/protected", headers={"Authorization": f"Bearer {token}"})
-        assert resp.status_code == 401
+        assert resp.status_code == 403
 
     def test_unknown_user_401(self, client_factory):
         client = client_factory()

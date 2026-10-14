@@ -1,11 +1,14 @@
 import logging
 import os
 from contextlib import asynccontextmanager
+from logging.handlers import RotatingFileHandler
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from app.api.endpoints import router as api_router
+from app.api.health_api import router as health_router
 from app.api.model_config_api import router as model_config_router, router_judge as judge_router
 from app.api.instruction_config_api import router as instruction_router
 from app.api.judge_config_api import router as judge_config_router
@@ -32,23 +35,27 @@ from app.api.hub_file_api import router as hub_file_router
 from app.api.hub_import_api import router as hub_import_router, dataset_router as hub_import_dataset_router
 from app.middleware.auth_middleware import AuthMiddleware
 from app.db.session import engine, Base
-from app.core.config import get_settings
+from app.core.config import get_settings, validate_runtime_settings
 import uvicorn
 
 logger = logging.getLogger(__name__)
 
 # ============================================
-# 日志配置：输出到控制台和文件
+# 日志配置：输出到控制台和文件（W13：文件改 RotatingFileHandler，
+# 10MB×10 个备份——日志不再无限增长，占满磁盘上限 ≈ 110MB）
 # ============================================
 LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
-# 文件 Handler
-file_handler = logging.FileHandler(
+# 文件 Handler（轮转：单文件 10MB，保留 10 个历史）
+file_handler = RotatingFileHandler(
     os.path.join(LOG_DIR, "auth_middleware.log"),
+    maxBytes=10 * 1024 * 1024,
+    backupCount=10,
     encoding="utf-8"
 )
-file_handler.setLevel(logging.DEBUG)
+# W13：auth 日志原为 DEBUG 级（每个请求刷 SSO 明细），降到 INFO
+file_handler.setLevel(logging.INFO)
 file_formatter = logging.Formatter(
     "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
@@ -69,8 +76,10 @@ root_logger = logging.getLogger()
 root_logger.setLevel(logging.INFO)
 root_logger.addHandler(console_handler)
 
+# W13：auth 两个 logger 由 DEBUG 降为 INFO（原本每个请求都把 SSO 请求/响应
+# 明细刷进文件，既拖慢请求又占磁盘；DEBUG 排障需要时临时调回）
 middleware_auth_logger = logging.getLogger("app.middleware.auth_middleware")
-middleware_auth_logger.setLevel(logging.DEBUG)
+middleware_auth_logger.setLevel(logging.INFO)
 middleware_auth_logger.addHandler(file_handler)
 middleware_auth_logger.addHandler(console_handler)
 
@@ -84,18 +93,23 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理：启动时清理孤立任务，关闭时执行必要清理"""
+    # W6-3：启动 fail-fast——缺 DATABASE_URL 直接拒绝启动（放在 lifespan 而非
+    # 模块 import 时，保证 import app.main 可在无配置环境完成，导入不等于运行）
+    validate_runtime_settings(settings)
+
     # === 启动阶段 ===
     # 清理上次服务重启遗留的 running 状态任务
+    # W10-4：改为心跳判定——只有当前执行记录 heartbeat_at 超 15 分钟无进展的
+    # running 任务才标 failed（真死收尸）；worker 仍在执行的任务（心跳新鲜）
+    # 与排队中任务（执行记录尚无心跳）不再被部署重启误标。
     try:
         from app.db.session import SessionLocal
         from app.services.evaluation_task_service import EvaluationTaskService
         with SessionLocal() as db:
             svc = EvaluationTaskService(db)
-            orphaned = svc.get_tasks(status="running")
-            for t in orphaned:
-                svc.fail_task(t.id, "服务重启，任务中断")
-            if orphaned:
-                logger.warning(f"已清理 {len(orphaned)} 个孤立 running 任务")
+            reaped = svc.fail_stale_running_tasks()
+            if reaped:
+                logger.warning(f"已收尸 {len(reaped)} 个心跳超时的 running 任务: {reaped}")
     except Exception as e:
         logger.warning(f"清理孤立任务失败: {e}")
 
@@ -181,6 +195,8 @@ if os.path.exists(DOCS_ASSETS_DIR):
 
 # 注册 API 路由
 app.include_router(api_router, prefix=settings.API_V1_STR)
+# 深健康检查（W13）：/api/v1/health/deep，白名单见 auth_middleware.WHITELIST_PREFIXES
+app.include_router(health_router, prefix=settings.API_V1_STR)
 app.include_router(model_config_router, prefix=settings.API_V1_STR)
 app.include_router(judge_router, prefix=settings.API_V1_STR)
 app.include_router(instruction_router, prefix=settings.API_V1_STR)

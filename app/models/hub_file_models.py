@@ -40,6 +40,9 @@ class HubFileRecord(Base):
     unpack_error = Column(Text, nullable=True, comment="最近一次解包失败的中文错误信息")
     file_count = Column(Integer, nullable=True, comment="解包文件数")
     total_size = Column(Integer, nullable=True, comment="解包后总字节数")
+    # 团队归属（W9 IDOR 收口）：导入时从目标数据集 team_code 继承写入；
+    # 历史行（迁移前导入）为 NULL，读取面按 DEFAULT 口径参与归属比较
+    team_code = Column(String, nullable=True, server_default="DEFAULT", comment="所属团队代码（导入时从数据集继承）")
     # 引用计数：执行/预览 acquire +1、release -1，归零时清理登记与解包目录
     ref_count = Column(Integer, nullable=False, server_default="0", default=0, comment="引用计数")
     # 文件索引（build_file_index 产物：[{path,type,size,is_nested_zip,nested_index}]）
@@ -73,6 +76,8 @@ class HubImportJob(Base):
     fail_detail = Column(JSON, nullable=True, comment="失败明细（{file_id: 错误信息}）")
     # 已成功导入的 file_id 集合：retry 只重跑失败项、已成功的不重复导入（幂等键）
     succeeded_file_ids = Column(JSON, nullable=True, comment="已成功导入的 file_id 列表")
+    # 导入时挂载的清洗脚本（脚本库 pre_judge_scripts.id，可空=原样导入不清洗）
+    script_id = Column(String, nullable=True, comment="清洗脚本 ID（脚本库，可空=不清洗）")
     created_by = Column(String, nullable=True, comment="创建人")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())

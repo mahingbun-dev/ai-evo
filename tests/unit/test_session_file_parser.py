@@ -15,6 +15,8 @@ from app.services.session_file_parser import (
     summarize_first_user_message,
 )
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 def _write_lines(tmp_path, name, lines):
     """将字符串行列表写入临时文件，返回路径"""

@@ -1,0 +1,220 @@
+{
+  "total": 4,
+  "success_count": 3,
+  "failed_count": 1,
+  "success_rate": 0.75,
+  "average_score": 7.62,
+  "max_score": 10,
+  "dimension_scores": {
+    "准确性": {
+      "average": 7.88,
+      "count": 2,
+      "weight": 2
+    },
+    "完整性": {
+      "average": 7.38,
+      "count": 2,
+      "weight": 1
+    }
+  },
+  "failed_judge_rows": 1,
+  "items": [
+    {
+      "idx": 0,
+      "success": true,
+      "model_output": "使用哈希表一次遍历，时间复杂度 O(n)",
+      "model_raw_response": "思路：遍历数组，用字典记录已出现的数值与下标……",
+      "input_data": "",
+      "judge_count": 2,
+      "judge_scores": [
+        {
+          "score": 8.5,
+          "feedback": "算法正确，解释清晰",
+          "dimension_scores": {
+            "准确性": 8.5,
+            "完整性": 8.0
+          },
+          "evaluation_target_name": "裁判1",
+          "langfuse_trace_id": "trace-judge1-row0",
+          "langfuse_trace_url": "http://langfuse.local/trace/judge1-row0",
+          "judge_failed": false,
+          "fail_reason": null
+        },
+        {
+          "score": 9.0,
+          "feedback": "覆盖边界条件",
+          "dimension_scores": {
+            "准确性": 9.0,
+            "完整性": 9.5
+          },
+          "evaluation_target_name": null,
+          "langfuse_trace_id": null,
+          "langfuse_trace_url": null,
+          "judge_failed": false,
+          "fail_reason": null
+        }
+      ],
+      "judge_details": [
+        {
+          "judge_index": 0,
+          "score": 8.5,
+          "feedback": "算法正确，解释清晰",
+          "dimension_scores": {
+            "准确性": 8.5,
+            "完整性": 8.0
+          },
+          "evaluation_target_name": "裁判1",
+          "langfuse_trace_id": "trace-judge1-row0",
+          "langfuse_trace_url": "http://langfuse.local/trace/judge1-row0",
+          "judge_failed": false,
+          "fail_reason": null
+        },
+        {
+          "judge_index": 1,
+          "score": 9.0,
+          "feedback": "覆盖边界条件",
+          "dimension_scores": {
+            "准确性": 9.0,
+            "完整性": 9.5
+          },
+          "evaluation_target_name": "裁判2",
+          "langfuse_trace_id": null,
+          "langfuse_trace_url": null,
+          "judge_failed": false,
+          "fail_reason": null
+        }
+      ],
+      "feedback": "整体实现正确",
+      "dimension_scores": {
+        "准确性": 8.75,
+        "完整性": 8.75
+      },
+      "row_status": "completed",
+      "failed_judge_count": 0,
+      "average_score": 8.75,
+      "pre_script_results": [
+        {
+          "name": "length_check",
+          "status": "passed",
+          "output": "128 chars"
+        }
+      ],
+      "user_input": "请写一个两数之和的解法"
+    },
+    {
+      "idx": 1,
+      "success": true,
+      "model_output": "冒泡排序，时间复杂度 O(n^2)",
+      "model_raw_response": "",
+      "input_data": "",
+      "judge_count": 1,
+      "judge_scores": [
+        {
+          "score": 6.5,
+          "feedback": "正确但效率偏低",
+          "dimension_scores": {
+            "准确性": 7.0,
+            "完整性": 6.0
+          },
+          "evaluation_target_name": "裁判1",
+          "langfuse_trace_id": "trace-judge1-row1",
+          "langfuse_trace_url": "http://langfuse.local/trace/judge1-row1",
+          "judge_failed": false,
+          "fail_reason": null
+        }
+      ],
+      "judge_details": [
+        {
+          "judge_index": 0,
+          "score": 6.5,
+          "feedback": "正确但效率偏低",
+          "dimension_scores": {
+            "准确性": 7.0,
+            "完整性": 6.0
+          },
+          "evaluation_target_name": "裁判1",
+          "langfuse_trace_id": "trace-judge1-row1",
+          "langfuse_trace_url": "http://langfuse.local/trace/judge1-row1",
+          "judge_failed": false,
+          "fail_reason": null
+        }
+      ],
+      "feedback": "效率较低",
+      "dimension_scores": {
+        "准确性": 7.0,
+        "完整性": 6.0
+      },
+      "row_status": "completed",
+      "failed_judge_count": 0,
+      "average_score": 6.5,
+      "user_input": "请写一个冒泡排序"
+    },
+    {
+      "idx": 2,
+      "success": true,
+      "model_output": "归并排序需要递归拆分数组……",
+      "model_raw_response": "",
+      "input_data": "",
+      "judge_count": 2,
+      "judge_scores": [
+        {
+          "score": null,
+          "feedback": null,
+          "dimension_scores": null,
+          "evaluation_target_name": "裁判1",
+          "langfuse_trace_id": null,
+          "langfuse_trace_url": null,
+          "judge_failed": true,
+          "fail_reason": "模型返回非 JSON"
+        },
+        {
+          "score": null,
+          "feedback": null,
+          "dimension_scores": null,
+          "evaluation_target_name": "裁判2",
+          "langfuse_trace_id": null,
+          "langfuse_trace_url": null,
+          "judge_failed": true,
+          "fail_reason": "裁判调用超时"
+        }
+      ],
+      "judge_details": [
+        {
+          "judge_index": 0,
+          "score": null,
+          "feedback": null,
+          "dimension_scores": null,
+          "evaluation_target_name": "裁判1",
+          "langfuse_trace_id": null,
+          "langfuse_trace_url": null,
+          "judge_failed": true,
+          "fail_reason": "模型返回非 JSON"
+        },
+        {
+          "judge_index": 1,
+          "score": null,
+          "feedback": null,
+          "dimension_scores": null,
+          "evaluation_target_name": "裁判2",
+          "langfuse_trace_id": null,
+          "langfuse_trace_url": null,
+          "judge_failed": true,
+          "fail_reason": "裁判调用超时"
+        }
+      ],
+      "feedback": "",
+      "dimension_scores": {},
+      "row_status": "judge_failed",
+      "failed_judge_count": 2,
+      "user_input": "请写一个归并排序"
+    }
+  ],
+  "failed_items": [
+    {
+      "idx": 3,
+      "success": false,
+      "error": "模型调用超时"
+    }
+  ],
+  "completed_at": "2026-01-01T12:00:00"
+}

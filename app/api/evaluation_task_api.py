@@ -8,6 +8,7 @@ from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field, field_serializer, field_validator, computed_field, ConfigDict
 from datetime import datetime
 from app.db.session import get_db
+from app.services.access_control import ensure_task_access
 from app.services.evaluation_task_service import EvaluationTaskService, TaskExecutionLogService
 
 logger = logging.getLogger(__name__)
@@ -274,6 +275,18 @@ class TaskDetailResponse(TaskResponse):
     template_id: Optional[str] = None
 
 
+class TaskStatusResponse(BaseModel):
+    """任务轻量状态（W14 轮询专用）：只含进度热字段，不查/不序列化大 JSON 列
+
+    面向前端 useTaskPolling 高频轮询：四个字段覆盖状态徽标与进度条渲染
+    （status/progress）与「已完成 X / Y 题」文案（completed_questions/total）。
+    """
+    status: str
+    progress: int = 0
+    completed_questions: int = 0
+    total: int = 0
+
+
 class EvaluationResultResponse(BaseModel):
     """评测结果响应模型 - 区分成功/失败状态"""
     model_config = ConfigDict(from_attributes=True)
@@ -324,6 +337,9 @@ class ExecutionRecordResponse(BaseModel):
     remark: Optional[str] = None
     started_at: datetime
     completed_at: Optional[datetime] = None
+    # W4（P0-C）配置归因锚点：执行开始写创建时双快照、结束写实际使用配置摘要
+    # （仅掩码凭据+指纹，无明文 api_key）
+    config_snapshot: Optional[Dict[str, Any]] = None
 
     @field_serializer('started_at')
     def serialize_started_at(self, value: datetime) -> str:
@@ -463,17 +479,16 @@ def get_model_variables(
 @router.get("/datasets/{dataset_id}/fields", summary="获取数据集可用字段")
 def get_dataset_fields(
     dataset_id: str,
+    request: Request,
     db: Session = Depends(get_db),
 ):
-    """获取数据集的可用字段（含自定义字段和is_media绑定）"""
-    from app.services.dataset_service import DatasetService, DatasetDataService
+    """获取数据集的可用字段（含自定义字段和is_media绑定；W9：数据集归属校验）"""
+    from app.services.access_control import ensure_dataset_access
+    from app.services.dataset_service import DatasetDataService
     from app.services.dataset_field_service import DatasetFieldService
 
-    # 验证数据集存在
-    dataset_service = DatasetService(db)
-    dataset = dataset_service.get_dataset(dataset_id)
-    if not dataset:
-        raise HTTPException(status_code=404, detail="数据集不存在")
+    # 验证数据集存在 + 团队归属
+    ensure_dataset_access(db, request.state.user, dataset_id)
 
     # 优先从字段元数据表获取字段结构
     field_service = DatasetFieldService(db)
@@ -568,44 +583,84 @@ def migrate_legacy_all_tasks(
 @router.get("/{task_id}", response_model=TaskDetailResponse, summary="获取任务详情")
 def get_task(
     task_id: str,
+    request: Request,
     db: Session = Depends(get_db),
 ):
-    """获取评测任务详情"""
-    service = EvaluationTaskService(db)
-    task = service.get_task(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="任务不存在")
+    """获取评测任务详情（W9：对象级归属校验，跨团队 403）"""
+    task = ensure_task_access(db, request.state.user, task_id)
     return task
 
 
 @router.get("/{task_id}/config", response_model=TaskConfigResponse, summary="获取任务配置（编辑场景）")
 def get_task_config(
     task_id: str,
+    request: Request,
     db: Session = Depends(get_db),
 ):
-    """获取任务配置信息，不包含执行结果等大体字段，用于编辑场景"""
-    service = EvaluationTaskService(db)
-    task = service.get_task(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="任务不存在")
+    """获取任务配置信息，不包含执行结果等大体字段，用于编辑场景（W9：归属校验）"""
+    task = ensure_task_access(db, request.state.user, task_id)
     return task
+
+
+@router.get("/{task_id}/status", response_model=TaskStatusResponse, summary="获取任务轻量状态（轮询专用）")
+def get_task_status(
+    task_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """轮询专用轻端点：仅返回 status/progress/completed_questions/total 四字段
+
+    W14 轮询优化：前端 useTaskPolling 由每 8s 拉全量 detail（GET /{task_id}，
+    加载 result/config 等大 JSON 列）切换至本端点——SQL 只 SELECT 标量列
+    （id 供过滤），不触碰大 JSON 列，单次轮询开销从全行加载降为标量读取。
+
+    W19b：补对象级归属校验（W14 时漏出 W9 收口，可被跨团队探测任务存在性
+    与进度）——team_code 并入同一条标量 SELECT 后用 check_team_access 判定，
+    单查询同时完成「查出 + 校验」，不回退 W14 的轻量化。
+    """
+    from app.models.task_models import EvaluationTask
+    from app.services.access_control import AccessDeniedError, check_team_access
+
+    row = (
+        db.query(
+            EvaluationTask.id,
+            EvaluationTask.status,
+            EvaluationTask.progress,
+            EvaluationTask.completed_questions,
+            EvaluationTask.total_questions,
+            EvaluationTask.team_code,
+        )
+        .filter(EvaluationTask.id == task_id)
+        .first()
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    try:
+        check_team_access(request.state.user, row.team_code)
+    except AccessDeniedError:
+        raise HTTPException(status_code=403, detail="无权访问该任务（跨团队操作被拒绝）")
+    return TaskStatusResponse(
+        status=row.status,
+        progress=row.progress or 0,
+        completed_questions=row.completed_questions or 0,
+        total=row.total_questions or 0,
+    )
 
 
 @router.put("/{task_id}", response_model=TaskResponse, summary="更新任务")
 def update_task(
     task_id: str,
     body: UpdateTaskRequest,
+    request: Request,
     db: Session = Depends(get_db),
 ):
-    """更新评测任务"""
+    """更新评测任务（W9：对象级归属校验，查出+校验一步完成防 TOCTOU）"""
+    task = ensure_task_access(db, request.state.user, task_id)
     service = EvaluationTaskService(db)
-    task = service.get_task(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="任务不存在")
 
     # 更新任务
     try:
-        task = service.update_task(task_id, **body.model_dump(exclude_unset=True))
+        task = service.update_task(task.id, **body.model_dump(exclude_unset=True))
     except ValueError as e:
         # pre_scripts 等配置校验失败（脚本不存在/已停用、exec_type 非法、input_mapping 字段缺失）
         raise HTTPException(status_code=400, detail=str(e))
@@ -621,9 +676,11 @@ def update_task(
 @router.delete("/{task_id}", summary="删除任务")
 def delete_task(
     task_id: str,
+    request: Request,
     db: Session = Depends(get_db),
 ):
-    """删除评测任务"""
+    """删除评测任务（W9：对象级归属校验）"""
+    ensure_task_access(db, request.state.user, task_id)
     service = EvaluationTaskService(db)
     success = service.delete_task(task_id)
     if not success:
@@ -634,13 +691,11 @@ def delete_task(
 @router.post("/{task_id}/run", response_model=TaskResponse, summary="执行评测")
 def run_task(
     task_id: str,
+    request: Request,
     db: Session = Depends(get_db),
 ):
-    """执行评测任务（提交到 APScheduler 线程池）"""
-    service = EvaluationTaskService(db)
-    task = service.get_task(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="任务不存在")
+    """执行评测任务（提交到 APScheduler 线程池；W9：对象级归属校验）"""
+    task = ensure_task_access(db, request.state.user, task_id)
 
     # 允许重新运行已停止或失败的任务
     if task.status == "running":
@@ -650,6 +705,7 @@ def run_task(
     scheduler = get_task_scheduler()
 
     # 先更新状态为 running（原子操作，防止并发请求重复提交）
+    service = EvaluationTaskService(db)
     task = service.start_task(task_id)
     if task is None:
         # start_task 返回 None 说明任务已被其他请求启动
@@ -667,13 +723,11 @@ def run_task(
 @router.post("/{task_id}/stop", response_model=TaskResponse, summary="停止评测")
 def stop_task(
     task_id: str,
+    request: Request,
     db: Session = Depends(get_db),
 ):
-    """停止评测任务（发送停止信号，真正中断执行中的任务）"""
-    service = EvaluationTaskService(db)
-    task = service.get_task(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="任务不存在")
+    """停止评测任务（发送停止信号，真正中断执行中的任务；W9：对象级归属校验）"""
+    task = ensure_task_access(db, request.state.user, task_id)
 
     # 如果任务已完成或已停止，直接返回成功
     if task.status in ["completed", "stopped"]:
@@ -688,21 +742,19 @@ def stop_task(
     get_task_scheduler().stop_task(task_id)
 
     # 更新数据库状态
-    task = service.stop_task(task_id)
+    task = EvaluationTaskService(db).stop_task(task_id)
     return task
 
 
 @router.post("/{task_id}/refresh-count", response_model=TaskResponse, summary="刷新题目数")
 def refresh_task_count(
     task_id: str,
+    request: Request,
     db: Session = Depends(get_db),
 ):
-    """从数据集刷新题目数"""
+    """从数据集刷新题目数（W9：对象级归属校验）"""
+    ensure_task_access(db, request.state.user, task_id)
     service = EvaluationTaskService(db)
-    task = service.get_task(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="任务不存在")
-
     task = service.refresh_dataset_count(task_id)
     return task
 
@@ -710,13 +762,11 @@ def refresh_task_count(
 @router.post("/{task_id}/migrate-config", response_model=TaskMigrateConfigResponse, summary="迁移旧版任务配置")
 def migrate_task_config(
     task_id: str,
+    request: Request,
     db: Session = Depends(get_db),
 ):
-    """迁移单个任务的旧版配置（幂等）：steps 合并进 score_details、pre_scripts 转为 script_output 待评测数据行"""
-    task_service = EvaluationTaskService(db)
-    task = task_service.get_task(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="任务不存在")
+    """迁移单个任务的旧版配置（幂等）：steps 合并进 score_details、pre_scripts 转为 script_output 待评测数据行（W9：归属校验）"""
+    task = ensure_task_access(db, request.state.user, task_id)
 
     from app.services.config_migration_service import ConfigMigrationService
     try:
@@ -729,16 +779,14 @@ def migrate_task_config(
 @router.get("/{task_id}/logs", response_model=List[LogResponse], summary="获取任务日志")
 def get_task_logs(
     task_id: str,
+    request: Request,
     level: Optional[str] = Query(None, description="日志级别过滤"),
     limit: int = Query(100, ge=1, le=500),
     db: Session = Depends(get_db),
 ):
-    """获取任务执行日志"""
-    # 验证任务存在
-    task_service = EvaluationTaskService(db)
-    task = task_service.get_task(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="任务不存在")
+    """获取任务执行日志（W9：对象级归属校验）"""
+    # 验证任务存在 + 团队归属
+    ensure_task_access(db, request.state.user, task_id)
 
     log_service = TaskExecutionLogService(db)
     logs = log_service.get_logs(task_id, level=level, limit=limit)
@@ -748,14 +796,12 @@ def get_task_logs(
 @router.get("/{task_id}/executions", response_model=List[ExecutionRecordResponse], summary="获取执行历史列表")
 def get_task_executions(
     task_id: str,
+    request: Request,
     limit: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
 ):
-    """获取任务的执行历史记录列表"""
-    task_service = EvaluationTaskService(db)
-    task = task_service.get_task(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="任务不存在")
+    """获取任务的执行历史记录列表（W9：对象级归属校验）"""
+    ensure_task_access(db, request.state.user, task_id)
 
     from app.services.evaluation_task_service import TaskExecutionRecordService
     record_service = TaskExecutionRecordService(db)
@@ -771,13 +817,11 @@ results_router = APIRouter(prefix="/evaluation/results", tags=["评测结果"])
 @results_router.get("/{task_id}", response_model=EvaluationResultResponse, summary="获取评测结果")
 def get_result(
     task_id: str,
+    request: Request,
     db: Session = Depends(get_db),
 ):
-    """获取评测结果"""
-    service = EvaluationTaskService(db)
-    task = service.get_task(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="任务不存在")
+    """获取评测结果（W9：对象级归属校验）"""
+    task = ensure_task_access(db, request.state.user, task_id)
 
     # 失败状态返回错误信息
     if task.status == "failed":
@@ -816,14 +860,12 @@ def get_result(
 @results_router.get("/{task_id}/history", summary="获取所有历史版本结果")
 def get_result_history(
     task_id: str,
+    request: Request,
     limit: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
 ):
-    """获取任务所有历史版本的评测结果列表"""
-    task_service = EvaluationTaskService(db)
-    task = task_service.get_task(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="任务不存在")
+    """获取任务所有历史版本的评测结果列表（W9：对象级归属校验）"""
+    task = ensure_task_access(db, request.state.user, task_id)
 
     from app.services.evaluation_task_service import TaskExecutionRecordService
     record_service = TaskExecutionRecordService(db)

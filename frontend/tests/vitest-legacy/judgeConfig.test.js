@@ -5,7 +5,11 @@ import { describe, it, expect } from 'vitest'
 
 describe('JudgeConfig API Module', () => {
   it('test_judgeConfig_api_module_exports', () => {
-    // 验证 API 方法存在性（通过检查文件内容）
+    // 验证 API 方法存在性（通过检查文件内容）。
+    // W8 修复：validateConfig 导出已随后端裁判配置 API 重构移除
+    // （judgeConfig.js 现仅 getTemplate / previewPrompt 两个导出，
+    // 与后端 judge_config_api 的 template/preview 两端点对应），
+    // 断言对齐现状并补上 URL 契约校验。
     const fs = require('fs')
     const path = require('path')
     const content = fs.readFileSync(
@@ -14,7 +18,8 @@ describe('JudgeConfig API Module', () => {
     )
     expect(content).toContain('export function getTemplate')
     expect(content).toContain('export function previewPrompt')
-    expect(content).toContain('export function validateConfig')
+    expect(content).toContain("url: '/evaluation/judge-config/template'")
+    expect(content).toContain("url: '/evaluation/judge-config/preview'")
   })
 })
 

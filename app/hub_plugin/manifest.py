@@ -184,7 +184,9 @@ TOOL_ROUTES: Dict[str, _ROUTE_TYPE] = {
         "body": True,
         "desc": (
             "把 anc-hub file-store 的执行包文件导入为评测数据集（异步任务，返回 job_id，"
-            "用 hub_import_job_status 查进度）。新建数据集给 name；追加到已有数据集给 real_dataset_id"
+            "用 hub_import_job_status 查进度）。新建数据集给 name；追加到已有数据集给 real_dataset_id；"
+            "挂清洗脚本给 script_id（脚本库 id 或名称）——非空时逐包执行清洗、脚本产出的行内容"
+            "作为数据集行，不传则只登记执行包引用（数据行停在 hub_file_id/hub_summary、内容不展开）"
         ),
         "schema": {
             "type": "object",
@@ -197,6 +199,13 @@ TOOL_ROUTES: Dict[str, _ROUTE_TYPE] = {
                 "name": {"type": "string", "description": "新建数据集的名称（新建模式必填）"},
                 "description": {"type": "string", "description": "数据集描述（可选）"},
                 "real_dataset_id": {"type": "string", "description": "追加模式下目标数据集 ID"},
+                "script_id": {
+                    "type": "string",
+                    "description": (
+                        "可选：脚本库清洗脚本 ID 或名称——非空时逐包执行清洗，脚本产出的行内容"
+                        "作为数据集行；不传则只登记执行包引用（数据行只有 hub_file_id/hub_summary，内容不展开）"
+                    ),
+                },
             },
             "required": ["file_ids"],
         },

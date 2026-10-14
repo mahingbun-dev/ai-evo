@@ -7,6 +7,8 @@ from sqlalchemy import inspect
 
 from app.models.task_models import EvaluationTask
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 class TestEvaluationTaskVersionField:
     """EvaluationTask version 字段测试类"""

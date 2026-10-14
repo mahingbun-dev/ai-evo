@@ -32,6 +32,9 @@ from app.services.hub_file_service import (
     HubFileError,
 )
 from app.services.session_dataset_service import preview_session_files
+from tests.unit.w9_direct_call import fake_request, fake_request_with_cookie  # W9: 端点直调适配
+
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
 
 # 最小可解析的 Claude Code 会话 jsonl
 SESSION_JSONL = (
@@ -81,8 +84,9 @@ def _enable_hub_cookie_channel(monkeypatch):
 
 
 def fake_request_with_cookie(cookie="PLATFORM_SSO=tok-test"):
-    """构造带平台 Cookie 头的请求对象（驱动 Bearer 凭证提取）"""
-    return SimpleNamespace(headers={"cookie": cookie})
+    """带平台 Cookie 头 + state.user 的 Request 替身（W9 归属校验 + 凭证提取）"""
+    from tests.unit.w9_direct_call import fake_request_with_cookie as _fake
+    return _fake(cookie)
 
 
 class TestHubFilesQueryApi:
@@ -180,7 +184,7 @@ def run_from_hub(file_ids=None, name="", description="", real_dataset_id="",
         else:
             mock_import.return_value = import_return if import_return is not None else {
                 "dataset_id": "ds-new", "count": 1, "hub_file_refs": []}
-        result = asyncio.run(import_sessions_from_hub(body, request=None, db=db))
+        result = asyncio.run(import_sessions_from_hub(body, request=fake_request(), db=db))
     return NS(result=result, mock_import=mock_import, mock_ensure=mock_ensure,
               mock_acquire=mock_acquire, mock_release=mock_release,
               mock_discard=mock_discard, db=db)
@@ -261,7 +265,7 @@ class TestFromHubImportApi:
             mock_import.return_value = {"dataset_id": "ds-new", "count": 3,
                                         "hub_file_refs": ["fid-1", "fid-1", "fid-2"]}
             with pytest.raises(HTTPException) as exc:
-                asyncio.run(import_sessions_from_hub(body, request=None, db=db))
+                asyncio.run(import_sessions_from_hub(body, request=fake_request(), db=db))
             assert exc.value.status_code == 500
             # 已成功持有 fid-1 两次 → 补偿释放两次；失败那次（fid-2）不释放
             assert [c.args[1] for c in mock_release.call_args_list] == ["fid-1", "fid-1"]
@@ -379,7 +383,7 @@ class TestFromHubImportApi:
                 patch("app.services.session_dataset_service.import_sessions") as mock_import:
             mock_ensure.side_effect = lambda _db, fid, **kw: infos[fid]
             with pytest.raises(HTTPException) as exc:
-                asyncio.run(import_sessions_from_hub(body, request=None, db=db))
+                asyncio.run(import_sessions_from_hub(body, request=fake_request(), db=db))
             assert exc.value.status_code == 400
             assert "未找到会话文件" in exc.value.detail
             mock_import.assert_not_called()
@@ -663,7 +667,7 @@ class TestFromHubZipCompat:
             mock_import.return_value = {"dataset_id": "ds-zip", "count": 1, "hub_file_refs": []}
             if import_side_effect is not None:
                 mock_import.side_effect = import_side_effect
-            result = asyncio.run(import_sessions_from_hub(body, request=None, db=db))
+            result = asyncio.run(import_sessions_from_hub(body, request=fake_request(), db=db))
         return result, mock_import
 
     @patch("app.services.hub_file_service.requests")
@@ -827,6 +831,15 @@ def rpc_result(id_, result) -> str:
 # 阶段C：批量导入 job（POST import/hub-files、GET /hub-import-jobs/{id}、POST retry）
 # ---------------------------------------------------------------------------
 
+def hub_job_db(job, dataset_team=None):
+    """W9 适配：ensure_hub_import_job_access 的 join 查询链替身
+    （返回 (job, dataset) 元组；dataset.team_code 可控）"""
+    dataset = SimpleNamespace(id="ds-p", team_code=dataset_team)
+    db = MagicMock()
+    db.query.return_value.outerjoin.return_value.filter.return_value.first.return_value = (
+        job, dataset)
+    return db
+
 def run_import_hub_files(file_ids=None, name="", description="", real_dataset_id="",
                          create_dataset_ret=SimpleNamespace(id="ds-api"),
                          get_dataset_ret=None, dispatch_error=None):
@@ -848,7 +861,7 @@ def run_import_hub_files(file_ids=None, name="", description="", real_dataset_id
         mock_ds.return_value.get_dataset.return_value = get_dataset_ret
         if dispatch_error is not None:
             mock_task.apply_async.side_effect = dispatch_error
-        result = import_hub_files(body, request=None, db=db)
+        result = import_hub_files(body, request=fake_request(), db=db)
     return result, added, mock_task, db
 
 
@@ -943,7 +956,7 @@ class TestHubImportJobApi:
             fail_detail={"fid-2": "不是有效的 zip 文件: bad.zip"},
             created_at=datetime(2026, 10, 8, 12, 0, 0))
         with patch("app.api.hub_import_api.get_job", return_value=job):
-            resp = get_hub_import_job("hubjob_p1", db=MagicMock())
+            resp = get_hub_import_job("hubjob_p1", request=fake_request(), db=hub_job_db(job))
         assert resp.status == "failed"
         assert resp.success_count == 1 and resp.fail_count == 1
         assert resp.fail_detail == {"fid-2": "不是有效的 zip 文件: bad.zip"}
@@ -956,7 +969,7 @@ class TestHubImportJobApi:
 
         with patch("app.api.hub_import_api.get_job", return_value=None):
             with pytest.raises(HTTPException) as exc:
-                get_hub_import_job("hubjob_gone", db=MagicMock())
+                get_hub_import_job("hubjob_gone", request=fake_request(), db=hub_job_db(None))
         assert exc.value.status_code == 404
 
     def test_retry_failed_job_redispatches(self):
@@ -970,7 +983,7 @@ class TestHubImportJobApi:
 
         with patch("app.api.hub_import_api.retry_job", return_value=job), \
                 patch("app.tasks.celery_tasks.run_hub_import_job") as mock_task:
-            resp = retry_hub_import_job("hubjob_r1", request=fake_request_with_cookie(), db=MagicMock())
+            resp = retry_hub_import_job("hubjob_r1", request=fake_request_with_cookie(), db=hub_job_db(job))
         assert resp.id == "hubjob_r1"
         assert resp.fail_detail == {"fid-2": "x"}
         mock_task.apply_async.assert_called_once_with(
@@ -984,7 +997,7 @@ class TestHubImportJobApi:
         with patch("app.api.hub_import_api.retry_job",
                    side_effect=ValueError("导入任务已全部完成，无需重试")):
             with pytest.raises(HTTPException) as exc:
-                retry_hub_import_job("hubjob_done", request=fake_request_with_cookie(), db=MagicMock())
+                retry_hub_import_job("hubjob_done", request=fake_request_with_cookie(), db=hub_job_db(SimpleNamespace(id="hubjob_done", dataset_id="ds-done")))
         assert exc.value.status_code == 400
 
     def test_retry_not_found_404(self):
@@ -994,7 +1007,7 @@ class TestHubImportJobApi:
 
         with patch("app.api.hub_import_api.retry_job", return_value=None):
             with pytest.raises(HTTPException) as exc:
-                retry_hub_import_job("hubjob_gone", request=fake_request_with_cookie(), db=MagicMock())
+                retry_hub_import_job("hubjob_gone", request=fake_request_with_cookie(), db=hub_job_db(None))
         assert exc.value.status_code == 404
 
 

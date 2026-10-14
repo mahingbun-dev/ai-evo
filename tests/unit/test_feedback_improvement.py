@@ -9,6 +9,8 @@ from dataclasses import is_dataclass
 from app.services.judge_evaluation_engine import JudgeEvaluationResult
 from app.services.result_aggregator import ResultAggregator
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 class TestJudgeEvaluationResultFields:
     """JudgeEvaluationResult 字段测试"""

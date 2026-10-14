@@ -9,6 +9,8 @@ import logging
 import threading
 from typing import Dict, Any, List, Optional, Protocol
 
+from celery.exceptions import SoftTimeLimitExceeded
+
 from app.core.config import get_settings
 from app.db.session import engine, SessionLocal
 from app.services.evaluation_task_service import EvaluationTaskService, TaskExecutionLogService
@@ -61,8 +63,8 @@ def run_evaluation_async(task_id: str, stop_event: Optional[StopEventProtocol] =
     2. 加载数据集
     3. 处理媒体文件
     4. 生成Payload
-    5. 并发执行评测
-    6. 聚合结果
+    5. 并发执行评测（W3：逐行 write-through 落库；断点续跑跳过已完成行）
+    6. 聚合结果（W3：优先从行级表聚合，含续跑前次已完成行）
     7. 存储结果
 
     Args:
@@ -97,13 +99,38 @@ def run_evaluation_async(task_id: str, stop_event: Optional[StopEventProtocol] =
         # 注意：start_task 已在 API 层调用，此处不重复调用
         log_service.add_log(task_id, "info", f"任务配置读取完成: {task.name}")
 
+        # W3：本次执行序号（start_task 已原子递增 execution_count 并创建执行记录，
+        # 与 stop_task/complete_task 的 execution_count 同口径）
+        execution_number = getattr(task, "execution_count", None) or 1
+
         # ========== 步骤2: 加载数据集 ==========
         log_service.add_log(task_id, "info", "开始加载数据集")
         dataset_items = _load_dataset(task, db)
         log_service.add_log(task_id, "info", f"数据集加载完成，共 {len(dataset_items)} 条数据")
 
-        # 更新题目总数
-        task_service.update_progress(task_id, 0, len(dataset_items))
+        # W3-3 断点续跑：同 (task_id, execution_number) 已有 completed/judge_failed
+        # 行跳过（celery 消息重投/worker 崩溃后重跑不重复计费）。
+        # 耗时评测除外：其行级落库键是 repeat_count 展开后的全序序号，
+        # 与数据行序号空间不一致，保守不跳过（完整重跑）。
+        completed_indexes = set()
+        if getattr(task, "evaluation_type", "") != "latency":
+            from app.services.evaluation_result_service import get_completed_data_indexes
+
+            completed_indexes = get_completed_data_indexes(db, task_id, execution_number)
+            if completed_indexes:
+                log_service.add_log(
+                    task_id, "info",
+                    f"断点续跑：本轮已有 {len(completed_indexes)} 行已完成（含 judge_failed），将跳过",
+                )
+
+        # 更新题目总数（进度基数为已跳过的已完成行——续跑时进度为累计值）
+        task_service.update_progress(task_id, len(completed_indexes), len(dataset_items))
+
+        # W10-4 执行心跳：任务真正开跑即写入首个心跳（此后每批行完成续跳，
+        # 写库按 60s 节流，首跳 force 绕过）。启动收尸 reaper 只认「心跳超时」
+        # ——排队中任务（执行记录尚无心跳）与执行中的任务在部署重启时都不会
+        # 被误标 failed。
+        task_service.touch_heartbeat(task_id, execution_number, force=True)
 
         # ========== 步骤3: 处理媒体文件 ==========
         log_service.add_log(task_id, "info", "开始处理媒体文件")
@@ -115,6 +142,12 @@ def run_evaluation_async(task_id: str, stop_event: Optional[StopEventProtocol] =
         payloads = _generate_payloads(task, processed_items, db)
         log_service.add_log(task_id, "info", f"Payload生成完成，共 {len(payloads)} 个")
 
+        # W3 行身份标注：data_index 以数据项在数据集中的原始序号为准
+        # （下划线内部键，不进裁判 prompt 变量、不进结果平铺字段），
+        # 使行级落库键与 hub 拆分/续跑过滤后的列表序号解耦、多次执行间稳定
+        for _orig_pos, _payload in enumerate(payloads):
+            _payload["_orig_idx"] = _orig_pos
+
         # ========== 步骤5: 并发执行评测 ==========
         # 执行前检查是否已被停止（可能在排队期间被停止）
         if stop_event.is_set():
@@ -125,11 +158,28 @@ def run_evaluation_async(task_id: str, stop_event: Optional[StopEventProtocol] =
         # hub 执行包不可用的数据项直接产出失败结果，不发起评测（阶段B：
         # 数据项级失败，其余数据继续评测、任务不中断，错误信息可定位 file_id）
         hub_failed_results, runnable_payloads = _split_hub_unresolved_payloads(payloads)
+
+        # W3-3：断点续跑过滤——已完成行不再评测（payloads 与 hub 失败行均按
+        # 原始序号过滤；行级 upsert 幂等，重跑失败/缺失行不产生重复数据）
+        if completed_indexes:
+            runnable_payloads = [
+                p for p in runnable_payloads
+                if p.get("_orig_idx") not in completed_indexes
+            ]
+            hub_failed_results = [
+                r for r in hub_failed_results
+                if r.get("idx") not in completed_indexes
+            ]
+
         if hub_failed_results:
             log_service.add_log(
                 task_id, "warning",
                 f"{len(hub_failed_results)} 条数据的 hub 执行包不可用，已标记失败（其余数据继续评测）",
             )
+            # W3-2：hub 失败行在执行开始前即落库（终态已知），
+            # 执行中途被停止/强杀也不丢
+            for hub_row in hub_failed_results:
+                _persist_row(task_id, execution_number, hub_row["idx"], hub_row)
 
         log_service.add_log(task_id, "info", "开始执行评测")
         results = _execute_evaluation(task, runnable_payloads, db, task_id, stop_event)
@@ -144,8 +194,16 @@ def run_evaluation_async(task_id: str, stop_event: Optional[StopEventProtocol] =
         log_service.add_log(task_id, "info", "评测执行完成")
 
         # ========== 步骤6: 聚合结果 ==========
+        # W3-2：优先从行级表聚合（行级表为本轮结果事实源，含续跑前次已完成行；
+        # DB 无行/读取异常回退内存结果——与旧口径一致，零丢失）
+        results = _merge_row_table_results(db, task_id, execution_number, results)
         log_service.add_log(task_id, "info", "开始聚合结果")
         aggregated_result = _aggregate_results(results, task)
+        # W4（P0-C）：快照使用标记——任务带创建时配置快照为 True（执行用快照
+        # 口径），快照为空（存量任务）走实时查询为 False；增量字段，旧消费方不受影响
+        from app.services.config_snapshot import snapshot_used
+
+        aggregated_result["config_snapshot"] = snapshot_used(task)
         log_service.add_log(task_id, "info", "结果聚合完成")
 
         # ========== 步骤7: 存储结果 ==========
@@ -163,6 +221,24 @@ def run_evaluation_async(task_id: str, stop_event: Optional[StopEventProtocol] =
         log_service.add_log(task_id, "info", "任务已主动停止")
         task_service.stop_task(task_id)
         return {"status": "stopped", "task_id": task_id}
+
+    except SoftTimeLimitExceeded:
+        # W3-4 软超时收尾（P0-E）：软超时不再被行级 except Exception 吞掉，
+        # 在硬杀（SIGKILL）前完成收尾——停止后续行、已落库行保留、任务标
+        # failed(error="soft time limit")，续跑可从行级表接续
+        logger.warning(f"评测任务软超时（soft time limit）: {task_id}")
+        try:
+            log_service.add_log(
+                task_id, "error",
+                "任务软超时（soft time limit），已完成行已落库保留，任务标记失败",
+            )
+        except Exception:  # noqa: BLE001 - 收尾日志失败不阻断状态更新
+            pass
+        try:
+            task_service.fail_task(task_id, "soft time limit")
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"软超时收尾 fail_task 失败: {e}")
+        return {"status": "failed", "task_id": task_id, "error": "soft time limit"}
 
     except Exception as e:
         logger.exception(f"评测任务执行失败: {task_id}")
@@ -183,6 +259,68 @@ def run_evaluation_async(task_id: str, stop_event: Optional[StopEventProtocol] =
         _cleanup_task_hub_cache(task_id)
         # 不再主动清理停止信号，让 on_revoke 回调处理
         # 如果是 RedisStopSignalChecker，on_revoke 会调用 stop_task(task_id) 更新状态
+
+
+def _persist_row(task_id: str, execution_number: Optional[int], data_index: int, result: Dict[str, Any]) -> None:
+    """行级 write-through 落库薄封装（W3-2）
+
+    execution_number 为 None（直调/测试链路）时跳过。
+    evaluation_result_service.persist_row_result 内部已按进程去重告警且不阻断
+    评测主流程；此处仅兜底导入等异常。软超时异常上抛，由收尾逻辑处理。
+    """
+    if execution_number is None:
+        return
+    try:
+        from app.services.evaluation_result_service import persist_row_result
+
+        persist_row_result(
+            task_id=task_id,
+            execution_number=execution_number,
+            data_index=data_index,
+            result=result,
+        )
+    except SoftTimeLimitExceeded:
+        raise
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[RowPersist] 行级结果落库失败（不影响评测主流程）idx={data_index}: {e}")
+
+
+def _merge_row_table_results(
+    db,
+    task_id: str,
+    execution_number: int,
+    results: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """complete 聚合前的行级表合并（W3-2）：行级表为本轮结果事实源
+
+    - 行级表包含续跑前次已完成行与本次执行全部已落库行——仅靠本次内存
+      results（只含本轮新跑的行）聚合会丢前次行，故优先从行级表重建；
+    - 同 data_index 冲突时以内存行为准（本轮内容最新）；
+    - 行级表无行（迁移未执行/全新链路/落库全失败）→ 原样返回内存结果
+      （与旧口径一致，零丢失）；
+    - 无行身份的内存行（异常兜底）按原顺序追加在尾部。
+    """
+    from app.services.evaluation_result_service import load_execution_results
+
+    db_rows = load_execution_results(db, task_id, execution_number)
+    if not db_rows:
+        return results
+
+    merged: Dict[int, Dict[str, Any]] = {}
+    for row in db_rows:
+        data_index = row.get("_orig_idx") if isinstance(row, dict) else None
+        if isinstance(data_index, int):
+            merged[data_index] = row
+
+    unidentified: List[Dict[str, Any]] = []
+    for row in results:
+        data_index = row.get("_orig_idx") if isinstance(row, dict) else None
+        if isinstance(data_index, int):
+            merged[data_index] = row
+        else:
+            unidentified.append(row)
+
+    return [merged[key] for key in sorted(merged)] + unidentified
 
 
 def _load_dataset(task, db) -> List[Dict[str, Any]]:
@@ -364,8 +502,13 @@ def _generate_payloads(task, items: List[Dict], db) -> List[Dict]:
 
 
 def _execute_evaluation(task, payloads: List[Dict], db, task_id: str, stop_event: Optional[StopEventProtocol] = None) -> List[Dict]:
-    """并发执行评测，传递 stop_event 以支持中断"""
+    """并发执行评测，传递 stop_event 以支持中断
+
+    W3：行级 write-through——execution_number/续跑进度偏移从 task/db 推导
+    （保持本函数签名与调用点稳定，兼容既有直调与打桩）。
+    """
     from app.services.evaluation_executor import EvaluationExecutor
+    from app.services.evaluation_result_service import get_completed_data_indexes
 
     # 获取配置实例
     settings = get_settings()
@@ -378,45 +521,74 @@ def _execute_evaluation(task, payloads: List[Dict], db, task_id: str, stop_event
         os.environ.setdefault("LANGFUSE_SECRET_KEY", settings.LANGFUSE_SECRET_KEY)
         os.environ.setdefault("LANGFUSE_HOST", settings.LANGFUSE_HOST)
 
-    # RAG 评测走专用路径
-    if task.evaluation_type == "rag":
-        return _execute_rag_evaluation(task, payloads, task_id, stop_event, langfuse_host)
+    # W3：行级落库执行序号（start_task 已递增，与 stop/complete 同口径）
+    execution_number = getattr(task, "execution_count", None) or 1
+    # W3：续跑进度偏移（本轮已跳过的已完成行数；表不可用时为 0）
+    progress_offset = len(get_completed_data_indexes(db, task_id, execution_number))
 
-    # 一致性评测走专用路径
-    if task.evaluation_type == "consistency":
-        return _execute_consistency_evaluation(task, payloads, db, task_id, stop_event)
+    # W17：类型执行路径收敛注册表——已迁移类型由适配器提供执行钩子；
+    # 未迁移类型沿用下方专用路径，未知类型走默认裁判批量执行通道。
+    # 函数体内延迟导入：与适配器模块（对执行函数延迟委托）互不构成导入环，
+    # 经模块属性取钩子保持既有 patch(..._execute_xxx) 打桩方式生效
+    from app.services.evaluators import evaluator_registry
+    from app.services.evaluators.context import EvaluationContext
+
+    type_adapter = evaluator_registry.get(task.evaluation_type)
+    if type_adapter is not None:
+        adapter_result = type_adapter.evaluate_batch(
+            EvaluationContext(
+                db=db,
+                task_id=task_id,
+                stop_event=stop_event,
+                execution_number=execution_number,
+                progress_offset=progress_offset,
+                langfuse_host=langfuse_host,
+            ),
+            task,
+            payloads,
+        )
+        if adapter_result is not None:
+            return adapter_result
+
+    # W17：rag 已迁移注册表（见上方类型适配器分发），专用路径保留
+    # 供适配器委托与直调使用
 
     # 成功率评测走专用路径（不使用裁判模型）
-    if task.evaluation_type == "success_rate":
-        return _execute_success_rate_evaluation(task, payloads, task_id, db, stop_event)
+    # W17：success_rate 已迁移注册表（见上方类型适配器分发），专用路径保留
+    # 供适配器委托与直调使用
 
-    # 耗时评测走专用路径
-    if task.evaluation_type == "latency":
-        executor = EvaluationExecutor(
-            max_workers=min(task.judge_count or 4, 4),
-            task_id=task_id,
-            stop_event=stop_event,
-            langfuse_host=langfuse_host,
-        )
-        return executor.execute_batch_latency(payloads, task)
+    # W17：latency 已迁移注册表（专用 EvaluationExecutor 构造在适配器内，
+    # 与本分支逐行等价：max_workers=min(judge_count,4)、progress_offset 恒 0）
 
-    # 二分分类评测走专用路径
-    if task.evaluation_type == "binary_classification":
-        return _execute_binary_classification_evaluation(task, payloads, task_id, db, stop_event)
+    # W17：binary_classification 已迁移注册表（见上方类型适配器分发），
+    # 专用路径保留供适配器委托与直调使用
 
     executor = EvaluationExecutor(
         max_workers=min(task.judge_count or 4, 4),
         task_id=task_id,
         stop_event=stop_event,
         langfuse_host=langfuse_host,
+        execution_number=execution_number,
+        progress_offset=progress_offset,
     )
 
     results = executor.execute_batch(payloads, task)
     return results
 
 
-def _execute_rag_evaluation(task, payloads: List[Dict], task_id: str, stop_event, langfuse_host="") -> List[Dict]:
-    """执行 RAG 评测，每条数据：调用 RAG 接口 → 评测各指标"""
+def _execute_rag_evaluation(
+    task,
+    payloads: List[Dict],
+    task_id: str,
+    stop_event,
+    langfuse_host="",
+    execution_number: Optional[int] = None,
+    progress_offset: int = 0,
+) -> List[Dict]:
+    """执行 RAG 评测，每条数据：调用 RAG 接口 → 评测各指标
+
+    execution_number 为 None（直调/测试链路）时执行器跳过行级落库。
+    """
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from app.services.evaluation_executor import EvaluationExecutor
 
@@ -425,14 +597,19 @@ def _execute_rag_evaluation(task, payloads: List[Dict], task_id: str, stop_event
         task_id=task_id,
         stop_event=stop_event,
         langfuse_host=langfuse_host,
+        execution_number=execution_number,
+        progress_offset=progress_offset,
     )
 
     results = executor.execute_batch_rag(payloads, task)
     return results
 
 
-def _execute_consistency_evaluation(task, payloads: List[Dict], db, task_id: str, stop_event: Optional[StopEventProtocol] = None) -> List[Dict]:
-    """执行一致性评测 - 多次调用模型计算一致性"""
+def _execute_consistency_evaluation(task, payloads: List[Dict], db, task_id: str, stop_event: Optional[StopEventProtocol] = None, execution_number: Optional[int] = None) -> List[Dict]:
+    """执行一致性评测 - 多次调用模型计算一致性
+
+    execution_number 为 None（直调/测试链路）时跳过行级落库。
+    """
     import asyncio
     import logging
     from app.services.consistency_evaluator import ConsistencyEvaluator
@@ -447,10 +624,11 @@ def _execute_consistency_evaluation(task, payloads: List[Dict], db, task_id: str
 
     logger.info(f"[_execute_consistency_evaluation] use_judge={use_judge}, evaluation_metrics={evaluation_metrics}, repeat_count={repeat_count}")
 
-    # 获取模型配置
-    model_config = task.model_config or {}
-    if not model_config and task.model_provider:
-        model_config = _load_model_config(task.model_provider, db)
+    # 获取模型配置：W4 快照优先（口径字段来自创建时快照，凭据实时解析），
+    # 快照为空（存量任务）回退实时查询
+    from app.services.config_snapshot import resolve_model_call_config
+
+    model_config, _config_source = resolve_model_call_config(task, db)
 
     # 获取裁判配置（与 AI 裁判员一致）
     judge_variable_config = getattr(task, 'judge_variable_config', None)
@@ -458,25 +636,16 @@ def _execute_consistency_evaluation(task, payloads: List[Dict], db, task_id: str
     if not judge_variable_config and consistency_config:
         judge_variable_config = consistency_config.get("judge_variable_config")
 
-    # 获取裁判模型配置（优先全局 Claude Code 配置，与 AI 裁判员评测一致）
+    # 获取裁判模型配置：W4 快照优先链（创建时快照 → 全局 Claude Code 配置 →
+    # task.judge_model 实时回退 → consistency_config.judge_config 兜底），
+    # 与 AI 裁判员评测共用同一解析器
     judge_config = None
     if use_judge:
-        try:
-            from app.services.claude_code_config_service import ClaudeCodeConfigService
+        from app.services.config_snapshot import resolve_judge_call_config
 
-            judge_config = ClaudeCodeConfigService.get_judge_llm_config()
-        except Exception:
-            judge_config = None
+        judge_config, _judge_source = resolve_judge_call_config(task, db)
         if judge_config:
-            logger.info("[_execute_consistency_evaluation] 使用全局 Claude Code 配置作为裁判配置")
-        # 回退：历史 task.judge_model（软退场，保证历史任务可复跑）
-        elif getattr(task, 'judge_model', None):
-            judge_config = _load_model_config(task.judge_model, db)
-            logger.info(f"[_execute_consistency_evaluation] 从 task.judge_model 加载裁判模型配置: model_id={task.judge_model}")
-        # 再回退到 consistency_config 中的 judge_config
-        elif consistency_config and consistency_config.get("judge_config"):
-            judge_config = consistency_config.get("judge_config")
-            logger.info(f"[_execute_consistency_evaluation] 从 consistency_config 加载裁判模型配置")
+            logger.info(f"[_execute_consistency_evaluation] 裁判配置来源: {_judge_source}")
 
     results = []
     total = len(payloads)
@@ -538,24 +707,35 @@ def _execute_consistency_evaluation(task, payloads: List[Dict], db, task_id: str
             result_item.update(input_variables)
             results.append(result_item)
 
-            # 更新进度
-            _update_progress(len(results), total, task_id)
+            # W3-2：行级 write-through（每行终态即时幂等落库，P0-E）
+            _persist_row(task_id, execution_number, payload.get("_orig_idx", idx), result_item)
 
+            # 更新进度
+            _update_progress(len(results), total, task_id, execution_number)
+
+        except SoftTimeLimitExceeded:
+            # W3-4：软超时不得按行失败吞掉（P0-E），上抛触发收尾
+            raise
         except Exception as e:
             logger.exception(f"一致性评测执行失败 (idx={idx})")
-            results.append({
+            failed_item = {
                 "idx": idx,
                 "success": False,
                 "error": str(e),
-            })
+            }
+            results.append(failed_item)
+            _persist_row(task_id, execution_number, payload.get("_orig_idx", idx), failed_item)
 
     # 按原始顺序排序结果
     results.sort(key=lambda x: x.get("idx", 0))
     return results
 
 
-def _execute_success_rate_evaluation(task, payloads: List[Dict], task_id: str, db, stop_event: Optional[StopEventProtocol] = None) -> List[Dict]:
-    """执行成功率评测 - 多次调用模型统计成功率，不使用裁判模型"""
+def _execute_success_rate_evaluation(task, payloads: List[Dict], task_id: str, db, stop_event: Optional[StopEventProtocol] = None, execution_number: Optional[int] = None) -> List[Dict]:
+    """执行成功率评测 - 多次调用模型统计成功率，不使用裁判模型
+
+    execution_number 为 None（直调/测试链路）时跳过行级落库。
+    """
     import asyncio
     import logging
     from app.services.success_rate_evaluator import SuccessRateEvaluator
@@ -568,10 +748,11 @@ def _execute_success_rate_evaluation(task, payloads: List[Dict], task_id: str, d
 
     logger.info(f"[_execute_success_rate_evaluation] repeat_count={repeat_count}")
 
-    # 获取模型配置
-    model_config = task.model_config or {}
-    if not model_config and task.model_provider:
-        model_config = _load_model_config(task.model_provider, db)
+    # 获取模型配置：W4 快照优先（口径字段来自创建时快照，凭据实时解析），
+    # 快照为空（存量任务）回退实时查询
+    from app.services.config_snapshot import resolve_model_call_config
+
+    model_config, _config_source = resolve_model_call_config(task, db)
 
     results = []
     total = len(payloads)
@@ -619,24 +800,35 @@ def _execute_success_rate_evaluation(task, payloads: List[Dict], task_id: str, d
             result_item.update(input_variables)
             results.append(result_item)
 
-            # 更新进度
-            _update_progress(len(results), total, task_id)
+            # W3-2：行级 write-through（每行终态即时幂等落库，P0-E）
+            _persist_row(task_id, execution_number, payload.get("_orig_idx", idx), result_item)
 
+            # 更新进度
+            _update_progress(len(results), total, task_id, execution_number)
+
+        except SoftTimeLimitExceeded:
+            # W3-4：软超时不得按行失败吞掉（P0-E），上抛触发收尾
+            raise
         except Exception as e:
             logger.exception(f"成功率评测执行失败 (idx={idx})")
-            results.append({
+            failed_item = {
                 "idx": idx,
                 "success": False,
                 "error": str(e),
-            })
+            }
+            results.append(failed_item)
+            _persist_row(task_id, execution_number, payload.get("_orig_idx", idx), failed_item)
 
     # 按原始顺序排序结果
     results.sort(key=lambda x: x.get("idx", 0))
     return results
 
 
-def _execute_binary_classification_evaluation(task, payloads: List[Dict], task_id: str, db, stop_event: Optional[StopEventProtocol] = None) -> List[Dict]:
-    """执行二分分类评测"""
+def _execute_binary_classification_evaluation(task, payloads: List[Dict], task_id: str, db, stop_event: Optional[StopEventProtocol] = None, execution_number: Optional[int] = None) -> List[Dict]:
+    """执行二分分类评测
+
+    execution_number 为 None（直调/测试链路）时跳过行级落库。
+    """
     import asyncio
     import logging
     import time
@@ -645,10 +837,11 @@ def _execute_binary_classification_evaluation(task, payloads: List[Dict], task_i
 
     logger = logging.getLogger(__name__)
 
-    # 获取模型配置
-    model_config = task.model_config or {}
-    if not model_config and task.model_provider:
-        model_config = _load_model_config(task.model_provider, db)
+    # 获取模型配置：W4 快照优先（口径字段来自创建时快照，凭据实时解析），
+    # 快照为空（存量任务）回退实时查询
+    from app.services.config_snapshot import resolve_model_call_config
+
+    model_config, _config_source = resolve_model_call_config(task, db)
     logger.info(f"[二分分类评测] task_id={task_id}, model_provider={task.model_provider}, model_config_keys={list(model_config.keys()) if model_config else 'EMPTY'}")
 
     # 获取配置
@@ -757,21 +950,30 @@ def _execute_binary_classification_evaluation(task, payloads: List[Dict], task_i
                     result_item.update(result.input_data)
                 results.append(result_item)
             else:
-                results.append({
+                result_item = {
                     "idx": idx,
                     "success": False,
                     "error": "No evaluation result returned",
-                })
+                }
+                results.append(result_item)
 
-            _update_progress(len(results), total, task_id)
+            # W3-2：行级 write-through（每行终态即时幂等落库，P0-E）
+            _persist_row(task_id, execution_number, payload.get("_orig_idx", idx), results[-1])
 
+            _update_progress(len(results), total, task_id, execution_number)
+
+        except SoftTimeLimitExceeded:
+            # W3-4：软超时不得按行失败吞掉（P0-E），上抛触发收尾
+            raise
         except Exception as e:
             logger.exception(f"二分分类评测执行失败 (idx={idx})")
-            results.append({
+            failed_item = {
                 "idx": idx,
                 "success": False,
                 "error": str(e),
-            })
+            }
+            results.append(failed_item)
+            _persist_row(task_id, execution_number, payload.get("_orig_idx", idx), failed_item)
 
     results.sort(key=lambda x: x.get("idx", 0))
     return results
@@ -796,32 +998,12 @@ def _restore_event_loop(loop):
     asyncio.set_event_loop(loop)
 
 
-def _load_model_config(model_provider_id: str, db) -> Dict[str, Any]:
-    """从数据库加载模型配置"""
-    from app.models.model_config_models import ModelConfig
+def _update_progress(completed: int, total: int, task_id: str, execution_number: Optional[int] = None):
+    """更新任务进度（consistency/success_rate/binary 专用路径）
 
-    session = SessionLocal()
-    try:
-        model_config_obj = session.query(ModelConfig).filter(ModelConfig.id == model_provider_id).first()
-        if model_config_obj:
-            return {
-                "provider": model_config_obj.provider,
-                "model_type": model_config_obj.model_type,
-                "endpoint": model_config_obj.endpoint,
-                "api_key": model_config_obj.api_key,
-                "auth_type": model_config_obj.auth_type,
-                "auth_config": model_config_obj.auth_config,
-                "request_config": model_config_obj.request_config,
-                "response_parse_config": model_config_obj.response_parse_config,
-                "model_id": model_config_obj.id,
-            }
-    finally:
-        session.close()
-    return {}
-
-
-def _update_progress(completed: int, total: int, task_id: str):
-    """更新任务进度"""
+    W10-4：进度推进即一批行完成，同步刷新执行记录心跳（heartbeat_at）——
+    API 启动期收尸 reaper 以心跳区分「正在执行」与「worker 已死」。
+    """
     try:
         from app.services.evaluation_task_service import EvaluationTaskService
 
@@ -829,6 +1011,7 @@ def _update_progress(completed: int, total: int, task_id: str):
         try:
             service = EvaluationTaskService(db)
             service.update_progress(task_id, completed, total)
+            service.touch_heartbeat(task_id, execution_number)
         finally:
             db.close()
     except Exception:
@@ -836,30 +1019,8 @@ def _update_progress(completed: int, total: int, task_id: str):
 
 
 def _aggregate_results(results: List[Dict], task) -> Dict[str, Any]:
-    """聚合评测结果"""
+    """聚合评测结果（分发逻辑收敛在 ResultAggregator.aggregate_for_task 单点维护，
+    W3 的 stop 部分结果聚合与 complete 聚合共用同一口径）"""
     from app.services.result_aggregator import ResultAggregator
 
-    if task.evaluation_type == "rag":
-        return ResultAggregator.aggregate_rag_results(results)
-
-    # 一致性评测走专用聚合
-    if task.evaluation_type == "consistency":
-        return ResultAggregator.aggregate_consistency_results(results)
-
-    # 成功率评测走专用聚合
-    if task.evaluation_type == "success_rate":
-        return ResultAggregator.aggregate_success_rate_results(results)
-
-    # 耗时评测走专用聚合
-    if task.evaluation_type == "latency":
-        latency_config = task.latency_config or {}
-        threshold = latency_config.get("threshold", 10.0)
-        return ResultAggregator.calculate_latency_metrics(results, threshold=threshold)
-
-    # 二分分类评测走专用聚合
-    if task.evaluation_type == "binary_classification":
-        binary_metrics_config = getattr(task, 'binary_metrics_config', None) or []
-        return ResultAggregator.aggregate_binary_classification_results(results, binary_metrics_config)
-
-    aggregator = ResultAggregator(task)
-    return aggregator.aggregate(results)
+    return ResultAggregator.aggregate_for_task(task, results)

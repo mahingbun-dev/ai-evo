@@ -43,6 +43,9 @@ from app.api.hub_file_api import (
     get_hub_file_tree,
     upload_supplements,
 )
+from tests.unit.w9_direct_call import fake_request  # W9: 端点直调适配
+
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
 
 FID = "fid-supp-1"
 
@@ -54,7 +57,44 @@ FID = "fid-supp-1"
 def make_db(first=None):
     db = MagicMock()
     db.query.return_value.filter.return_value.first.return_value = first
+    _install_w11_ref_stmts(db, first)
     return db
+
+
+def _install_w11_ref_stmts(db, record):
+    """W11 原子 ref 语句模拟：Update ±1（CASE 下限 0）/ 归零条件 Delete / Select 回读
+
+    acquire_ref/release_ref 已改为 SQL 端单语句原子更新，替身按编译语句作用于
+    record 使计数语义在单元层可见；真实 SQL 并发正确性由
+    tests/integration/test_hub_import_concurrency.py 覆盖。
+    """
+    from types import SimpleNamespace
+
+    from sqlalchemy import Delete, Select, Update
+
+    def _execute(stmt, *args, **kwargs):
+        if isinstance(stmt, Update) and getattr(stmt.table, "name", None) == "hub_files":
+            if record is None:
+                return SimpleNamespace(rowcount=0)
+            sql = str(stmt.compile())
+            count = int(record.ref_count or 0)
+            if "CASE" in sql.upper():
+                record.ref_count = max(0, count - 1)
+            elif "+" in sql:
+                record.ref_count = count + 1
+            else:
+                record.ref_count = max(0, count - 1)
+            return SimpleNamespace(rowcount=1)
+        if isinstance(stmt, Delete) and getattr(stmt.table, "name", None) == "hub_files":
+            if record is not None and int(record.ref_count or 0) == 0:
+                return SimpleNamespace(rowcount=1)
+            return SimpleNamespace(rowcount=0)
+        if isinstance(stmt, Select):
+            value = (record.ref_count if record is not None else 0) or 0
+            return SimpleNamespace(scalar=lambda: value)
+        return MagicMock()
+
+    db.execute.side_effect = _execute
 
 
 def make_record(unpack_dir, ref_count=0):
@@ -478,7 +518,7 @@ class TestSupplementApi:
         db = make_db(first=rec)
         add_supplements(db, FID, [upload("note.txt", b"n")])
 
-        result = get_hub_file_tree(FID, db=db)
+        result = get_hub_file_tree(FID, request=fake_request(), db=db)
         by_path = {e["path"]: e for e in result["file_index"]}
         assert by_path["note.txt"]["is_manual"] is True
         assert "is_manual" not in by_path["meta.json"]
@@ -489,7 +529,7 @@ class TestSupplementApi:
         db = make_db(first=rec)
         add_supplements(db, FID, [upload("note.txt", "补传内容".encode("utf-8"))])
 
-        result = get_hub_file_content(FID, "note.txt", db=db)
+        result = get_hub_file_content(FID, request=fake_request(), path="note.txt", db=db)
         assert result["content"] == "补传内容"
         assert result["path"] == "note.txt"
 
@@ -536,9 +576,9 @@ class TestSupplementApi:
         db = make_db(first=rec)
         add_supplements(db, FID, [upload("note.txt", b"n")])
 
-        result = delete_supplement_endpoint(FID, path="note.txt", db=db)
+        result = delete_supplement_endpoint(FID, path="note.txt", request=fake_request(), db=db)
         assert result["deleted"] == "note.txt"
 
         with pytest.raises(HTTPException) as exc:
-            delete_supplement_endpoint(FID, path="note.txt", db=db)
+            delete_supplement_endpoint(FID, path="note.txt", request=fake_request(), db=db)
         assert exc.value.status_code == 400

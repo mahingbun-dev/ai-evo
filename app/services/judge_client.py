@@ -103,41 +103,6 @@ class JudgeClient:
         response = self._call_judge_model(system_prompt, user_prompt)
         return response
 
-    def judge(self, system_prompt: str, user_prompt: str, runtime_variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """
-        请求裁判模型评分
-
-        Args:
-            system_prompt: 系统提示词
-            user_prompt: 用户提示词
-            runtime_variables: 运行时变量（用于请求链变量替换）
-
-        Returns:
-            裁判评分结果，包含score、feedback等
-        """
-        # 空值校验：当 system_prompt 和 user_prompt 都为空时才跳过评测
-        # 注意：评测内容可能注入到 system_prompt 中（通过 evaluation_targets），
-        # 此时 user_prompt 可能为空，但 system_prompt 包含有效内容
-        system_prompt_empty = not system_prompt or not system_prompt.strip()
-        user_prompt_empty = not user_prompt or not user_prompt.strip()
-
-        if system_prompt_empty and user_prompt_empty:
-            logger.warning(f"[JudgeClient] system_prompt 和 user_prompt 都为空，跳过裁判评测，直接返回零分")
-            return {
-                "score": 0,
-                "feedback": "待评测内容为空，跳过裁判评测",
-                "dimension_scores": {},
-                "is_empty_content": True,
-            }
-
-        # 调用模型
-        response = self._call_judge_model(system_prompt, user_prompt, runtime_variables)
-
-        # 解析响应
-        result = self._parse_judge_response(response)
-
-        return result
-
     @staticmethod
     def _is_context_overflow_error(error_msg: str) -> bool:
         """判断是否为上下文超限错误"""
@@ -286,93 +251,6 @@ class JudgeClient:
         except Exception as e:
             logger.exception("裁判模型调用失败")
             raise RuntimeError(f"裁判模型调用失败: {str(e)}")
-
-    def _parse_judge_response(self, response: str) -> Dict[str, Any]:
-        """
-        解析裁判模型响应
-
-        使用多阶段渐进式解析：
-        1. JSON解析
-        2. 截断修复
-        3. 正则兜底
-        4. AI二次校正（如需要）
-        5. 最终降级
-
-        Args:
-            response: 裁判模型原始响应
-
-        Returns:
-            解析后的结果（兼容原有接口）
-        """
-        # 导入新的解析器
-        from app.services.response_parser import JudgeResponseParser
-
-        # 获取裁判模型配置
-        judge_config = self._get_judge_model_config()
-
-        parser = JudgeResponseParser(
-            evaluation_metrics=self.evaluation_metrics,
-            max_score=self.max_score,
-            judge_config=judge_config
-        )
-
-        # 使用新的解析器（最多重试2次AI校正）
-        parse_result = parser.parse(response, max_retries=2)
-
-        # 转换为原有格式
-        return parse_result.to_dict()
-
-    def _get_judge_model_config(self) -> Optional[Dict[str, Any]]:
-        """获取裁判模型配置"""
-        judge_config = getattr(self.task, "judge_model_config", {}) or {}
-
-        # 如果 judge_model_config 为空，尝试从数据库查询
-        if not judge_config and self.judge_model:
-            try:
-                from app.db.session import SessionLocal
-                from app.models.model_config_models import ModelConfig
-
-                db = SessionLocal()
-                try:
-                    model_config_obj = db.query(ModelConfig).filter(ModelConfig.id == self.judge_model).first()
-                    if model_config_obj:
-                        judge_config = {
-                            "provider": model_config_obj.provider,
-                            "model_type": model_config_obj.model_type,
-                            "endpoint": model_config_obj.endpoint,
-                            "api_key": model_config_obj.api_key,
-                            "auth_type": model_config_obj.auth_type,
-                            "auth_config": model_config_obj.auth_config,
-                            "request_config": model_config_obj.request_config,
-                            "response_parse_config": model_config_obj.response_parse_config,
-                            "model_id": model_config_obj.id,
-                        }
-                finally:
-                    db.close()
-            except Exception as e:
-                logger.warning(f"获取裁判模型配置失败: {e}")
-
-        return judge_config if judge_config else None
-
-    def _extract_dimension_scores(self, response: str) -> Optional[Dict[str, Any]]:
-        """提取各维度评分（纯文本正则匹配，作为 JSON 解析失败时的兜底）"""
-        dimension_scores = {}
-
-        for metric in self.evaluation_metrics:
-            metric_name = metric.get("name", "")
-            if not metric_name:
-                continue
-
-            # 匹配 "XX评分: Y"
-            pattern = rf'{metric_name}[评得]分[：:]\s*(\d+(?:\.\d+)?)'
-            match = re.search(pattern, response)
-
-            if match:
-                score = float(match.group(1))
-                dimension_scores[metric_name] = score
-
-        return dimension_scores if dimension_scores else None
-
     def _extract_dimension_scores_from_json(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """从裁判模型返回的 JSON 数据中提取各维度评分。
 

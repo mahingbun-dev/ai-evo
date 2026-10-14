@@ -21,6 +21,8 @@ from app.models.pre_judge_models import PreJudgeScript
 from app.services import pre_judge_runner
 from app.services import pre_judge_script_service as script_service
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 # ---------------- fake 脚本源码（子进程执行，run(stdin) 函数式契约） ----------------
 
@@ -147,7 +149,8 @@ def script_env(tmp_path, monkeypatch):
         db.commit()
         for name, source in FAKE_SCRIPTS.items():
             _write_script_pkg(upload_base, f"pjs_{name}", source)
-        script_service.ensure_builtin_scripts_migrated(db)
+        # 表非空：显式重建缺失内置，保持「统一落库环境」语义
+        script_service.ensure_builtin_scripts_migrated(db, recreate_missing=True)
     monkeypatch.setattr(pre_judge_runner, "SessionLocal", Session)
     return {"session": Session, "upload_base": upload_base}
 
@@ -283,6 +286,58 @@ class TestOrchestration:
         assert artifact.is_file()
         # 产物落在进程 cwd 下的真实 script_runs 目录，而非子进程隔离 cwd 里
         assert artifact == (tmp_path / "uploads/script_runs/task_runner_x/data_1/artifact.txt").resolve()
+
+
+# ---------------- 脚本产物目录 outputs/（平台保证创建，脚本统一写这里） ----------------
+
+_WRITER_OUTPUTS_SRC = '''
+from pathlib import Path
+
+
+def run(stdin):
+    """按产物目录规范写 {_run_dir}/outputs/ 并注册进 files（验证平台建区保证）"""
+    outputs_dir = Path(stdin["_run_dir"]) / "outputs"
+    target = outputs_dir / "artifact.txt"
+    target.write_text("artifact-content", encoding="utf-8")
+    return {
+        "status": "ok",
+        "output": {"a": 1},
+        "files": {"artifact.txt": str(target)},
+        "summary": "wrote artifact",
+        "finish_reason": "completed",
+        "error": None,
+    }
+'''
+
+
+class TestOutputsDir:
+    def test_build_run_dir_creates_outputs(self, run_base):
+        """工作区组装即创建 outputs/（真实任务与试跑 debug 共用 build_run_dir）"""
+        run_dir = pre_judge_runner.build_run_dir("task_x", "data_1")
+        assert run_dir.is_absolute()
+        assert (run_dir / "outputs").is_dir()
+        # 幂等：重复调用不报错
+        pre_judge_runner.build_run_dir("task_x", "data_1")
+        assert (run_dir / "outputs").is_dir()
+
+    def test_script_writes_to_outputs_dir_end_to_end(self, script_env):
+        """按规范写 {_run_dir}/outputs/ 的脚本在真实执行链路下产物真实落盘"""
+        _write_script_pkg(script_env["upload_base"], "pjs_fake_writer2", _WRITER_OUTPUTS_SRC)
+        with script_env["session"]() as db:
+            db.add(PreJudgeScript(id="pjs_fake_writer2", name="fake_writer2", exec_type="script",
+                                  entrypoint="main.py", timeout_seconds=60, is_active=True))
+            db.commit()
+
+        out = pre_judge_runner.run_pre_scripts(
+            _task([{"script_id": "fake_writer2", "output_var": "s1"}]),
+            payload={}, dataset_item=_dataset_item())
+
+        assert out["pre_script_results"][0]["status"] == "ok"
+        artifact = Path(out["script_files"]["s1"]["artifact.txt"])
+        assert artifact.is_file()
+        # 产物落在工作区 outputs/ 下，而非 cwd 隔离目录或工作区根
+        assert artifact.parent == pre_judge_runner.build_run_dir("task_runner_x", "data_1") / "outputs"
+        assert artifact.read_text(encoding="utf-8") == "artifact-content"
 
 
 # ---------------- steps 显式入参（共享设计契约 v3 §三） ----------------
@@ -507,7 +562,14 @@ class TestTimeoutAndTypes:
         assert result["output"] == {"doubled": 42}
 
     def test_platform_import_via_pythonpath(self, script_env, run_base, monkeypatch):
-        """PYTHONPATH 注入项目根：子进程可 import 平台侧模块（app 包）"""
+        """PYTHONPATH 注入项目根：子进程可 import 平台侧模块（app 包）
+
+        W8 调整：timeout_seconds 15→60。CI 容器模拟全量套件实测（qemu 模拟
+        amd64、套件满载时）该用例两次 status=fail、单独复跑与快速全量均绿
+        （2210 passed 全绿轮耗时 335s vs 失败轮 956s）——唯一负载敏感机制是
+        子进程 15s 超时（子进程要冷启动 import 整个 app 包）。用例意图是
+        「import 可达」而非「15s 内完成」，放宽到 60s 消除负载敏感。
+        """
         pkg = script_env["upload_base"] / "fake_platform"
         pkg.mkdir(parents=True, exist_ok=True)
         (pkg / "main.py").write_text(
@@ -519,7 +581,7 @@ class TestTimeoutAndTypes:
 
         result = pre_judge_runner.execute_script(
             {"script_id": "fake_platform", "name": "fake_platform", "exec_type": "script",
-             "entrypoint": "main.py", "timeout_seconds": 15},
+             "entrypoint": "main.py", "timeout_seconds": 60},
             {"fields": {}, "params": {}, "upstream": {}, "_run_dir": str(run_base / "t")},
         )
         assert result["status"] == "ok"

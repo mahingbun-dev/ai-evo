@@ -2,8 +2,14 @@
 通用模型调用服务
 根据模型类型自动选择合适的调用方式
 """
-from typing import List, Dict, Any, Optional
+import logging
+from typing import Any, Awaitable, Callable, Dict, List, Optional
+
 import httpx
+
+from app.utils.llm_retry import with_llm_retry, with_llm_retry_async, is_retryable_llm_error
+
+logger = logging.getLogger(__name__)
 
 
 # 动态导入，避免未安装时报错
@@ -16,6 +22,59 @@ try:
     import anthropic
 except ImportError:
     anthropic = None
+
+
+class _RetryableProviderFailure(Exception):
+    """provider 返回可重试失败结果（如 HTTP 429/5xx）的内部信号
+
+    各 provider 方法把异常统一包装为 {success: False, error} 字典返回（不抛异常），
+    该内部异常只在重试包装层流转，用于把「可重试的失败结果」送入退避循环；
+    耗尽后还原为原始结果字典，对外契约（失败返回 dict 而非抛异常）保持不变。
+    """
+
+    def __init__(self, result: Dict[str, Any]):
+        super().__init__(result.get("error", "unknown provider failure"))
+        self.result = result
+
+
+def _execute_with_retry(invoke: Callable[[], Dict[str, Any]]) -> Dict[str, Any]:
+    """同步 provider 调用单点收口（W2-3）
+
+    超时 / 连接错误 / HTTP 429/5xx 等瞬时性失败经 with_llm_retry 退避重试；
+    4xx 等确定性失败不重试。结果契约与旧实现一致：失败返回 {success: False, error}。
+    """
+    def _attempt() -> Dict[str, Any]:
+        result = invoke()
+        if isinstance(result, dict) and not result.get("success"):
+            if is_retryable_llm_error(result.get("error", "") or ""):
+                raise _RetryableProviderFailure(result)
+        return result
+
+    try:
+        return with_llm_retry(_attempt)
+    except _RetryableProviderFailure as e:
+        return e.result
+    except Exception as e:  # 与原 provider 内部 except Exception 包装语义一致
+        logger.warning(f"[ModelCaller] 调用失败（不重试或重试耗尽）: {type(e).__name__}: {e}")
+        return {"success": False, "error": str(e)}
+
+
+async def _execute_with_retry_async(invoke: Callable[[], Awaitable[Dict[str, Any]]]) -> Dict[str, Any]:
+    """异步 provider 调用单点收口（W2-3），语义同 _execute_with_retry"""
+    async def _attempt() -> Dict[str, Any]:
+        result = await invoke()
+        if isinstance(result, dict) and not result.get("success"):
+            if is_retryable_llm_error(result.get("error", "") or ""):
+                raise _RetryableProviderFailure(result)
+        return result
+
+    try:
+        return await with_llm_retry_async(_attempt)
+    except _RetryableProviderFailure as e:
+        return e.result
+    except Exception as e:  # 与原 provider 内部 except Exception 包装语义一致
+        logger.warning(f"[ModelCaller] 调用失败（不重试或重试耗尽）: {type(e).__name__}: {e}")
+        return {"success": False, "error": str(e)}
 
 
 class ModelCaller:
@@ -145,15 +204,19 @@ class ModelCaller:
                 - raw: 原始响应
                 - error: 错误信息
         """
-        # 使用 provider 决定调用方式
+        # 使用 provider 决定调用方式（W2-3：分发经 _execute_with_retry_async 单点收口，
+        # 瞬时性失败（超时/连接/429/5xx）退避重试；4xx 确定性失败不重试）
         provider = (config.get("provider") or config.get("model_type") or "").lower()
 
-        if provider == "openai":
-            return await ModelCaller._call_openai(messages, config)
-        elif provider == "anthropic":
-            return await ModelCaller._call_anthropic(messages, config)
-        else:
-            return await ModelCaller._call_http(messages, config, runtime_variables, debug)
+        async def _dispatch() -> Dict[str, Any]:
+            if provider == "openai":
+                return await ModelCaller._call_openai(messages, config)
+            elif provider == "anthropic":
+                return await ModelCaller._call_anthropic(messages, config)
+            else:
+                return await ModelCaller._call_http(messages, config, runtime_variables, debug)
+
+        return await _execute_with_retry_async(_dispatch)
 
     @staticmethod
     async def _call_openai(
@@ -514,15 +577,19 @@ class ModelCallerSync:
         runtime_variables: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """同步调用模型"""
-        # 使用 provider 决定调用方式
+        # 使用 provider 决定调用方式（W2-3：分发经 _execute_with_retry 单点收口，
+        # 瞬时性失败（超时/连接/429/5xx）退避重试；4xx 确定性失败不重试）
         provider = (config.get("provider") or config.get("model_type") or "").lower()
 
-        if provider == "openai":
-            return ModelCallerSync._call_openai(messages, config)
-        elif provider == "anthropic":
-            return ModelCallerSync._call_anthropic(messages, config)
-        else:
-            return ModelCallerSync._call_http(messages, config, runtime_variables)
+        def _dispatch() -> Dict[str, Any]:
+            if provider == "openai":
+                return ModelCallerSync._call_openai(messages, config)
+            elif provider == "anthropic":
+                return ModelCallerSync._call_anthropic(messages, config)
+            else:
+                return ModelCallerSync._call_http(messages, config, runtime_variables)
+
+        return _execute_with_retry(_dispatch)
 
     @staticmethod
     def _call_openai(

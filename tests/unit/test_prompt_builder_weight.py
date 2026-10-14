@@ -2,6 +2,8 @@
 import pytest
 from app.services.prompt_builder import PromptBuilder, WEIGHT_MAP
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 class TestPromptBuilderWeightDisplay:
     """权重展示格式测试"""

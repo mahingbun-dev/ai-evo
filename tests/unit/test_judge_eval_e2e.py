@@ -4,6 +4,8 @@ from types import SimpleNamespace
 from app.services.prompt_builder import PromptBuilder
 from app.services.judge_client import JudgeClient
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 class TestJudgeEvalE2E:
     """裁判评测端到端测试"""

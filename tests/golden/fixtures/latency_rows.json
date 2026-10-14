@@ -1,0 +1,38 @@
+[
+  {
+    "idx": 0,
+    "success": true,
+    "duration": 1.234,
+    "passed": true,
+    "threshold": 2.5,
+    "input_tokens": 128,
+    "output_tokens": 256,
+    "user_input": "你好"
+  },
+  {
+    "idx": 1,
+    "success": true,
+    "duration": 2.499,
+    "passed": true,
+    "threshold": 2.5,
+    "input_tokens": 96,
+    "output_tokens": 512,
+    "user_input": "介绍一下 RAG"
+  },
+  {
+    "idx": 2,
+    "success": true,
+    "duration": 3.87,
+    "passed": false,
+    "threshold": 2.5,
+    "input_tokens": 210,
+    "output_tokens": 64,
+    "user_input": "写一首诗"
+  },
+  {
+    "idx": 3,
+    "success": false,
+    "error": "模型调用超时",
+    "user_input": "超时样例"
+  }
+]

@@ -14,6 +14,8 @@ import pytest
 
 from app.services.deepseek_adapter import DeepSeekAdapter
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 VALID_JSON = json.dumps({"score": 9, "feedback": "优秀", "dimension_scores": {"完成度": 9}})
 
 DSH_CONFIG = {

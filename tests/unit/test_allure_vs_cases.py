@@ -12,6 +12,8 @@ import pytest
 
 from app.scripts_builtin import allure_vs_cases as avc
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 def _result(name, status, full_name="", message=""):
     return {

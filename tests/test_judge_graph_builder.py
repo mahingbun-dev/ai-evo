@@ -1,6 +1,8 @@
 """Tests for judge graph builder module"""
 import pytest
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 class TestJudgeGraphBuilder:
     """Test graph builder topology"""

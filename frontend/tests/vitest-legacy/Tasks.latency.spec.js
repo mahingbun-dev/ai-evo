@@ -1,12 +1,23 @@
 /**
  * Task 6: 前端 - 评测类型选择和配置区
- * 测试文件: frontend/tests/unit/Tasks.latency.spec.js
+ * 测试文件: frontend/tests/vitest-legacy/Tasks.latency.spec.js
  *
- * 注意: 由于 frontend/package.json 中未定义 test 脚本，
- * 这些测试无法通过 npm run test 运行，仅作为人工验证参考。
+ * W8 修复（整改计划 §3 W8「6 个既有前端测试修复到可运行」）：
+ * 原文件因 package.json 无 test 脚本从未运行过，且断言为
+ * `expect(true).toBe(true)` 占位（文件头注释自述「已通过 grep 验证」）。
+ * 现随 vitest 接入（package.json test:unit + vitest.config.js）真正执行，
+ * 并把原本口头「grep 验证」的内容固化为对 Tasks.vue 真实源码的断言。
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { join, dirname } from 'node:path'
+
+const tasksVue = readFileSync(
+  join(dirname(fileURLToPath(import.meta.url)), '../../src/views/Tasks.vue'),
+  'utf-8'
+)
 
 // 测试场景
 describe('Tasks.latency', () => {
@@ -14,32 +25,30 @@ describe('Tasks.latency', () => {
    * test_latency_option_exists: 验证评测类型下拉框中存在 latency 选项
    */
   it('test_latency_option_exists', () => {
-    // 验证 Tasks.vue 中包含 latency 选项
-    const latencyOptionExists = true; // 已通过 grep 验证
-    expect(latencyOptionExists).toBe(true);
+    expect(tasksVue).toContain('value="latency"')
+    expect(tasksVue).toContain('响应耗时评测')
   });
 
   /**
    * test_latency_config_form_renders: 验证当选择 latency 类型时，耗时配置区正确渲染
    */
   it('test_latency_config_form_renders', () => {
-    // 验证 latency 配置模板存在且使用正确的条件渲染
-    const templateCondition = "form.evaluation_type === 'latency'";
-    const latencyConfigExists = true; // 已通过代码审查验证
-    expect(latencyConfigExists).toBe(true);
+    // latency 配置区由 evaluation_type === 'latency' 条件渲染
+    expect(tasksVue).toContain("form.evaluation_type === 'latency'")
+    // 配置项绑定 latency_config（阈值 / 次数 / 计分方式）
+    expect(tasksVue).toContain('form.latency_config.threshold')
+    expect(tasksVue).toContain('form.latency_config.repeat_count')
+    expect(tasksVue).toContain('form.latency_config.score_mode')
   });
 
   /**
    * test_latency_config_defaults: 验证 form.latency_config 有正确的默认值
    */
   it('test_latency_config_defaults', () => {
-    // 验证默认配置值
-    const expectedDefaults = {
-      threshold: 10.0,
-      repeat_count: 1,
-      score_mode: 'inverse'
-    };
-    const defaultsCorrect = true; // 已通过 grep 验证 form.latency_config 定义
-    expect(defaultsCorrect).toBe(true);
+    // Tasks.vue 表单默认值（与后端 latency 评测约定的缺省一致）
+    expect(tasksVue).toContain('latency_config: {')
+    expect(tasksVue).toContain('threshold: 10.0')
+    expect(tasksVue).toContain('repeat_count: 1')
+    expect(tasksVue).toContain("score_mode: 'inverse'")
   });
 });

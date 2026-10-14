@@ -335,6 +335,91 @@ build-service 在**每次部署成功后**清理超期镜像，保留策略是�
 docker exec -it ai-evo-api alembic upgrade head
 ```
 
+命令保持不变，但 W6-2 起 `alembic` 的目标库**优先读容器内 `DATABASE_URL`**
+（`docker exec` 自动继承容器 env，即跟随部署目录 `.env`）；`alembic.ini` 内只保留
+占位符，不再硬编码任何库地址——「拿着 ini 里写死的共享 dev 库地址、在错误环境执行
+迁移」的风险就此消除。
+
+### 备份与恢复
+
+整改前平台零备份：`scripts/` 下没有 pg_dump；`uploads/hub_supplements/`（人工补传区）
+无法从 anc-hub 幂等重建，宿主卷一旦损坏，补传文件全部丢失且必须重新人工上传。
+W6-1 起交付两个脚本（与 `ensure_worker.sh` 一样，**`scripts/` 不由 CI 同步，
+改完需手工同步到部署机**）：
+
+| 脚本 | 用途 |
+|---|---|
+| `scripts/backup.sh db` | `pg_dump -Fc` 全量备份 PostgreSQL（连接串经 `DATABASE_URL` 注入，口令不落任何文件） |
+| `scripts/backup.sh uploads` | `tar -czf` 全量归档 `uploads/hub_supplements/`（每周） |
+| `scripts/restore.sh` | 恢复演练：`pg_restore` 到专用临时库 + 校验 `alembic_version` 与源库一致 |
+
+两类备份默认保留 14 天（`RETENTION_DAYS` / `UPLOADS_RETENTION_DAYS` 可调），输出到
+部署目录 `./backups/`（`BACKUP_DIR` 可调），过期文件在每次备份成功后自动清理。
+
+**crontab 落地步骤**（部署机手工操作，一次性）：
+
+```bash
+# 0) 同步脚本到部署机（scripts/ 不由 CI 同步）
+scp scripts/backup.sh scripts/restore.sh <部署机>:/apps/qa-code/ai-evo/scripts/
+chmod +x /apps/qa-code/ai-evo/scripts/{backup,restore}.sh
+
+# 1) 确认部署机有 postgresql-client（pg_dump/pg_restore/psql）
+command -v pg_dump || echo "需安装 postgresql-client（部署机无外网，走离线包）"
+
+# 2) 编辑 crontab：每日 02:00 备份 DB（从 .env 注入 DATABASE_URL，口令不进 crontab），
+#    每周日 03:00 归档补传区（不需要 DATABASE_URL）
+crontab -e
+#   0 2 * * * cd /apps/qa-code/ai-evo && set -a && . ./.env && set +a && ./scripts/backup.sh db >> logs/backup.log 2>&1
+#   0 3 * * 0 cd /apps/qa-code/ai-evo && ./scripts/backup.sh uploads >> logs/backup.log 2>&1
+
+# 3) 次日核对：logs/backup.log 无报错、backups/db/ 出现当日 .dump（非空且 PGDMP 头）
+```
+
+**恢复演练步骤**（每季度至少一次，也是备份有效性的唯一证明）：
+
+```bash
+cd /apps/qa-code/ai-evo && set -a && . ./.env && set +a
+
+# 1) 取最近一次 DB 备份
+ls -lt backups/db/ | head
+
+# 2) 在同实例创建专用演练临时库（严禁把目标写成共享/生产库；
+#    restore.sh 会 --clean --if-exists 清空重建目标库同名对象）
+psql "postgresql://<user>:<password>@<host>:5432/postgres" \
+  -c "CREATE DATABASE ai_evo_restore_drill"
+
+# 3) 恢复 + 自动比对 alembic_version（第 3 个参数为源库 DSN，不一致则非零退出）
+./scripts/restore.sh backups/db/db_<最新时间戳>.dump \
+  "postgresql://<user>:<password>@<host>:5432/ai_evo_restore_drill" "$DATABASE_URL"
+
+# 4) 清理演练库
+psql "postgresql://<user>:<password>@<host>:5432/postgres" \
+  -c "DROP DATABASE ai_evo_restore_drill"
+```
+
+演练通过的标准：`restore.sh` 输出 `✓ alembic_version 比对一致`。若失败，优先排查
+备份链路（`logs/backup.log`、`.dump` 文件大小），再排查演练库权限。
+
+**补传区归档的恢复**（只在补传文件丢失时用）：
+
+```bash
+tar -tzf backups/hub_supplements/hub_supplements_<时间戳>.tar.gz   # 先核对清单
+tar -xzf backups/hub_supplements/hub_supplements_<时间戳>.tar.gz -C /apps/qa-code/ai-evo/uploads/
+```
+
+**口令轮换（依赖 D-1，与共享库各使用方协调窗口后执行）**：
+
+W6-3 已把明文口令从 `alembic.ini`、`alembic_local.ini`（已删除）、
+`scripts/sync_database.py`、`app/core/config.py` 四处清除，全部改为读环境变量
+（`DATABASE_URL` / `REMOTE_DATABASE_URL` / `LOCAL_DATABASE_URL`）。但 git 历史仍可
+翻到旧口令，轮换后才彻底作废：
+
+1. 与共享 dev 库的各使用方约好变更窗口；
+2. DBA 执行 `ALTER USER ... WITH PASSWORD '<新口令>'`；
+3. 更新部署机 `/apps/qa-code/ai-evo/.env` 的 `DATABASE_URL`（以及各使用方自己的配置）；
+4. `docker compose up -d` 重启 api/worker，跑一遍冒烟（登录 + 建任务）确认连通；
+5. 通知全组：仓库 git 历史里的两个旧口令已作废，入库残留变为无害字符串。
+
 ### 部署时的任务中断行为
 
 `worker` 服务设置了 `stop_grace_period: 900s`。部署触发 `docker compose up -d` 时：

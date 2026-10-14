@@ -36,6 +36,10 @@ docs/*.md
 !docs/build-pipeline.md
 # anc-hub 插件（hub-plugin 服务）的部署/运维/工具面文档，必须入库
 !docs/hub-plugin.md
+# W13 告警与健康检查运维文档（离线告警升级路径，必须入库）
+!docs/alerts-and-health.md
+# 分支治理纪律（整改计划 §0 约定，W18），必须入库
+!docs/branch-discipline.md
 docs/superpowers/
 logs/
 # 脚手架模板源码里的样例日志属于模板交付物，必须入库（否则全新 clone 重建 zip 会与提交版不一致）
@@ -62,9 +66,19 @@ ai-evo-image.tar
 infra-images.tar
 infra-images.tar.gz
 
-# 本地 alembic 连接串（含真实库密码，不入库）
-alembic_local.ini
-
-# ===== 运行产物 / 本地工具状态（不入库）=====
+# 运行时数据与测试副产物（脚本库/任务工作区/冒烟日志等，绝不入库）
 uploads/
+.deepeval/
+frontend/uploads/
+
+# ===== 本地运行/工具产物（W18 仓库治理补齐，历史上 out/ 54 张截图曾被误提交）=====
+# agent/自动化验证的工作产物目录（截图、报告、临时输出），只留本地不入库
+out/
+output/
+# zcode 工作区元数据与 playwright-cli 状态
+.zcode/
+.zcodeignore
+frontend/.playwright-cli/
+# 某些工具在根目录误生成的空目录
+None/
 .mimosa/

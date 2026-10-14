@@ -3,6 +3,7 @@ import logging
 from datetime import date
 from typing import Optional
 from fastapi import APIRouter, Depends, Query, HTTPException
+from app.services.access_control import ensure_super_admin
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
 from app.db.session import get_db
@@ -10,7 +11,7 @@ from app.services.coverage_service import CoverageService
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/coverage", tags=["周覆盖度"])
+router = APIRouter(prefix="/coverage", tags=["周覆盖度"], dependencies=[Depends(ensure_super_admin)])
 
 
 class ConfigResponse(BaseModel):

@@ -2,6 +2,7 @@
 评测指令配置API
 """
 from fastapi import APIRouter, Depends, HTTPException, Query
+from app.services.access_control import ensure_super_admin
 from sqlalchemy.orm import Session
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field, field_serializer, field_validator, ConfigDict
@@ -277,7 +278,7 @@ def delete_instruction_config(
     return {"message": "删除成功"}
 
 
-@router.post("/configs/migrate-legacy-all", response_model=MigrateLegacyAllResponse, summary="批量迁移旧版评测模板")
+@router.post("/configs/migrate-legacy-all", response_model=MigrateLegacyAllResponse, summary="批量迁移旧版评测模板", dependencies=[Depends(ensure_super_admin)])
 def migrate_legacy_templates(
     db: Session = Depends(get_db),
 ):

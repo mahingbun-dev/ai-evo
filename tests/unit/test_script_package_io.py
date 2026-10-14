@@ -48,6 +48,8 @@ from app.api.pre_judge_script_api import (
 )
 from fastapi import UploadFile
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 MAIN_SRC = "def run(stdin):\n    return {'status': 'ok', 'output': {'v': 1}, 'files': {},\n            'summary': '', 'finish_reason': 'completed', 'error': None}\n"
 HELPER_SRC = "def build():\n    return {'v': 1}\n"
@@ -88,9 +90,14 @@ def service(db_session):
 
 
 def _request(user=None) -> Request:
+    """构造最小 Request，模拟鉴权中间件写入的 request.state.user（dict）。
+
+    W1-4 起脚本写/管理端点校验 super_admin_flag == 1：缺省注入超管用户。
+    """
     request = Request({"type": "http", "method": "GET", "path": "/", "headers": [], "query_string": b""})
-    if user is not None:
-        request.state.user = user
+    if user is None:
+        user = {"user_code": "u_admin", "super_admin_flag": 1}
+    request.state.user = user
     return request
 
 
@@ -624,7 +631,7 @@ class TestPackageApi:
     def test_import_package_endpoint(self, db_session):
         """multipart 多文件（文件夹直选形态）+ relative_paths 表单字段"""
         body = asyncio.run(import_script_package(
-            request=_request(user={"user_code": "u1"}),
+            request=_request(user={"user_code": "u1", "super_admin_flag": 1}),
             files=[_upload("proj/main.py", MAIN_SRC.encode()),
                    _upload("proj/model.py", MODEL_SRC),
                    _upload("proj/utils.py", HELPER_SRC.encode())],
@@ -678,7 +685,7 @@ class TestPackageApi:
     def test_import_package_endpoint_source_name_hint(self, db_session):
         """平铺多文件（前端本地解压 zip 形态）：显式 source_name 表单字段优先于路径推断命名"""
         body = asyncio.run(import_script_package(
-            request=_request(user={"user_code": "u1"}),
+            request=_request(user={"user_code": "u1", "super_admin_flag": 1}),
             files=[_upload("main.py", MAIN_SRC.encode()),
                    _upload("model.py", MODEL_SRC)],
             relative_paths=["main.py", "model.py"],
@@ -693,7 +700,7 @@ class TestPackageApi:
     def test_import_package_endpoint_source_name_blank_falls_back(self, db_session):
         """source_name 缺省时保持原推断行为（平铺多文件回退首个文件名 stem）"""
         body = asyncio.run(import_script_package(
-            request=_request(user={"user_code": "u1"}),
+            request=_request(user={"user_code": "u1", "super_admin_flag": 1}),
             files=[_upload("main.py", MAIN_SRC.encode()),
                    _upload("model.py", MODEL_SRC)],
             relative_paths=["main.py", "model.py"],

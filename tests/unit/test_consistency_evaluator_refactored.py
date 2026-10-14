@@ -4,6 +4,8 @@ import json
 from unittest.mock import AsyncMock, MagicMock, patch
 from app.services.consistency_evaluator import ConsistencyEvaluator, ConsistencyResult
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 class TestExtractRuntimeVariables:
     """_extract_runtime_variables 测试"""

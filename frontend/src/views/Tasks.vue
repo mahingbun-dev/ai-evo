@@ -90,8 +90,10 @@
             <el-option label="响应耗时评测" value="latency" />
             <el-option label="二分分类评测" value="binary_classification" />
             <el-option label="Agent评测" value="agent" />
-            <el-option label="安全评测" value="safety" />
-            <el-option label="对话评测" value="dialogue" />
+            <!-- W12-2：safety/dialogue 后端尚未实现执行链（deepeval 接入列入 M3-W16），
+                 前端禁用并标注「规划中」，防止创建后无法执行的任务 -->
+            <el-option label="安全评测（规划中）" value="safety" disabled />
+            <el-option label="对话评测（规划中）" value="dialogue" disabled />
           </el-select>
         </el-form-item>
 
@@ -1289,13 +1291,18 @@ const { startPolling, stopPolling, stopAll } = useTaskPolling({
     }
   },
   onTaskComplete: (taskId, task) => {
-    ElMessage.success(`任务 "${task.name}" 已完成`)
+    // 轻端点载荷不含任务名，从当前列表行补齐
+    const row = tasks.value.find(t => t.id === taskId) || task
+    ElMessage.success(`任务 "${row.name}" 已完成`)
   },
   onTaskFailed: (taskId, task) => {
-    ElMessage.error(`任务 "${task.name}" 执行失败`)
+    const row = tasks.value.find(t => t.id === taskId) || task
+    ElMessage.error(`任务 "${row.name}" 执行失败`)
   },
   onPollingError: (taskId, error) => {
+    // W14：轮询连续失败已自动降频重试（不再永久停摆），此处给出用户提示
     console.error(`任务 ${taskId} 轮询失败:`, error)
+    ElMessage.warning(`任务 ${taskId} 状态轮询暂时不可用，已降低频率继续重试`)
   }
 })
 
@@ -1310,6 +1317,9 @@ const { startWebSocket, stopWebSocket, stopAll: stopAllWebSocket } = useTaskWebS
   },
   onConnect: (taskId) => {
     console.log(`WebSocket connected: ${taskId}`)
+    // W14：WS 通道就绪即停该任务的轮询，消除「WS + 轮询」双通道并存；
+    // WS 断开重连耗尽后由 onFallback 恢复轮询
+    stopPolling(taskId)
   },
   onDisconnect: (taskId) => {
     console.log(`WebSocket disconnected: ${taskId}`)
@@ -1318,7 +1328,7 @@ const { startWebSocket, stopWebSocket, stopAll: stopAllWebSocket } = useTaskWebS
     console.error(`WebSocket error: ${taskId}`, error)
   },
   onFallback: (taskId) => {
-    // 降级到轮询
+    // WS 重连 3 次失败：降级回轮询
     startPolling(taskId)
   }
 })

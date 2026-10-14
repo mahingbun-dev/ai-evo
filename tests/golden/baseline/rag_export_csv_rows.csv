@@ -1,0 +1,4 @@
+idx,success,question,ground_truth,model_answer,contexts,scores,reasons,user_input,retrieval_top_k,error
+0,True,什么是 RAG？,RAG 是检索增强生成，结合检索与生成回答问题,RAG（检索增强生成）先检索相关文档再生成回答,"['文档1片段：RAG 是一种结合检索与生成的技术', '文档2片段：检索结果作为上下文提供给大模型', '文档3片段：无关内容占位']","{'context_precision': 0.85, 'context_recall': 0.9, 'hit_rate': 1.0, 'mrr': 0.75, 'noise_sensitivity': 0.1, 'negative_rejection': 0.2}","{'context_precision': '前两个检索片段与问题高度相关', 'context_recall': '覆盖了标准答案的全部要点'}",什么是 RAG？,3.0,
+1,True,RAG 有哪些缺点？,依赖检索质量，可能被噪声误导,RAG 的缺点包括对检索质量的依赖……,['文档1片段：RAG 依赖外部知识库的质量'],"{'context_precision': 0.6, 'context_recall': 0.5, 'hit_rate': 0.0, 'mrr': 0.0, 'noise_sensitivity': 0.4, 'negative_rejection': 0.3}","{'context_precision': '仅一个相关片段', 'context_recall': '未完全覆盖标准答案'}",RAG 有哪些缺点？,1.0,
+2,False,,,,,,,,,向量库连接失败

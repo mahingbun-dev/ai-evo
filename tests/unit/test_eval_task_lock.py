@@ -15,6 +15,8 @@ import pytest
 from app.services import redis_stop_signal
 from app.services.redis_stop_signal import EVAL_TASK_LOCK_TTL, EvalTaskLock
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 class FakeRedis:
     """最小 redis 客户端假实现：set(nx)/get/delete/exists（字符串值）"""

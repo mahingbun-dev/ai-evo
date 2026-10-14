@@ -10,7 +10,7 @@ from app.models.pre_judge_models import PreJudgeScript
 from app.models.media_models import MediaResource
 from app.models.dataset_models import EvaluationDataset, EvaluationData
 from app.models.hub_file_models import HubFileRecord, HubImportJob
-from app.models.task_models import EvaluationTask, TaskExecutionLog
+from app.models.task_models import EvaluationTask, TaskExecutionLog, TaskExecutionRecord, EvaluationResult
 from app.models.template_models import EvaluationTemplate, MultiJudgeConfig, EvaluationMetric
 from app.models.user_models import User
 from app.models.team_models import Team
@@ -44,6 +44,10 @@ __all__ = [
     # 任务
     "EvaluationTask",
     "TaskExecutionLog",
+    # 任务执行历史记录
+    "TaskExecutionRecord",
+    # 评测行级结果（W3 行级落库）
+    "EvaluationResult",
     # 模板
     "EvaluationTemplate",
     "MultiJudgeConfig",

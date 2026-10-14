@@ -10,6 +10,8 @@ from datetime import datetime
 from app.models.ab_test_models import ABTestSession
 from app.services.ab_test_service import ABTestService
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 class TestABTestSession:
     """ABTestSession 模型测试"""

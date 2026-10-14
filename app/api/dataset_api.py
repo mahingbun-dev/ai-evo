@@ -8,6 +8,13 @@ from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime
 from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict
 from app.db.session import get_db
+from app.core.config import get_settings
+from app.services.access_control import (
+    ensure_dataset_access,
+    ensure_super_admin,
+    filter_team_code,
+    user_team_code,
+)
 from app.services.dataset_service import DatasetService, DatasetDataService
 from app.services.dataset_field_service import DatasetFieldService
 from app.services.dataset_export_service import (
@@ -16,7 +23,8 @@ from app.services.dataset_export_service import (
     MAX_EXPORT_ROWS,
 )
 from app.models.dataset_models import EvaluationDataset, ImportTempFile
-from app.utils.path_safety import sanitize_upload_filename
+from app.utils.read_limited import read_limited
+from app.utils.secure_filename import secure_filename
 import pandas as pd
 import io
 import json
@@ -319,10 +327,8 @@ def export_dataset_excel(
     """
     from urllib.parse import quote
 
-    dataset_service = DatasetService(db)
-    dataset = dataset_service.get_dataset(dataset_id)
-    if not dataset:
-        raise HTTPException(status_code=404, detail="数据集不存在")
+    # W9：导出即数据外流，对象级归属校验（跨团队下载拒绝）
+    dataset = ensure_dataset_access(db, request.state.user, dataset_id)
 
     export_service = DatasetExportService(db)
 
@@ -374,15 +380,17 @@ def export_dataset_excel(
 @router.post("", response_model=DatasetResponse, summary="创建数据集")
 def create_dataset(
     body: CreateDatasetRequest,
+    request: Request,
     db: Session = Depends(get_db),
 ):
-    """创建新的评测数据集"""
+    """创建新的评测数据集（W9：team_code 随用户团队落库，列表过滤/归属校验的归属锚点）"""
     service = DatasetService(db)
     try:
         dataset = service.create_dataset(
             name=body.name,
             description=body.description,
             created_by=body.created_by,
+            team_code=user_team_code(request.state.user),
         )
         return dataset
     except ValueError as e:
@@ -391,26 +399,28 @@ def create_dataset(
 
 @router.get("", response_model=List[DatasetResponse], summary="获取数据集列表")
 def get_datasets(
+    request: Request,
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=1000),
     db: Session = Depends(get_db),
 ):
-    """获取评测数据集列表"""
+    """获取评测数据集列表（W9：超管看全部，普通用户只看本团队——修复根因
+    「数据集列表连 team 过滤都没传」（dataset_api.py:393-402））"""
     service = DatasetService(db)
-    datasets = service.get_datasets(skip=skip, limit=limit)
+    datasets = service.get_datasets(
+        skip=skip, limit=limit, team_code=filter_team_code(request.state.user)
+    )
     return datasets
 
 
 @router.get("/{dataset_id}", response_model=DatasetResponse, summary="获取数据集详情")
 def get_dataset(
     dataset_id: str,
+    request: Request,
     db: Session = Depends(get_db),
 ):
-    """获取评测数据集详情"""
-    service = DatasetService(db)
-    dataset = service.get_dataset(dataset_id)
-    if not dataset:
-        raise HTTPException(status_code=404, detail="数据集不存在")
+    """获取评测数据集详情（W9：对象级归属校验）"""
+    dataset = ensure_dataset_access(db, request.state.user, dataset_id)
     return dataset
 
 
@@ -418,9 +428,11 @@ def get_dataset(
 def update_dataset(
     dataset_id: str,
     body: UpdateDatasetRequest,
+    request: Request,
     db: Session = Depends(get_db),
 ):
-    """更新数据集信息"""
+    """更新数据集信息（W9：对象级归属校验）"""
+    ensure_dataset_access(db, request.state.user, dataset_id)
     service = DatasetService(db)
     dataset = service.update_dataset(dataset_id, **body.model_dump(exclude_unset=True))
     if not dataset:
@@ -431,9 +443,11 @@ def update_dataset(
 @router.delete("/{dataset_id}", summary="删除数据集")
 def delete_dataset(
     dataset_id: str,
+    request: Request,
     db: Session = Depends(get_db),
 ):
-    """删除数据集"""
+    """删除数据集（W9：对象级归属校验）"""
+    ensure_dataset_access(db, request.state.user, dataset_id)
     service = DatasetService(db)
     try:
         success = service.delete_dataset(dataset_id)
@@ -448,14 +462,12 @@ def delete_dataset(
 @router.get("/{dataset_id}/fields", response_model=List[DatasetFieldResponse], summary="获取数据集字段结构")
 def get_dataset_fields(
     dataset_id: str,
+    request: Request,
     db: Session = Depends(get_db),
 ):
-    """获取数据集的字段结构（含自定义字段）"""
-    # 验证数据集存在
-    dataset_service = DatasetService(db)
-    dataset = dataset_service.get_dataset(dataset_id)
-    if not dataset:
-        raise HTTPException(status_code=404, detail="数据集不存在")
+    """获取数据集的字段结构（含自定义字段；W9：对象级归属校验）"""
+    # 验证数据集存在 + 团队归属
+    ensure_dataset_access(db, request.state.user, dataset_id)
 
     # 获取字段元数据
     field_service = DatasetFieldService(db)
@@ -468,14 +480,12 @@ def get_dataset_fields(
 def update_dataset_fields(
     dataset_id: str,
     fields: List[DatasetFieldResponse],
+    request: Request,
     db: Session = Depends(get_db),
 ):
-    """更新数据集的字段元数据"""
-    # 验证数据集存在
-    dataset_service = DatasetService(db)
-    dataset = dataset_service.get_dataset(dataset_id)
-    if not dataset:
-        raise HTTPException(status_code=404, detail="数据集不存在")
+    """更新数据集的字段元数据（W9：对象级归属校验）"""
+    # 验证数据集存在 + 团队归属
+    ensure_dataset_access(db, request.state.user, dataset_id)
 
     # 保存字段元数据
     field_service = DatasetFieldService(db)
@@ -489,9 +499,15 @@ def update_dataset_fields(
 
 @router.post("/cleanup-duplicates", summary="清理重复数据集")
 def cleanup_duplicates(
+    request: Request,
     db: Session = Depends(get_db),
 ):
-    """清理重复的数据集（保留最早创建的）"""
+    """清理重复的数据集（保留最早创建的）
+
+    W19b：仅超管——去重范围跨全部团队且联动释放他团 hub 引用，属破坏性
+    批量写，不随调用者团队收窄。
+    """
+    ensure_super_admin(request)
     from sqlalchemy import func
     from app.models.dataset_models import EvaluationDataset
 
@@ -552,10 +568,13 @@ def cleanup_duplicates(
 @router.post("/{dataset_id}/import/excel", response_model=ImportResponse, summary="从Excel导入数据")
 async def import_from_excel(
     dataset_id: str,
+    request: Request,
     file: UploadFile = File(..., description="Excel文件"),
     db: Session = Depends(get_db),
 ):
-    """从Excel文件导入评测数据"""
+    """从Excel文件导入评测数据（W9：对象级归属校验）"""
+    # W9：数据集归属校验
+    ensure_dataset_access(db, request.state.user, dataset_id)
     # 保存上传的文件
     import tempfile
     import os
@@ -580,9 +599,11 @@ async def import_from_excel(
 def import_from_json(
     dataset_id: str,
     body: ImportJsonRequest,
+    request: Request,
     db: Session = Depends(get_db),
 ):
-    """从JSON导入评测数据"""
+    """从JSON导入评测数据（W9：对象级归属校验）"""
+    ensure_dataset_access(db, request.state.user, dataset_id)
     service = DatasetService(db)
     count = service.import_from_json(dataset_id, body.data)
     return {"count": count, "message": f"成功导入 {count} 条数据"}
@@ -593,24 +614,22 @@ def import_from_json(
 async def upload_data_file(
     dataset_id: str,
     data_id: str,
+    request: Request,
     field: str = Query("answer", description="字段名：user_input 或 answer"),
     file: UploadFile = File(..., description="上传的文件"),
     db: Session = Depends(get_db),
 ):
-    """上传文件并与具体数据项关联"""
+    """上传文件并与具体数据项关联（W9：数据集归属校验）"""
     # 校验field参数
     if field not in ["user_input", "answer"]:
         field = "answer"
 
-    # 验证数据集存在
-    dataset_service = DatasetService(db)
-    dataset = dataset_service.get_dataset(dataset_id)
-    if not dataset:
-        raise HTTPException(status_code=404, detail="数据集不存在")
+    # 验证数据集存在 + 团队归属
+    ensure_dataset_access(db, request.state.user, dataset_id)
 
     try:
         # 上传文件并建立与数据项的关联
-        result = dataset_service.upload_data_file(dataset_id, data_id, file, field)
+        result = DatasetService(db).upload_data_file(dataset_id, data_id, file, field)
         return result
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -620,15 +639,13 @@ async def upload_data_file(
 def get_data_files(
     dataset_id: str,
     data_id: str,
+    request: Request,
     field: str = Query(None, description="字段名：user_input 或 answer，不传则返回全部"),
     db: Session = Depends(get_db),
 ):
-    """获取与具体数据项关联的文件列表"""
-    # 验证数据集存在
-    dataset_service = DatasetService(db)
-    dataset = dataset_service.get_dataset(dataset_id)
-    if not dataset:
-        raise HTTPException(status_code=404, detail="数据集不存在")
+    """获取与具体数据项关联的文件列表（W9：数据集归属校验）"""
+    # 验证数据集存在 + 团队归属
+    ensure_dataset_access(db, request.state.user, dataset_id)
 
     # 验证数据项存在
     data_service = DatasetDataService(db)
@@ -645,13 +662,18 @@ def delete_data_file(
     dataset_id: str,
     data_id: str,
     file_id: str,
+    request: Request,
     field: str = Query("answer", description="字段名：user_input 或 answer"),
     db: Session = Depends(get_db),
 ):
-    """删除与具体数据项关联的文件"""
+    """删除与具体数据项关联的文件（W9：原实现仅按 data_id 直删、无数据集校验，
+    现补齐数据集存在性 + 团队归属校验）"""
     # 校验field参数
     if field not in ["user_input", "answer"]:
         field = "answer"
+
+    # W9：数据集存在 + 团队归属（原实现完全绕过数据集校验）
+    ensure_dataset_access(db, request.state.user, dataset_id)
 
     data_service = DatasetDataService(db)
     success = data_service.delete_data_file(data_id, file_id, field)
@@ -664,16 +686,14 @@ def delete_data_file(
 @router.get("/{dataset_id}/data", response_model=DataListResponse, summary="获取数据集题目列表")
 def get_dataset_data(
     dataset_id: str,
+    request: Request,
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=500),
     db: Session = Depends(get_db),
 ):
-    """获取评测数据列表（从 V2 表读取，构造 V1 兼容格式）"""
-    # 验证数据集存在
-    dataset_service = DatasetService(db)
-    dataset = dataset_service.get_dataset(dataset_id)
-    if not dataset:
-        raise HTTPException(status_code=404, detail="数据集不存在")
+    """获取评测数据列表（从 V2 表读取，构造 V1 兼容格式；W9：数据集归属校验）"""
+    # 验证数据集存在 + 团队归属
+    ensure_dataset_access(db, request.state.user, dataset_id)
 
     data_service = DatasetDataService(db)
     # V1 兼容格式只取 user_input/answer/_is_media/files 等小字段，
@@ -683,7 +703,8 @@ def get_dataset_data(
     # 构造 V1 兼容格式
     items = []
     for item in v2_items:
-        data_json = item.data or {}
+        # get_data_list_v2_slim 返回 dict（mappings()），按下标访问
+        data_json = item.get("data") or {}
         meta_data = {}
         # 提取 *_is_media 字段到 meta_data
         for key, value in data_json.items():
@@ -695,8 +716,8 @@ def get_dataset_data(
                 meta_data[key] = data_json[key]
 
         items.append({
-            "id": item.id,
-            "index": item.index,
+            "id": item.get("id"),
+            "index": item.get("index"),
             "question": data_json.get("user_input", ""),
             "ref_answer": data_json.get("answer", ""),
             "user_input_is_media": data_json.get("user_input_is_media", False),
@@ -714,16 +735,14 @@ def get_dataset_data(
 @router.get("/{dataset_id}/data/v2", response_model=DataListResponseV2, summary="获取数据集题目列表 V2（自由格式）")
 def get_dataset_data_v2(
     dataset_id: str,
+    request: Request,
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=500),
     db: Session = Depends(get_db),
 ):
-    """获取评测数据列表 V2（返回 data JSON 对象）"""
-    # 验证数据集存在
-    dataset_service = DatasetService(db)
-    dataset = dataset_service.get_dataset(dataset_id)
-    if not dataset:
-        raise HTTPException(status_code=404, detail="数据集不存在")
+    """获取评测数据列表 V2（返回 data JSON 对象；W9：数据集归属校验）"""
+    # 验证数据集存在 + 团队归属
+    ensure_dataset_access(db, request.state.user, dataset_id)
 
     data_service = DatasetDataService(db)
     # 列表展示走 DB 端瘦身：超大字段（如会话数据集的 session_messages，单条可达
@@ -741,14 +760,12 @@ def get_dataset_data_v2(
 def add_data(
     dataset_id: str,
     body: AddDataRequest,
+    request: Request,
     db: Session = Depends(get_db),
 ):
-    """添加单条评测数据"""
-    # 验证数据集存在
-    dataset_service = DatasetService(db)
-    dataset = dataset_service.get_dataset(dataset_id)
-    if not dataset:
-        raise HTTPException(status_code=404, detail="数据集不存在")
+    """添加单条评测数据（W9：数据集归属校验）"""
+    # 验证数据集存在 + 团队归属
+    ensure_dataset_access(db, request.state.user, dataset_id)
 
     data_service = DatasetDataService(db)
     body_dict = body.model_dump(exclude_unset=True)
@@ -779,10 +796,16 @@ def add_data(
 @router.delete("/data/{data_id}", summary="删除评测数据")
 def delete_data(
     data_id: str,
+    request: Request,
     db: Session = Depends(get_db),
 ):
-    """删除评测数据"""
+    """删除评测数据（W9：原实现按 data_id 直删无归属校验，现经所属数据集团队校验）"""
     data_service = DatasetDataService(db)
+    data_item = data_service.get_data(data_id)
+    if not data_item:
+        raise HTTPException(status_code=404, detail="数据不存在")
+    # W9：经数据项所属数据集做团队归属校验
+    ensure_dataset_access(db, request.state.user, data_item.dataset_id)
     success = data_service.delete_data(data_id)
     if not success:
         raise HTTPException(status_code=404, detail="数据不存在")
@@ -794,14 +817,12 @@ def update_data(
     dataset_id: str,
     data_id: str,
     body: DataItemUpdateRequest,
+    request: Request,
     db: Session = Depends(get_db),
 ):
-    """更新单条评测数据"""
-    # 验证数据集存在
-    dataset_service = DatasetService(db)
-    dataset = dataset_service.get_dataset(dataset_id)
-    if not dataset:
-        raise HTTPException(status_code=404, detail="数据集不存在")
+    """更新单条评测数据（W9：数据集归属校验）"""
+    # 验证数据集存在 + 团队归属
+    ensure_dataset_access(db, request.state.user, dataset_id)
 
     data_service = DatasetDataService(db)
 
@@ -1193,6 +1214,7 @@ async def preview_import_v2(
 @router.post("/{dataset_id}/import/confirm", response_model=ImportResponse, summary="确认导入数据")
 async def confirm_import(
     dataset_id: str,
+    request: Request,
     name: str = Form(''),
     description: str = Form(''),
     real_dataset_id: str = Form('', description="追加模式下的真实数据集ID"),
@@ -1201,9 +1223,15 @@ async def confirm_import(
     file: UploadFile = File(..., description="Excel文件"),
     db: Session = Depends(get_db),
 ):
-    """确认导入校验后的数据"""
+    """确认导入校验后的数据（W9：追加模式目标数据集归属校验；新建数据集随用户团队落库）"""
     import tempfile
     import os
+
+    # W9：归属校验（新建模式无目标数据集可校验；追加模式必须先过团队归属）
+    is_preview_id = dataset_id.startswith('preview_') or dataset_id.startswith('import_preview_')
+    has_name = bool(name and name.strip())
+    if not (is_preview_id and has_name):
+        ensure_dataset_access(db, request.state.user, real_dataset_id or dataset_id)
 
     # 保存上传的文件
     with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
@@ -1229,10 +1257,11 @@ async def confirm_import(
         has_name = bool(name and name.strip())
 
         if is_preview_id and has_name:
-            # 创建新数据集
+            # 创建新数据集（W9：随用户团队落库）
             dataset = dataset_service.create_dataset(
                 name=name or file.filename.replace('.xlsx', '').replace('.xls', ''),
-                description=description or '从Excel导入'
+                description=description or '从Excel导入',
+                team_code=user_team_code(request.state.user),
             )
             real_dataset_id = dataset.id
 
@@ -1450,6 +1479,7 @@ async def confirm_import(
 @router.post("/{dataset_id}/import/preview/upload-temp-file", response_model=Dict[str, Any], summary="预览阶段上传临时文件")
 async def upload_temp_file(
     dataset_id: str,
+    request: Request,
     data_index: int = Query(..., description="数据项索引（从0开始）"),
     field: str = Query("answer", description="字段名：user_input 或 answer"),
     file: UploadFile = File(..., description="上传的文件"),
@@ -1460,23 +1490,29 @@ async def upload_temp_file(
     import logging
     logger = logging.getLogger(__name__)
 
+    # W9：dataset_id 为真实数据集 ID（追加模式预览）时校验团队归属；
+    # preview_ 前缀是新建数据集预览的临时缓存 key（confirm_import 同口径），无资源可校验
+    if not (dataset_id.startswith("preview_") or dataset_id.startswith("import_preview_")):
+        ensure_dataset_access(db, request.state.user, dataset_id)
+
     # 校验field参数 - 支持多字段名（如 answer_带附件、answer_不带附件）
     _allowed_prefixes = ["user_input", "answer"]
     if not any(field.startswith(prefix) for prefix in _allowed_prefixes):
         field = "answer"  # 默认值
 
-    # 读取文件内容
-    content = await file.read()
+    # 读取文件内容（W1-1：超限即抛 413，媒体与临时上传共用 UPLOAD_MAX_BYTES）
+    content = await read_limited(file, get_settings().UPLOAD_MAX_BYTES)
     file_size = len(content)
 
     # 生成临时文件ID
     temp_file_id = f"temp_{uuid.uuid4().hex[:12]}"
 
+    # 文件名清洗：剥目录成分/控制字符，防路径穿越写（W1-1）
+    safe_name = secure_filename(file.filename)
+
     # 保存文件到临时目录
     temp_dir = "./uploads/datasets/temp"
     os.makedirs(temp_dir, exist_ok=True)
-    # 文件名来自客户端，压成 basename 防穿越（../、盘符、反斜杠变形均无效）
-    safe_name = sanitize_upload_filename(file.filename)
     file_path = os.path.join(temp_dir, f"{temp_file_id}_{safe_name}")
 
     Path(file_path).write_bytes(content)
@@ -1506,9 +1542,9 @@ async def upload_temp_file(
             preview_id=dataset_id,
             data_index=data_index,
             field=field,
-            file_name=file.filename,
+            file_name=safe_name,
             file_path=file_path,
-            file_type=get_file_type(file.filename),
+            file_type=get_file_type(safe_name),
             file_size=file_size,
             is_active=True
         )
@@ -1521,8 +1557,8 @@ async def upload_temp_file(
         # 如果数据库保存失败，回退到内存存储（兼容旧逻辑）
         file_info = {
             "id": temp_file_id,
-            "file_name": file.filename,
-            "file_type": get_file_type(file.filename),
+            "file_name": safe_name,
+            "file_type": get_file_type(safe_name),
             "file_size": file_size,
             "file_path": file_path,
             "field": field
@@ -1535,8 +1571,8 @@ async def upload_temp_file(
 
     return {
         "id": temp_file_id,
-        "file_name": file.filename,
-        "file_type": get_file_type(file.filename),
+        "file_name": safe_name,
+        "file_type": get_file_type(safe_name),
         "file_size": file_size,
     }
 
@@ -1545,13 +1581,18 @@ async def upload_temp_file(
 async def delete_temp_file(
     dataset_id: str,
     temp_file_id: str,
+    request: Request,
     data_index: int = Query(..., description="数据项索引（从0开始）"),
     field: str = Query("answer", description="字段名：user_input 或 answer"),
     db: Session = Depends(get_db),
 ):
-    """删除预览阶段上传的临时文件（从数据库中删除）"""
+    """删除预览阶段上传的临时文件（从数据库中删除；W9：真实数据集 ID 时校验归属）"""
     import logging
     logger = logging.getLogger(__name__)
+
+    # W9：同 upload_temp_file 口径——真实数据集 ID 校验归属，preview_ 前缀为临时 key
+    if not (dataset_id.startswith("preview_") or dataset_id.startswith("import_preview_")):
+        ensure_dataset_access(db, request.state.user, dataset_id)
 
     # 校验field参数
     if field not in ["user_input", "answer"]:
@@ -1733,6 +1774,10 @@ async def confirm_session_import(
     elif user is not None and hasattr(user, "user_code"):
         user_code = user.user_code
 
+    # W9：追加模式目标数据集归属校验（与 confirm_import 同口径；新建无资源可校验）
+    if real_dataset_id:
+        ensure_dataset_access(db, user, real_dataset_id)
+
     entries = _read_session_uploads(files)
     try:
         result = import_sessions(
@@ -1742,6 +1787,7 @@ async def confirm_session_import(
             description=description,
             real_dataset_id=real_dataset_id or None,
             created_by=user_code,
+            team_code=user_team_code(user),
         )
         return SessionImportResponse(
             dataset_id=result["dataset_id"],
@@ -1799,6 +1845,8 @@ async def import_sessions_from_hub(
     导入的每条会话数据自动记录原始 file_id（session_file_id /
     session_file_name），供需要原始文件的任务以 hub_file 通道直接引用；
     导入成功后按数据行粒度 acquire_ref（与软删释放严格成对）。
+
+    W9：追加模式目标数据集归属校验（同 confirm_session_import 口径）。
     """
     import logging as _logging
     import os as _os
@@ -1862,6 +1910,10 @@ async def import_sessions_from_hub(
     elif user is not None and hasattr(user, "user_code"):
         user_code = user.user_code
 
+    # W9：追加模式目标数据集归属校验（与 confirm_session_import 同口径）
+    if body.real_dataset_id:
+        ensure_dataset_access(db, user, body.real_dataset_id)
+
     workdir = _tempfile.mkdtemp(prefix="hub_session_import_")
     # 本次调用中新物化（cached=False）的 file_id：校验/导入失败时回滚清理，
     # 避免留下无引用的登记记录；导入成功后不得清理（数据行已引用）
@@ -1916,6 +1968,7 @@ async def import_sessions_from_hub(
             real_dataset_id=body.real_dataset_id or None,
             created_by=user_code,
             file_extra=file_extra,
+            team_code=user_team_code(request.state.user),
         )
         import_completed = True
         # 引用计数与释放端（release_dataset_hub_refs 逐行多重释放）严格成对：

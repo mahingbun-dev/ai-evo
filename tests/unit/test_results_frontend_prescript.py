@@ -19,6 +19,14 @@ from pathlib import Path
 
 import pytest
 
+# W8 分类：unit（无网络/无 DB）；本文件是 frontend/tests/unit/*.test.mjs 的
+# pytest 桥接入口，依赖宿主机 node 运行时——离线 CI runner 无 node 时整套
+# 明确 skip（本文件 test_node_available 已声明的意图），绝不假绿也绝不误报。
+pytestmark = [
+    pytest.mark.unit,
+    pytest.mark.skipif(shutil.which("node") is None, reason="未找到 node，跳过前端逻辑单测（CI 离线 runner 无 node）"),
+]
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 NODE_TEST_FILES = [
     PROJECT_ROOT / "frontend" / "tests" / "unit" / "resultsPreScript.test.mjs",

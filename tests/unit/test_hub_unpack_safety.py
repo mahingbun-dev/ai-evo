@@ -22,6 +22,8 @@ from app.services.hub_file_service import (
     unpack_zip_safely,
 )
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 # ---------------------------------------------------------------------------
 # fixture 工具：现场合成小样本 zip

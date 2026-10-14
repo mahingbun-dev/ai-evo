@@ -7,6 +7,8 @@ from app.services.efficiency_service import EfficiencyService
 from app.models.task_models import TaskExecutionRecord, EvaluationTask
 from app.models.stats_models import TaskExecutionStats
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 class TestTotalEfficiency:
     """get_total_efficiency 测试"""

@@ -30,6 +30,7 @@
 │   │       ├── reports/（allure_results/*.json、screenshots/*.png、logs/）← 评测脚本最常消费
 │   │       └── segments/{uuid}/（pytest 产物 + allure-data/ + runtime/）  ← 分段执行产物
 │   └── hub_pkg_index.json                           ← 未配 path_pattern 时的索引文件（inputs.index_path）
+├── outputs/                                         ← 脚本产物目录（文件产物只写这里，平台保证存在）
 ├── sample_stdin.json                                ← 本地试跑样例（平台运行时由 stdin 注入）
 ├── README.md                                        ← 本文件（骨架说明）
 └── AGENTS.md                                        ← AI agent 开发/打包指引（agent 优先读它）
@@ -56,7 +57,7 @@
 3. **导入平台**：对你自己的 `scripts/{你的脚本名}/` **文件夹整体压缩**为 zip
    （zip 根为一层目录，平台可识别），或把该文件夹**内的文件**直接打包（main.py 在
    包根），走脚本库「上传包」导入；或直接用「新建脚本」在线编辑。`scripts/hub_package/`、
-   `inputs/`、`sample_stdin.json`、`README.md`、`AGENTS.md` 是参考与指引文件，
+   `inputs/`、`outputs/`、`sample_stdin.json`、`README.md`、`AGENTS.md` 是参考与指引文件，
    不要打进上传包。
 
 > AI agent 开发：优先读 `AGENTS.md`（含硬性规则、本地验证与打包步骤）。
@@ -75,7 +76,8 @@
 - `path_pattern` 相对解包根书写：写全路径（`{...}-attempt-1/reports/...`）最稳；
   解包根下仅一个顶层目录且 pattern 首段不是它时，平台自动以 `{顶层目录}/{pattern}`
   重试一次（单顶层自动拼接）；解包根混有多个顶层条目时自动拼接不生效。
-- 产物只写 `_run_dir`；输出引用文件一律 `rel_path`；stdout 最后一行 JSON：
-  `{status: ok|skip|fail, outputs, message, ...}`。
+- **产物只写 `{_run_dir}/outputs/`**（平台保证该目录存在，脚本侧可防御式创建）；
+  落盘后在 stdout 的 `files` 键注册绝对路径；输出引用输入文件一律用 `rel_path`；
+  stdout 最后一行 JSON：`{status: ok|skip|fail, outputs, message, ...}`。
 
 完整契约、风险/依赖声明、超时说明见 `scripts/hub_package/README.md`。

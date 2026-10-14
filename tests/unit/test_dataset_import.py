@@ -12,6 +12,8 @@ from unittest.mock import MagicMock, patch
 
 from app.services.dataset_service import DatasetService
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 class TestConvertToString:
     """_convert_to_string 辅助函数测试"""

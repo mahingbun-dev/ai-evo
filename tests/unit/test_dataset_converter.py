@@ -6,6 +6,8 @@
 import pytest
 from deepeval.dataset import Golden
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 # ============================================================
 # 基本转换测试: ai_evo_to_golden

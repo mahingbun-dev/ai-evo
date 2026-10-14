@@ -3,6 +3,7 @@ API接口
 保留Excel接口，移除老式pytest和直接评测接口
 """
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Path
+from app.services.access_control import ensure_super_admin
 from sqlalchemy.orm import Session
 from typing import Optional
 from app.db.session import get_db
@@ -19,7 +20,7 @@ def _get_excel_data_params(file_id: int = Path(..., description="Excel 文件 ID
     return ExcelDataRequestModel(file_id=file_id)
 
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(ensure_super_admin)])
 
 
 # =============================================================================

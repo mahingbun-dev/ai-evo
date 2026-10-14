@@ -16,6 +16,7 @@ export const clearToken = () => localStorage.removeItem(TOKEN_KEY)
 export const getWsTokenQuery = () =>
   getToken() ? `?token=${encodeURIComponent(getToken())}` : ''
 
+
 // 请求拦截器：注入 Authorization: Bearer <token>
 request.interceptors.request.use(
   config => {
@@ -42,6 +43,8 @@ request.interceptors.response.use(
   async error => {
     // 401：登录态失效，清除本地 token 并跳转登录页
     // 登录/注册接口自身的 401（密码错误等）不触发跳转，正常走错误提示
+    // W14 修复：跳转后 reject 让调用方拿到明确失败——原实现返回永不
+    // settle 的空 Promise，所有 await 该请求的调用链（含 finally）被永久挂起。
     if (error.response?.status === 401) {
       const reqUrl = error.config?.url || ''
       const isAuthRequest = reqUrl.includes('/auth/login') || reqUrl.includes('/auth/register')
@@ -50,8 +53,8 @@ request.interceptors.response.use(
         if (!window.location.pathname.startsWith('/login')) {
           const redirect = encodeURIComponent(window.location.pathname + window.location.search)
           window.location.href = `/login?redirect=${redirect}`
-          return new Promise(() => {}) // 阻止后续错误处理
         }
+        return Promise.reject(new Error('登录已失效，请重新登录'))
       }
     }
 
@@ -216,7 +219,9 @@ export const datasetApi = {
     headers: { 'Content-Type': 'multipart/form-data' }
   }),
   // 从 anc-hub 拉取会话文件并导入（JSON：{file_ids, name, description, real_dataset_id}）
-  // 同步链路含大包下载解包（执行包可达几十 MB），超时放宽到 10 分钟
+  // @deprecated W14 起废弃：Datasets.vue 已改走 hubImportApi 异步 job 链路
+  // （POST /evaluation/datasets/import/hub-files + WS 进度推送），同步 10 分钟
+  // 链路不再有页面调用入口；后端端点与客户端方法暂保留兼容外部调用方
   importSessionsFromHub: (data) => request.post('/evaluation/datasets/import/sessions/from-hub', data, { timeout: 600000 }),
   dataListV2: (id, params) => request.get(`/evaluation/datasets/${id}/data/v2`, { params }),
   addData: (id, data) => request.post(`/evaluation/datasets/${id}/data`, data),
@@ -262,8 +267,8 @@ export const hubImportApi = {
   retryJob: (jobId) => request.post(`/hub-import-jobs/${encodeURIComponent(jobId)}/retry`)
 }
 
-// 统计API
-export { statsApi, coverageApi, efficiencyApi } from './stats'
+// 统计API（ESM 规范要求显式扩展名：node:test 行为测试直接导入本模块）
+export { statsApi, coverageApi, efficiencyApi } from './stats.js'
 
 // 评测任务API
 export const taskApi = {
@@ -277,6 +282,9 @@ export const taskApi = {
   stop: (id) => request.post(`/evaluation/tasks/${id}/stop`),
   executions: (id, params) => request.get(`/evaluation/tasks/${id}/executions`, { params }),
   getDatasetFields: (datasetId) => request.get(`/evaluation/tasks/datasets/${datasetId}/fields`),
+  // 轮询专用轻端点（W14）：{status, progress, completed_questions, total} 四字段，
+  // 供 useTaskPolling 高频拉取，替代每 8s 拉全量 detail
+  getStatus: (id) => request.get(`/evaluation/tasks/${id}/status`),
   // 迁移单个旧版任务配置（steps 合并进 score_details、pre_scripts 转为 script_output 待评测数据行，幂等）
   migrateConfig: (id) => request.post(`/evaluation/tasks/${id}/migrate-config`),
   // 批量迁移全部旧版任务配置（幂等；返回 {total, migrated, skipped, errors}）
@@ -333,8 +341,8 @@ export const authApi = {
 }
 
 // OSS 直传上传API（企业内网 OSS 可选功能，地址经 VITE_OSS_BASE_URL 构建时注入；未配置则功能不可用）
-const OSS_BASE_URL = import.meta.env.VITE_OSS_BASE_URL || ''
-const OSS_TENANT_CODE = import.meta.env.VITE_OSS_TENANT_CODE || ''
+const OSS_BASE_URL = import.meta.env?.VITE_OSS_BASE_URL || ''
+const OSS_TENANT_CODE = import.meta.env?.VITE_OSS_TENANT_CODE || ''
 
 export const ossApi = {
   get enabled() {

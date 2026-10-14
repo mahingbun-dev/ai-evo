@@ -1,7 +1,8 @@
 """
 数据合成 API
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
+from app.services.access_control import ensure_super_admin
 from pydantic import BaseModel, Field
 from typing import Dict, Any, List, Optional
 from app.services.deepeval_synthesizer import (
@@ -10,7 +11,7 @@ from app.services.deepeval_synthesizer import (
     synthesize_from_scratch,
 )
 
-router = APIRouter(prefix="/dataset-synthesis", tags=["Dataset Synthesis"])
+router = APIRouter(prefix="/dataset-synthesis", tags=["Dataset Synthesis"], dependencies=[Depends(ensure_super_admin)])
 
 
 class LLMConfigParam(BaseModel):

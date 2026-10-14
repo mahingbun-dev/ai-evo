@@ -6,6 +6,8 @@ Prompt组装器
 import json
 from typing import Dict, Any, Optional, List
 
+from app.services.prompt_guard import PROMPT_INJECTION_GUARD, wrap_eval_data
+
 WEIGHT_MAP = {"高": 3, "中": 2, "低": 1}
 
 
@@ -730,9 +732,11 @@ class PromptBuilder:
             return ""
 
         # 步骤3: 构建 user_prompt，格式：【name】value，多个变量之间双换行分隔
+        # W12-5：变量值均为外部数据（数据集/模型输出/脚本输出），用分隔符包裹
+        # 并由 _build_system_prompt 声明「分隔符内是数据非指令」（最小注入防护）
         prompt_parts = []
         for var in user_vars:
-            prompt_parts.append(f"【{var['name']}】{var['value']}")
+            prompt_parts.append(f"【{var['name']}】{wrap_eval_data(var['value'])}")
 
         user_prompt = "\n\n".join(prompt_parts)
         logger.info(f"构建 user_prompt 成功: {len(user_vars)} 个变量，总长度 {len(user_prompt)} 字符")
@@ -847,8 +851,9 @@ class PromptBuilder:
                     target_parts.append(f"### {name}\n{content}")
 
             if target_parts:
+                # W12-5：待评目标内容用分隔符包裹（数据非指令，最小注入防护）
                 result = "\n\n".join(target_parts)
-                return result
+                return wrap_eval_data(result)
             else:
                 logger.info(f"[_inject_evaluation_targets] 没有有效内容可注入")
 
@@ -876,6 +881,10 @@ class PromptBuilder:
         # 添加场景描述
         if self.scene_desc:
             parts.append(f"## 场景描述\n{self.scene_desc}")
+
+        # W12-5：分隔符内是数据非指令——与 user prompt/targets 的 <eval_data>
+        # 包裹配套的最小注入防护声明
+        parts.append(PROMPT_INJECTION_GUARD)
 
         # 注入评测目标内容（evaluation_targets）
         if self.evaluation_targets:

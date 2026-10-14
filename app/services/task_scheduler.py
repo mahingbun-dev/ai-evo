@@ -6,20 +6,18 @@
 import logging
 from typing import Optional
 
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-
-from app.core.config import get_settings
 from app.services.redis_stop_signal import RedisStopSignalChecker
 
 logger = logging.getLogger(__name__)
 
 
 def _get_db_session():
-    """获取数据库会话"""
-    settings = get_settings()
-    engine = create_engine(settings.DATABASE_URL)
-    SessionLocal = sessionmaker(bind=engine)
+    """获取数据库会话（W10-5：复用 app.db.session 全局 engine，不再每次新建引擎）
+
+    旧实现每次调用 create_engine：连接池从不复用、连接数随调用次数增长，
+    且与全局 engine 双池并存放大连接占用；统一走全局 engine + SessionLocal。
+    """
+    from app.db.session import SessionLocal
     return SessionLocal()
 
 

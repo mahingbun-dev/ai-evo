@@ -2,6 +2,8 @@
 import pytest
 from app.services.rule_metrics_calculator import RuleMetricsCalculator
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 class TestRuleMetricsCalculator:
     """RuleMetricsCalculator 测试"""

@@ -1,11 +1,18 @@
 from logging.config import fileConfig
 
+import os
+
 from sqlalchemy import engine_from_config
 
 def _resolve_db_url(config) -> str:
-    """数据库连接串：优先 AIEVO_DATABASE_URL 环境变量，回退 ini 配置"""
+    """数据库连接串：优先 AIEVO_DATABASE_URL（部署口径），兼容 DATABASE_URL
+    （W6-2 迁移链路集成测试与容器内 docker exec 场景注入），回退 ini 配置"""
     import os
-    return os.environ.get("AIEVO_DATABASE_URL") or config.get_main_option("sqlalchemy.url")
+    return (
+        os.environ.get("AIEVO_DATABASE_URL")
+        or os.environ.get("DATABASE_URL")
+        or config.get_main_option("sqlalchemy.url")
+    )
 
 from sqlalchemy import pool
 
@@ -54,8 +61,8 @@ def run_migrations_offline() -> None:
     here as well.  By skipping the Engine creation
     we don't even need a DBAPI to be available.
 
-    Calls to context.execute() here emit the given string to the
-    script output.
+    Calls to context.execute() here emit the string
+    to the script output.
 
     """
     url = _resolve_db_url(config)
@@ -78,9 +85,8 @@ def run_migrations_online() -> None:
     and associate a connection with the context.
 
     """
-    import os
     section = dict(config.get_section(config.config_ini_section, {}))
-    section["sqlalchemy.url"] = os.environ.get("AIEVO_DATABASE_URL") or section.get("sqlalchemy.url")
+    section["sqlalchemy.url"] = _resolve_db_url(config)
     connectable = engine_from_config(
         section,
         prefix="sqlalchemy.",

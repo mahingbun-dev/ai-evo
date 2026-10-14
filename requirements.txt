@@ -45,10 +45,13 @@ protobuf==7.36.2
 # ============ AI/LLM ============
 openai==2.24.0
 anthropic==0.83.0
-langgraph>=0.4.0
-langfuse>=2.0.0
+# langgraph/langfuse/deepeval 三者此前用范围声明（>=），与 requirements.lock /
+# tools/prod-constraints.txt 的钉版漂移（本地装出的版本和离线镜像不一致）。
+# W18 收紧为与 lock 一致的精确版本——下次 pip-compile 结果不变。
+langgraph==1.2.2
+langfuse==4.14.4
 ragas==0.4.3
-deepeval>=4.0.0
+deepeval==4.1.8
 # Claude Code Agent 裁判引擎（运行时依赖镜像内 Claude Code CLI，见 Dockerfile）
 claude-agent-sdk==0.2.163
 # DeepSeek Harness Agent 裁判引擎（捆绑 linux/amd64 原生运行时 wheel，无需 Node.js）

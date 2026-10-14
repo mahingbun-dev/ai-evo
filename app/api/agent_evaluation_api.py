@@ -2,12 +2,13 @@
 Agent 评测 API
 """
 from dataclasses import asdict
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
+from app.services.access_control import ensure_super_admin
 from pydantic import BaseModel, Field
 from typing import Dict, Any, List, Optional
 from app.services.agent_evaluator import AgentEvaluator
 
-router = APIRouter(prefix="/agent-evaluation", tags=["Agent Evaluation"])
+router = APIRouter(prefix="/agent-evaluation", tags=["Agent Evaluation"], dependencies=[Depends(ensure_super_admin)])
 
 _evaluator = AgentEvaluator()
 

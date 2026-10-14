@@ -1,0 +1,5 @@
+index,question,is_valid,prediction,expected_label,predicted_label,is_correct,duration
+1,该评论「服务很好」是正面评价吗？,True,True,True,True,True,1.234
+2,该评论「环境脏乱」是正面评价吗？,True,False,True,False,False,0.987
+3,该评论「价格昂贵」是正面评价吗？,False,False,False,False,True,1.001
+4,,,,,,,

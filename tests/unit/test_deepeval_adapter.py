@@ -22,6 +22,8 @@ from app.services.deepeval_result_transformer import (
     TransformedEvaluationResult,
 )
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 # deepeval 指标在实例化时会尝试初始化 OpenAI 模型，
 # 需要设置 dummy API key 以避免测试因缺少 key 而失败。
 _DUMMY_API_KEY_ENV = {"OPENAI_API_KEY": "sk-test-dummy-key-for-testing"}
@@ -273,7 +275,7 @@ class TestEvaluate:
 
     @patch("app.services.deepeval_adapter.DeepEvalMetricRegistry.create_metric")
     def test_evaluate_handles_metric_error(self, mock_create_metric):
-        """测试当指标 measure 抛出异常时返回错误结果"""
+        """测试当指标 measure 抛出异常时返回 metric_unavailable 结果（W16 语义修正）"""
         mock_metric = MagicMock()
         mock_metric.measure.side_effect = RuntimeError("API connection failed")
         mock_create_metric.return_value = mock_metric
@@ -292,11 +294,13 @@ class TestEvaluate:
         assert result.success is False
         assert result.error is not None
         assert "API connection failed" in result.error
-        assert result.score == 0.0
+        # W16：适配失败标 metric_unavailable，score 为 None（不再伪装 0 分）
+        assert result.metric_unavailable is True
+        assert result.score is None
 
     @patch("app.services.deepeval_adapter.DeepEvalMetricRegistry.create_metric")
     def test_evaluate_handles_metric_not_found(self, mock_create_metric):
-        """测试当指标 key 不存在时返回错误结果"""
+        """测试当指标 key 不存在时返回 metric_unavailable 结果（W16 语义修正）"""
         from app.services.deepeval_metric_registry import MetricNotFoundError
 
         mock_create_metric.side_effect = MetricNotFoundError(
@@ -318,6 +322,9 @@ class TestEvaluate:
         assert result.success is False
         assert result.error is not None
         assert "nonexistent" in result.error
+        # W16：指标不存在同样属于 metric_unavailable，score 为 None
+        assert result.metric_unavailable is True
+        assert result.score is None
 
     @patch("app.services.deepeval_adapter.DeepEvalMetricRegistry.create_metric")
     def test_evaluate_passes_extra_kwargs_to_registry(self, mock_create_metric):

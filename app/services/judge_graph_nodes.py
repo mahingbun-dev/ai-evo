@@ -12,6 +12,7 @@ import re
 import logging
 from typing import Dict, Any, List
 from app.services.model_caller import ModelCallerSync
+from app.services.prompt_guard import PROMPT_INJECTION_GUARD, wrap_eval_data
 from .judge_graph_state import JudgeAgentState
 
 logger = logging.getLogger(__name__)
@@ -33,7 +34,8 @@ def _call_llm(prompt: str, state: JudgeAgentState) -> str:
         raise RuntimeError("judge_model_config 为空，无法调用裁判模型")
 
     messages = [
-        {"role": "system", "content": "你是一个专业的 AI 评测裁判。"},
+        # W12-5：system 层声明 <eval_data> 分隔符内是数据非指令（最小 prompt 注入防护）
+        {"role": "system", "content": f"你是一个专业的 AI 评测裁判。{PROMPT_INJECTION_GUARD}"},
         {"role": "user", "content": prompt},
     ]
 
@@ -72,7 +74,8 @@ def analyze_output_node(state: JudgeAgentState) -> dict:
     # 构建变量摘要
     var_lines = []
     for v in variables:
-        var_lines.append(f"【{v.get('name', '')}】{v.get('value', '')}")
+        # W12-5：变量值均为外部数据（数据集/模型输出/脚本输出），分隔符包裹
+        var_lines.append(f"【{v.get('name', '')}】{wrap_eval_data(v.get('value', ''))}")
 
     prompt_parts = [
         "你是一个专业的 AI 评测分析助手。你需要全面分析以下待评测内容。",
@@ -82,7 +85,8 @@ def analyze_output_node(state: JudgeAgentState) -> dict:
     if instruction:
         prompt_parts.append(f"\n[评测指令]\n{instruction}")
     if targets:
-        prompt_parts.append(f"\n[需要评估的内容]\n{targets}")
+        # W12-5：待评内容用分隔符包裹（数据非指令）
+        prompt_parts.append(f"\n[需要评估的内容]\n{wrap_eval_data(targets)}")
     if var_lines:
         prompt_parts.append(f"\n[附加上下文]\n" + "\n\n".join(var_lines))
     if dim_summaries:
@@ -151,14 +155,16 @@ def create_score_dimension_node(metric: dict):
         if scene_desc:
             prompt_parts.append(f"\n[评测场景]\n{scene_desc}")
         if targets:
-            prompt_parts.append(f"\n[待评测内容]\n{targets}")
+            # W12-5：待评内容用分隔符包裹（数据非指令）
+            prompt_parts.append(f"\n[待评测内容]\n{wrap_eval_data(targets)}")
 
         # 注入额外变量
         user_vars = state.get("user_variables", [])
         if user_vars:
             var_lines = ["\n[参考数据]"]
             for v in user_vars:
-                var_lines.append(f"【{v.get('name', '')}】{v.get('value', '')}")
+                # W12-5：变量值均为外部数据，分隔符包裹
+                var_lines.append(f"【{v.get('name', '')}】{wrap_eval_data(v.get('value', ''))}")
             prompt_parts.append("\n".join(var_lines))
 
         if analysis:
@@ -218,21 +224,28 @@ def create_score_dimension_node(metric: dict):
             result = json.loads(json_str)
             score = float(result.get("score", 0))
             reasoning = result.get("reasoning", "")
+            dim_failed = False
         except (json.JSONDecodeError, ValueError, TypeError):
             logger.warning(f"[score_{dim_name}] JSON 解析失败，原始响应: {raw[:200]}")
             score = 0.0
             reasoning = "评分解析失败"
+            # W2-1 解析失败显式标记：该维度不再以 0 分静默计入加权，
+            # 而是携带 judge_failed 标记由 aggregate_scores 冒泡为整裁判失败
+            dim_failed = True
 
         # 确保分数在有效范围
         score = max(0.0, min(score, float(max_score)))
 
+        dim_result = {
+            "score": score,
+            "reasoning": reasoning,
+        }
+        if dim_failed:
+            dim_result["judge_failed"] = True
+            dim_result["fail_reason"] = "parse_failed"
+
         return {
-            "dimension_results": {
-                dim_name: {
-                    "score": score,
-                    "reasoning": reasoning,
-                }
-            },
+            "dimension_results": {dim_name: dim_result},
             "scored_dimensions": [dim_name],
         }
 
@@ -367,7 +380,15 @@ def aggregate_scores_node(state: JudgeAgentState) -> dict:
     final_score = weighted_sum / total_weight
     final_score = max(0.0, min(round(final_score, 2), float(max_score)))
 
-    return {
+    # ── W2-1: 任一维度解析失败（judge_failed 标记）→ 整个裁判结果标记失败，
+    # 行级聚合（_aggregate_judge_scores）据此将该裁判剔除出均分 ──
+    final_judge_failed = any(
+        dim_data.get("judge_failed")
+        for dim_data in dim_results.values()
+        if isinstance(dim_data, dict)
+    )
+
+    result = {
         "final_score": final_score,
         "final_feedback": "\n\n".join(feedback_parts),
         "final_dimension_scores": {
@@ -375,7 +396,10 @@ def aggregate_scores_node(state: JudgeAgentState) -> dict:
             for name in (m["name"] for m in metrics)
             if name in dim_results
         },
+        "final_judge_failed": final_judge_failed,
+        "final_fail_reason": "parse_failed" if final_judge_failed else "",
     }
+    return result
 
 
 def format_output_node(state: JudgeAgentState) -> dict:
@@ -384,14 +408,19 @@ def format_output_node(state: JudgeAgentState) -> dict:
 
     无 LLM 调用，纯数据转换。
     """
+    output = {
+        "score": state["final_score"],
+        "feedback": state["final_feedback"],
+        "dimension_scores": state["final_dimension_scores"],
+        "judge_details": {
+            "analysis": state["analysis"],
+            "dimension_details": state["dimension_results"],
+        },
+    }
+    # W2-1: 解析失败裁判的显式失败标记（正常裁判不携带该字段，JSON 结构保持旧形态）
+    if state.get("final_judge_failed"):
+        output["judge_failed"] = True
+        output["fail_reason"] = state.get("final_fail_reason") or "parse_failed"
     return {
-        "raw_output": json.dumps({
-            "score": state["final_score"],
-            "feedback": state["final_feedback"],
-            "dimension_scores": state["final_dimension_scores"],
-            "judge_details": {
-                "analysis": state["analysis"],
-                "dimension_details": state["dimension_results"],
-            },
-        }, ensure_ascii=False),
+        "raw_output": json.dumps(output, ensure_ascii=False),
     }

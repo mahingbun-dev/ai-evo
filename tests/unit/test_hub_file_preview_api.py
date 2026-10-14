@@ -42,6 +42,9 @@ from app.services.hub_file_service import (
     resolve_path_in_root,
 )
 from urllib.parse import quote
+from tests.unit.w9_direct_call import fake_request  # W9: 端点直调适配
+
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
 
 
 # ---------------------------------------------------------------------------
@@ -113,13 +116,13 @@ class TestHubFileTreeApi:
         # 解包目录指向不存在的路径，若端点触碰文件系统则会失败——证明零 IO
         record = make_record("/nonexistent/unpack/fid-1", file_index=index)
         db = make_record_db(record)
-        result = get_hub_file_tree("fid-1", db=db)
+        result = get_hub_file_tree("fid-1", request=fake_request(), db=db)
         assert result == {"file_id": "fid-1", "unpack_status": "unpacked", "file_index": index}
 
     def test_tree_unregistered_404(self):
         db = make_record_db(None)
         with pytest.raises(HTTPException) as exc:
-            get_hub_file_tree("fid-gone", db=db)
+            get_hub_file_tree("fid-gone", request=fake_request(), db=db)
         assert exc.value.status_code == 404
         assert "未登记" in exc.value.detail
         assert "fid-gone" in exc.value.detail
@@ -128,14 +131,14 @@ class TestHubFileTreeApi:
         """登记存在但解包失败：返回空索引（file_index 为 None → []）"""
         record = make_record("/nonexistent", file_index=None, unpack_status="failed")
         db = make_record_db(record)
-        result = get_hub_file_tree("fid-1", db=db)
+        result = get_hub_file_tree("fid-1", request=fake_request(), db=db)
         assert result["file_index"] == []
         assert result["unpack_status"] == "failed"
 
     def test_tree_empty_file_id_400(self):
         db = make_record_db(None)
         with pytest.raises(HTTPException) as exc:
-            get_hub_file_tree("  ", db=db)
+            get_hub_file_tree("  ", request=fake_request(), db=db)
         assert exc.value.status_code == 400
 
 
@@ -146,7 +149,7 @@ class TestHubFileTreeApi:
 class TestHubFileNestedTreeApi:
     def test_nested_tree_lists_inner_entries(self, unpack_root):
         db = make_record_db(make_record(unpack_root))
-        result = get_hub_file_nested_tree("fid-1", path="nested.zip", db=db)
+        result = get_hub_file_nested_tree("fid-1", path="nested.zip", request=fake_request(), db=db)
         assert result["file_id"] == "fid-1"
         assert result["path"] == "nested.zip"
         paths = [e["path"] for e in result["entries"]]
@@ -158,40 +161,40 @@ class TestHubFileNestedTreeApi:
         """path 非嵌套 zip（普通文本文件）→ 4xx 中文错误"""
         db = make_record_db(make_record(unpack_root))
         with pytest.raises(HTTPException) as exc:
-            get_hub_file_nested_tree("fid-1", path="logs/run.log", db=db)
+            get_hub_file_nested_tree("fid-1", path="logs/run.log", request=fake_request(), db=db)
         assert exc.value.status_code == 400
         assert "不是 zip" in exc.value.detail
 
     def test_nested_tree_binary_non_zip_400(self, unpack_root):
         db = make_record_db(make_record(unpack_root))
         with pytest.raises(HTTPException) as exc:
-            get_hub_file_nested_tree("fid-1", path="数据.xlsx", db=db)
+            get_hub_file_nested_tree("fid-1", path="数据.xlsx", request=fake_request(), db=db)
         assert exc.value.status_code == 400
 
     def test_nested_tree_directory_400(self, unpack_root):
         db = make_record_db(make_record(unpack_root))
         with pytest.raises(HTTPException) as exc:
-            get_hub_file_nested_tree("fid-1", path="logs", db=db)
+            get_hub_file_nested_tree("fid-1", path="logs", request=fake_request(), db=db)
         assert exc.value.status_code == 400
         assert "不是文件" in exc.value.detail
 
     def test_nested_tree_missing_path_404(self, unpack_root):
         db = make_record_db(make_record(unpack_root))
         with pytest.raises(HTTPException) as exc:
-            get_hub_file_nested_tree("fid-1", path="no/such.zip", db=db)
+            get_hub_file_nested_tree("fid-1", path="no/such.zip", request=fake_request(), db=db)
         assert exc.value.status_code == 404
 
     def test_nested_tree_unregistered_404(self, unpack_root):
         db = make_record_db(None)
         with pytest.raises(HTTPException) as exc:
-            get_hub_file_nested_tree("fid-gone", path="nested.zip", db=db)
+            get_hub_file_nested_tree("fid-gone", path="nested.zip", request=fake_request(), db=db)
         assert exc.value.status_code == 404
 
     def test_nested_tree_not_unpacked_404(self, unpack_root):
         """登记状态 failed：无可用解包区 → 404 提示重新导入"""
         db = make_record_db(make_record(unpack_root, unpack_status="failed"))
         with pytest.raises(HTTPException) as exc:
-            get_hub_file_nested_tree("fid-1", path="nested.zip", db=db)
+            get_hub_file_nested_tree("fid-1", path="nested.zip", request=fake_request(), db=db)
         assert exc.value.status_code == 404
         assert "重新导入" in exc.value.detail
 
@@ -203,7 +206,7 @@ class TestHubFileNestedTreeApi:
 class TestHubFileContentApi:
     def test_text_py_with_chinese(self, unpack_root):
         db = make_record_db(make_record(unpack_root))
-        result = get_hub_file_content("fid-1", path="脚本.py", db=db)
+        result = get_hub_file_content("fid-1", path="脚本.py", request=fake_request(), db=db)
         assert isinstance(result, dict)
         assert result["content"] == "print('你好')"
         assert result["mime"] == "text/x-python"
@@ -212,13 +215,13 @@ class TestHubFileContentApi:
 
     def test_text_json_mime(self, unpack_root):
         db = make_record_db(make_record(unpack_root))
-        result = get_hub_file_content("fid-1", path="meta.json", db=db)
+        result = get_hub_file_content("fid-1", path="meta.json", request=fake_request(), db=db)
         assert result["mime"] == "application/json"
         assert result["content"] == '{"a": 1}'
 
     def test_text_log_mime(self, unpack_root):
         db = make_record_db(make_record(unpack_root))
-        result = get_hub_file_content("fid-1", path="logs/run.log", db=db)
+        result = get_hub_file_content("fid-1", path="logs/run.log", request=fake_request(), db=db)
         assert result["mime"] == "text/plain"
         assert result["content"] == "日志内容"
 
@@ -228,7 +231,7 @@ class TestHubFileContentApi:
         payload = "汉" * 10 + "a" * (PREVIEW_TEXT_LIMIT + 100)
         big.write_text(payload, encoding="utf-8")
         db = make_record_db(make_record(unpack_root))
-        result = get_hub_file_content("fid-1", path="big.log", db=db)
+        result = get_hub_file_content("fid-1", path="big.log", request=fake_request(), db=db)
         assert result["truncated"] is True
         assert result["size"] == len(payload.encode("utf-8"))
         # 截断按 2MB 字节计算（前 2MB 字节按 UTF-8 容错解码）
@@ -236,13 +239,13 @@ class TestHubFileContentApi:
 
     def test_image_png_file_response(self, unpack_root):
         db = make_record_db(make_record(unpack_root))
-        result = get_hub_file_content("fid-1", path="img.png", db=db)
+        result = get_hub_file_content("fid-1", path="img.png", request=fake_request(), db=db)
         assert isinstance(result, FileResponse)
         assert result.media_type == "image/png"
 
     def test_image_svg_file_response(self, unpack_root):
         db = make_record_db(make_record(unpack_root))
-        result = get_hub_file_content("fid-1", path="pic.svg", db=db)
+        result = get_hub_file_content("fid-1", path="pic.svg", request=fake_request(), db=db)
         assert isinstance(result, FileResponse)
         assert result.media_type == "image/svg+xml"
 
@@ -251,20 +254,20 @@ class TestHubFileContentApi:
         """xlsx / zip 等二进制 → 4xx，中文提示走下载"""
         db = make_record_db(make_record(unpack_root))
         with pytest.raises(HTTPException) as exc:
-            get_hub_file_content("fid-1", path=path, db=db)
+            get_hub_file_content("fid-1", path=path, request=fake_request(), db=db)
         assert 400 <= exc.value.status_code < 500
         assert "下载" in exc.value.detail
 
     def test_missing_file_404(self, unpack_root):
         db = make_record_db(make_record(unpack_root))
         with pytest.raises(HTTPException) as exc:
-            get_hub_file_content("fid-1", path="no/such.txt", db=db)
+            get_hub_file_content("fid-1", path="no/such.txt", request=fake_request(), db=db)
         assert exc.value.status_code == 404
 
     def test_unregistered_404(self, unpack_root):
         db = make_record_db(None)
         with pytest.raises(HTTPException) as exc:
-            get_hub_file_content("fid-gone", path="meta.json", db=db)
+            get_hub_file_content("fid-gone", path="meta.json", request=fake_request(), db=db)
         assert exc.value.status_code == 404
 
 
@@ -276,7 +279,7 @@ class TestHubFileDownloadApi:
     def test_download_chinese_filename_url_encoded(self, unpack_root):
         """中文文件名按 dataset_api 模板下载同一模式做 URL 编码"""
         db = make_record_db(make_record(unpack_root))
-        resp = download_hub_file("fid-1", path="数据.xlsx", db=db)
+        resp = download_hub_file("fid-1", path="数据.xlsx", request=fake_request(), db=db)
         assert isinstance(resp, FileResponse)
         encoded = quote("数据.xlsx")
         disposition = resp.headers["content-disposition"]
@@ -285,29 +288,34 @@ class TestHubFileDownloadApi:
         assert "数据.xlsx" not in disposition  # 原始中文名不裸出现在 header
 
     def test_download_media_type_by_ext(self, unpack_root):
+        """media_type 按扩展名推断（mimetypes 内建表，跨环境稳定）"""
         db = make_record_db(make_record(unpack_root))
-        resp = download_hub_file("fid-1", path="logs/run.log", db=db)
-        assert resp.media_type == "text/plain"
-        resp2 = download_hub_file("fid-1", path="img.png", db=db)
-        assert resp2.media_type == "image/png"
+        # W8 修复：原断言用 .log → text/plain，该映射来自系统 mime db
+        # （/etc/mime.types），python:3.12-slim 离线镜像与生产镜像都没有它
+        # （实测 guess_type('run.log') → None → 落 octet-stream）。改用
+        # Python mimetypes 内建表覆盖的扩展名断言，CI 与生产环境行为一致。
+        resp = download_hub_file("fid-1", path="img.png", request=fake_request(), db=db)
+        assert resp.media_type == "image/png"
+        resp2 = download_hub_file("fid-1", path="meta.json", request=fake_request(), db=db)
+        assert resp2.media_type == "application/json"
 
     def test_download_nested_zip(self, unpack_root):
         """嵌套 zip 本身可整包下载"""
         db = make_record_db(make_record(unpack_root))
-        resp = download_hub_file("fid-1", path="nested.zip", db=db)
+        resp = download_hub_file("fid-1", path="nested.zip", request=fake_request(), db=db)
         assert isinstance(resp, FileResponse)
         assert resp.media_type == "application/zip"
 
     def test_download_missing_404(self, unpack_root):
         db = make_record_db(make_record(unpack_root))
         with pytest.raises(HTTPException) as exc:
-            download_hub_file("fid-1", path="nope.bin", db=db)
+            download_hub_file("fid-1", path="nope.bin", request=fake_request(), db=db)
         assert exc.value.status_code == 404
 
     def test_download_unregistered_404(self, unpack_root):
         db = make_record_db(None)
         with pytest.raises(HTTPException) as exc:
-            download_hub_file("fid-gone", path="meta.json", db=db)
+            download_hub_file("fid-gone", path="meta.json", request=fake_request(), db=db)
         assert exc.value.status_code == 404
 
 
@@ -329,7 +337,7 @@ class TestHubMatchPreviewApi:
         ]
         db = self._db(unpack_root, rows=rows)
         body = HubMatchPreviewRequest(dataset_id="ds-1", field_name="cases_file", pattern="**/*.log")
-        result = match_preview(body, db=db)
+        result = match_preview(body, request=fake_request(), db=db)
         assert result["file_id"] == "fid-1"
         assert result["sample_data_index"] == 3
         assert result["matched_count"] == 1
@@ -348,7 +356,7 @@ class TestHubMatchPreviewApi:
         rows = [SimpleNamespace(index=0, data={"cases_file": "fid-1"})]
         db = self._db(root, rows=rows)
         body = HubMatchPreviewRequest(dataset_id="ds-1", field_name="cases_file", pattern="logs/*.log")
-        result = match_preview(body, db=db)
+        result = match_preview(body, request=fake_request(), db=db)
         assert result["matched_count"] == 30
         assert len(result["sample_paths"]) == 20
         assert result["sample_paths"][0] == "logs/f00.log"
@@ -357,7 +365,7 @@ class TestHubMatchPreviewApi:
         rows = [SimpleNamespace(index=0, data={"cases_file": "fid-1"})]
         db = self._db(unpack_root, rows=rows)
         body = HubMatchPreviewRequest(dataset_id="ds-1", field_name="cases_file", pattern="**/*.rs")
-        result = match_preview(body, db=db)
+        result = match_preview(body, request=fake_request(), db=db)
         assert result["matched_count"] == 0
         assert result["sample_paths"] == []
         assert result["sample_data_index"] == 0
@@ -371,7 +379,7 @@ class TestHubMatchPreviewApi:
         ):
             db = self._db(unpack_root, rows=rows)
             body = HubMatchPreviewRequest(dataset_id="ds-1", field_name="cases_file", pattern="*.log")
-            result = match_preview(body, db=db)
+            result = match_preview(body, request=fake_request(), db=db)
             assert result["matched_count"] == 0
             assert result["sample_paths"] == []
             assert result["sample_data_index"] is None
@@ -384,7 +392,7 @@ class TestHubMatchPreviewApi:
         db = make_preview_db(rows=rows, record=None)
         body = HubMatchPreviewRequest(dataset_id="ds-1", field_name="cases_file", pattern="*.log")
         with pytest.raises(HTTPException) as exc:
-            match_preview(body, db=db)
+            match_preview(body, request=fake_request(), db=db)
         assert exc.value.status_code == 404
         assert "fid-gone" in exc.value.detail
         assert "重新导入" in exc.value.detail
@@ -395,7 +403,7 @@ class TestHubMatchPreviewApi:
         db = self._db(unpack_root, rows=rows)
         body = HubMatchPreviewRequest(dataset_id="ds-1", field_name="cases_file", pattern="   ")
         with pytest.raises(HTTPException) as exc:
-            match_preview(body, db=db)
+            match_preview(body, request=fake_request(), db=db)
         assert exc.value.status_code == 400
         assert "不能为空" in exc.value.detail
 
@@ -405,7 +413,7 @@ class TestHubMatchPreviewApi:
         db = self._db(unpack_root, rows=rows)
         body = HubMatchPreviewRequest(dataset_id="ds-1", field_name="cases_file", pattern="../**/*.log")
         with pytest.raises(HTTPException) as exc:
-            match_preview(body, db=db)
+            match_preview(body, request=fake_request(), db=db)
         assert exc.value.status_code == 400
         assert "穿越" in exc.value.detail
 
@@ -450,7 +458,7 @@ class TestPathTraversalAttacks:
         """.. / 绝对路径 / 编码字面量一律 4xx，绝不读到包外 secret.txt"""
         db = make_record_db(make_record(unpack_root))
         with pytest.raises(HTTPException) as exc:
-            endpoint("fid-1", path=attack, db=db)
+            endpoint("fid-1", request=fake_request(), path=attack, db=db)
         assert 400 <= exc.value.status_code < 500, (
             f"{endpoint_name} 对攻击路径 {attack!r} 应返回 4xx，实际 {exc.value.status_code}"
         )
@@ -462,7 +470,7 @@ class TestPathTraversalAttacks:
         decoded = "%2e%2e%2fsecret.txt".replace("%2e%2e%2f", "../")
         assert decoded == "../secret.txt"
         with pytest.raises(HTTPException) as exc:
-            endpoint("fid-1", path=decoded, db=db)
+            endpoint("fid-1", request=fake_request(), path=decoded, db=db)
         assert 400 <= exc.value.status_code < 500
 
     @pytest.mark.parametrize("endpoint_name,endpoint", PATH_ENDPOINTS, ids=[n for n, _ in PATH_ENDPOINTS])
@@ -475,7 +483,7 @@ class TestPathTraversalAttacks:
             pytest.skip("当前环境无法创建 symlink")
         db = make_record_db(make_record(unpack_root))
         with pytest.raises(HTTPException) as exc:
-            endpoint("fid-1", path="leak.txt", db=db)
+            endpoint("fid-1", request=fake_request(), path="leak.txt", db=db)
         assert 400 <= exc.value.status_code < 500
         assert "越出执行包范围" in exc.value.detail
 
@@ -483,7 +491,7 @@ class TestPathTraversalAttacks:
     def test_empty_path_rejected(self, unpack_root, endpoint_name, endpoint):
         db = make_record_db(make_record(unpack_root))
         with pytest.raises(HTTPException) as exc:
-            endpoint("fid-1", path="", db=db)
+            endpoint("fid-1", request=fake_request(), path="", db=db)
         assert 400 <= exc.value.status_code < 500
 
 
@@ -645,6 +653,6 @@ class TestSingleTopDirAutoPrefix:
         db = make_preview_db(rows=rows, record=record)
         body = HubMatchPreviewRequest(dataset_id="ds-1", field_name="cases_file",
                                       pattern="reports/allure_results/*.json")
-        result = match_preview(body, db=db)
+        result = match_preview(body, request=fake_request(), db=db)
         assert result["matched_count"] == 2
         assert result["sample_paths"][0].endswith("r1-result.json")

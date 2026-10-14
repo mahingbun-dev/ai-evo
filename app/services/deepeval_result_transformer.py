@@ -20,12 +20,17 @@ class TransformedMetricResult:
     """转换后的单个指标结果"""
     metric_key: str
     metric_name: str
-    score: float = 0.0
+    # W16 异常语义修正：适配失败（指标不存在/网关异常等）时 score 为 None
+    # （无分数），不再伪装 0.0；正常评测路径仍为 float
+    score: Optional[float] = 0.0
     reason: Optional[str] = None
     success: bool = False
     score_breakdown: Optional[Dict[str, Any]] = None
     verdicts: Optional[List[Dict[str, str]]] = None
     error: Optional[str] = None
+    # W16：适配失败标记——True 表示该指标本次未产出有效评分（指标不存在、
+    # 平台网关异常、配置解析失败等），下游不得把此类结果当 0 分参与统计
+    metric_unavailable: bool = False
 
 
 @dataclass
@@ -63,6 +68,11 @@ class DeepEvalResultTransformer:
         success = getattr(metric_result, "success", None)
         score_breakdown = getattr(metric_result, "score_breakdown", None)
         error = getattr(metric_result, "error", None)
+        # W16 复核修复：重建对象时必须保留 metric_unavailable 标记——
+        # transform_to_evaluation_result 对输入再走一遍本方法重建，
+        # 丢失该标记会让 dimension_scores 恒 False，下游无法区分
+        # 「真 0 分」与「指标不可用」
+        metric_unavailable = getattr(metric_result, "metric_unavailable", False)
 
         # 处理 score 为 None 的情况，默认 0.0
         if score is None:
@@ -92,6 +102,7 @@ class DeepEvalResultTransformer:
             score_breakdown=score_breakdown,
             verdicts=verdicts,
             error=error,
+            metric_unavailable=metric_unavailable,
         )
 
     @staticmethod
@@ -140,13 +151,16 @@ class DeepEvalResultTransformer:
             )
 
             # 将 score 映射到 max_score 分制
-            mapped_score = transformed.score * max_score
+            # W16：metric_unavailable 结果的 score 为 None（无分数），
+            # 聚合口径维持既有约定按 0 参与，不因 None 崩溃
+            mapped_score = (transformed.score or 0.0) * max_score
 
             dimension_scores[key] = {
                 "score": mapped_score,
                 "name": name,
                 "success": transformed.success,
                 "reason": transformed.reason,
+                "metric_unavailable": transformed.metric_unavailable,
             }
 
             scores_for_weighted[key] = mapped_score

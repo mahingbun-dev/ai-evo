@@ -117,15 +117,25 @@ class ClaudeCodeJudgeAgent:
                     results.append(future.result())
                 except Exception as e:
                     logger.error(f"[CCJudge] 并行执行中裁判 {futures[future]} 失败: {e}")
+                    # W2-1 失败显式标记：score 置 None + judge_failed=True，
+                    # 行级聚合据此剔除出均分（与 JudgeLangGraphAgent 口径一致）
                     results.append({
-                        "score": 0,
+                        "score": None,
                         "feedback": f"Claude Code 裁判执行失败: {e}",
                         "dimension_scores": {},
+                        "judge_failed": True,
+                        "fail_reason": "llm_error",
                     })
 
+        # W2-1: 失败裁判 score 为 None，日志均值只统计有效分数（与聚合口径一致）
+        valid_scores = [
+            r["score"] for r in results
+            if not r.get("judge_failed") and isinstance(r.get("score"), (int, float))
+        ]
+        avg_text = f"{sum(valid_scores) / len(valid_scores):.2f}" if valid_scores else "N/A"
         logger.info(
             f"[CCJudge] {judge_count} 个 Claude Code 裁判完成，"
-            f"平均分: {sum(r.get('score', 0) for r in results) / len(results):.2f}"
+            f"失败 {len(results) - len(valid_scores)} 个，平均分: {avg_text}"
         )
         return results
 
@@ -159,10 +169,15 @@ class ClaudeCodeJudgeAgent:
                     trace.update(output={"error": str(e)})
                 except Exception:
                     pass
+            # W2-1 失败显式标记（与 run_parallel 异常分支口径一致）；
+            # harness 两次 JSON 解析失败抛 "无法解析为 JSON" → parse_failed，其余为 llm_error
+            fail_reason = "parse_failed" if "无法解析为 JSON" in str(e) else "llm_error"
             result = {
-                "score": 0,
+                "score": None,
                 "feedback": f"Claude Code 裁判执行失败: {e}",
                 "dimension_scores": {},
+                "judge_failed": True,
+                "fail_reason": fail_reason,
             }
             if trace_id:
                 result["langfuse_trace_id"] = trace_id

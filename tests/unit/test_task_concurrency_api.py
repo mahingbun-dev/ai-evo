@@ -10,6 +10,9 @@ from fastapi import HTTPException
 
 from app.api.evaluation_task_api import run_task
 from app.api.batch_operations_api import batch_run_tasks, BatchRunRequest
+from tests.unit.w9_direct_call import fake_request  # W9: 端点直调适配
+
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
 
 
 def _mock_task(status="pending"):
@@ -28,9 +31,11 @@ class TestRunTaskConcurrency:
             mock_service = MagicMock()
             mock_cls.return_value = mock_service
             mock_service.get_task.return_value = _mock_task(status="running")
+            # W9：存在性/归属由 ensure_task_access 承担，查询链返回预置任务
+            mock_db.query.return_value.filter.return_value.first.return_value = _mock_task(status="running")
 
             with pytest.raises(HTTPException) as excinfo:
-                run_task("task_xxx", mock_db)
+                run_task("task_xxx", fake_request(), db=mock_db)
 
             assert excinfo.value.status_code == 400
             mock_service.start_task.assert_not_called()
@@ -44,11 +49,12 @@ class TestRunTaskConcurrency:
             mock_service = MagicMock()
             mock_cls.return_value = mock_service
             mock_service.get_task.return_value = _mock_task(status="pending")
+            mock_db.query.return_value.filter.return_value.first.return_value = _mock_task(status="pending")
             # 并发场景：另一个请求已把任务置为 running
             mock_service.start_task.return_value = None
 
             with pytest.raises(HTTPException) as excinfo:
-                run_task("task_xxx", mock_db)
+                run_task("task_xxx", fake_request(), db=mock_db)
 
             assert excinfo.value.status_code == 400
             mock_service.start_task.assert_called_once_with("task_xxx")
@@ -64,10 +70,11 @@ class TestRunTaskConcurrency:
             pending = _mock_task(status="pending")
             running = _mock_task(status="running")
             mock_service.get_task.return_value = pending
+            mock_db.query.return_value.filter.return_value.first.return_value = pending
             mock_service.start_task.return_value = running
             mock_sched.return_value.submit_task.return_value = True
 
-            result = run_task("task_xxx", mock_db)
+            result = run_task("task_xxx", fake_request(), db=mock_db)
 
             assert result is running
             mock_sched.return_value.submit_task.assert_called_once_with("task_xxx")
@@ -86,7 +93,7 @@ class TestBatchRunConcurrency:
             mock_service.start_task.return_value = None
 
             body = BatchRunRequest(task_ids=["task_xxx"])
-            result = batch_run_tasks(body, mock_db)
+            result = batch_run_tasks(body, fake_request(), db=mock_db)
 
             assert result["total"] == 1
             assert result["success"] == 0
@@ -103,11 +110,12 @@ class TestBatchRunConcurrency:
             pending = _mock_task(status="pending")
             running = _mock_task(status="running")
             mock_service.get_task.return_value = pending
+            mock_db.query.return_value.filter.return_value.first.return_value = pending
             mock_service.start_task.return_value = running
             mock_sched.return_value.submit_task.return_value = True
 
             body = BatchRunRequest(task_ids=["task_xxx"])
-            result = batch_run_tasks(body, mock_db)
+            result = batch_run_tasks(body, fake_request(), db=mock_db)
 
             assert result["total"] == 1
             assert result["success"] == 1

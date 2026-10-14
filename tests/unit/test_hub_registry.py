@@ -33,6 +33,8 @@ from app.services.hub_file_service import (
     unpack_zip_safely,
 )
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 SESSION_ID = "sess-registry-1"
 ENDPOINT = "http://hub.test/mcp"
 
@@ -150,7 +152,46 @@ def make_db(first=None, added=None):
     db.query.return_value.filter.return_value.first.return_value = first
     if added is not None:
         db.add.side_effect = lambda obj: added.append(obj)
+    _install_w11_ref_stmts(db, first)
     return db
+
+
+def _install_w11_ref_stmts(db, record):
+    """W11 原子 ref 语句模拟：Update ±1（CASE 下限 0）/ 归零条件 Delete / Select 回读
+
+    acquire_ref/release_ref 已改为 SQL 端单语句原子更新（不再读写 ORM 对象），
+    替身按编译语句作用于 record，使计数语义在单元层可见；真实 SQL 并发正确性
+    由 tests/integration/test_hub_import_concurrency.py 覆盖。归零条件删除以
+    db.hub_zero_deleted 标记（替代旧 db.delete(record) 断言）。
+    """
+    from types import SimpleNamespace
+
+    from sqlalchemy import Delete, Select, Update
+
+    def _execute(stmt, *args, **kwargs):
+        if isinstance(stmt, Update) and getattr(stmt.table, "name", None) == "hub_files":
+            if record is None:
+                return SimpleNamespace(rowcount=0)
+            sql = str(stmt.compile())
+            count = int(record.ref_count or 0)
+            if "CASE" in sql.upper():
+                record.ref_count = max(0, count - 1)
+            elif "+" in sql:
+                record.ref_count = count + 1
+            else:
+                record.ref_count = max(0, count - 1)
+            return SimpleNamespace(rowcount=1)
+        if isinstance(stmt, Delete) and getattr(stmt.table, "name", None) == "hub_files":
+            if record is not None and int(record.ref_count or 0) == 0:
+                db.hub_zero_deleted = True
+                return SimpleNamespace(rowcount=1)
+            return SimpleNamespace(rowcount=0)
+        if isinstance(stmt, Select):
+            value = (record.ref_count if record is not None else 0) or 0
+            return SimpleNamespace(scalar=lambda: value)
+        return MagicMock()
+
+    db.execute.side_effect = _execute
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +204,7 @@ class TestHubFileRecordModel:
         "hub_created_at", "unpack_dir", "unpack_status", "unpack_error",
         "file_count", "total_size", "ref_count", "file_index",
         "supplement_index", "created_at", "updated_at",
+        "team_code",  # W9 IDOR 收口：团队归属（导入时从数据集继承）
     }
 
     def test_table_name_and_columns(self):
@@ -546,15 +588,14 @@ class TestRefCounts:
         db.delete.assert_not_called()
 
     def test_release_to_zero_cleans_dir_and_record(self, tmp_path, cache_root):
-        """归零：清理解包目录并删除登记记录"""
+        """归零：清理解包目录并条件删除登记记录（DELETE ... WHERE ref_count = 0 命中）"""
         rec = self._record(tmp_path, ref_count=1)
         unpack_dir = tmp_path / "ds" / "fid-ref"
         db = make_db(first=rec)
 
         assert release_ref(db, "fid-ref") == 0
         assert not unpack_dir.exists(), "归零后解包目录应被清理"
-        db.delete.assert_called_once()
-        assert db.delete.call_args.args[0] is rec
+        assert getattr(db, "hub_zero_deleted", False) is True, "归零条件删除应命中"
 
     # ----- 小项1：归零联动清理下载缓存目录 uploads/hub_files/{file_id}/ -----
 
@@ -587,11 +628,11 @@ class TestRefCounts:
         assert (cache_dir / "pkg.zip").is_file()
 
     def test_release_to_zero_cache_dir_missing_is_noop(self, tmp_path, cache_root):
-        """归零但缓存目录本就不存在：no-op 不报错（登记记录仍正常删除）"""
+        """归零但缓存目录本就不存在：no-op 不报错（登记记录仍正常条件删除）"""
         rec = self._record(tmp_path, ref_count=1)
         db = make_db(first=rec)
         assert release_ref(db, "fid-ref") == 0
-        db.delete.assert_called_once()
+        assert getattr(db, "hub_zero_deleted", False) is True
 
     def test_acquire_unregistered_raises(self, tmp_path):
         """未登记文件 acquire：中文报错"""

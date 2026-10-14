@@ -4,6 +4,9 @@ from app.hub_plugin.result_summary import (
     summarize_result,
 )
 
+import pytest
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 def _full_result(n_items=90, n_failed=25) -> dict:
     return {

@@ -1,13 +1,18 @@
 """
 评测任务管理服务
 """
+import json
+import time
 import uuid
 import logging
+import threading
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone, timedelta
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import OperationalError, IntegrityError
 from sqlalchemy import func
+import redis
+from app.core.config import get_settings
 from app.models.task_models import EvaluationTask, TaskExecutionLog, TaskExecutionRecord
 
 logger = logging.getLogger(__name__)
@@ -19,6 +24,49 @@ BEIJING_TZ = timezone(timedelta(hours=8))
 def beijing_now():
     """获取当前北京时间"""
     return datetime.now(BEIJING_TZ)
+
+
+# 模块级 Redis 发布客户端：状态更新是高频调用（start/stop/complete/fail/progress），
+# 复用内建连接池的进程级单例，避免每次 publish 都 redis.from_url 新建连接。
+# 惰性创建，celery prefork worker 在 fork 后首次 publish 才建连。
+_redis_publisher: Optional["redis.Redis"] = None
+_redis_publisher_lock = threading.Lock()
+
+
+def _get_redis_publisher() -> "redis.Redis":
+    """获取模块级 Redis 发布客户端（内建连接池，进程内复用连接）"""
+    global _redis_publisher
+    with _redis_publisher_lock:
+        if _redis_publisher is None:
+            _redis_publisher = redis.from_url(get_settings().REDIS_URL)
+        return _redis_publisher
+
+
+# ---------------- W10-4 心跳写库节流 ----------------
+
+# 同任务两次心跳写库的最小间隔（秒）。收尸 reaper 阈值 15 分钟，分钟级心跳
+# 足够；行级完成高频时避免每行一次额外 UPDATE/commit（也避免拖慢主落库循环）
+HEARTBEAT_MIN_INTERVAL_SECONDS = 60.0
+# 节流表容量上限：超过即清理过期项（worker 常驻进程防无界增长）
+_HEARTBEAT_TABLE_MAX = 4096
+
+_heartbeat_last_write: Dict[str, float] = {}
+_heartbeat_lock = threading.Lock()
+
+
+def _heartbeat_throttled(task_id: str) -> bool:
+    """节流判定：距该任务上次心跳写库不足间隔时返回 True（并登记本次意图）"""
+    now = time.monotonic()
+    with _heartbeat_lock:
+        if len(_heartbeat_last_write) > _HEARTBEAT_TABLE_MAX:
+            for k in [k for k, t in _heartbeat_last_write.items()
+                      if now - t > HEARTBEAT_MIN_INTERVAL_SECONDS]:
+                _heartbeat_last_write.pop(k, None)
+        last = _heartbeat_last_write.get(task_id)
+        if last is not None and (now - last) < HEARTBEAT_MIN_INTERVAL_SECONDS:
+            return True
+        _heartbeat_last_write[task_id] = now
+        return False
 
 
 class EvaluationTaskService:
@@ -40,13 +88,9 @@ class EvaluationTaskService:
         return self.log_service.add_log(task_id, level, message, details)
 
     def _publish_status_update(self, task: EvaluationTask):
-        """发布任务状态更新到 Redis Pub/Sub"""
+        """发布任务状态更新到 Redis Pub/Sub（复用模块级连接池）"""
         try:
-            import redis
-            import json
-            from app.core.config import get_settings
-            settings = get_settings()
-            r = redis.from_url(settings.REDIS_URL)
+            r = _get_redis_publisher()
             message = {
                 "type": "status_update",
                 "task_id": task.id,
@@ -102,7 +146,8 @@ class EvaluationTaskService:
     ) -> EvaluationTask:
         """创建评测任务"""
         # 验证评测类型
-        valid_evaluation_types = ["judge", "consistency", "success_rate", "rag", "binary_classification", "agent"]
+        # W12-2：latency 白名单激活（执行/聚合/导出链早已就绪，此前仅因白名单缺席被拒）
+        valid_evaluation_types = ["judge", "consistency", "success_rate", "rag", "binary_classification", "agent", "latency"]
         if evaluation_type not in valid_evaluation_types:
             raise ValueError(f"不支持的评测类型: {evaluation_type}，可选值: {valid_evaluation_types}")
 
@@ -145,13 +190,26 @@ class EvaluationTaskService:
             evaluation_targets,
         )
 
+        # W4（P0-C）配置快照：创建时对被评测模型（model_provider）与裁判模型
+        # （judge_model）各做一次深拷贝快照，写入 task.model_config /
+        # task.judge_model_config。快照只含口径字段+掩码凭据（严禁明文
+        # api_key/auth_config），执行时「快照优先、实时回退」。
+        # model_config 显式传参时透传优先（现网前端不传该字段，快照为主路径）
+        from app.services.config_snapshot import build_model_config_snapshot
+
+        effective_model_config = (
+            model_config if model_config
+            else build_model_config_snapshot(self.db, model_provider)
+        )
+        judge_model_config_snapshot = build_model_config_snapshot(self.db, judge_model)
+
         task = EvaluationTask(
             id=task_id,
             name=name,
             description=description,
             evaluation_type=evaluation_type,
             status="pending",
-            model_config=model_config,
+            model_config=effective_model_config,
             model_provider=model_provider,
             model_endpoint=model_endpoint,
             dataset_id=dataset_id,
@@ -165,6 +223,9 @@ class EvaluationTaskService:
             binary_metrics_config=binary_metrics_config,
             multi_judge_config=multi_judge_config,
             judge_count=judge_count,
+            # W4：创建时裁判配置快照（judge_model 为空时为 None，
+            # claude_agent 引擎裁判走 CC 全局配置不消费该字段）
+            judge_model_config=judge_model_config_snapshot,
             parallel_config=parallel_config,
             evaluation_scene=evaluation_scene,
             scene_desc=scene_desc,
@@ -274,6 +335,32 @@ class EvaluationTaskService:
         for key, value in kwargs.items():
             if hasattr(task, key):
                 setattr(task, key, value)
+
+        # W4（P0-C）：显式切换被评测/裁判模型时同步刷新配置快照——任务编辑是
+        # 明确的口径变更意图，快照必须跟随，否则「编辑切模型不生效」。
+        # 快照已固定同一 model_id 时不重建：表单回传同值不应重置口径锚点
+        # （改 ModelConfig 后重跑旧任务口径不变）；存量任务（无快照）首次
+        # 显式携带模型字段时按当前配置补建快照（非迁移回填）。
+        from app.services.config_snapshot import build_model_config_snapshot
+
+        def _pinned_model_id(snapshot) -> Optional[str]:
+            return snapshot.get("model_id") if isinstance(snapshot, dict) else None
+
+        if "model_provider" in kwargs:
+            if (task.model_provider or None) != _pinned_model_id(task.model_config):
+                task.model_config = build_model_config_snapshot(self.db, task.model_provider)
+        if "judge_model" in kwargs:
+            if (task.judge_model or None) != _pinned_model_id(task.judge_model_config):
+                task.judge_model_config = build_model_config_snapshot(self.db, task.judge_model)
+
+        # W12-1：评分标准口径变更后失效 judge 图缓存。图拓扑由 evaluation_metrics
+        # 编译并被 JudgeLangGraphAgent 类级缓存按 task.id 复用（judge_prompt 虽不进
+        # 拓扑，但同为评分口径字段，一并失效以覆盖未来缓存扩展）。显式携带即视为
+        # 口径变更意图，同值重编译代价可忽略，避免逐字段深比较的误判风险。
+        if "evaluation_metrics" in kwargs or "judge_prompt" in kwargs:
+            from app.services.judge_langgraph_agent import JudgeLangGraphAgent
+
+            JudgeLangGraphAgent.clear_cache(task.id)
 
         self.db.commit()
         self.db.refresh(task)
@@ -617,13 +704,17 @@ class EvaluationTaskService:
         exec_service = TaskExecutionRecordService(self.db)
         exec_service.create_record(task_id, task.execution_count)
 
-        # 创建统计记录
+        # 创建统计记录（model_config_id：W4 快照统一存 ModelConfig.id 于
+        # model_id 键；旧调用 .get("id") 在快照/实时两条路径下均为空，按快照键取值）
         from app.services.stats_service import StatsService
         stats_service = StatsService(self.db)
         stats_service.create_record(
             task_id=task_id,
             evaluation_type=task.evaluation_type,
-            model_config_id=task.model_config.get("id") if task.model_config else None,
+            model_config_id=(
+                task.model_config.get("model_id")
+                if isinstance(task.model_config, dict) else None
+            ),
             dataset_id=task.dataset_id,
         )
         stats_service.start_record(task_id)
@@ -647,9 +738,15 @@ class EvaluationTaskService:
         self.db.commit()
         self.db.refresh(task)
 
-        # 同步更新执行历史记录（保留停止时的部分结果）
+        # 同步更新执行历史记录（W3/P0-E：partial_result 改从行级表取本轮已完成行——
+        # 旧语义存 task.result，执行期为上一轮结果，本轮停止即全丢）
         exec_service = TaskExecutionRecordService(self.db)
-        exec_service.stop_record(task_id, task.execution_count or 1, partial_result=task.result)
+        execution_number = task.execution_count or 1
+        exec_service.stop_record(
+            task_id,
+            execution_number,
+            partial_result=self._build_partial_result_from_rows(task, execution_number),
+        )
 
         # 更新统计记录
         from app.services.stats_service import StatsService
@@ -659,6 +756,28 @@ class EvaluationTaskService:
         self.add_log(task_id, "info", "任务已停止")
         self._publish_status_update(task)
         return task
+
+    def _build_partial_result_from_rows(self, task: EvaluationTask, execution_number: int) -> Optional[Dict[str, Any]]:
+        """从行级表聚合本轮已完成行的部分结果（W3 stop_task 专用，P0-E）
+
+        - 行级表只存终态行（write-through），全量即本轮已完成部分；
+        - 表无行（本轮尚未评出任何行/表不可用/迁移未执行）时返回 None——
+          诚实反映「本轮无部分结果」，不再错误回填上一轮 task.result；
+        - 聚合与 complete 同口径（ResultAggregator.aggregate_for_task），
+          result JSON 同构，前端无需改动。
+        """
+        from app.services.evaluation_result_service import load_execution_results
+
+        rows = load_execution_results(self.db, task.id, execution_number)
+        if not rows:
+            return None
+        try:
+            from app.services.result_aggregator import ResultAggregator
+
+            return ResultAggregator.aggregate_for_task(task, rows)
+        except Exception as e:  # noqa: BLE001 - 部分结果聚合失败不影响停止主流程
+            logger.warning(f"[RowPersist] 行级部分结果聚合失败 task={task.id}: {e}")
+            return None
 
     def complete_task(
         self,
@@ -847,6 +966,80 @@ class EvaluationTaskService:
         finally:
             new_db.close()
 
+    # ---------- W10-4 执行心跳与启动收尸 reaper ----------
+
+    def touch_heartbeat(
+        self, task_id: str, execution_number: Optional[int] = None, force: bool = False
+    ) -> None:
+        """刷新当前执行记录心跳（W10-4：每批评测完成后调用）
+
+        节流：同任务两次心跳写库最小间隔 HEARTBEAT_MIN_INTERVAL_SECONDS——
+        收尸 reaper 阈值 15 分钟，分钟级心跳足够；行级完成高频时避免每行
+        一次额外 UPDATE/commit。任务执行开始的首跳用 force=True 绕过节流。
+        execution_number 缺失（非任务执行链路）时跳过。
+        """
+        if not execution_number:
+            return
+        if not force and _heartbeat_throttled(task_id):
+            return
+        try:
+            TaskExecutionRecordService(self.db).touch_heartbeat(task_id, execution_number)
+        except Exception as e:  # noqa: BLE001 - 心跳缺失只影响收尸判定，不阻断评测
+            logger.warning(f"刷新执行心跳失败（task_id={task_id}）: {e}")
+
+    def fail_stale_running_tasks(self, max_age_seconds: int = 15 * 60) -> List[str]:
+        """启动期收尸 reaper（W10-4）：仅将「心跳超时」的 running 任务标 failed
+
+        背景：API lifespan 原实现把所有 running 任务一律标 failed——部署重启
+        期间 worker 正在执行的任务会被误标（任务实际还在跑完写回）。
+
+        判定口径：任务 status=running，且其当前执行记录（execution_number 与
+        任务 execution_count 对齐）status=running、heartbeat_at 非 NULL 且早于
+        cutoff（now - max_age_seconds）。heartbeat_at 为 NULL（排队中尚未开跑、
+        或旧版本 worker 写入的记录）一律跳过——保守方向：宁可漏收，不误杀。
+
+        Returns:
+            被标 failed 的任务 id 列表
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=max_age_seconds)
+        # 只对 id 列 distinct（evaluation_tasks 含 JSON 列，整行 DISTINCT 在 PG
+        # 无等值算子）；(task_id, execution_number) 业务上唯一，去重仅为防御。
+        # 执行序号与执行链路同口径：execution_count or 1（0/NULL 视为 1）。
+        stale_ids = [
+            row[0] for row in (
+                self.db.query(EvaluationTask.id)
+                .join(
+                    TaskExecutionRecord,
+                    (TaskExecutionRecord.task_id == EvaluationTask.id)
+                    & (TaskExecutionRecord.execution_number
+                       == func.coalesce(func.nullif(EvaluationTask.execution_count, 0), 1)),
+                )
+                .filter(
+                    EvaluationTask.status == "running",
+                    TaskExecutionRecord.status == "running",
+                    TaskExecutionRecord.heartbeat_at.isnot(None),
+                    TaskExecutionRecord.heartbeat_at < cutoff,
+                )
+                .distinct()
+                .all()
+            )
+        ]
+        if not stale_ids:
+            return []
+
+        reaped: List[str] = []
+        for task_id in stale_ids:
+            try:
+                self.fail_task(
+                    task_id,
+                    f"执行心跳超时（>{max_age_seconds // 60} 分钟无进展），"
+                    "启动收尸判定任务已死（W10-4 reaper）",
+                )
+                reaped.append(task_id)
+            except Exception as e:  # noqa: BLE001 - 单个任务收尸失败不影响其余
+                logger.warning(f"收尸任务 {task_id} 失败: {e}")
+        return reaped
+
     def update_progress(
         self,
         task_id: str,
@@ -919,14 +1112,18 @@ class TaskExecutionLogService:
         return log
 
     def _retry_add_log(self, log: TaskExecutionLog, max_retries: int = 2):
-        """重试添加日志，通过清空连接池确保获取新连接"""
-        from app.db.session import engine, SessionLocal
+        """重试添加日志（换新会话重试，不再 dispose 全局连接池）
+
+        W10-5：原实现每次重试 engine.dispose()——dispose 会把整个进程的
+        连接池清空，其它并发线程正在使用的健康连接一并作废，评测高峰期会
+        放大成批量数据库异常。pool_pre_ping 已负责剔除失效连接，重试只需
+        换新会话拿到健康连接。
+        """
+        from app.db.session import SessionLocal
 
         for attempt in range(max_retries):
             try:
-                # dispose 连接池，清除所有无效连接
-                engine.dispose()
-                # 获取新会话
+                # 获取新会话重试
                 new_db = SessionLocal()
                 try:
                     new_db.add(log)
@@ -939,8 +1136,6 @@ class TaskExecutionLogService:
                 logger.warning(f"重试记录日志失败（尝试 {attempt + 1}/{max_retries}）: {retry_e}")
                 if attempt == max_retries - 1:
                     logger.error(f"重试日志记录最终失败: {retry_e}")
-                else:
-                    engine.dispose()  # 再次清空连接池后重试
 
     def get_logs(
         self,
@@ -974,6 +1169,8 @@ class TaskExecutionRecordService:
             execution_number=execution_number,
             status="running",
         )
+        # W4：执行开始把创建时双快照写入 config_snapshot（归因锚点「应然」面）
+        self._attach_start_config_snapshot(record)
         self.db.add(record)
         self.db.commit()
         return record
@@ -984,6 +1181,68 @@ class TaskExecutionRecordService:
             TaskExecutionRecord.task_id == task_id,
             TaskExecutionRecord.execution_number == execution_number,
         ).first()
+
+    def touch_heartbeat(self, task_id: str, execution_number: int) -> None:
+        """刷新当前执行记录心跳（W10-4 收尸 reaper 判定依据：每批评测完成后调用）
+
+        仅更新 status=running 的执行记录（终态记录的心跳无意义）；记录缺失
+        静默跳过。失败仅告警回滚——心跳缺失只让启动收尸漏收，不影响评测主流程。
+        """
+        try:
+            record = self._get_current_record(task_id, execution_number)
+            if record is None or record.status != "running":
+                return
+            record.heartbeat_at = datetime.now(timezone.utc)
+            self.db.commit()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"刷新执行心跳失败（task_id={task_id}, exec={execution_number}）: {e}")
+            try:
+                self.db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+
+    # ---------- W4 配置快照写入（失败仅告警，不影响执行记录主流程） ----------
+
+    def _attach_start_config_snapshot(self, record: TaskExecutionRecord):
+        """执行开始写入创建时双快照（掩码凭据，严禁明文 api_key/auth_config）"""
+        try:
+            from app.services.config_snapshot import build_execution_config_snapshot
+
+            task = self.db.query(EvaluationTask).filter(
+                EvaluationTask.id == record.task_id
+            ).first()
+            if task is not None:
+                record.config_snapshot = build_execution_config_snapshot(task, self.db)
+        except Exception as e:
+            logger.warning(f"写入执行配置快照失败（task_id={record.task_id}）: {e}")
+
+    def _attach_used_config_summary(self, record: TaskExecutionRecord):
+        """执行结束写入该次实际使用的配置摘要（归因锚点「实然」面）
+
+        与执行链路共用同一解析器（config_snapshot.resolve_*），摘要即可回答
+        「这次 X 分当时用的什么模型/温度」；裁判侧按 judge_engine 归因
+        （claude_agent 走 CC 全局配置，graph 走快照优先链）。
+        """
+        try:
+            from app.services.config_snapshot import (
+                build_execution_config_snapshot,
+                build_used_config_summary,
+            )
+
+            task = self.db.query(EvaluationTask).filter(
+                EvaluationTask.id == record.task_id
+            ).first()
+            if task is None:
+                return
+            snapshot = (
+                dict(record.config_snapshot)
+                if isinstance(record.config_snapshot, dict) and record.config_snapshot
+                else build_execution_config_snapshot(task, self.db)
+            )
+            snapshot["used"] = build_used_config_summary(task, self.db)
+            record.config_snapshot = snapshot
+        except Exception as e:
+            logger.warning(f"写入实际使用配置摘要失败（task_id={record.task_id}）: {e}")
 
     def complete_record(
         self,
@@ -1006,6 +1265,8 @@ class TaskExecutionRecordService:
                 started_at=beijing_now(),
                 completed_at=beijing_now(),
             )
+            self._attach_start_config_snapshot(record)
+            self._attach_used_config_summary(record)
             self.db.add(record)
             self.db.commit()
             return record
@@ -1013,6 +1274,8 @@ class TaskExecutionRecordService:
         record.result = result
         record.total_cost = total_cost
         record.completed_at = beijing_now()
+        # W4：执行结束写入该次实际使用的配置摘要（归因锚点）
+        self._attach_used_config_summary(record)
         self.db.commit()
         return record
 
@@ -1031,6 +1294,8 @@ class TaskExecutionRecordService:
                 started_at=beijing_now(),
                 completed_at=beijing_now(),
             )
+            self._attach_start_config_snapshot(record)
+            self._attach_used_config_summary(record)
             self.db.add(record)
             self.db.commit()
             return record
@@ -1038,6 +1303,8 @@ class TaskExecutionRecordService:
         record.error_message = error
         record.result = {"error": error}
         record.completed_at = beijing_now()
+        # W4：执行结束写入该次实际使用的配置摘要（归因锚点）
+        self._attach_used_config_summary(record)
         self.db.commit()
         return record
 
@@ -1060,12 +1327,16 @@ class TaskExecutionRecordService:
                 started_at=beijing_now(),
                 completed_at=beijing_now(),
             )
+            self._attach_start_config_snapshot(record)
+            self._attach_used_config_summary(record)
             self.db.add(record)
             self.db.commit()
             return record
         record.status = "stopped"
         record.result = partial_result
         record.completed_at = beijing_now()
+        # W4：执行结束写入该次实际使用的配置摘要（归因锚点）
+        self._attach_used_config_summary(record)
         self.db.commit()
         return record
 
@@ -1078,3 +1349,25 @@ class TaskExecutionRecordService:
     def get_record_by_number(self, task_id: str, execution_number: int) -> Optional[TaskExecutionRecord]:
         """按执行序号获取单条记录"""
         return self._get_current_record(task_id, execution_number)
+
+    def delete_execution_record(self, task_id: str, execution_number: int) -> bool:
+        """删除单条执行历史记录，并联动删除该次执行的全部行级结果（W3-5）
+
+        行级表随 TaskExecutionRecord 生命周期：执行记录删除时其行级结果一并
+        清理（批量归档任务为 M2 B-1，届时复用本联动语义）。
+        行级表不可用（迁移未执行）时仅告警，不阻断执行记录删除。
+        delete_task 软删不动行级表（与现状一致，本方法不参与）。
+
+        Returns: 执行记录是否存在（False = 无记录，行级孤儿行仍被清理）
+        """
+        record = self._get_current_record(task_id, execution_number)
+        if record is not None:
+            self.db.delete(record)
+        try:
+            from app.services.evaluation_result_service import delete_execution_rows
+
+            delete_execution_rows(self.db, task_id, execution_number)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"联动删除行级结果失败（继续删除执行记录）: {e}")
+            self.db.commit()
+        return record is not None

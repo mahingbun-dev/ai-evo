@@ -40,6 +40,13 @@ python scripts/run_local_dev.py          # 默认 http://0.0.0.0:8100
 # 热重载开发：python scripts/run_local_dev.py --reload
 ```
 
+注意：这个脚本只起 API 进程。评测任务是 Celery 异步任务，本地跑评测需要另开一个终端起 worker：
+
+```bash
+export $(grep -v '^#' .env | xargs)      # 载入 DATABASE_URL / REDIS_URL
+celery -A app.celery_app worker --loglevel=info
+```
+
 ## 4. 启动前端
 
 ```bash

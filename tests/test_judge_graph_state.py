@@ -2,6 +2,8 @@
 import pytest
 from app.services.judge_graph_state import JudgeAgentState, DimensionDependency
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 class TestBuildStateInput:
     """Test build_state_input with mock task"""

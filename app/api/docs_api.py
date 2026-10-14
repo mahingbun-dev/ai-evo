@@ -3,7 +3,8 @@
 提供用户使用文档的读取和更新接口
 """
 import logging
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
+from app.services.access_control import ensure_super_admin
 from pydantic import BaseModel
 from app.core.config import get_settings
 
@@ -35,7 +36,7 @@ def get_user_guide():
         raise HTTPException(status_code=500, detail="读取文档失败")
 
 
-@router.put("/user-guide", summary="更新用户使用文档")
+@router.put("/user-guide", summary="更新用户使用文档", dependencies=[Depends(ensure_super_admin)])
 def update_user_guide(body: UpdateDocRequest):
     """更新 Markdown 格式的用户使用文档（管理员操作）"""
     try:

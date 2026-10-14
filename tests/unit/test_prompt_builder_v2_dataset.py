@@ -7,6 +7,8 @@ import pytest
 from unittest.mock import MagicMock
 from app.services.prompt_builder import PromptBuilder
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 def _make_pb_with_vars(judge_variable_config=None, runtime_variables=None):
     """创建 PromptBuilder 实例，task 为 mock"""

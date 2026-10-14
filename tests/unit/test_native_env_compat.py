@@ -17,6 +17,8 @@ import sys
 
 import pytest
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 def _loop_method_module() -> str:
     """nest_asyncio.apply() 会替换模块级 asyncio.run，可据此探测是否已打补丁
@@ -48,11 +50,23 @@ def test_rag_evaluator_uses_same_version_guard():
     assert "sys.version_info < (3, 14)" in src, "rag_evaluator 应带 nest_asyncio 版本守卫"
 
 
+def _fake_dsn(monkeypatch):
+    """W6-3 后 DATABASE_URL 默认空串（不再内置真实口令），直接调 create_db_engine
+    的测试需注入假 DSN——create_engine 懒连接，不会真的连库；断言对象是
+    PGGSSENCMODE 环境变量，与 DSN 内容无关。"""
+    from app.core.config import get_settings
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://user:password@localhost:5432/ut")
+    # get_settings 带 lru_cache，清掉进程内早先无 DATABASE_URL 时的缓存实例
+    get_settings.cache_clear()
+
+
 @pytest.mark.skipif(platform.system() != "Darwin", reason="仅 macOS 触发 GSS 默认禁用")
 def test_darwin_defaults_gssencmode_disable(monkeypatch):
     """macOS 上 create_db_engine 应默认设置 PGGSSENCMODE=disable（不覆盖显式配置）"""
     import app.db.session as s
 
+    _fake_dsn(monkeypatch)
     monkeypatch.delenv("PGGSSENCMODE", raising=False)
     engine = s.create_db_engine()
     try:
@@ -66,6 +80,7 @@ def test_non_darwin_keeps_gss_default(monkeypatch):
     """Linux/生产不注入 PGGSSENCMODE 默认值，行为与存量一致"""
     import app.db.session as s
 
+    _fake_dsn(monkeypatch)
     monkeypatch.delenv("PGGSSENCMODE", raising=False)
     engine = s.create_db_engine()
     try:

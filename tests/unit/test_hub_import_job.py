@@ -18,6 +18,7 @@ import base64
 import hashlib
 import json
 import zipfile
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -28,12 +29,15 @@ from app.models.hub_file_models import HubImportJob, HubFileRecord
 from app.services.hub_import_job_service import (
     HUB_FILE_ID_FIELD,
     HUB_IMPORT_FIELD_METADATA,
+    HUB_JOB_STUCK_AFTER_SECONDS,
     _normalize_file_ids,
     create_import_job,
     get_job,
     process_hub_import_job,
     retry_job,
 )
+
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
 
 ENDPOINT = "http://hub.test/mcp"
 
@@ -154,10 +158,15 @@ class FakeJobDb:
     - query(HubImportJob) 返回 job（get_job 查询）；其余模型 all() 为空
     - add 捕获对象并把 HubFileRecord 实时注册到 registry（供 _query_record 命中）
     - commit / rollback / delete 记调用
+    - execute 模拟 W11 原子 ref 语句（真实 SQL 行为由集成测试覆盖）：
+      Update(hub_files) 自增/自减作用于 registry；Delete(hub_files 且 ref_count=0)
+      条件删除；Select(ref_count) 回读 registry 当前值；其余透传 MagicMock
     """
 
     def __init__(self, job):
         self.job = job
+        # W9：目标数据集行替身（process 继承团队用）；None 表示查不到数据集
+        self.dataset_row = None
         self.registry = {}   # file_id -> HubFileRecord
         self.added = []
         self.commits = 0
@@ -171,10 +180,73 @@ class FakeJobDb:
     def close(self):
         pass
 
-    def query(self, model):
+    @staticmethod
+    def _stmt_file_id(stmt) -> str:
+        """从语句绑定参数里取 file_id（编译参数名带 _N 后缀，按含 file_id 匹配）"""
+        for key, value in stmt.compile().params.items():
+            if "file_id" in key:
+                return value
+        raise AssertionError(f"语句缺少 file_id 绑定参数: {stmt}")
+
+    def execute(self, stmt, params=None, **kw):
+        from sqlalchemy import Delete, Select, Update
+
+        if isinstance(stmt, Update) and getattr(stmt.table, "name", None) == "hub_files":
+            rec = self.registry.get(self._stmt_file_id(stmt))
+            if rec is None:
+                return SimpleNamespace(rowcount=0)
+            sql = str(stmt.compile())
+            count = int(rec.ref_count or 0)
+            if "CASE" in sql.upper():
+                rec.ref_count = max(0, count - 1)     # 自减（CASE 下限 0）
+            elif "+" in sql:
+                rec.ref_count = count + 1             # 自增
+            else:
+                rec.ref_count = max(0, count - 1)     # 兜底按自减处理
+            return SimpleNamespace(rowcount=1)
+        if isinstance(stmt, Delete) and getattr(stmt.table, "name", None) == "hub_files":
+            rec = self.registry.get(self._stmt_file_id(stmt))
+            if rec is not None and int(rec.ref_count or 0) == 0:
+                self.registry.pop(rec.file_id, None)
+                if rec not in self.deleted:
+                    self.deleted.append(rec)
+                return SimpleNamespace(rowcount=1)
+            return SimpleNamespace(rowcount=0)
+        if isinstance(stmt, Select):
+            rec = self.registry.get(self._stmt_file_id(stmt))
+            value = (rec.ref_count if rec is not None else 0) or 0
+            return SimpleNamespace(scalar=lambda: value)
+        return self._mock.execute(stmt, params, **kw)
+
+    def query(self, model, *criteria):
+        """query 应答：
+
+        - HubImportJob → 返回 job（get_job 查询）
+        - HubFileRecord → filter 条件里的 file_id 从 registry 命中（保证
+          ensure_unpacked 首包落库 / 二次导入复用 / acquire 预检查的真实语义）
+        - 其余模型 → all() 为空（保持既有替身语义）
+        """
         q = MagicMock()
         if model is HubImportJob:
             q.filter.return_value.first.return_value = self.job
+            return q
+        if model is HubFileRecord:
+            state = {"fid": None}
+
+            def _filter(*crits):
+                for criterion in crits:
+                    right = getattr(criterion, "right", None)
+                    if right is not None and isinstance(getattr(right, "value", None), str):
+                        state["fid"] = right.value
+                return q
+
+            q.filter.side_effect = _filter
+            q.first = lambda: self.registry.get(state["fid"]) if state["fid"] else None
+            return q
+        if getattr(model, "__name__", "") == "EvaluationDataset":
+            # W9：process 查目标数据集团队（hub_files.team_code 继承来源）；
+            # 缺省无行（team 继承为 None → DEFAULT 口径），用例可注入
+            q.filter.return_value.first.return_value = self.dataset_row
         else:
             q.filter.return_value.all.return_value = []
         return q
@@ -293,7 +365,7 @@ class TestHubImportJobModel:
     EXPECTED_COLUMNS = {
         "id", "dataset_id", "file_ids", "status",
         "total_count", "success_count", "fail_count", "fail_detail",
-        "succeeded_file_ids", "created_by", "created_at", "updated_at",
+        "succeeded_file_ids", "script_id", "created_by", "created_at", "updated_at",
     }
 
     def test_table_name_and_columns(self):
@@ -773,7 +845,10 @@ class TestDeleteLinkage:
         db.query.side_effect = query
 
         with patch("app.services.hub_file_service.release_hub_refs") as mock_release:
-            result = cleanup_duplicates(db=db)
+            # W19b：cleanup-duplicates 收口仅超管，测试以超管身份调用
+            from types import SimpleNamespace as _SN
+            _req = _SN(state=_SN(user={'user_code': 'root', 'org_code': 'ROOT', 'super_admin_flag': 1}))
+            result = cleanup_duplicates(_req, db=db)
         assert result["deleted_count"] == 1
         assert dup.is_active is False and earliest.is_active is True
         mock_release.assert_called_once_with(db, ["fid-dup"])
@@ -801,7 +876,12 @@ class TestEagerCeleryTask:
                     patch("app.services.hub_file_service.requests") as mock_requests, \
                     patch("app.services.dataset_service.DatasetDataService") as mock_ds_cls, \
                     patch("app.services.dataset_field_service.DatasetFieldService") as mock_fs_cls, \
-                    patch("redis.from_url") as mock_redis:
+                    patch("redis.from_url") as mock_redis, \
+                    patch("app.services.redis_stop_signal.get_redis_client",
+                          return_value=FakeRedisClient()):
+                # 互斥锁走受控 FakeRedisClient：避免 get_redis_client（lru_cache
+                # 单例）在 redis.from_url 被 patch 的窗口内首次构建，把 MagicMock
+                # 客户端永久缓存进进程级 cache，污染后续真实 Redis 测试
                 mock_requests.post.side_effect = zip_post(make_attempt_zip_bytes(), "ek.zip")
                 mock_requests.delete.return_value = FakeResp("")
                 rows = []
@@ -823,3 +903,224 @@ class TestEagerCeleryTask:
     def test_get_job_service(self):
         assert get_job(FakeJobDb(make_job(["fid-1"])), "hubjob_test0001").dataset_id == "ds-job"
         assert get_job(FakeJobDb(None), "hubjob_none") is None
+
+
+# ---------------------------------------------------------------------------
+# W11: retry 卡死接管（running 超 30 分钟 updated_at 未推进）
+# ---------------------------------------------------------------------------
+
+def _seconds_ago(seconds: float, *, aware: bool = True) -> datetime:
+    ts = datetime.now(timezone.utc) - timedelta(seconds=seconds)
+    return ts if aware else ts.replace(tzinfo=None)
+
+
+class FakeRedisClient:
+    """EvalTaskLock 用 Redis 替身（SET NX EX / GET / DELETE 最小实现）"""
+
+    def __init__(self, store=None):
+        self.store = dict(store or {})
+
+    def set(self, key, value, nx=False, ex=None):
+        if nx and key in self.store:
+            return False
+        self.store[key] = value
+        return True
+
+    def get(self, key):
+        return self.store.get(key)
+
+    def delete(self, *keys):
+        n = 0
+        for key in keys:
+            if self.store.pop(key, None) is not None:
+                n += 1
+        return n
+
+
+class TestRetryStuckTakeover:
+    def test_fresh_running_refuses_and_keeps_lock(self, monkeypatch):
+        """未卡死的 running（updated_at 30 分钟内）拒绝重试，且不清除他人持有的锁"""
+        fake = FakeRedisClient({"hubjob:hubjob_live01": "worker-a:1"})
+        monkeypatch.setattr("app.services.redis_stop_signal.get_redis_client", lambda: fake)
+        job = make_job(["fid-1"], status="running", id="hubjob_live01")
+        job.updated_at = _seconds_ago(60)
+        with pytest.raises(ValueError, match="进行中"):
+            retry_job(FakeJobDb(job), job.id)
+        assert job.status == "running"
+        assert fake.store.get("hubjob:hubjob_live01") == "worker-a:1", "未卡死不得清他人锁"
+
+    def test_stuck_running_aware_ts_taken_over(self, monkeypatch):
+        """updated_at 超 30 分钟（带时区）→ 接管重置 pending 并清除残留互斥锁"""
+        fake = FakeRedisClient({"hubjob:hubjob_stk01": "dead-worker:1"})
+        monkeypatch.setattr("app.services.redis_stop_signal.get_redis_client", lambda: fake)
+        job = make_job(["fid-1", "fid-2"], status="running", id="hubjob_stk01")
+        job.updated_at = _seconds_ago(HUB_JOB_STUCK_AFTER_SECONDS + 60)
+        assert retry_job(FakeJobDb(job), job.id).status == "pending"
+        assert "hubjob:hubjob_stk01" not in fake.store, "接管应清除残留互斥锁"
+
+    def test_stuck_running_naive_ts_taken_over(self, monkeypatch):
+        """naive updated_at（SQLite CURRENT_TIMESTAMP 语义）按 UTC 解释后同样接管"""
+        monkeypatch.setattr("app.services.redis_stop_signal.get_redis_client", FakeRedisClient)
+        job = make_job(["fid-1"], status="running", id="hubjob_stk02")
+        job.updated_at = _seconds_ago(HUB_JOB_STUCK_AFTER_SECONDS + 60, aware=False)
+        assert retry_job(FakeJobDb(job), job.id).status == "pending"
+
+    def test_running_without_updated_at_refuses(self):
+        """updated_at 缺失/异常无法判定卡死 → 保守拒绝（维持原行为）"""
+        job = make_job(["fid-1"], status="running", id="hubjob_none1")
+        job.updated_at = None
+        with pytest.raises(ValueError, match="进行中"):
+            retry_job(FakeJobDb(job), job.id)
+
+    def test_stuck_takeover_allows_empty_fail_detail(self):
+        """卡死接管不要求存在失败项（可能尚未产生任何失败），重跑幂等由 succeeded_file_ids 保证"""
+        job = make_job(["fid-1", "fid-2"], status="running", id="hubjob_stk03",
+                       fail_detail={}, succeeded_file_ids=["fid-1"])
+        job.updated_at = _seconds_ago(HUB_JOB_STUCK_AFTER_SECONDS + 300)
+        assert retry_job(FakeJobDb(job), job.id).status == "pending"
+
+    def test_failed_empty_detail_still_refuses(self):
+        """failed 且无失败项仍拒绝（仅卡死 running 接管豁免失败项检查）"""
+        job = make_job(["fid-1"], status="failed", fail_detail={})
+        with pytest.raises(ValueError, match="没有可重试"):
+            retry_job(FakeJobDb(job), job.id)
+
+
+# ---------------------------------------------------------------------------
+# W11: run_hub_import_job 互斥锁（hubjob:{job_id} SETNX，acks_late 重投拒执行）
+# ---------------------------------------------------------------------------
+
+class TestHubJobMutex:
+    def test_duplicate_redelivery_rejected_without_processing(self, monkeypatch):
+        """锁被其它 worker 持有 → 拒绝本次重投（不触达处理逻辑、不误删他人锁）"""
+        from app.tasks.celery_tasks import run_hub_import_job
+
+        fake = FakeRedisClient({"hubjob:hubjob_dup01": "other-worker:1"})
+        monkeypatch.setattr("app.services.redis_stop_signal.get_redis_client", lambda: fake)
+        job = make_job(["fid-x"], id="hubjob_dup01")
+        db = FakeJobDb(job)
+        processed = []
+        with patch("app.services.hub_import_job_service.process_hub_import_job",
+                   side_effect=lambda *a, **k: processed.append(a) or {}), \
+                patch("app.tasks.evaluation_tasks_async.get_db_session", return_value=db):
+            res = run_hub_import_job("hubjob_dup01")
+        assert res == {"status": "duplicate_rejected", "job_id": "hubjob_dup01",
+                       "lock_holder": "other-worker:1"}
+        assert processed == []
+        assert fake.store.get("hubjob:hubjob_dup01") == "other-worker:1"
+
+    def test_lock_released_after_success(self, monkeypatch):
+        from app.tasks.celery_tasks import run_hub_import_job
+
+        fake = FakeRedisClient()
+        monkeypatch.setattr("app.services.redis_stop_signal.get_redis_client", lambda: fake)
+        job = make_job(["fid-x"], id="hubjob_ok01")
+        db = FakeJobDb(job)
+        with patch("app.services.hub_import_job_service.process_hub_import_job",
+                   return_value={"status": "completed", "job_id": job.id}) as mock_proc, \
+                patch("app.tasks.evaluation_tasks_async.get_db_session", return_value=db):
+            res = run_hub_import_job("hubjob_ok01")
+        assert res["status"] == "completed"
+        mock_proc.assert_called_once()
+        assert "hubjob:hubjob_ok01" not in fake.store, "任务结束后应释放互斥锁"
+
+    def test_lock_released_after_failure(self, monkeypatch):
+        from app.tasks.celery_tasks import run_hub_import_job
+
+        fake = FakeRedisClient()
+        monkeypatch.setattr("app.services.redis_stop_signal.get_redis_client", lambda: fake)
+        job = make_job(["fid-x"], id="hubjob_err01")
+        db = FakeJobDb(job)
+        with patch("app.services.hub_import_job_service.process_hub_import_job",
+                   side_effect=RuntimeError("处理失败")), \
+                patch("app.tasks.evaluation_tasks_async.get_db_session", return_value=db):
+            with pytest.raises(RuntimeError, match="处理失败"):
+                run_hub_import_job("hubjob_err01")
+        assert "hubjob:hubjob_err01" not in fake.store, "异常路径也应释放互斥锁（finally）"
+
+
+# ---------------------------------------------------------------------------
+# W11: ref_count 原子化（acquire/release 走 SQL 端 UPDATE ± 1）
+# ---------------------------------------------------------------------------
+
+class TestRefAtomicSemantics:
+    def test_transient_dbapi_error_retried(self, monkeypatch):
+        """瞬时 DBAPI 错误回滚后有限重试：最终计数正确且不重复自增"""
+        from sqlalchemy.exc import DBAPIError
+        from sqlalchemy import Update
+
+        from app.services.hub_file_service import acquire_ref
+
+        rec = HubFileRecord(id="hub_rt", file_id="fid-rt", ref_count=5)
+        db = FakeJobDb(None)
+        db.registry["fid-rt"] = rec
+        real_execute = db.execute
+        updates = {"n": 0}
+
+        def flaky_execute(stmt, *args, **kwargs):
+            if isinstance(stmt, Update):
+                updates["n"] += 1
+                if updates["n"] == 1:
+                    raise DBAPIError("UPDATE hub_files", {}, Exception("connection reset"))
+            return real_execute(stmt, *args, **kwargs)
+
+        monkeypatch.setattr(db, "execute", flaky_execute)
+        assert acquire_ref(db, "fid-rt") == 6
+        assert rec.ref_count == 6
+        assert updates["n"] == 2, "UPDATE 首次失败应重试恰好一次（回滚后语句可重入，不重复计数）"
+
+    def test_acquire_unregistered_rowcount_zero_raises(self):
+        """UPDATE 影响行数为 0（预检查后记录被并发归零清理）→ 未登记错误"""
+        from app.services.hub_file_service import HubFileError, acquire_ref
+
+        with pytest.raises(HubFileError, match="未登记"):
+            acquire_ref(FakeJobDb(None), "fid-gone")
+
+    def test_release_unregistered_rowcount_zero_raises(self):
+        from app.services.hub_file_service import HubFileError, release_ref
+
+        with pytest.raises(HubFileError, match="未登记"):
+            release_ref(FakeJobDb(None), "fid-gone")
+
+    @pytest.mark.usefixtures("record_registry")
+    def test_zero_path_cleans_dirs_and_record(self, tmp_path):
+        """末引用归零：条件删除命中 → 登记记录删除 + 解包目录清理"""
+        from app.services.hub_file_service import release_ref
+
+        unpack_dir = tmp_path / "fid-zero"
+        unpack_dir.mkdir()
+        (unpack_dir / "x.txt").write_text("1")
+        rec = HubFileRecord(id="hub_z", file_id="fid-zero", ref_count=1,
+                            unpack_dir=str(unpack_dir))
+        db = FakeJobDb(None)
+        db.registry["fid-zero"] = rec
+        assert release_ref(db, "fid-zero") == 0
+        assert not unpack_dir.exists()
+        assert rec in db.deleted
+        assert "fid-zero" not in db.registry
+
+    @pytest.mark.usefixtures("record_registry")
+    def test_zero_path_skips_cleanup_when_concurrent_acquire_won(self, monkeypatch, tmp_path):
+        """条件删除防竞态：并发 acquire 恰在删除前抢先持有引用 → 删除不命中，跳过目录清理"""
+        from sqlalchemy import Delete
+
+        from app.services.hub_file_service import release_ref
+
+        unpack_dir = tmp_path / "fid-race"
+        unpack_dir.mkdir()
+        (unpack_dir / "x.txt").write_text("1")
+        rec = HubFileRecord(id="hub_race", file_id="fid-race", ref_count=1,
+                            unpack_dir=str(unpack_dir))
+        db = FakeJobDb(None)
+        db.registry["fid-race"] = rec
+        real_execute = db.execute
+
+        def racing_execute(stmt, *args, **kwargs):
+            if isinstance(stmt, Delete):
+                # 模拟并发 acquire 恰在本删除执行前提交（ref_count 0→1）
+                rec.ref_count = 1
+            return real_execute(stmt, *args, **kwargs)
+
+        monkeypatch.setattr(db, "execute", racing_execute)
+        assert release_ref(db, "fid-race") == 0
+        assert unpack_dir.exists(), "并发 acquire 抢先时不得清理其刚持有的包"

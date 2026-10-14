@@ -37,7 +37,6 @@ COPY app/ app/
 COPY hubkit/ hubkit/
 COPY alembic/ alembic/
 COPY alembic.ini .
-COPY alembic_local.ini .
 
 # 复制前端构建产物（由 FastAPI 托管）
 # 注意：dist 不再入库，由 tools/build-in-container.sh 里的 `pnpm build` 产出；

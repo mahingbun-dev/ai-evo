@@ -11,6 +11,8 @@ from app.services.deepeval_metric_registry import (
     MetricNotFoundError,
 )
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 # deepeval 指标在实例化时会尝试初始化 OpenAI 模型，
 # 需要设置 dummy API key 以避免测试因缺少 key 而失败。
 _DUMMY_API_KEY_ENV = {"OPENAI_API_KEY": "sk-test-dummy-key-for-testing"}

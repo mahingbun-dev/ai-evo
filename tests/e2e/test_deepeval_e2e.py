@@ -7,7 +7,10 @@ import json
 import time
 import os
 
-BASE_URL = "http://localhost:8000/api/v1"
+import pytest
+pytestmark = pytest.mark.e2e  # W8 分类：e2e（真模型/真服务，CI 永不跑）
+
+BASE_URL = "http://localhost:8100/api/v1"
 AUTH_TOKEN = os.environ.get("TEST_AUTH_TOKEN", "")
 
 

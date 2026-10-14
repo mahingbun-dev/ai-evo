@@ -30,6 +30,8 @@ from app.services.variable_injector import (
     resolve_script_output_value,
 )
 
+pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
+
 
 # ---------------- fake 脚本（统一子进程执行：run(stdin) 函数式脚本包） ----------------
 
@@ -97,7 +99,9 @@ def fake_flow_builtins(tmp_path, monkeypatch):
             pkg = upload_base / f"pjs_{name}"
             pkg.mkdir(parents=True, exist_ok=True)
             (pkg / "main.py").write_text(source, encoding="utf-8")
-        ensure_builtin_scripts_migrated(db)
+        # 表非空（已有自定义脚本）：显式重建缺失内置，保持本 fixture 的
+        # 「统一落库环境」语义（启动路径的空表才补种语义见服务实现）
+        ensure_builtin_scripts_migrated(db, recreate_missing=True)
     monkeypatch.setattr("app.services.pre_judge_runner.SessionLocal", Session)
     yield Session
 
@@ -384,7 +388,7 @@ class TestExecutorDerivedScriptPath:
         assert result["pre_script_results"][0]["status"] == "fail"
         assert not mock_cc.return_value.run_parallel.called
 
-    def test_derived_fail_continue_required_target_empty_zero_score(self, fake_flow_builtins):
+    def test_derived_fail_continue_required_target_marks_pre_script_failed(self, fake_flow_builtins):
         """契约 v3 §三：脚本失败（on_fail=continue）→ 行内容为空 → required=true
         走既有空值为0分逻辑（不新增校验）"""
         task = _make_task(
@@ -396,15 +400,19 @@ class TestExecutorDerivedScriptPath:
             mock_cc.return_value.run_parallel.return_value = [
                 {"score": 9, "feedback": "ok", "dimension_scores": {}}]
             with patch("app.services.model_caller.ModelCallerSync") as mock_caller:
-                # 模型输出为空 + required 目标内容为空（脚本失败置空）→ 待评测内容为空
+                # 模型输出为空 + required 目标内容为空（脚本失败置空）→ 脚本输出缺失显式化
                 mock_caller.return_value.call.return_value = {
                     "success": True, "content": "", "chain_results": []}
                 result = executor._evaluate_single(
                     {"idx": 0, "user_input": "q", "_dataset_item": {"id": "d1", "data": {}}}, task)
 
-        assert result["success"] is True
-        assert result["average_score"] == 0
-        assert "待评测内容为空" in result["feedback"]
+        # W12-3 脚本置空显式化（取代契约 v3 §三「置空走 0 分」旧口径）：
+        # 脚本失败 on_fail=continue → required 的 script_output 目标被置空 →
+        # 行级 pre_script_failed、跳过裁判、不进任务均分
+        # （旧行为为空值校验 0 分进均分，即「脚本故障=模型 0 分」，整改消除）
+        assert result["success"] is False
+        assert result["row_status"] == "pre_script_failed"
+        assert "前处理脚本输出缺失" in result["error"]
         assert result["pre_script_results"][0]["status"] == "fail"
         assert not mock_cc.return_value.run_parallel.called
 

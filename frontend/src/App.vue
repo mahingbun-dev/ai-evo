@@ -55,7 +55,7 @@
             <el-icon><DataAnalysis /></el-icon>
             <span>结果展示</span>
           </el-menu-item>
-          <el-menu-item index="/statistics">
+          <el-menu-item index="/statistics" v-if="isSuperAdmin">
             <el-icon><TrendCharts /></el-icon>
             <span>统计分析</span>
           </el-menu-item>
