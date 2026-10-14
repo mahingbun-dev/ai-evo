@@ -52,11 +52,14 @@ ARCH-1-2（设计 §2.3 D1 / §3 表 1-2 行 / 「远期 K8s」预留扩展点�
 import logging
 import os
 import subprocess
+import time
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
+
+from prometheus_client import Histogram
 
 from app.core.config import get_settings
 
@@ -79,6 +82,20 @@ from executor.sandbox_params import (  # noqa: F401
 )
 
 logger = logging.getLogger(__name__)
+
+# ARCH-2-3：沙箱启动（受理）延迟直方图（设计 §2.3 D7「沙箱启动延迟」/
+# §3 Phase 2 表 2-3 行）。口径 = execute_script_in_container 内 driver.run()
+# 从发起到受理完成：executor HTTP 通道即 POST /sandbox/run 往返（含 docker
+# run detach 冷启动，设计 §2.4 的 0.3-0.8s 量级）；docker-CLI 前台通道为
+# 子进程 spawn 耗时（受理与执行一体，无独立启动阶段，亚毫秒档）。driver
+# 标签区分两条通道；受理失败（SandboxDriverError）不观察——失败归任务
+# 失败指标与日志，不进延迟分布。
+SANDBOX_START_LATENCY = Histogram(
+    "aievo_sandbox_start_latency_seconds",
+    "沙箱启动（受理）延迟：driver.run() 发起→受理完成（秒）",
+    ["driver"],
+    buckets=(0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30),
+)
 
 # 超时后 SIGTERM docker CLI 的宽限期（秒）：给容器优雅退出与 --rm 收尾的时间
 CONTAINER_TERM_GRACE_SECONDS = 5.0
@@ -587,7 +604,12 @@ def execute_script_in_container(
     sandbox_driver = driver or get_sandbox_driver()
 
     try:
+        # ARCH-2-3：沙箱启动（受理）延迟打点——只观察受理成功（口径见
+        # SANDBOX_START_LATENCY 注释）
+        _sandbox_start = time.monotonic()
         handle = sandbox_driver.run(spec)
+        SANDBOX_START_LATENCY.labels(driver=sandbox_driver.name).observe(
+            time.monotonic() - _sandbox_start)
         status = sandbox_driver.wait(handle, timeout)
     except SandboxDriverError as e:
         # 驱动层错误（CLI 启动失败/executor 白名单拒绝/连接失败）：面向运维定位

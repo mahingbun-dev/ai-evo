@@ -137,6 +137,22 @@ services:
     networks:
       - ai-evo-net
 
+  # ARCH-2-1：worker 按队列拆分（设计 §2.3 决策 D4 / §3 Phase 2 表 2-1 行）——
+  # 本服务只消费 eval（评测）队列；hub 导入类任务路由到 ingest 队列、由下方
+  # worker-ingest 独立消费，消除单队列互相争抢（hub 导入高峰不再拖慢评测）
+  # 与单 worker SPOF。队列归属的路由表单一事实源在 app/celery_app.py
+  # （TASK_ROUTES）；本处只声明 worker 消费哪条队列：
+  #   - entrypoint 的 worker 分支固定 celery 命令、不接 -Q，队列绑定经配置面
+  #     表达——celery worker 未指定 -Q 时消费 task_queues 全集，本容器经
+  #     CELERY_WORKER_QUEUES 把 task_queues 收敛为 eval（多队列用逗号分隔）；
+  #   - 队列名拼错会在容器启动时 fail-fast（celery_app._resolve_task_queues
+  #     校验只认 eval/ingest/maint），不会静默消费错队列；
+  #   - maint（清理/迁移）队列当前无任务也无消费者，随条目 2-4 归档清理落地
+  #     时再增补 worker-maint 服务与 app.tasks.maintenance.* 任务。
+  # 本服务名/容器名保持 worker / ai-evo-worker 不变：scripts/ensure_worker.sh
+  # （部署机 cron 每 5 分钟保活）与 scripts/do_deploy.sh（应急旁路脚本）均点名
+  # ai-evo-worker 容器名，改名会破坏保活链路（worker-ingest 暂只有
+  # restart: unless-stopped 自愈，保活 cron 覆盖面维持现状）。
   worker:
     image: ai-evo:${IMAGE_TAG:-latest}
     build:
@@ -158,6 +174,8 @@ services:
       - .env
     environment:
       - SERVICE_TYPE=worker
+      # ARCH-2-1：本 worker 只消费 eval 队列（机制见上方 ARCH-2-1 注释块）
+      - CELERY_WORKER_QUEUES=eval
       - LANGFUSE_ENABLED=false
       - OPENBLAS_CORETYPE=GENERIC
       - MKL_DEBUG_CPU_TYPE=5
@@ -190,6 +208,17 @@ services:
       # 企业内网域名/私有 OSS 由部署侧在 WORKER_NO_PROXY 追加覆盖
       - NO_PROXY=${WORKER_NO_PROXY:-localhost,127.0.0.1,::1,api,redis,postgres,executor,egress}
       - no_proxy=${WORKER_NO_PROXY:-localhost,127.0.0.1,::1,api,redis,postgres,executor,egress}
+      # ARCH-2-3：worker 指标暴露（设计 §2.3 D7）——PROMETHEUS_WORKER_
+      # METRICS_PORT 启用 worker 进程内 Prometheus 指标 server（监听 compose
+      # 内网，不发布宿主端口；monitoring profile 的 Prometheus 经
+      # worker:9108 抓取，未启用 profile 时 server 空转、开销可忽略）。
+      # PROMETHEUS_MULTIPROC_DIR 让 prefork 子进程的任务时长/失败指标经
+      # per-pid mmap 文件聚合到该端口（fork 安全由 prometheus_client 自身
+      # 的 pid 变更检测保证，见 app/celery_app.py ARCH-2-3 注释块）；目录
+      # 落在既有 /tmp tmpfs 上，容器重建即清零（Counter 重计不影响
+      # Prometheus rate/increase）。
+      - PROMETHEUS_WORKER_METRICS_PORT=9108
+      - PROMETHEUS_MULTIPROC_DIR=/tmp/prometheus_multiproc
     # 停止时给 Celery 优雅退出的时间：收到 SIGTERM 后跑完当前任务再退出，
     # 排队中的任务保留在 Redis 队列由新 worker 接手（部署脚本不再清空队列）。
     # W10-3：900s → 7200s，与 celery task_time_limit（单任务最长 2h）对齐——
@@ -215,6 +244,85 @@ services:
       - /home/app:rw,exec,nosuid,nodev,uid=10002,gid=10002,mode=0750,size=${TMPFS_HOME_SIZE:-1g}
     # W13：日志轮转 + healthcheck（celery inspect ping 定点问本 worker，
     # 无响应 = 进程僵死/丢注册；Redis 不可达时同样失败）
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.celery_app inspect ping -d celery@$$HOSTNAME --timeout 10"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+      start_period: 90s
+    restart: unless-stopped
+    networks:
+      - ai-evo-net
+
+  # ARCH-2-1：ingest 队列 worker（hub 导入/数据集处理）——与上方 worker 同口径
+  # 定义（镜像/卷/加固/优雅退出/日志轮转/健康探活全部一致，见 worker 段各注释），
+  # 差异仅两点：CELERY_WORKER_QUEUES=ingest（只消费 ingest 队列）与容器名。
+  # hub 导入的清洗脚本（_run_clean_script → pre_judge_runner）在本容器执行，
+  # 故 SCRIPT_EXEC_MODE / executor / egress proxy 接线与 worker 完全同款。
+  # maint 队列无消费者属预期（见上方 ARCH-2-1 注释，随条目 2-4 落地）。
+  worker-ingest:
+    image: ai-evo:${IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile.online
+      args:
+        - NODE_IMAGE=${NODE_IMAGE:-node:24-slim}
+        - PY_IMAGE=${PY_IMAGE:-python:3.12-slim}
+        - PIP_INDEX_URL=${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+        - NPM_REGISTRY=${NPM_REGISTRY:-https://registry.npmmirror.com}
+    container_name: ai-evo-worker-ingest
+    depends_on:
+      redis:
+        condition: service_started
+      # ARCH-0-1：等卷属主迁移完成再起（见上方 volume-init）
+      volume-init:
+        condition: service_completed_successfully
+    env_file:
+      - .env
+    environment:
+      - SERVICE_TYPE=worker
+      # ARCH-2-1：本 worker 只消费 ingest 队列（机制见上方 ARCH-2-1 注释块）
+      - CELERY_WORKER_QUEUES=ingest
+      - LANGFUSE_ENABLED=false
+      - OPENBLAS_CORETYPE=GENERIC
+      - MKL_DEBUG_CPU_TYPE=5
+      # ARCH-1-4：清洗脚本执行模式与 worker 同款（缺省 container、.env 可回退，
+      # 完整说明见上方 worker 段同名注释）
+      - SCRIPT_EXEC_MODE=${SCRIPT_EXEC_MODE:-container}
+      # ARCH-1-3：外呼代理接线与 worker 同款（完整说明见上方 worker 段同名注释）
+      - HTTP_PROXY=${WORKER_EGRESS_PROXY:-}
+      - HTTPS_PROXY=${WORKER_EGRESS_PROXY:-}
+      - http_proxy=${WORKER_EGRESS_PROXY:-}
+      - https_proxy=${WORKER_EGRESS_PROXY:-}
+      - NO_PROXY=${WORKER_NO_PROXY:-localhost,127.0.0.1,::1,api,redis,postgres,executor,egress}
+      - no_proxy=${WORKER_NO_PROXY:-localhost,127.0.0.1,::1,api,redis,postgres,executor,egress}
+      # ARCH-2-3：指标暴露接线与 worker 同款（完整说明见上方 worker 段
+      # PROMETHEUS_WORKER_METRICS_PORT 注释）
+      - PROMETHEUS_WORKER_METRICS_PORT=9108
+      - PROMETHEUS_MULTIPROC_DIR=/tmp/prometheus_multiproc
+    # 停止时给 Celery 优雅退出的时间（W10-3，与 worker 同款）：task_time_limit
+    # 为全局配置（7200s）对 ingest 任务同样生效，900s 窗口内跑不完的长导入会被
+    # docker 强杀（SIGKILL），消息未 ACK 重投。
+    stop_grace_period: 7200s
+    volumes:
+      - ${LOGS_VOLUME:-./logs}:/app/logs
+      # 与 api/worker 共享同一卷（导入任务读写 uploads：执行包解包区
+      # hub_datasets/、清洗脚本工作区 script_runs/hub_import/）
+      - ${UPLOADS_VOLUME:-./uploads}:/app/uploads
+    # ARCH-0-1：运行期加固，与 api/worker 同一套（理由见 api 段注释）
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,exec,nosuid,nodev,size=${TMPFS_TMP_SIZE:-1g}
+      - /home/app:rw,exec,nosuid,nodev,uid=10002,gid=10002,mode=0750,size=${TMPFS_HOME_SIZE:-1g}
+    # W13：日志轮转 + healthcheck（celery inspect ping 定点问本 worker，
+    # 与 worker 同款；容器名不同、各自探各自的）
     logging:
       driver: json-file
       options:
@@ -379,11 +487,92 @@ services:
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
 
+  # ======================================================================
+  # ARCH-2-3：监控编排（设计 §2.3 决策 D7 / §3 Phase 2 表 2-3 行）——
+  # profile "monitoring" 可选启用（.env COMPOSE_PROFILES=monitoring 或
+  # --profile monitoring），既有部署不设 profile 时行为完全不变（离线部署机
+  # 未预载监控镜像不受影响）。三件套只挂 ai-evo-net 内网：
+  #   - prometheus：抓 api:8100/metrics（队列深度 gauge）+ worker:9108（任务
+  #     时长/失败/沙箱指标，worker 容器统一注入的 PROMETHEUS_WORKER_
+  #     METRICS_PORT），规则评估经 alert.rules → alertmanager:9093；
+  #   - alertmanager：占位 receiver（不外发通知，见
+  #     docker/monitoring/alertmanager.yml），UI :9093 查告警分组；
+  #   - grafana：数据源已 provisioning（docker/monitoring/grafana/），dashboard
+  #     占位见同目录 README；唯一发布宿主端口的监控服务（:3000 面板要人看，
+  #     端口/口令经 GRAFANA_PORT/GRAFANA_ADMIN_PASSWORD 调整）。
+  # 加固口径与 egress 同款：第三方官方镜像、无业务凭证（grafana 管理口令经
+  # .env），不套 cap_drop/read_only——prometheus/grafana 需写各自数据卷，
+  # 硬化收益有限而联调风险在前；安全边界落在「仅内网 + 不发布宿主端口
+  # （grafana 除外）+ profile 可选」。镜像 tag 为官方源稳定版，内网源缺货
+  # 经 PROMETHEUS_IMAGE/GRAFANA_IMAGE/ALERTMANAGER_IMAGE 换源（同
+  # POSTGRES_IMAGE 机制）。注意：离线 CI 部署目录若只同步了
+  # docker-compose.yml，须把 docker/monitoring/ 一并放过去（挂载源在仓库）。
+  # ======================================================================
+  prometheus:
+    image: ${PROMETHEUS_IMAGE:-prom/prometheus:v2.53.5}
+    profiles: ["monitoring"]
+    container_name: ai-evo-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=15d
+    volumes:
+      - ./docker/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./docker/monitoring/alert.rules:/etc/prometheus/alert.rules:ro
+      - prometheus-data:/prometheus
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    restart: unless-stopped
+    networks:
+      - ai-evo-net
+
+  alertmanager:
+    image: ${ALERTMANAGER_IMAGE:-prom/alertmanager:v0.28.1}
+    profiles: ["monitoring"]
+    container_name: ai-evo-alertmanager
+    volumes:
+      - ./docker/monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    restart: unless-stopped
+    networks:
+      - ai-evo-net
+
+  grafana:
+    image: ${GRAFANA_IMAGE:-grafana/grafana:11.6.0}
+    profiles: ["monitoring"]
+    container_name: ai-evo-grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - ./docker/monitoring/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - grafana-data:/var/lib/grafana
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    restart: unless-stopped
+    networks:
+      - ai-evo-net
+
 volumes:
   pgdata:
   # 群晖等部署通过 .env 设 UPLOADS_VOLUME/LOGS_VOLUME 指向这两个命名卷
   uploads:
   logs:
+  # ARCH-2-3：监控栈数据卷（TSDB/告警静默态/grafana 库；容器重建不丢历史）
+  prometheus-data:
+  alertmanager-data:
+  grafana-data:
 
 networks:
   ai-evo-net:

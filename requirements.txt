@@ -58,6 +58,10 @@ claude-agent-sdk==0.2.163
 # DeepSeek Harness Agent 裁判引擎（捆绑 linux/amd64 原生运行时 wheel，无需 Node.js）
 deepseek-harness-sdk==0.1.5rc1
 
+# ============ Observability ============
+# ARCH-2-3：Prometheus 指标埋点（/metrics 端点 + celery signals 任务指标）
+prometheus-client==0.26.0
+
 # ============ Template & Formatting ============
 Jinja2==3.1.6
 rich==14.3.2

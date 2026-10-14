@@ -1,0 +1,11 @@
+# ARCH-2-3：Grafana 数据源预置（provisioning）——免手工添加 Prometheus
+# 面板（dashboard）暂为占位，见同目录上级 README.md。
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false

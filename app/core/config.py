@@ -157,6 +157,14 @@ class Settings(BaseSettings):
     # 与 executor/sandbox_params.NET_PROFILES；非法值 fail-safe 回退 none（告警）
     SCRIPT_NET_PROFILE: str = "none"
 
+    # team 级评测并发配额（ARCH-2-2，设计 §2.3 决策 D4 / §3 Phase 2 表 2-2 行）：
+    # 单团队同时在途（已提交、未到终态）的评测任务数上限，防止单团队打满全局
+    # worker 并发（验收口径：单团队 100 并发任务不打满全局）。Redis 计数实现
+    # 见 app/services/quota.py；超限提交被**拒绝**（不排队），任务按既有失败
+    # 路径标记 failed，团队额度释放后重跑即可。必须为正整数（0 无「禁用」
+    # 歧义语义，彻底放开请配一个大值）
+    TEAM_MAX_CONCURRENT: int = Field(8, gt=0)
+
     # DeepEval 接入平台模型网关（W16，P0-D）：依赖 D-6 技术决策（f1518c1 revert
     # 根因未确认），决策前保守关闭。true 时 safety/agent 等 deepeval 指标判分
     # 经 PlatformLLMWrapper 走平台模型配置出真实分；false 时行为与未接线一致

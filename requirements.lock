@@ -534,6 +534,10 @@ posthog==7.39.1
     # via
     #   -c /src/prod-constraints.txt
     #   deepeval
+prometheus-client==0.26.0
+    # via
+    #   -c /src/prod-constraints.txt
+    #   -r /src/requirements.txt
 prompt-toolkit==3.0.53
     # via
     #   -c /src/prod-constraints.txt

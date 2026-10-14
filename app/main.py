@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -6,7 +7,8 @@ from logging.handlers import RotatingFileHandler
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from app.api.endpoints import router as api_router
 from app.api.health_api import router as health_router
 from app.api.model_config_api import router as model_config_router, router_judge as judge_router
@@ -89,6 +91,27 @@ logger.info(f"日志配置完成，日志目录: {LOG_DIR}")
 # 获取配置实例
 settings = get_settings()
 
+# ARCH-2-3：队列深度刷新间隔（秒）——与 Prometheus 缺省抓取间隔 15s 对齐
+# （设计 §2.3 D7「队列深度」指标；gauge 由 api 进程单写，见下方循环注释）
+QUEUE_DEPTH_REFRESH_SECONDS = 15
+
+
+async def _queue_depth_refresh_loop():
+    """周期把 Redis llen 队列深度刷进 aievo_celery_queue_depth gauge（ARCH-2-3）
+
+    api 进程是该 gauge 的唯一写者（worker 容器的任务指标走各自的
+    PROMETHEUS_WORKER_METRICS_PORT，见 app/celery_app.py ARCH-2-3 拓扑注释）。
+    Redis 抖动时本轮放弃（gauge 保留上次值）、下一拍重试——指标陈旧优于
+    打断 API；to_thread 把同步 Redis IO 挪出事件循环。
+    """
+    from app.celery_app import update_queue_depth_metrics
+    while True:
+        try:
+            await asyncio.to_thread(update_queue_depth_metrics)
+        except Exception as e:
+            logger.warning(f"队列深度指标刷新失败（保留上次值，下一拍重试）: {e}")
+        await asyncio.sleep(QUEUE_DEPTH_REFRESH_SECONDS)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -128,10 +151,19 @@ async def lifespan(app: FastAPI):
     # Celery Worker 由独立进程管理
     logger.info("TaskScheduler (Celery) 已初始化")
 
+    # ARCH-2-3：队列深度 gauge 周期刷新（Redis llen）——随应用启停
+    queue_depth_task = asyncio.create_task(_queue_depth_refresh_loop())
+
     yield
 
     # === 关闭阶段 ===
     # Celery 由独立进程管理，API 进程关闭时无需特殊处理
+    # ARCH-2-3：收掉队列深度刷新任务（await 收割取消，避免残挂 warning）
+    queue_depth_task.cancel()
+    try:
+        await queue_depth_task
+    except asyncio.CancelledError:
+        pass
     logger.info("API 进程关闭")
 
 # OpenAPI 标签说明，用于 /docs 分组展示
@@ -237,6 +269,25 @@ async def root():
     if os.path.exists(index_path):
         return FileResponse(index_path)
     return {"message": "Welcome to AI Evaluation Platform"}
+
+
+@app.get("/metrics")
+async def prometheus_metrics():
+    """Prometheus 抓取端点（ARCH-2-3，设计 §2.3 D7 / §3 Phase 2 表 2-3 行）
+
+    与 /health 同层（根路径层，非 /api/v1 业务面）：AuthMiddleware 对非
+    /api/ 前缀请求直接放行（auth_middleware.py「非 API 路径放行」规则，
+    与前端静态资源同面），抓取器不带业务 token 匿名可达——即白名单内的
+    探活级暴露面；不单列进 WHITELIST_PREFIXES，因为本端点不经 /api 前缀、
+    天然落在放行规则里（补前缀反而扩大该规则的匹配面）。
+    输出本进程（api）默认 registry：队列深度 gauge（lifespan 周期 Redis
+    llen 刷新）+ python/process 运行时指标；任务时长/失败与沙箱指标在
+    worker 容器的独立指标 server 聚合（docker/monitoring/prometheus.yml
+    的 ai-evo-worker 抓取目标）。
+    注意：必须注册在 SPA catch-all serve_frontend 之前，否则被 /{path:path}
+    兜底吞成 index.html（FastAPI 按注册顺序匹配）。
+    """
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/{path:path}")

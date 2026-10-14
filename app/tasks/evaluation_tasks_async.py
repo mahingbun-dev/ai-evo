@@ -23,6 +23,26 @@ class TaskStoppedException(Exception):
     pass
 
 
+def _archive_task_workspace(task_id: Optional[str]) -> None:
+    """任务级工作区归档（ARCH-2-4，设计 §2.3 D5 / §3 Phase 2 表 2-4 行）
+
+    工作区 uploads/script_runs/{task_id}/ 打包为 uploads/archives/{task_id}.tar.gz
+    后清原目录。正常链路工作区已被逐条（评完即清）与 execute_batch 任务级
+    兜底清理，此处为 no-op 不产生归档；本归档兜住异常中断等残留（压缩留档
+    + 清原目录，磁盘增长曲线平稳），同时作为 Phase 3 工作区整体搬对象存储
+    的挂载点。归档失败保留原目录仅告警（走既有兜底清理），不影响任务状态
+    ——与 _cleanup_task_hub_cache 同口径。
+    """
+    if not task_id:
+        return
+    try:
+        from app.services.workspace import archive_task_workspace
+
+        archive_task_workspace(task_id)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"工作区归档失败（保留原目录待兜底清理）: task_id={task_id} 错误: {e}")
+
+
 def _cleanup_task_hub_cache(task_id: Optional[str]) -> None:
     """清理任务级 hub 拉取缓存目录 uploads/hub_files/{task_id}/
 
@@ -254,6 +274,9 @@ def run_evaluation_async(task_id: str, stop_event: Optional[StopEventProtocol] =
 
     finally:
         db.close()
+        # ARCH-2-4：任务结束工作区归档（tar + 清原目录，失败保留原目录）——
+        # 沿用本清理点（成功/失败/停止统一覆盖），见 _archive_task_workspace
+        _archive_task_workspace(task_id)
         # hub 拉取缓存随任务结束清理（成功/失败/停止统一覆盖，与 judge_sessions
         # 临时文件同批清理时机一致，设计文档 §七.6）
         _cleanup_task_hub_cache(task_id)

@@ -8,8 +8,9 @@
      root 且其后无 RUN/COPY/ADD（安装全在 root 阶段完成）；HOME 钉 /home/app；
      Claude CLI 不落 /root（/root 为 0700，非 root 读不到也执行不了）；uploads/logs
      写面预建并 chown app，而 /app 代码保持 root 属主（防篡改，read_only 下无写需求）。
-  2. docker-compose.yml：api/worker/hub-plugin 三自有服务 cap_drop [ALL] +
-     no-new-privileges；api/worker read_only + tmpfs（/tmp、/home/app 且 uid=10002）；
+  2. docker-compose.yml：api/worker/worker-ingest/hub-plugin 自有服务 cap_drop [ALL] +
+     no-new-privileges；api/worker/worker-ingest read_only + tmpfs（/tmp、/home/app 且
+     uid=10002）；
      hub-plugin 按设计 D3 保持 host 网络 sidecar 形态、不加 read_only（注释给理由）；
      volume-init 一次性属主迁移服务（root、仅 CHOWN/DAC_OVERRIDE、只读根、无网络、
      不挂 .env、与 api/worker 挂同一组卷），api/worker depends_on 其成功完成；
@@ -39,8 +40,9 @@ ENTRYPOINT_PATH = REPO_ROOT / "docker-entrypoint.sh"
 # 设计 D3 钉死的主镜像运行用户；与 script-runner 沙箱用户（10001）分离
 APP_UID = 10002
 DOCKERFILES = ["Dockerfile", "Dockerfile.online"]
-HARDENED_SERVICES = ("api", "worker", "hub-plugin")
-READ_ONLY_SERVICES = ("api", "worker")
+# ARCH-2-1：worker 拆分后 worker（eval 队列）与 worker-ingest 同口径加固
+HARDENED_SERVICES = ("api", "worker", "worker-ingest", "hub-plugin")
+READ_ONLY_SERVICES = ("api", "worker", "worker-ingest")
 
 
 # ======================================================================
@@ -219,11 +221,14 @@ class TestVolumeInitOwnershipMigration:
         assert "SERVICE_TYPE=volume-init" in vi["environment"]
 
     def test_mounts_exactly_the_shared_data_volumes(self, services):
-        """迁移容器挂的必须与 api/worker 完全同一组卷（同一 env 源），漏一个就有属主死角"""
-        api_m, worker_m, vi_m = (_mounts(services[n]) for n in ("api", "worker", "volume-init"))
+        """迁移容器挂的必须与 api/worker 完全同一组卷（同一 env 源），漏一个就有属主死角
+        （ARCH-2-1：worker-ingest 同样读写 uploads/logs，一并纳入等值断言）"""
+        names = ("api", "worker", "worker-ingest", "volume-init")
+        mounts = {n: _mounts(services[n]) for n in names}
+        vi_m = mounts["volume-init"]
         assert set(vi_m) == {"/app/uploads", "/app/logs"}
         for target in vi_m:
-            assert vi_m[target] == api_m[target] == worker_m[target], target
+            assert len({mounts[n][target] for n in names}) == 1, target
 
     @pytest.mark.parametrize("name", READ_ONLY_SERVICES)
     def test_api_worker_wait_for_volume_init(self, services, name):
