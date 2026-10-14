@@ -23,8 +23,13 @@ task.pre_scripts 旧配置。支持 exec_type：
   执行（脚本对自身包目录的写操作只影响本条副本，不污染脚本库与其它数据条）；
   local/上传文件与 hub_file 执行包目录解析时拷进工作区 inputs/ 下，stdin
   一律给工作区内副本路径（inline 值本就落盘工作区）
-- claude_agent / deepseek_agent：由 HarnessAdapter 阶段接入，到达此处明确 fail
-  （on_fail 默认 continue，裁判可见失败事实）
+- claude_agent / deepseek_agent：ARCH-3-2 起（设计 §2.3 D8）经 SandboxDriver 在
+  沙箱内拉起被测 agent——与前处理脚本同级对待（同一 executor 驱动、同一
+  script_runs 工作区与结果条目结构），镜像按 exec_type 选 Dockerfile.harness
+  变体（claude 变体含离线 claude-local CLI），出网恒 egress 档；指令文本取
+  entrypoint，凭据/参数经 app/services/harness_adapter.py 组装（harness.json 随
+  工作区落盘，评完即清），编排见 app/services/script_container.py
+  的 execute_harness_in_container（on_fail 默认 continue，与 script 类型一致）
 
 扩展点（设计：docs/design/pre-judge-scripts.md §九.3，挂载点规范化命名）：
 - EXTENSION_POINT_PRE_JUDGE = "evaluation/pre-judge"（已启用）
@@ -616,12 +621,57 @@ def execute_script(
         stdin = _inject_builtin_db_dsn(script, stdin)
         return _execute_script_subprocess(script, stdin, timeout, started, network=network)
 
+    if exec_type in ("claude_agent", "deepseek_agent"):
+        # ARCH-3-2（设计 §2.3 D8 / §3 表 3-2 行）：被测 agent 进沙箱——
+        # 经 SandboxDriver 在 harness 变体镜像内执行，指令文本 = entrypoint，
+        # 凭据/参数经 harness_adapter 组装；agent 步骤无 local 子进程等价通道
+        # （裁判 judge 链路的 SDK 直跑不受影响），恒走沙箱
+        return _execute_harness_agent(script, stdin, timeout, started, exec_type=exec_type)
+
     return _result(
         script_id, name, "fail",
-        error=(f"暂不支持 exec_type={exec_type}（claude_agent/deepseek_agent 类型由 HarnessAdapter 阶段接入）"
-               if exec_type in ("claude_agent", "deepseek_agent")
-               else f"exec_type={exec_type} 已废除（builtin 进程内执行已统一为子进程 script 执行）"),
+        error=f"exec_type={exec_type} 已废除（builtin 进程内执行已统一为子进程 script 执行）",
         finish_reason="error", started_at=started,
+    )
+
+
+def _execute_harness_agent(
+    script: Dict[str, Any],
+    stdin: Dict[str, Any],
+    timeout: float,
+    started: float,
+    exec_type: str,
+) -> Dict[str, Any]:
+    """exec_type=claude_agent/deepseek_agent：组装 harness 载荷并经沙箱执行（ARCH-3-2）
+
+    职责边界：本函数只做 harness 语义组装（变体/指令/凭据，见
+    harness_adapter.build_harness_agent_config），docker 编排（镜像选择/egress 档/
+    载荷三件套落盘/产物回收）在 script_container.execute_harness_in_container。
+    组装失败（未配置全局凭据/缺指令文本）按该步骤 fail 处理（on_fail 语义与
+    script 类型一致），错误消息面向配置方。
+    """
+    # 懒加载：harness_adapter 引 claude/deepseek 配置服务，随用随引避免顶层依赖扩散
+    from app.services import harness_adapter
+
+    script_id = str(script.get("script_id") or script.get("id") or "")
+    name = script.get("name") or script_id
+    try:
+        variant = harness_adapter.harness_variant_for(exec_type)
+        instruction = harness_adapter.build_harness_instruction(script)
+        harness_config = harness_adapter.build_harness_agent_config(
+            variant, script=script, timeout=timeout)
+    except harness_adapter.HarnessConfigError as e:
+        return _result(script_id, name, "fail", error=str(e),
+                       finish_reason="error", started_at=started)
+
+    return script_container.execute_harness_in_container(
+        script=script,
+        stdin=stdin,
+        timeout=timeout,
+        started=started,
+        variant=variant,
+        instruction=instruction,
+        harness_config=harness_config,
     )
 
 
@@ -962,6 +1012,10 @@ def _load_script(script_id: str) -> Optional[Dict[str, Any]]:
             "exec_type": row.exec_type,
             "entrypoint": row.entrypoint,
             "timeout_seconds": row.timeout_seconds if row.timeout_seconds is not None else 120,
+            # ARCH-3-2：agent 类型专用字段透传（allowed_tools=CC 工具白名单 /
+            # harness_extra=DSH 参数覆盖），harness_adapter 组装 harness.json 时消费
+            "allowed_tools": row.allowed_tools,
+            "harness_extra": row.harness_extra,
         }
 
 

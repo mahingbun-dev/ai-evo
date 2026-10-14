@@ -7,6 +7,11 @@ import logging
 import re
 from functools import lru_cache
 
+# 运行时档白名单同源引用（ARCH-3-4）：executor/sandbox_params 只依赖标准库
+# （worker 镜像 COPY 全仓库，两侧均可导入），Settings 校验与沙箱参数构造共用
+# 一份白名单——约束演进只改 sandbox_params.CONTAINER_RUNTIMES 一处
+from executor.sandbox_params import CONTAINER_RUNTIMES
+
 # 项目根目录
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 
@@ -156,6 +161,30 @@ class Settings(BaseSettings):
     # open 档。档位 → 容器网络参数映射见 script_container.WORKER_NET_PROFILE_TO_DOCKER
     # 与 executor/sandbox_params.NET_PROFILES；非法值 fail-safe 回退 none（告警）
     SCRIPT_NET_PROFILE: str = "none"
+
+    # 沙箱容器运行时档（ARCH-3-4，设计 §3 Phase 3 表 3-4 行「gVisor 可选
+    # 运行时档」）：runc（默认——docker daemon 缺省运行时，构造参数不拼
+    # --runtime，默认行为与历史逐字节一致）| runsc（gVisor 加固档：应用层
+    # 内核拦截系统调用，收窄容器内载荷触达宿主内核的面，高危脚本专用；
+    # 宿主机须预装 runsc 并注册 docker daemon，安装步骤与适用场景见
+    # docs/sandbox-runtime-gvisor.md）。白名单仅 runc|runsc（与
+    # executor/sandbox_params.CONTAINER_RUNTIMES 同源），非法值启动即拒
+    # （field_validator fail-fast，不带病进沙箱通道）；环境变量实时读取
+    # 优先（见 app.services.script_container.sandbox_runtime：改 env 重启
+    # worker 即切换或回退；HTTP executor 通道的客户端透传接线属后续批次，
+    # 本批 docker-CLI 通道生效）
+    SANDBOX_RUNTIME: str = "runc"
+
+    @field_validator("SANDBOX_RUNTIME")
+    @classmethod
+    def _validate_sandbox_runtime(cls, v: str) -> str:
+        """运行时档白名单闸（ARCH-3-4）：仅 runc|runsc（gVisor 加固档）"""
+        runtime = (v or "").strip()
+        if runtime not in CONTAINER_RUNTIMES:
+            raise ValueError(
+                f"SANDBOX_RUNTIME 非法运行时档 {v!r}：仅允许 {'|'.join(CONTAINER_RUNTIMES)}"
+                "（runsc 为 gVisor 加固档，宿主机安装步骤见 docs/sandbox-runtime-gvisor.md）")
+        return runtime
 
     # team 级评测并发配额（ARCH-2-2，设计 §2.3 决策 D4 / §3 Phase 2 表 2-2 行）：
     # 单团队同时在途（已提交、未到终态）的评测任务数上限，防止单团队打满全局

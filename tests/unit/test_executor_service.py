@@ -15,11 +15,14 @@ executor 健康/白名单拒绝（privileged/越界 volume/未知镜像/未知�
   * 未知网络档：bridge/open/host/空 → 400（仅 none|egress）
   * entrypoint 非法：空列表、空元素、NUL、首元素 flag 样值 → 422/400
   * timeout 越界（0/负/超上限）→ 422
+  * workdir 越界：挂载根之外、../ 穿越、前缀仿冒、相对路径、flag 样值、空串、
+    NUL → 400（仅 /workspace 子树，单一事实源 resolve_container_workdir）
 - 受理与生命周期（FakeDocker 按子命令分发）：
   * 202 + run_id；docker run 参数全套加固位（--user 10001:10001、--cap-drop
     ALL、no-new-privileges、--read-only、--network none、唯一 -v 落在
     script_runs 子树、-d 后台、无 --privileged）
   * egress 档位 → --network 映射沙箱出网 bridge
+  * workdir 透传 -w（per-script cwd；规范化；缺省挂载根行为不变）
   * run→wait→logs→rm 序列；stdout/stderr 落工作区；GET 状态 done + exit_code
   * 非零退出码仍算 done（脚本失败 ≠ 基础设施失败）
   * 超时路径：wait 超时 → rm -f 强杀、state=timeout
@@ -30,9 +33,12 @@ executor 健康/白名单拒绝（privileged/越界 volume/未知镜像/未知�
 - 单一事实源：worker 通道 script_container.build_docker_run_args 与 executor
   构造共用 sandbox_params（--cap-drop ALL/no-new-privileges 一致，预对齐 1-5）
 """
+import io
+import json
 import logging
 import os
 import subprocess
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -256,6 +262,24 @@ class TestWhitelistRejects:
         payload = _valid_request(ws_root, timeout=bad_timeout)
         assert client.post("/sandbox/run", json=payload, headers=_auth()).status_code == 422
 
+    @pytest.mark.parametrize("bad_workdir", [
+        "/etc",                         # 挂载根之外（镜像只读层任意位置）
+        "/workspace/../etc",            # .. 穿越出挂载根
+        "/workspace/s1/../../tmp",      # 多级 .. 穿越
+        "/workspacefoo",                # 前缀仿冒（非子路径）
+        "relative/s1",                  # 相对路径（-w 必须绝对）
+        "-w",                           # 旗标样值（防被 docker CLI 解析成额外旗标）
+        "",                             # 空串（显式带字段却为空：拒绝，与 net_profile 同口径）
+        "/workspace/s1\x00",            # NUL
+    ])
+    def test_workdir_outside_workspace_rejected_400(self, client, ws_root, bad_workdir):
+        """容器内工作目录白名单：仅 /workspace 子树（单一事实源
+        sandbox_params.resolve_container_workdir），越界/穿越/相对/旗标/NUL → 400"""
+        payload = _valid_request(ws_root, workdir=bad_workdir)
+        resp = client.post("/sandbox/run", json=payload, headers=_auth())
+        assert resp.status_code == 400
+        assert "workdir" in resp.json()["detail"]
+
 
 # ---------------- 受理与生命周期 ----------------
 
@@ -328,6 +352,33 @@ class TestRunLifecycle:
         run_cmd = next(c for c in fake_docker.calls if c[1] == "run")
         assert run_cmd[run_cmd.index("--network") + 1] == \
             sandbox_params.NET_PROFILES["egress"]
+
+    def test_workdir_passed_through_to_dash_w(self, client, ws_root, fake_docker):
+        """请求 workdir（worker per-script cwd /workspace/{script_id}）→ docker run -w
+        同值：harness 三件套/脚本 artifacts 按 cwd 相对寻址，-w 不得硬编码挂载根"""
+        payload = _valid_request(ws_root, workdir="/workspace/s1")
+        resp = client.post("/sandbox/run", json=payload, headers=_auth())
+        assert resp.status_code == 202
+        run_cmd = next(c for c in fake_docker.calls if c[1] == "run")
+        assert run_cmd[run_cmd.index("-w") + 1] == "/workspace/s1"
+        # 挂载点仍是挂载根（-w 在挂载面内部，不改变 -v）
+        binds = [run_cmd[i + 1] for i, a in enumerate(run_cmd) if a == "-v"]
+        assert binds == [f"{os.path.realpath(str(ws_root / 't1' / 'd1'))}:/workspace"]
+
+    def test_workdir_normalized_before_dash_w(self, client, ws_root, fake_docker):
+        """posix 规范化：尾斜杠/./多斜杠归一后进 -w（仍在子树内即放行）"""
+        payload = _valid_request(ws_root, workdir="/workspace/./s1//")
+        assert client.post("/sandbox/run", json=payload, headers=_auth()).status_code == 202
+        run_cmd = next(c for c in fake_docker.calls if c[1] == "run")
+        assert run_cmd[run_cmd.index("-w") + 1] == "/workspace/s1"
+
+    def test_workdir_omitted_defaults_to_workspace_root(self, client, ws_root, fake_docker):
+        """未带 workdir 字段（既有调用方）→ -w /workspace（挂载根），行为不变"""
+        payload = _valid_request(ws_root)
+        assert "workdir" not in payload
+        assert client.post("/sandbox/run", json=payload, headers=_auth()).status_code == 202
+        run_cmd = next(c for c in fake_docker.calls if c[1] == "run")
+        assert run_cmd[run_cmd.index("-w") + 1] == sandbox_params.CONTAINER_WORKSPACE
 
     def test_nonzero_exit_is_done_with_exit_code(self, client, ws_root, fake_docker):
         """脚本非零退出码仍是 done（脚本失败 ≠ 基础设施失败），exit_code 透传"""
@@ -433,3 +484,111 @@ class TestSingleSourceWithWorkerChannel:
     def test_sandbox_param_error_is_value_error(self):
         """executor 统一捕获口径：SandboxParamError 是 ValueError 子类"""
         assert issubclass(SandboxParamError, ValueError)
+
+    def test_resolve_container_workdir_single_source(self):
+        """workdir 白名单单一事实源：None → 挂载根；子树内放行并规范化；越界拒绝"""
+        ws = sandbox_params.CONTAINER_WORKSPACE
+        assert sandbox_params.resolve_container_workdir(None) == ws
+        assert sandbox_params.resolve_container_workdir(ws) == ws
+        assert sandbox_params.resolve_container_workdir(f"{ws}/") == ws
+        assert sandbox_params.resolve_container_workdir(f"{ws}/pjs_agent") == f"{ws}/pjs_agent"
+        assert sandbox_params.resolve_container_workdir(f"{ws}/a/./b//") == f"{ws}/a/b"
+        for bad in ("/etc", f"{ws}/../etc", f"{ws}foo", "rel", "-w", "", "//workspace"):
+            with pytest.raises(SandboxParamError):
+                sandbox_params.resolve_container_workdir(bad)
+
+
+# ---------------- worker HTTP 驱动 ↔ executor 线上契约（请求体原样喂 executor） ----------------
+
+class TestWorkerHttpDriverWireContract:
+    """HttpExecutorDriver 真实构造的请求体 → executor 受理：-w 必须等于 spec.workdir_container
+
+    回归护栏（评审阻断项）：agent 评测步骤（execute_harness_in_container）的
+    entrypoint 以裸相对文件名引用 staged 三件套，依赖 -w 指向 per-script cwd
+    （/workspace/{script_id}）；此前请求体无 workdir 字段且 executor 硬编码
+    -w /workspace，harness_entry 在挂载根找不到三件套 → FileNotFoundError 退出 1。
+    本用例不 mock 任何一侧的组包/校验逻辑：客户端唯一 I/O 出口 _http_open 被
+    替换为「转发到 executor TestClient」，走的就是生产线上的字节。
+    """
+
+    def _wire(self, monkeypatch, client):
+        """把 executor_client._http_open 接到 executor TestClient（同进程转发）"""
+        from app.services import executor_client
+
+        monkeypatch.setenv("EXECUTOR_URL", "http://executor:8300")
+        monkeypatch.setenv("EXECUTOR_TOKEN", TOKEN)
+        captured = {}
+
+        def _forward(req, timeout):
+            body = json.loads(req.data.decode("utf-8")) if req.data else None
+            captured["body"] = body
+            path = req.full_url[len("http://executor:8300"):]
+            resp = client.request(req.method, path, json=body,
+                                  headers={"Authorization": req.get_header("Authorization")})
+            if resp.status_code >= 400:
+                raise urllib.error.HTTPError(req.full_url, resp.status_code, "error", None,
+                                             io.BytesIO(resp.content))
+            return resp.status_code, resp.content
+
+        monkeypatch.setattr(executor_client, "_http_open", _forward)
+        return captured
+
+    def test_harness_spec_workdir_reaches_dash_w(self, client, ws_root, fake_docker, monkeypatch):
+        """harness 形状的 spec（三件套裸相对文件名）经真实 HttpExecutorDriver.run →
+        executor docker run 的 -w == spec.workdir_container（per-script cwd）"""
+        from app.services.executor_client import HttpExecutorDriver
+
+        captured = self._wire(monkeypatch, client)
+        run_dir = ws_root / "t1" / "d1"
+        cwd = run_dir / "pjs_agent"
+        cwd.mkdir()
+        paths = script_container.build_container_paths(run_dir, cwd, cwd)
+        assert paths.cwd_container == "/workspace/pjs_agent"  # 评审 spec 期望值
+        spec = script_container.SandboxRunSpec(
+            image="ai-evo-script-runner:harness-claude", user="10001:10001",
+            workspace_host=paths.run_dir_host, workspace_container=paths.run_dir_container,
+            workdir_container=paths.cwd_container, cwd_host=paths.cwd_host,
+            net_profile="egress", container_name="aievo-script-harness-pjs-agent-abc",
+            entrypoint=[script_container.CONTAINER_PYTHON, script_container.CONTAINER_HARNESS_ENTRY,
+                        "claude", script_container.HARNESS_INSTRUCTION_FILE,
+                        script_container.HARNESS_STDIN_FILE, script_container.HARNESS_CONFIG_FILE],
+            stdin_payload=b"", timeout=90.0,
+        )
+        handle = HttpExecutorDriver().run(spec)
+        assert handle.run_id
+
+        # 线上请求体带 workdir 且 executor 受理（非 400/422）
+        assert captured["body"]["workdir"] == "/workspace/pjs_agent"
+        run_cmd = next(c for c in fake_docker.calls if c[1] == "run")
+        assert run_cmd[run_cmd.index("-w") + 1] == spec.workdir_container == "/workspace/pjs_agent"
+        # 三件套在 argv 里仍是裸相对文件名（契约不变）——正因如此 -w 必须是 cwd
+        shell_cmd = run_cmd[-1]
+        for name in (script_container.HARNESS_INSTRUCTION_FILE,
+                     script_container.HARNESS_STDIN_FILE,
+                     script_container.HARNESS_CONFIG_FILE):
+            assert f" {name}" in shell_cmd and f"/{name}" not in shell_cmd.split("<")[0]
+
+    def test_script_spec_workdir_reaches_dash_w(self, client, ws_root, fake_docker, monkeypatch):
+        """脚本通道同口径：execute_script_in_container 推导的 cwd_container 到达 -w"""
+        from app.services.executor_client import HttpExecutorDriver
+
+        captured = self._wire(monkeypatch, client)
+        run_dir = ws_root / "t1" / "d1"
+        staged = run_dir / "scripts" / "s1"
+        staged.mkdir(parents=True)
+        cwd = run_dir / "s1"
+        cwd.mkdir()
+        paths = script_container.build_container_paths(run_dir, cwd, staged)
+        spec = script_container.SandboxRunSpec(
+            image="ai-evo-script-runner:latest", user="10001:10001",
+            workspace_host=paths.run_dir_host, workspace_container=paths.run_dir_container,
+            workdir_container=paths.cwd_container, cwd_host=paths.cwd_host,
+            net_profile="none", container_name="aievo-script-s1-abc",
+            entrypoint=[script_container.CONTAINER_PYTHON, script_container.CONTAINER_ENTRY_WRAPPER,
+                        paths.staged_dir_container, "main.py"],
+            stdin_payload=b"{}", timeout=30.0,
+        )
+        HttpExecutorDriver().run(spec)
+        assert captured["body"]["workdir"] == "/workspace/s1"
+        run_cmd = next(c for c in fake_docker.calls if c[1] == "run")
+        assert run_cmd[run_cmd.index("-w") + 1] == "/workspace/s1"

@@ -1,0 +1,298 @@
+# ============================================================
+# ai-evo-script-runner harness 变体 —— 被测 agent 沙箱镜像
+# （ARCH-3-2，设计 plans/2026-10-15-企业级评测系统架构设计.md §2.3 D8 /
+#  §3 Phase 3 表 3-2 行）
+#
+#   构建（仓库根为上下文，部署机执行；本仓库不要求本机构建）：
+#     docker build --platform linux/amd64 \
+#       -f docker/script-runner/Dockerfile.harness --target harness-claude \
+#       -t ai-evo-script-runner:harness-claude .
+#     docker build --platform linux/amd64 \
+#       -f docker/script-runner/Dockerfile.harness --target harness-deepseek \
+#       -t ai-evo-script-runner:harness-deepseek .
+#
+#   与基础 script-runner（同目录 Dockerfile）同约束：python:3.12-slim 基座、
+#   只装脚本常用依赖集合（packages.txt 同源）、非 root（uid 10001）、不含
+#   平台代码与任何凭证。隔离参数（--read-only / --cap-drop ALL / 资源上限 /
+#   tmpfs）由 docker run 侧统一注入（executor/sandbox_params.py 单一事实源，
+#   两侧严禁任一侧私增 docker 参数）。变体差异只在被测 agent 运行时：
+#   - harness-claude ：COPY 离线 claude-local CLI（claude 变体必需；目录由
+#     build-service 按 tools/claude-bin.json 下载就位仓库根，不入 git——
+#     .gitignore 已有 claude-local/ 规则；缺位时本 target 构建即失败，
+#     fail-fast 不产出残缺镜像），headless -p 模式拉起被测 agent；
+#   - harness-deepseek：装 deepseek-harness-sdk（版本与 requirements.lock
+#     钉死版同源），DSH runtime 进程内拉起被测 agent。
+#
+#   沙箱入口 /opt/runner/harness_entry.py（本文件 heredoc 写入，不新增仓库
+#   路径）：argv = [variant, instruction.md, stdin.json, harness.json]，三件套
+#   由 worker 侧（app/services/script_container.execute_harness_in_container）
+#   staged 到本次工作区（容器内 /workspace/{script_id}/，即 workdir）；其中
+#   harness.json 携带凭据 env（D6：不进镜像、不进日志，随工作区评完即清）。
+#   出网：docker run 恒 --network aievo-sandbox-egress（egress 档，白名单域名
+#   出网，D8）。镜像基名落在 executor 白名单 RUNNER_IMAGE_BASES（变体=tag）。
+#
+#   同步纪律：本入口的 argv/文件名契约与 app/services/script_container.py 的
+#   CONTAINER_HARNESS_ENTRY / HARNESS_INSTRUCTION_FILE / HARNESS_STDIN_FILE /
+#   HARNESS_CONFIG_FILE 常量一一对应，改任一侧必须同步另一侧并重建变体镜像。
+# ============================================================
+FROM --platform=linux/amd64 python:3.12-slim AS harness-base
+
+# pip 源可在构建时覆盖（内网源：--build-arg PIP_INDEX_URL=...）
+ARG PIP_INDEX_URL=https://pypi.org/simple
+
+# 脚本常用依赖集合（与基础 script-runner 同源；harness_entry 与被测 agent 的
+# 数据处理工具链共用该集合）
+COPY docker/script-runner/packages.txt /tmp/packages.txt
+RUN pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" -r /tmp/packages.txt \
+    && rm -f /tmp/packages.txt
+
+# 统一 harness 入口（ARCH-3-2 契约见文件头注释；BuildKit heredoc 写入，
+# 不新增仓库路径；引号定界符 'PYEOF' 禁变量展开，脚本原文逐字落盘）
+RUN <<PYEOF cat > /opt/runner_harness_entry.py
+#!/usr/bin/env python3
+"""沙箱内被测 agent 拉起入口（ARCH-3-2，设计 §2.3 D8）
+
+worker 侧 staged 三件套到 workdir 后以
+  python /opt/runner/harness_entry.py <variant> instruction.md stdin.json harness.json
+拉起本入口。职责：加载 harness.json（含凭据 env）注入子进程环境 → 组装任务
+prompt（指令 + stdin 数据块）→ 按 variant 拉起被测 agent（claude headless /
+DSH in-process），工具调用记录写 artifacts/ → 最终回复宽容解析为 JSON →
+标准输出最后一行输出与 script 类型同契约的结果 JSON：
+  {status, output, files, summary, finish_reason, error}
+"""
+import json
+import os
+import subprocess
+import sys
+
+ARTIFACTS_DIR = "artifacts"
+CORRECTION_SUFFIX = (
+    "\n\n---\n注意：你上一次的回复无法解析为 JSON。"
+    "请重新执行任务，最终回复必须只包含一个 JSON 对象。"
+)
+
+
+def _extract_json_object(text):
+    """宽容 JSON 提取：首个配对花括号/方括号块（与平台 extract_json_object 同语义）"""
+    for opener, closer in (("{", "}"), ("[", "]")):
+        start = text.find(opener)
+        while start != -1:
+            depth, in_str, escape = 0, False, False
+            for i in range(start, len(text)):
+                ch = text[i]
+                if in_str:
+                    if escape:
+                        escape = False
+                    elif ch == "\\":
+                        escape = True
+                    elif ch == '"':
+                        in_str = False
+                    continue
+                if ch == '"':
+                    in_str = True
+                elif ch == opener:
+                    depth += 1
+                elif ch == closer:
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            return json.loads(text[start:i + 1])
+                        except json.JSONDecodeError:
+                            break
+            start = text.find(opener, start + 1)
+    return None
+
+
+def _emit(payload):
+    """结果 JSON 作为标准输出最后一行（worker 侧按「最后一行 JSON」契约解析）"""
+    print(json.dumps(payload, ensure_ascii=False, default=str), flush=True)
+
+
+def _run_claude(prompt, harness):
+    """claude 变体：headless -p 拉起被测 agent，stream-json 事件转录进 artifacts/"""
+    cmd = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose",
+           "--max-turns", str(int(harness.get("max_turns") or 30))]
+    if harness.get("model"):
+        cmd += ["--model", str(harness["model"])]
+    tools = harness.get("allowed_tools")
+    if isinstance(tools, list) and tools:
+        cmd += ["--allowedTools", ",".join(str(t) for t in tools)]
+    # 沙箱即权限边界（--read-only 根文件系统 + 唯一可写面工作区 + cap-drop ALL +
+    # egress 白名单出网 + 非根用户），headless 评测链路同口径放行工具执行
+    cmd += ["--dangerously-skip-permissions"]
+    final_text, tool_events = "", []
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    for line in proc.stdout:
+        event = None
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "result":
+            final_text = str(event.get("result") or "")
+        else:
+            tool_events.append(event)
+    stderr_tail = proc.stderr.read()[-4096:]
+    returncode = proc.wait()
+    if returncode != 0:
+        raise RuntimeError(f"claude CLI 退出码 {returncode}: {stderr_tail.strip() or '无 stderr 输出'}")
+    with open(os.path.join(ARTIFACTS_DIR, "tool_calls.jsonl"), "w", encoding="utf-8") as f:
+        for event in tool_events:
+            f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+    return final_text, "completed"
+
+
+def _build_dsh_patch(harness):
+    """网关协议（openai/anthropic）：生成 pi-ai provider patch（与平台
+    deepseek_adapter.build_provider_patch 同结构；key 经 apiKeyEnv 环境变量引用，
+    不落 patch 文件）"""
+    api = {"openai": "openai-completions", "anthropic": "anthropic-messages"}[
+        str(harness.get("protocol") or "")]
+    patch = [{"insert": [{"id": "llm-pi-ai", "name": "@deepseek-ai/dsh-llm-pi-ai",
+                          "config": {"providers": {"pi-ai-gateway": {
+                              "displayName": "PI-AI Gateway", "settingsNs": "pi-ai-gateway",
+                              "apiKeyEnv": "DSH_PROVIDER_API_KEY", "api": api,
+                              "baseURL": str(harness["base_url"]).rstrip("/"),
+                              "models": [{"id": str(harness["model"])}]}}}}]}]
+    path = os.path.join(ARTIFACTS_DIR, "dsh-provider-patch.yml")
+    try:
+        import yaml
+        content = yaml.safe_dump(patch, allow_unicode=True, sort_keys=False)
+    except ImportError:
+        content = json.dumps(patch, ensure_ascii=False, indent=2)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+    return path
+
+
+def _run_deepseek(prompt, harness):
+    """deepseek 变体：DSH runtime 进程内拉起被测 agent，转录写 artifacts/"""
+    import tempfile
+    from deepseek_harness import DeepSeekHarness
+
+    kwargs = {
+        "provider": harness.get("provider") or "deepseek-official",
+        "model": harness.get("model") or "deepseek-v4-flash",
+        "profile": harness.get("profile") or "sdk-minimal",
+        # DSH 工作区/家目录用容器 tmpfs（危险档 profile 的隔离面收敛在沙箱内）
+        "cwd": os.getcwd(),
+        "dsh_home": tempfile.mkdtemp(prefix="dsh_home_"),
+        "env": dict(os.environ),
+        "request_timeout_seconds": float(harness.get("request_timeout_seconds") or 300),
+        "initialize_timeout_seconds": float(harness.get("initialize_timeout_seconds") or 30),
+    }
+    if harness.get("max_tokens"):
+        kwargs["max_tokens"] = int(harness["max_tokens"])
+    native = str(harness.get("protocol") or "deepseek") == "deepseek"
+    if native:
+        if harness.get("base_url"):
+            kwargs["base_url"] = str(harness["base_url"]).rstrip("/")
+        kwargs["api_key"] = str(harness.get("api_key") or "")
+    else:
+        kwargs["patches"] = (_build_dsh_patch(harness),)
+        kwargs["provider"] = "pi-ai-gateway"
+    with DeepSeekHarness(**kwargs) as dsh:
+        result = dsh.run(prompt)
+    final_text = str(getattr(result, "final_response", "") or "")
+    with open(os.path.join(ARTIFACTS_DIR, "dsh_result.json"), "w", encoding="utf-8") as f:
+        json.dump({"finish_reason": getattr(result, "finish_reason", None),
+                   "final_response": final_text}, f, ensure_ascii=False, indent=2)
+    return final_text, getattr(result, "finish_reason", None) or "completed"
+
+
+def _envelope(parsed, finish_reason, raw):
+    """agent 最终回复 JSON → 标准结果条目（status 缺省 ok / 整体作 output）"""
+    if isinstance(parsed, dict) and parsed.get("status"):
+        return {"status": parsed.get("status"), "output": parsed.get("output"),
+                "files": parsed.get("files") or {}, "summary": parsed.get("summary") or "",
+                "finish_reason": finish_reason or "completed", "error": parsed.get("error")}
+    if parsed is not None:
+        return {"status": "ok", "output": parsed, "files": {}, "summary": "",
+                "finish_reason": finish_reason or "completed", "error": None}
+    return {"status": "fail", "output": None, "files": {}, "summary": "",
+            "finish_reason": finish_reason or "error",
+            "error": f"agent 最终回复无法解析为 JSON: {raw[:200]}"}
+
+
+def main():
+    variant, instruction_path, stdin_path, harness_path = sys.argv[1:5]
+    with open(instruction_path, encoding="utf-8") as f:
+        instruction = f.read().strip()
+    with open(stdin_path, encoding="utf-8") as f:
+        stdin_payload = json.load(f)
+    with open(harness_path, encoding="utf-8") as f:
+        harness = json.load(f)
+    # 凭据 env 注入子进程（D6：harness.json 随工作区评完即清，不进镜像不进日志）
+    for key, value in (harness.get("env") or {}).items():
+        if isinstance(key, str) and isinstance(value, (str, int, float)):
+            os.environ[key] = str(value)
+    os.makedirs(ARTIFACTS_DIR, exist_ok=True)
+    prompt = (instruction + "\n\n---\n## 输入数据（JSON）\n"
+              + json.dumps(stdin_payload, ensure_ascii=False, default=str))
+
+    runner = {"claude": _run_claude, "deepseek": _run_deepseek}.get(variant)
+    if runner is None:
+        _emit({"status": "fail", "output": None, "files": {}, "summary": "",
+               "finish_reason": "error", "error": f"未知 harness 变体: {variant}"})
+        return
+    try:
+        raw, finish_reason = runner(prompt, harness)
+    except Exception as e:  # noqa: BLE001 - agent 失败转结构化 fail（退出码保持 0，错误进条目）
+        _emit({"status": "fail", "output": None, "files": {}, "summary": "",
+               "finish_reason": "error", "error": f"被测 agent 执行失败: {e}"})
+        return
+    parsed = _extract_json_object(raw)
+    if parsed is None:
+        # 一次格式纠正重试（与平台 HarnessAdapter.run_prompt 同策略）
+        try:
+            raw, finish_reason = runner(prompt + CORRECTION_SUFFIX, harness)
+            parsed = _extract_json_object(raw)
+        except Exception as e:  # noqa: BLE001
+            _emit({"status": "fail", "output": None, "files": {}, "summary": "",
+                   "finish_reason": "error", "error": f"被测 agent 重试失败: {e}"})
+            return
+    _emit(_envelope(parsed, finish_reason, raw))
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
+RUN mkdir -p /opt/runner \
+    && mv /opt/runner_harness_entry.py /opt/runner/harness_entry.py \
+    && chown root:root /opt/runner/harness_entry.py \
+    && chmod 0755 /opt/runner/harness_entry.py
+
+# 非 root 运行用户（uid/gid 10001，与 SCRIPT_RUNNER_USER 缺省一致）；
+# /workspace 为运行时 bind mount 挂载点（只读层里仅建目录）
+RUN groupadd -g 10001 runner \
+    && useradd -m -u 10001 -g 10001 -s /usr/sbin/nologin runner \
+    && mkdir -p /workspace /home/runner \
+    && chown -R runner:runner /workspace /home/runner
+
+# 运行必需最小 env（与基础 script-runner 同集合；docker run 侧显式 -e 注入
+# 同一白名单，见 executor/sandbox_params.CONTAINER_ENV_ALLOWLIST）
+ENV PYTHONIOENCODING=utf-8 \
+    PYTHONUNBUFFERED=1 \
+    LANG=C.UTF-8 \
+    HOME=/home/runner
+
+WORKDIR /workspace
+USER runner
+
+# ---------------- deepseek 变体：DSH runtime ----------------
+FROM harness-base AS harness-deepseek
+ARG PIP_INDEX_URL=https://pypi.org/simple
+# 版本与 requirements.lock 钉死版同源（含捆绑 node 运行时的 -runtime-bin）
+RUN pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" \
+    "deepseek-harness-sdk==0.1.5rc1"
+
+# ---------------- claude 变体：离线 claude-local CLI ----------------
+FROM harness-base AS harness-claude
+# 离线 CLI 由 build-service 按 tools/claude-bin.json 下载就位仓库根（不入 git）；
+# 缺位即 COPY 失败——fail-fast，不产出无 CLI 的残缺镜像。claude 为自包含
+# ELF 二进制，无系统包依赖（与主 Dockerfile 的安装口径一致：/opt/claude +
+# /usr/local/bin 符号链接，root 属主全局可读可执行）
+COPY claude-local/ /opt/claude/
+RUN ln -sf /opt/claude/bin/claude /usr/local/bin/claude \
+    && /usr/local/bin/claude --version
+ENV CLAUDE_CODE_PATH=/usr/local/bin/claude

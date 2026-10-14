@@ -277,8 +277,10 @@ class TestCliProfileMapping:
 
 class TestHttpDriverRequests:
     def test_run_posts_whitelist_shaped_payload(self, tmp_path, mock_executor):
-        """请求字段集即白名单面：{image, workspace, net_profile, timeout, entrypoint}；
-        stdin 载荷落盘工作区、entrypoint 为 shell 重定向包装（无额外字段可表达）"""
+        """请求字段集即白名单面：{image, workspace, workdir, net_profile, timeout,
+        entrypoint}；stdin 载荷落盘工作区、entrypoint 为 shell 重定向包装（无额外
+        字段可表达）；workdir = spec.workdir_container（per-script cwd，与 CLI
+        通道 -w 同值——harness 三件套/脚本 artifacts 按 cwd 寻址）"""
         run_dir, _, _ = _workspace(tmp_path)
         spec = script_container.SandboxRunSpec(
             image="ai-evo-script-runner:latest", user="10001:10001",
@@ -300,9 +302,11 @@ class TestHttpDriverRequests:
         # 字段集恰为白名单面（无 privileged/volumes 等可表达位）
         body = post["body"]
         assert sorted(body) == ["entrypoint", "image", "net_profile",
-                                "timeout", "workspace"]
+                                "timeout", "workdir", "workspace"]
         assert body["image"] == spec.image
         assert body["workspace"] == str(run_dir)
+        # 容器内工作目录透传 per-script cwd（不是挂载根）
+        assert body["workdir"] == spec.workdir_container == "/workspace/s1"
         assert body["net_profile"] == "none"
         assert body["timeout"] == 120.0
         # entrypoint = sh -c「原 argv 逐段引号包裹 + stdin 文件重定向」
@@ -314,6 +318,16 @@ class TestHttpDriverRequests:
         # stdin 载荷已落盘工作区（挂载面内，随工作区清理）
         stdin_file = run_dir / "stdin-aievo-script-s1-abc123.json"
         assert json.loads(stdin_file.read_text("utf-8")) == {"_run_dir": "/workspace"}
+
+    def test_orchestration_sends_per_script_cwd_as_workdir(self, tmp_path, mock_executor):
+        """编排层 → 请求 workdir = build_container_paths 推导的 per-script cwd
+        （/workspace/{script_id}），与 docker-CLI 通道 -w 同值，不是挂载根"""
+        result, (run_dir, staged, cwd) = _run_in_container(tmp_path)
+        assert result["status"] == "ok"
+        paths = script_container.build_container_paths(run_dir, cwd, staged)
+        body = mock_executor.posts()[0]["body"]
+        assert body["workdir"] == paths.cwd_container == "/workspace/s1"
+        assert body["workspace"] == paths.run_dir_host == str(run_dir)
 
     def test_missing_token_fails_closed(self, tmp_path, monkeypatch):
         """EXECUTOR_TOKEN 未配置：客户端 fail-closed 不发起任何调用（与 executor 503 对齐）"""

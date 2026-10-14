@@ -47,6 +47,22 @@ ARCH-1-2（设计 §2.3 D1 / §3 表 1-2 行 / 「远期 K8s」预留扩展点�
 远期扩展点 1）。网络三档（设计 D2）：``SCRIPT_NET_PROFILE``（none|egress|open，
 默认 none）+ step.network:true → open 档，映射见 WORKER_NET_PROFILE_TO_DOCKER。
 
+ARCH-3-2（设计 §2.3 D8 / §3 表 3-2 行）：被测 agent 与前处理脚本同级进沙箱。
+``execute_harness_in_container`` 复用同一 SandboxDriver 与工作区语义（差异只有
+三点：镜像按 exec_type 选 Dockerfile.harness 变体、出网恒 egress 档（模型外呼
+是刚需，不走 step.network 的 open 档语义）、载荷改工作区三件套落盘——
+instruction.md/stdin.json/harness.json，agent 侧不依赖 -i 管道）。harness 语义
+（变体/指令/凭据组装）在 app/services/harness_adapter.py，调度接线在
+app/services/pre_judge_runner.py。
+
+ARCH-3-4（设计 §3 Phase 3 表 3-4 行「gVisor 可选运行时档」）：沙箱可选
+``--runtime runsc`` 加固档（gVisor 应用层内核，高危脚本专用），档位经
+``SANDBOX_RUNTIME``（app/core/config.py，默认 runc）配置，由 ``sandbox_runtime``
+读取后经 SandboxRunSpec.runtime 透传到驱动；白名单（runc|runsc）与旗标构造的
+单一事实源在 executor/sandbox_params（两侧一致，缺省 runc 不拼旗标——默认
+行为不变）。HTTP executor 驱动的客户端透传（请求体带 runtime 字段）属后续
+批次接线（executor 侧字段与校验本批已开，见 executor/app.py.SandboxRunRequest）。
+
 执行返回结构与 local 模式完全一致（pre_script_results 标准条目）。
 """
 import logging
@@ -62,6 +78,7 @@ from typing import Any, Dict, List, Optional, Union
 from prometheus_client import Histogram
 
 from app.core.config import get_settings
+from app.utils.path_safety import PathEscapeError
 
 # ARCH-1-1：单一事实源 re-export（保持既有调用面不变；noqa 见下——本模块
 # 对外仍暴露这些名字，pre_judge_script_service 与单测直接引用）
@@ -72,13 +89,17 @@ from executor.sandbox_params import (  # noqa: F401
     CONTAINER_MEMORY,
     CONTAINER_PIDS_LIMIT,
     CONTAINER_PYTHON,
+    CONTAINER_RUNTIMES,
     CONTAINER_TMPFS_HOME,
     CONTAINER_TMPFS_SIZE,
     CONTAINER_TMPFS_TMP,
     CONTAINER_WORKSPACE,
+    DEFAULT_RUNTIME,
     NET_PROFILES as _EXECUTOR_NET_PROFILES,
+    SandboxParamError as _SandboxParamError,
     build_docker_run_args as _build_sandbox_docker_run_args,
     docker_binary,
+    validate_container_runtime as _validate_container_runtime,
 )
 
 logger = logging.getLogger(__name__)
@@ -163,6 +184,71 @@ def runner_user() -> str:
     if raw:
         return raw
     return (get_settings().SCRIPT_RUNNER_USER or "10001:10001").strip()
+
+
+# ---------------- 沙箱容器运行时档（ARCH-3-4，设计 §3 表 3-4 行） ----------------
+
+def sandbox_runtime() -> str:
+    """沙箱容器运行时档（SANDBOX_RUNTIME，默认 runc；白名单 runc|runsc）
+
+    环境变量实时读取（与 runner_image 同语义：改 env 重启 worker 即切换或
+    回退）；非法值抛 SandboxDriverError 拒绝——与 SCRIPT_NET_PROFILE 的
+    fail-safe 回退方向不同：网络档回退是收紧（不出网），运行时档回退是放松
+    （加固档悄悄降回 runc，高危脚本看似在 gVisor 下跑实际没有），必须
+    fail-loud。白名单同源 executor/sandbox_params.CONTAINER_RUNTIMES；
+    Settings 层同闸（app/core/config.py field_validator，启动即拒）。
+    """
+    raw = (os.environ.get("SANDBOX_RUNTIME") or "").strip()
+    value = raw or (get_settings().SANDBOX_RUNTIME or DEFAULT_RUNTIME).strip()
+    try:
+        return _validate_container_runtime(value)
+    except _SandboxParamError as e:
+        raise SandboxDriverError(f"SANDBOX_RUNTIME 非法: {e}") from e
+
+
+# ---------------- 被测 agent harness 变体镜像（ARCH-3-2，设计 D8） ----------------
+
+# 变体 → 缺省镜像引用。变体镜像由 docker/script-runner/Dockerfile.harness 构建
+# （claude 变体含离线 claude-local CLI 的 COPY，目录不入 git，真实构建留部署机）；
+# 基名仍落 executor 镜像白名单 RUNNER_IMAGE_BASES（sandbox_params，单一事实源），
+# 不开放 registry 前缀/digest 引用（与 3-3 注明的 digest 白名单现状同批约束）。
+# Settings 字段扩展不在本批边界（app/core/config.py 未动），故镜像引用只有
+# 「环境变量覆盖 + 缺省钉 tag」两级，读取语义与 runner_image 的 env 实时读一致。
+DEFAULT_HARNESS_IMAGES: Dict[str, str] = {
+    "claude": "ai-evo-script-runner:harness-claude",
+    "deepseek": "ai-evo-script-runner:harness-deepseek",
+}
+# 变体 → 镜像覆盖环境变量（部署机切换变体镜像 tag 用）
+HARNESS_IMAGE_ENV_VARS: Dict[str, str] = {
+    "claude": "HARNESS_CLAUDE_IMAGE",
+    "deepseek": "HARNESS_DEEPSEEK_IMAGE",
+}
+
+# 沙箱内 harness 入口（Dockerfile.harness 构建时 heredoc 写入镜像，契约：
+# argv = [variant, instruction.md, stdin.json, harness.json]，三件套由
+# execute_harness_in_container staged 到 workdir，容器内相对路径引用）
+CONTAINER_HARNESS_ENTRY = "/opt/runner/harness_entry.py"
+# 工作区 staged 三件套文件名（cwd 直下，与下方 HARNESS_* 常量一一对应）
+HARNESS_INSTRUCTION_FILE = "instruction.md"
+HARNESS_STDIN_FILE = "stdin.json"
+HARNESS_CONFIG_FILE = "harness.json"
+# harness 产物目录名：容器内 harness_entry 把工具调用记录/转录写 workdir 下
+# 该目录（D8「被测 agent 的工具调用记录由 harness 采集回工作区」），worker
+# 侧执行后回收为结果条目 files（宿主路径）
+HARNESS_ARTIFACTS_DIR = "artifacts"
+
+
+def harness_image(variant: str) -> str:
+    """harness 变体镜像引用（HARNESS_CLAUDE_IMAGE/HARNESS_DEEPSEEK_IMAGE 覆盖）
+
+    环境变量实时读 + 缺省钉 tag；未知变体明确拒绝（fail-fast，不猜镜像）。
+    """
+    env_var = HARNESS_IMAGE_ENV_VARS.get(variant)
+    if not env_var:
+        raise SandboxDriverError(
+            f"未知 harness 变体 {variant!r}（可选: {'/'.join(sorted(DEFAULT_HARNESS_IMAGES))}）")
+    raw = (os.environ.get(env_var) or "").strip()
+    return raw or DEFAULT_HARNESS_IMAGES[variant]
 
 
 # ---------------- 网络三档（ARCH-1-2，设计 D2） ----------------
@@ -371,6 +457,9 @@ class SandboxRunSpec:
     entrypoint: List[str]          # exec 形式容器 argv（[python, wrapper, staged, entry_rel]）
     stdin_payload: bytes           # stdin 载荷（CLI：管道传入；executor：驱动落盘工作区）
     timeout: float                 # 执行超时秒数
+    # 容器运行时档（ARCH-3-4：runc 默认|runsc 加固；sandbox_runtime 读取，
+    # 白名单校验后进驱动；既有 spec 构造面缺省 runc 不变）
+    runtime: str = DEFAULT_RUNTIME
 
 
 @dataclass
@@ -446,6 +535,7 @@ class DockerCliDriver(SandboxDriver):
             network_name=_worker_network_name(spec.net_profile),
             container_name=spec.container_name,
             tail_command=spec.entrypoint,
+            runtime=spec.runtime,  # ARCH-3-4：运行时档透传（runc|runsc）
             interactive=True,
         )]
         try:
@@ -604,6 +694,9 @@ def execute_script_in_container(
     sandbox_driver = driver or get_sandbox_driver()
 
     try:
+        # ARCH-3-4：运行时档读取（SANDBOX_RUNTIME）与白名单校验在受理 try 内
+        # ——非法配置（SandboxDriverError）按驱动错误转脚本 fail 条目，不炸编排
+        spec.runtime = sandbox_runtime()
         # ARCH-2-3：沙箱启动（受理）延迟打点——只观察受理成功（口径见
         # SANDBOX_START_LATENCY 注释）
         _sandbox_start = time.monotonic()
@@ -647,6 +740,203 @@ def execute_script_in_container(
                        finish_reason="error", started_at=started, static_check=static_check)
 
     return _normalize_stdout(script_id, name, stdout, started, static_check=static_check)
+
+
+# ---------------- 被测 agent 沙箱执行（ARCH-3-2，设计 §2.3 D8 / §3 表 3-2 行） ----------------
+
+def execute_harness_in_container(
+    script: Dict[str, Any],
+    stdin: Dict[str, Any],
+    timeout: float,
+    started: float,
+    variant: str,
+    instruction: str,
+    harness_config: Dict[str, Any],
+    driver: Optional[SandboxDriver] = None,
+) -> Dict[str, Any]:
+    """exec_type=claude_agent/deepseek_agent：经 SandboxDriver 在沙箱内拉起被测 agent
+
+    与 execute_script_in_container 同构的驱动无关编排（同一 SandboxDriver、同一
+    script_runs 工作区语义、同一 stdout/stderr 日志位与结果条目结构），差异：
+
+    - 镜像：按 variant 选 Dockerfile.harness 变体（harness_image，env 可覆盖）；
+    - 网络：恒 egress 档（D8「沙箱内出网走 egress 档」——模型 API 外呼是 agent
+      刚需，白名单域名经 egress 网络，不受 step.network/SCRIPT_NET_PROFILE 影响）；
+    - 载荷：无脚本包副本，改在工作区 staged 三件套（instruction.md 指令文本 /
+      stdin.json 容器路径版 payload / harness.json 凭据与参数），容器入口
+      /opt/runner/harness_entry.py 按相对文件名读取（stdin_payload 为空——
+      两条驱动通道对空载荷均兼容：CLI 空写即关管道，executor 落盘空文件重定向）；
+    - 回收：agent 结果 JSON 的 files 路径是容器路径（/workspace/...），统一逆
+      映射回宿主工作区路径；artifacts/ 目录内产物（工具调用记录等）自动并入
+      files——产物只落工作区（D5 工作区语义），评完即清。
+
+    Args:
+        script: 脚本定义 {script_id, name, exec_type, ...}（agent 类型）
+        stdin: stdin payload（宿主路径版；函数内重写为容器路径后落盘 stdin.json）
+        timeout: 超时秒数（超时终止容器）
+        started: 计时起点 time.time()
+        variant: harness 变体（claude|deepseek，harness_adapter.harness_variant_for）
+        instruction: 指令文本（harness_adapter.build_harness_instruction 产物）
+        harness_config: 凭据与参数（harness_adapter.build_harness_agent_config 产物；
+            含敏感 env，随工作区 0o750 目录落盘、评完即清，不进日志）
+        driver: 显式驱动（测试注入）；缺省按 get_sandbox_driver() 解析
+
+    返回 pre_script_results 标准条目（复用 _normalize_stdout，另加 harness 元信息：
+    variant/image/artifacts_dir 供结果页与排障区分执行通道）。
+    """
+    # 延迟 import：与 execute_script_in_container 同口径避免模块顶层互引
+    from app.services.pre_judge_runner import (
+        _normalize_stdout,
+        _parse_last_json_line,
+        _read_file_tail,
+        _result,
+        build_script_run_dir,
+        SCRIPT_STDERR_LIMIT,
+        SCRIPT_STDOUT_LIMIT,
+    )
+
+    script_id = str(script.get("script_id") or script.get("id") or "")
+    name = script.get("name") or script_id
+    script_key = script_id or name or "agent"
+
+    try:
+        image = harness_image(variant)
+    except SandboxDriverError as e:
+        return _result(script_id, name, "fail", error=str(e),
+                       finish_reason="error", started_at=started)
+
+    # 工作区：与 script 类型同构（uploads/script_runs/{task}/{data}/{script_id}/）
+    try:
+        cwd = build_script_run_dir(
+            str(stdin.get("task_id") or "unknown"),
+            str(stdin.get("data_id") or "item"),
+            script_key,
+        )
+    except (OSError, PathEscapeError) as e:
+        # ARCH-0-3 口径：路径越界（.. 穿越/symlink 逃出 SCRIPT_RUN_BASE）绝不越界建目录
+        return _result(script_id, name, "fail", error=f"创建 agent 运行目录失败: {e}",
+                       finish_reason="error", started_at=started)
+    run_dir_value = stdin.get("_run_dir")
+    run_dir = Path(str(run_dir_value)) if run_dir_value else Path(cwd).parent
+    paths = build_container_paths(run_dir, cwd, cwd)
+
+    # 载荷三件套 staged 到 workdir：stdin 宿主路径先重写为容器路径（脚本通道
+    # 同口径），harness.json 原样落盘（凭据只进工作区，不进日志/env 白名单）
+    container_stdin = rewrite_stdin_paths(stdin, paths.run_dir_host, paths.run_dir_container)
+    staged: Dict[str, str] = {
+        HARNESS_INSTRUCTION_FILE: instruction,
+        HARNESS_STDIN_FILE: _dump_stdin_json(container_stdin),
+        HARNESS_CONFIG_FILE: _dump_stdin_json(harness_config),
+    }
+    try:
+        for file_name, content in staged.items():
+            (Path(cwd) / file_name).write_text(content, encoding="utf-8")
+    except OSError as e:
+        return _result(script_id, name, "fail", error=f"agent 载荷落盘工作区失败: {e}",
+                       finish_reason="error", started_at=started)
+
+    spec = SandboxRunSpec(
+        image=image,
+        user=runner_user(),
+        workspace_host=paths.run_dir_host,
+        workspace_container=paths.run_dir_container,
+        workdir_container=paths.cwd_container,
+        cwd_host=paths.cwd_host,
+        net_profile="egress",
+        container_name=_new_container_name(f"harness-{script_key}"),
+        entrypoint=[CONTAINER_PYTHON, CONTAINER_HARNESS_ENTRY, variant,
+                    HARNESS_INSTRUCTION_FILE, HARNESS_STDIN_FILE, HARNESS_CONFIG_FILE],
+        stdin_payload=b"",
+        timeout=timeout,
+    )
+    sandbox_driver = driver or get_sandbox_driver()
+
+    try:
+        # ARCH-3-4：运行时档读取与脚本通道同口径（受理 try 内，非法配置转 fail 条目）
+        spec.runtime = sandbox_runtime()
+        # ARCH-2-3：受理延迟打点口径与脚本通道一致（driver 标签区分通道）
+        _sandbox_start = time.monotonic()
+        handle = sandbox_driver.run(spec)
+        SANDBOX_START_LATENCY.labels(driver=sandbox_driver.name).observe(
+            time.monotonic() - _sandbox_start)
+        status = sandbox_driver.wait(handle, timeout)
+    except SandboxDriverError as e:
+        return _result(script_id, name, "fail", error=str(e),
+                       finish_reason="error", started_at=started)
+
+    # 日志归位：两条驱动的 stdout/stderr 统一在 cwd 下（agent 通道同理）
+    stdout_file = Path(cwd) / "stdout.log"
+    stderr_file = Path(cwd) / "stderr.log"
+    stdout_tail = _read_file_tail(stdout_file, SCRIPT_STDOUT_LIMIT)
+    stderr_tail = _read_file_tail(stderr_file, SCRIPT_STDERR_LIMIT)
+
+    if status.state == "timeout":
+        detail = f"；{status.error}" if status.error else ""
+        return _result(script_id, name, "fail",
+                       error=f"agent 执行超时被终止（>{timeout:.0f}秒，容器已回收）{detail}",
+                       finish_reason="timeout", started_at=started)
+
+    if status.state == "failed":
+        return _result(script_id, name, "fail",
+                       error=(status.error or f"沙箱执行失败（{sandbox_driver.name} 驱动）")[:4000],
+                       finish_reason="error", started_at=started)
+
+    if status.exit_code != 0:
+        hint = _docker_failure_hint(status.exit_code, stderr_tail, image)
+        error = f"agent 容器退出码 {status.exit_code}: {(stderr_tail.strip() or '无 stderr 输出')[:4000]}{hint}"
+        return _result(script_id, name, "fail", error=error[:4000],
+                       finish_reason="error", started_at=started)
+
+    try:
+        stdout = _parse_last_json_line(stdout_tail)
+    except ValueError as e:
+        return _result(script_id, name, "fail", error=str(e),
+                       finish_reason="error", started_at=started)
+
+    result = _normalize_stdout(script_id, name, stdout, started)
+    # 产物回收：agent 声明的 files 是容器路径，逆映射回宿主工作区路径；artifacts/
+    # 目录（工具调用记录/转录）自动并入 files（宿主路径），评分输入与结果页可直接引用
+    result["files"] = _recover_harness_artifacts(result.get("files") or {}, paths.run_dir_host, Path(cwd))
+    result["harness"] = {
+        "variant": variant,
+        "image": image,
+        "artifacts_dir": str(Path(cwd) / HARNESS_ARTIFACTS_DIR),
+    }
+    return result
+
+
+def _dump_stdin_json(value: Any) -> str:
+    """staged 载荷序列化（文本形态落盘；与 _dump_stdin 同口径的容错）"""
+    import json
+    return json.dumps(value, ensure_ascii=False, default=str, indent=2)
+
+
+def _recover_harness_artifacts(
+    files: Dict[str, Any],
+    mount_host: str,
+    cwd_host: Path,
+) -> Dict[str, Any]:
+    """agent 结果 files 的容器路径逆映射回宿主 + artifacts/ 目录自动回收
+
+    - 容器路径（/workspace/... 前缀）→ 挂载源宿主路径（mount_host + 后缀），
+      挂载面外/非字符串值原样保留（与 rewrite_stdin_paths 的边界匹配口径一致）；
+    - artifacts/ 目录下全部文件按相对名并入 files（agent 未声明的转录/工具
+      调用记录也进结果，setdefault 不覆盖 agent 显式声明）。
+    """
+    prefix = CONTAINER_WORKSPACE.rstrip("/")
+    boundary = prefix + "/"
+    recovered: Dict[str, Any] = {}
+    for key, value in files.items():
+        if isinstance(value, str) and (value == prefix or value.startswith(boundary)):
+            recovered[str(key)] = mount_host.rstrip("/") + value[len(prefix):]
+        else:
+            recovered[str(key)] = value
+    artifacts_dir = cwd_host / HARNESS_ARTIFACTS_DIR
+    if artifacts_dir.is_dir():
+        for path in sorted(artifacts_dir.rglob("*")):
+            if path.is_file():
+                recovered.setdefault(path.relative_to(artifacts_dir).as_posix(), str(path))
+    return recovered
 
 
 def _dump_stdin(value: Any) -> bytes:

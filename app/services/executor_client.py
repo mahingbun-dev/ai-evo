@@ -7,6 +7,8 @@
 
 - ``run``    stdin 载荷落盘工作区 → entrypoint 包一层 shell 重定向（executor
              detached 受理无 stdin 通道，与 CLI 通道 ``-i`` 管道语义等价）→
+             请求体带 ``workdir``（spec.workdir_container，per-script cwd——与
+             CLI 通道的 ``-w`` 同值，harness 三件套/脚本 artifacts 按 cwd 寻址）→
              ``POST /sandbox/run`` → 202 {run_id}；
 - ``wait``   轮询 ``GET /sandbox/runs/{id}`` 至终态（done|timeout|failed），
              客户端死线 = 脚本 timeout + WAIT_MARGIN_SECONDS 兜底（超时强制
@@ -175,6 +177,11 @@ class HttpExecutorDriver(SandboxDriver):
         body = {
             "image": spec.image,
             "workspace": spec.workspace_host,
+            # 容器内工作目录（per-script cwd，/workspace/{script_id}）：harness 通道
+            # entrypoint 以裸相对文件名引用 staged 三件套、脚本通道 artifacts 按
+            # cwd 落盘，都依赖 -w 指向 cwd——executor 侧按 /workspace 子树白名单
+            # 校验（sandbox_params.resolve_container_workdir），越界 400 透传
+            "workdir": spec.workdir_container,
             "net_profile": spec.net_profile,
             "timeout": spec.timeout,
             "entrypoint": ["sh", "-c", shell_command],

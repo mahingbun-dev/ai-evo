@@ -16,7 +16,11 @@ token 的 HTTP 调用（1-2 起由 SandboxDriver 的 HTTP 驱动接入）。
 与 worker docker-CLI 通道同一事实源）：
 - 镜像仅 script-runner 系清单；``--user 10001:10001``、资源上限/read-only/
   tmpfs/cap-drop=ALL/no-new-privileges 固定；网络档仅 none|egress；
+  运行时档仅 runc|runsc（runsc = gVisor 加固档，高危脚本专用，ARCH-3-4）；
   bind mount 仅 /app/uploads/script_runs 子树（realpath 校验）；
+  容器内工作目录（``workdir`` → ``-w``）仅 /workspace 子树（缺省挂载根；worker
+  的 per-script cwd /workspace/{script_id} 经此透传——harness 三件套与脚本
+  artifacts 按 cwd 相对寻址，硬编码挂载根会让 agent 通道必然 FileNotFound）；
 - 请求模型 ``extra="forbid"``——``privileged``、``--pid=host``、任意 ``-v``
   等一切额外 docker 能性**没有字段可表达**，注入未知字段在反序列化层即 422。
 
@@ -113,7 +117,8 @@ app = FastAPI(
 # ---------------- 请求/登记模型 ----------------
 
 class SandboxRunRequest(BaseModel):
-    """沙箱运行请求——字段集即白名单（设计 §2.4：{image, workspace, net_profile, timeout, entrypoint}）
+    """沙箱运行请求——字段集即白名单（设计 §2.4：{image, workspace, net_profile, timeout, entrypoint}
+    + 后续批次按白名单纪律扩的 runtime（ARCH-3-4）/ workdir（容器内工作目录））
 
     ``extra="forbid"``：privileged/pid_host/volumes 等任何额外 docker 能力
     没有字段可表达，注入未知字段直接 422——executor 不是通用 docker 代理。
@@ -123,7 +128,18 @@ class SandboxRunRequest(BaseModel):
     image: str = Field(min_length=1, max_length=256)
     # 宿主（executor 视角）工作区绝对路径，须在 /app/uploads/script_runs 子树内
     workspace: str = Field(min_length=1, max_length=4096)
+    # 容器内工作目录（docker run -w）：worker 侧 per-script cwd = /workspace/{script_id}
+    # （script_container.build_container_paths 推导，harness 通道的三件套与脚本通道
+    # 的 artifacts 都按 cwd 相对寻址）。白名单校验在 sandbox_params.
+    # resolve_container_workdir（单一事实源）：须落在 /workspace 子树内，否则 400；
+    # 缺省 None → /workspace（挂载根，既有未带字段的调用方行为不变）
+    workdir: Optional[str] = Field(default=None, max_length=4096)
     net_profile: str = "none"  # 档位枚举校验在 sandbox_params（单一事实源），未知档 400
+    # 容器运行时档（ARCH-3-4，设计 §3 表 3-4 行）：runc（缺省，daemon 默认，
+    # 不拼旗标）| runsc（gVisor 加固档，宿主机须预装注册，见
+    # docs/sandbox-runtime-gvisor.md）；枚举校验在 sandbox_params（单一事实源），
+    # 未知值 400。缺省 runc 保证既有调用方（未带本字段的 worker 客户端）行为不变
+    runtime: str = "runc"
     timeout: float = Field(default=600.0, gt=0.0, le=3600.0)
     # exec 形式容器 argv（镜像后的命令），无 shell 参与拼接
     entrypoint: List[str] = Field(min_length=1, max_length=ENTRYPOINT_MAX_ITEMS)
@@ -279,7 +295,12 @@ def sandbox_run(
     try:
         image = sandbox_params.validate_runner_image(req.image)
         mount_host = sandbox_params.resolve_workspace_mount(req.workspace)
+        # 容器内工作目录白名单：须在 /workspace 子树内（缺省挂载根）；worker 的
+        # per-script cwd 经此透传到 -w——harness 三件套/脚本 artifacts 按 cwd 寻址
+        workdir_container = sandbox_params.resolve_container_workdir(req.workdir)
         network_name = sandbox_params.network_profile_to_docker(req.net_profile)
+        # ARCH-3-4：运行时档白名单（runc|runsc），非法值 400 拒绝并审计
+        runtime = sandbox_params.validate_container_runtime(req.runtime)
         entrypoint = _validate_entrypoint(req.entrypoint)
     except SandboxParamError as e:
         audit_logger.warning(f"[sandbox:reject] 原因={e} 参数={req.model_dump()}")
@@ -292,10 +313,11 @@ def sandbox_run(
         user=sandbox_params.SANDBOX_USER,  # 固定 10001:10001（设计 D1，非请求参数）
         mount_host=mount_host,
         mount_container=sandbox_params.CONTAINER_WORKSPACE,
-        workdir_container=sandbox_params.CONTAINER_WORKSPACE,
+        workdir_container=workdir_container,  # 请求 workdir（白名单已校验）；缺省挂载根
         network_name=network_name,
         container_name=container_name,
         tail_command=entrypoint,
+        runtime=runtime,   # ARCH-3-4：runc|runsc（gVisor 加固档），白名单已校验
         detach=True,       # 202 异步受理；退出码经 GET / docker wait 收口
         auto_rm=False,     # 退出后 docker logs 取日志，再显式 rm -f 回收
         interactive=False, # detached 无 stdin 载荷（payload 在工作区文件）

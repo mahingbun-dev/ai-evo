@@ -48,6 +48,8 @@ GitLab push main
          ├─ docker run ai-evo-builder（挂载 docker.sock）
          │    ├─ pnpm install --offline && pnpm build   → frontend/dist
          │    └─ docker build -t ai-evo:<短sha>         → 宿主 daemon
+         ├─ trivy 镜像扫描（ARCH-3-3）：HIGH+ 且有修复版本 → 构建失败
+         │    （不写 release 记录，有漏洞的镜像不可部署/回滚，见第十一节）
          └─ deploy：同步 docker-compose.yml → 写 .env 的 IMAGE_TAG
                      → docker compose up -d → 校验容器与接口
                      → 同步 frontend/dist 到 nginx 静态根（宿主机目录）
@@ -284,7 +286,7 @@ api/worker 容器。部署相关变量一览（✅ 必填、⛔ 严禁设置；�
 | `AUTH_JWT_SECRET` | ✅ | JWT 签名密钥（ARCH-0-2）。缺失即拒启，生成与轮换见「JWT 密钥配置与轮换」 |
 | `AUTH_JWT_ALLOW_DERIVED` | ⛔ | **企业部署严禁开启**（ARCH-0-2）。仅开发机 `.env_local` 可显式设 true 保留派生回退 |
 | `SCRIPT_EXEC_MODE` | 见「九」 | 前处理脚本执行模式（ARCH-0-4；ARCH-1-4 起缺省 `container`，`local` 仅开发机显式 env）——灰度与回退步骤见第九节 9.1 |
-| `SCRIPT_RUNNER_IMAGE` | 可选 | `container` 模式 runner 镜像（默认 `ai-evo-script-runner:latest`），离线预载见 `docker/script-runner/README.md` |
+| `SCRIPT_RUNNER_IMAGE` | 可选 | `container` 模式 runner 镜像（默认 `ai-evo-script-runner:latest`），离线预载见 `docker/script-runner/README.md`；自 ARCH-1-5 支持 digest 钉扎 `<repo>@sha256:<64hex>`（取法与通道限制见 11.4，ARCH-3-3 对齐口径） |
 | `SCRIPT_RUNNER_USER` | 可选 | `container` 模式容器内运行用户（默认 `10001:10001`）；Linux 部署机需与挂载目录属主匹配 |
 | `IMAGE_TAG` | 自动 | CI 部署时自动写入当前短 sha；手工回滚即改回旧值 |
 | `TMPFS_TMP_SIZE` / `TMPFS_HOME_SIZE` | 可选 | `/tmp`、`/home/app` 两个 tmpfs 的容量上限（ARCH-0-1，默认各 1g，只按实际写入占内存） |
@@ -842,3 +844,117 @@ worker 的模型测连/OSS 外呼走的是第 6 步的 `WORKER_EGRESS_PROXY`，�
   `tests/unit/test_compose_topology.py` 静态断言（deny 内网段先于 allow 白名单、
   末条 deny all）持续看守。
 
+
+---
+
+## 十一、镜像漏洞扫描与 digest 钉扎（ARCH-3-3）
+
+设计依据：`plans/2026-10-15-企业级评测系统架构设计.md` §3 Phase 3 表 3-3 行——
+「CI 加 trivy 镜像扫描；script-runner 镜像 digest 钉扎进配置」。两条产线的
+门禁口径完全一致：**trivy 扫描主镜像与 script-runner 镜像，HIGH 及以上
+（`HIGH,CRITICAL`）且有修复版本的 CVE 卡门禁（exit-code 1）**。
+
+### 11.1 两条产线的扫描接入点
+
+| 产线 | 接入点 | 行为 |
+|---|---|---|
+| GitHub CI | `.github/workflows/ci.yml` 的 `image-scan` job | `docker-image` job 构建主镜像后 `docker save` 成 artifact；scan job load 回来 + 现场构建 script-runner 镜像（`docker/script-runner/Dockerfile`），trivy 各扫一遍，HIGH+ fail |
+| 企业 GitLab 线 | `build-service` 构建钩子（`tools/build-service/build_service.py` 的 `scan_image`，`config.toml` 的 `[scan]` 段） | 构建产物落 daemon 之后、写 release 记录**之前**扫描；不过 → 构建任务 failed，有漏洞的镜像不进可部署/可回滚列表 |
+
+为什么 GitLab 线扫在 build-service 里：GitLab runner 只做 curl + 轮询
+（见第一节），CI 侧没有构建现场；镜像只存在于部署机 daemon 里，扫描必须
+在产物所在地跑——build-service 就是企业线的等价构建钩子。
+
+`ignore-unfixed` 的取舍（两线同参）：Debian slim 基座常态带着「无修复版本」
+的 HIGH CVE，一律卡会把门禁变成永久红灯；这类由镜像基座升级
+（`python:3.12-slim` 的 `FROM` 变更时）解决。**有修复版本的 HIGH/CRITICAL
+仍然卡**——11.3 的门禁演练用的就是这类。
+
+### 11.2 离线扫描器镜像的预载（部署机一次性 + 周期更新）
+
+部署机不能下载任何东西，扫描器（trivy + 漏洞库）必须预烘焙成镜像运过去：
+
+```bash
+# 开发机（联网）：构建含离线漏洞库的扫描器镜像。
+# DB 烘焙进镜像后，扫描时 --skip-db-update --offline-scan 零外呼。
+cat > Dockerfile.trivy <<'EOF'
+FROM aquasec/trivy:latest
+RUN trivy image --download-db-only
+EOF
+docker build --platform linux/amd64 -t ai-evo-trivy:latest -f Dockerfile.trivy .
+
+# 传输 + 部署机加载（与 runner 镜像同一离线预载流程，见 docker/script-runner/README.md）
+docker save ai-evo-trivy:latest | gzip > ai-evo-trivy.tar.gz
+# scp 到部署机后：
+gunzip -c ai-evo-trivy.tar.gz | docker load
+```
+
+- **上线顺序**：先预载 `ai-evo-trivy`，再部署含扫描门禁的新版
+  `ai-evo-build-service` 镜像。门禁 fail-closed（与 `AUTH_JWT_SECRET` /
+  `EXECUTOR_TOKEN` 同整改纪律）：`[scan].enabled` 缺省 `true`，扫描器镜像
+  缺失时构建同样失败（报错文案带本节指引），不会静默放行。
+- **漏洞库更新**：库烘焙在镜像里、随镜像更新。建议每月在开发机重跑上面
+  的构建（`--download-db-only` 拉新库）并重新预载，节奏与基座镜像升级对齐。
+- **配置**：`build-service/config.toml` 的 `[scan]` 段（`enabled` / `image` /
+  `severity` / `timeout_sec`，模板与注释见 `tools/build-service/config.example.toml`）。
+  `enabled=false` 仅限扫描器未就绪的过渡期，需安全负责人知情，修完预载即恢复。
+
+### 11.3 门禁演练（验收口径：高危 CVE 卡门禁演练触发一次）
+
+门禁必须证明「真的会拦」，否则形同虚设。演练方式（开发机即可，不动部署机）：
+
+```bash
+# 找一个带「有修复版本 HIGH CVE」的镜像——最现成的是数月前构建的旧版
+# ai-evo 应用镜像（pip 依赖老化必然命中）；没有旧 tag 就专门钉旧依赖构建一个。
+# 命令与 build-service scan_image 完全同参（同口径）：
+docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+  ai-evo-trivy:latest image \
+  --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed \
+  --skip-db-update --offline-scan ai-evo:<旧tag>
+echo "exit=$?"   # 期望非 0，且表格式输出里可见 HIGH/CRITICAL 条目
+```
+
+GitHub CI 线等价演练：临时把 `image-scan` job 的 `severity` 加宽一档
+（如 `MEDIUM,HIGH,CRITICAL`）推一个分支，确认 job 红灯后还原。
+演练记录（日期、命中的 CVE、处置动作）归档到安全检查单。
+
+### 11.4 script-runner 镜像 digest 钉扎（SCRIPT_RUNNER_IMAGE@sha256）
+
+`SCRIPT_RUNNER_IMAGE`（默认浮动 tag `ai-evo-script-runner:latest`，`.env`/
+环境变量可覆盖）自 ARCH-1-5 起支持 digest 钉扎，ARCH-3-3 对齐口径：默认
+tag、env 覆盖、钉扎可选（文法校验见 `app/core/config.py` 的
+`validate_runner_image_ref`，格式错在配置解析层 fail-fast）：
+
+```bash
+# 浮动引用（缺省）
+SCRIPT_RUNNER_IMAGE=ai-evo-script-runner:latest
+# digest 钉扎：镜像内容寻址——同 tag 被覆盖/缓存投毒对钉扎引用无效
+SCRIPT_RUNNER_IMAGE=harbor.internal:5000/ai-evo/script-runner@sha256:<64 位十六进制>
+```
+
+钉扎值的取法（离线机注意）：**digest 只有经 registry 中转才有**——
+`docker build` / `docker load` 出来的本地镜像 `RepoDigests` 为空，取不到
+digest。企业有内网 registry（如 harbor）时：
+
+```bash
+# 开发机：推到内网 registry，读回 RepoDigests
+docker tag ai-evo-script-runner:latest harbor.internal:5000/ai-evo/script-runner:2026-10-15
+docker push harbor.internal:5000/ai-evo/script-runner:2026-10-15
+docker inspect --format '{{json .RepoDigests}}' \
+  harbor.internal:5000/ai-evo/script-runner:2026-10-15
+# 取 "repo@sha256:..." 中的 sha256 段写入部署机 .env：
+#   SCRIPT_RUNNER_IMAGE=harbor.internal:5000/ai-evo/script-runner@sha256:<64hex>
+docker compose up -d worker   # 改 env 重启即生效（镜像引用环境变量实时读）
+```
+
+- 换版本：push 新 tag → 取新 digest → 改 `.env` 重启；registry 里旧 digest
+  长期保留即回滚目标（改回旧 digest 行再重启）。
+- **通道现状**：worker docker-CLI 通道（无 executor 的形态）原样把引用交给
+  `docker run`，daemon 原生按 digest 内容寻址校验；**executor 通道（第十节
+  沙箱面）的镜像白名单尚未放开 digest 引用**（`executor/sandbox_params.py`
+  对含 `@` 的引用仍拒绝），企业 executor 形态暂以「registry 固化 tag +
+  registry 侧不可变 tag 策略」替代，白名单放开属后续条目（放开时两侧同步，
+  见该文件注释）。
+- 与镜像扫描的关系：扫描保证「构建出的镜像没有高危漏洞」，钉扎保证
+  「部署跑的镜像就是扫过的那份内容」——把部署侧的镜像漂移面（同 tag
+  被覆盖）收掉，两者合起来才是供应链闭环。

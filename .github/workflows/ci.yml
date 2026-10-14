@@ -103,3 +103,60 @@ jobs:
           --build-arg PIP_INDEX_URL=https://pypi.org/simple
           --build-arg NPM_REGISTRY=https://registry.npmjs.org
           -t ai-evo:ci .
+
+      # ARCH-3-3（设计 §3 表 3-3 行）：构建一次、下游 image-scan job 复用
+      # （docker save 打包上传 artifact，扫描 job load 回来跑 trivy——
+      # GitHub runner 间不共享 docker daemon，重复构建主镜像太浪费）
+      - name: Save image for scan
+        run: docker save ai-evo:ci | gzip > /tmp/ai-evo-ci.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: main-image
+          path: /tmp/ai-evo-ci.tar.gz
+          retention-days: 1
+
+  # ARCH-3-3（设计 §3 Phase 3 表 3-3 行）：镜像漏洞扫描门禁——主镜像与
+  # script-runner 沙箱镜像（docker/script-runner/Dockerfile）各扫一遍，
+  # HIGH 及以上（HIGH,CRITICAL）exit-code 1 卡门禁。企业 GitLab 线的等价
+  # 扫描在 build-service 构建钩子里（tools/build-service/，[scan] 配置段），
+  # 两端口径一致：同 severity 阈值 + ignore-unfixed（无修复版本的基座 CVE
+  # 由基座升级解决，不永久卡门禁；有修复的高危 CVE 仍卡——演练口径即此类）。
+  image-scan:
+    name: Image vulnerability scan (trivy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: docker-image
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: main-image
+          path: /tmp
+
+      - name: Load main image
+        run: docker load -i /tmp/ai-evo-ci.tar.gz
+
+      # script-runner 镜像轻（python:3.12-slim + packages.txt 少量依赖），
+      # 直接在本 job 内构建；沙箱是用户代码执行面，必须与主镜像同口径过闸
+      - name: Build script-runner image
+        run: docker build -f docker/script-runner/Dockerfile -t ai-evo-script-runner:ci .
+
+      - name: Scan main image (ai-evo)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ai-evo:ci
+          format: table
+          exit-code: '1'
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+
+      - name: Scan script-runner image
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ai-evo-script-runner:ci
+          format: table
+          exit-code: '1'
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true

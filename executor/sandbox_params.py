@@ -12,14 +12,19 @@
   调用面不变），executor 侧在受理请求时校验白名单后调用；
 - 加固位（--user/--memory/--cpus/--pids-limit/--read-only/--tmpfs/--cap-drop/
   no-new-privileges/-e 最小集合）对两侧一致——worker 通道随抽取一并获得
-  ``--cap-drop ALL`` 与 ``no-new-privileges``（预对齐 Phase 1-5 门禁）。
+  ``--cap-drop ALL`` 与 ``no-new-privileges``（预对齐 Phase 1-5 门禁）；
+- 可选运行时档 ``--runtime``（ARCH-3-4，设计 §3 表 3-4 行）：白名单仅
+  runc|runsc（gVisor 加固档，高危脚本专用）；缺省 runc 不拼旗标（默认行为
+  不变）。worker 配置入口 SANDBOX_RUNTIME（app/core/config.py）与 executor
+  请求字段 runtime（executor/app.py）都过本模块 validate_container_runtime。
 
 本模块刻意只用标准库：worker 镜像（COPY 全仓库）与 executor 镜像（仅 COPY
 executor/）两侧都要零依赖可导入。
 """
 import os
+import posixpath
 import re
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 # ---------------- 沙箱容器固定常量（原 script_container 常量平移，名称不变） ----------------
 
@@ -146,6 +151,68 @@ def resolve_workspace_mount(workspace: str) -> str:
     return ws_real
 
 
+# ---------------- 容器内工作目录白名单（executor 请求 workdir 字段） ----------------
+
+def resolve_container_workdir(workdir: Optional[str]) -> str:
+    """容器内工作目录（``docker run -w``）白名单：缺省挂载根，否则须在挂载根子树内
+
+    worker 侧 per-script cwd 是 ``/workspace/{script_id}``（script_container.
+    build_container_paths 推导）——harness 通道的 entrypoint 以裸相对文件名引用
+    staged 三件套（instruction.md/stdin.json/harness.json），脚本通道的产物/
+    artifacts 也按 cwd 相对落盘，两者都依赖 ``-w`` 指向 per-script cwd；executor
+    若硬编码 ``-w /workspace`` 则 harness_entry 在挂载根找不到三件套（FileNotFound）。
+    本函数是 executor 侧对请求 ``workdir`` 字段的单一校验点：
+
+    - ``None``（调用方未带字段）→ ``CONTAINER_WORKSPACE``（既有客户端行为不变）；
+    - 否则必须是容器内绝对路径，posix 规范化后等于 ``CONTAINER_WORKSPACE`` 或
+      严格落在其之下（``..`` 穿越、相对路径、旗标样值、NUL、空串一律拒绝）——
+      ``-w`` 只能指向 bind mount 工作区内部，不得指向镜像只读层任意位置。
+    返回规范化后的容器绝对路径。
+    """
+    if workdir is None:
+        return CONTAINER_WORKSPACE
+    if not isinstance(workdir, str) or "\x00" in workdir:
+        raise SandboxParamError("workdir 非法取值：含 NUL 字符或非字符串")
+    _require_flag_safe("workdir", workdir)
+    if not workdir.startswith("/"):
+        raise SandboxParamError(f"workdir {workdir!r} 必须是容器内绝对路径")
+    normalized = posixpath.normpath(workdir)
+    if normalized != CONTAINER_WORKSPACE and not normalized.startswith(CONTAINER_WORKSPACE + "/"):
+        raise SandboxParamError(
+            f"workdir {workdir!r} 不在 {CONTAINER_WORKSPACE} 子树内（-w 只能指向工作区内部）")
+    return normalized
+
+
+# ---------------- 容器运行时档白名单（ARCH-3-4，设计 §3 表 3-4 行） ----------------
+
+# 可选容器运行时档（gVisor 可选运行时档）：runc = docker daemon 缺省运行时
+# （不拼 --runtime 旗标，与历史参数逐字节一致——默认行为不变）；runsc =
+# gVisor 加固档（应用层内核拦截系统调用，高危脚本专用；宿主机须预装 runsc
+# 并注册到 daemon，安装步骤见 docs/sandbox-runtime-gvisor.md）。
+# worker 侧配置入口 SANDBOX_RUNTIME（app/core/config.py，本白名单同源）；
+# executor 侧请求字段 runtime（executor/app.py.SandboxRunRequest）。
+CONTAINER_RUNTIMES: Tuple[str, ...] = ("runc", "runsc")
+
+# 缺省档（不拼旗标的哨兵值——runc 即 daemon 缺省，显式 --runtime runc 反而
+# 会钉死 daemon 级自定义缺省，违背「默认行为不变」）
+DEFAULT_RUNTIME = "runc"
+
+
+def validate_container_runtime(runtime: str) -> str:
+    """容器运行时档白名单校验：仅 runc|runsc，非法值拒绝（SandboxParamError）
+
+    先过旗标闸（防 ``-`` 开头值被 docker CLI 解析成额外旗标），再对白名单
+    逐一比对——两通道（worker docker-CLI / executor）共用本函数，约束演改
+    只改 CONTAINER_RUNTIMES 一处（单一事实源纪律，ARCH-1-1）。
+    """
+    _require_flag_safe("容器运行时", runtime)
+    if runtime not in CONTAINER_RUNTIMES:
+        raise SandboxParamError(
+            f"容器运行时 {runtime!r} 不在白名单：仅允许 {'|'.join(CONTAINER_RUNTIMES)}"
+            "（runsc 为 gVisor 加固档，宿主机安装步骤见 docs/sandbox-runtime-gvisor.md）")
+    return runtime
+
+
 # ---------------- 网络档位白名单（设计 D2：executor 仅放行 none|egress） ----------------
 
 # 档位 → docker 网络名。egress 档加入沙箱出网 bridge（白名单域名出网，
@@ -179,6 +246,7 @@ def build_docker_run_args(
     interactive: bool = False,
     detach: bool = False,
     auto_rm: bool = True,
+    runtime: str = DEFAULT_RUNTIME,
 ) -> List[str]:
     """构造 docker run 参数列表（不含执行，纯构造；不含 "docker" 前缀）
 
@@ -195,7 +263,11 @@ def build_docker_run_args(
     - ``--read-only`` 根文件系统只读；可写面仅 bind mount 工作区 + tmpfs
     - ``--tmpfs``     /tmp 与容器用户 home（nosuid,noexec，限 64m）
     - ``--network``   由调用方给最终网络名（worker：none|bridge 任务级开关；
-      executor：none|egress 档位经 network_profile_to_docker 映射）
+                      executor：none|egress 档位经 network_profile_to_docker 映射）
+    - ``--runtime``   可选加固档（ARCH-3-4）：仅 runsc 时拼 ``--runtime runsc``
+                      （gVisor，高危脚本专用）；缺省 runc 不拼旗标——runc 即
+                      docker daemon 缺省运行时，默认行为与历史逐字节一致。
+                      取值过 validate_container_runtime 白名单，非法值拒绝
     - ``-e``          仅注入 CONTAINER_ENV_ALLOWLIST 最小集合（平台 env 剥离）
     - ``-i``          stdin 载荷经 docker CLI 传入容器（interactive；-t 不加：无 TTY）
     - ``-v``          仅挂载调用方给定的单一工作区（worker：本次 script_runs
@@ -213,6 +285,9 @@ def build_docker_run_args(
         ("mount_container", mount_container), ("workdir_container", workdir_container),
     ):
         _require_flag_safe(kind, value)
+    # ARCH-3-4：运行时档白名单（runc|runsc），非法值拒绝（纵深防御——调用方
+    # 上游已校验，白名单语义仍在此收口）
+    validate_container_runtime(runtime)
     if not tail_command:
         raise SandboxParamError("tail_command 不能为空")
     _require_flag_safe("tail_command[0]", tail_command[0])
@@ -236,6 +311,10 @@ def build_docker_run_args(
         "--tmpfs", f"{CONTAINER_TMPFS_HOME}:rw,nosuid,noexec,size={CONTAINER_TMPFS_SIZE}",
         "--network", network_name,
     ])
+    # ARCH-3-4：仅加固档拼 --runtime（runsc = gVisor）；缺省 runc 不拼——
+    # runc 即 daemon 缺省，保持默认参数与历史逐字节一致（默认行为不变）
+    if runtime != DEFAULT_RUNTIME:
+        args.extend(["--runtime", runtime])
     for key, val in CONTAINER_ENV_ALLOWLIST.items():
         args.extend(["-e", f"{key}={val}"])
     if interactive:

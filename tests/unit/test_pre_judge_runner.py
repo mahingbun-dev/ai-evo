@@ -2,7 +2,8 @@
 
 覆盖：串行编排与 output_var 输出收集、标准输入组装（inline 字段落盘本地路径、
 params、upstream 传递）、产物目录 uploads/script_runs/{task_id}/{data_id}/、
-on_fail continue/abort 策略、子进程超时 kill、DB 脚本加载、agent 类型明确 fail、
+on_fail continue/abort 策略、子进程超时 kill、DB 脚本加载、agent 类型凭据缺失
+fail-fast（ARCH-3-2 起进沙箱，完整链路见 test_arch_3_2_harness_sandbox.py）、
 与真实内置脚本 allure_vs_cases 的集成（统一子进程执行：builtin 进程内类型已
 废除，fake 脚本以脚本包形态落盘 SCRIPT_UPLOAD_BASE/{id}/main.py）。
 v3 契约：run_pre_scripts 的 steps 显式入参（优先于 task.pre_scripts）与
@@ -498,14 +499,25 @@ class TestTimeoutAndTypes:
         assert result["finish_reason"] == "timeout"
         assert "超时" in result["error"]
 
-    def test_agent_type_fails_clearly(self, script_env, run_base):
+    def test_agent_type_fails_clearly(self, script_env, run_base, monkeypatch):
+        """ARCH-3-2 起 agent 类型进沙箱执行；凭据未配置时 fail-fast（不发起 docker）"""
+        from app.services import claude_code_config_service
+
+        monkeypatch.setattr(claude_code_config_service.ClaudeCodeConfigService,
+                            "get_active_config", classmethod(lambda cls: None))
+        monkeypatch.setattr(claude_code_config_service.ClaudeCodeConfigService,
+                            "get_sdk_env", classmethod(lambda cls: {}))
+        from app.services import script_container
+        monkeypatch.setattr(script_container, "get_sandbox_driver",
+                            lambda: pytest.fail("凭据缺失应 fail-fast，不应发起沙箱执行"))
         result = pre_judge_runner.execute_script(
             {"script_id": "pjs_agent", "name": "agent_script", "exec_type": "claude_agent",
              "entrypoint": "指令文本", "timeout_seconds": 60},
             {"fields": {}, "params": {}, "upstream": {}, "_run_dir": str(run_base / "t")},
         )
         assert result["status"] == "fail"
-        assert "暂不支持" in result["error"]
+        assert result["finish_reason"] == "error"
+        assert "Claude Code 全局配置" in result["error"]
 
     def test_builtin_exec_type_rejected(self, script_env, run_base):
         """历史 builtin 类型已废除：明确 fail 提示而非静默回退"""
