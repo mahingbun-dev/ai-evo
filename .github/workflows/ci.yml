@@ -16,6 +16,7 @@ jobs:
     env:
       DATABASE_URL: postgresql://ai_evo:ai_evo@127.0.0.1:5432/ai_evo
       REDIS_URL: redis://127.0.0.1:6379/0
+      AUTH_JWT_SECRET: ci-fixed-test-secret-0123456789abcdef
     services:
       postgres:
         image: postgres:16
@@ -144,7 +145,7 @@ jobs:
         run: docker build -f docker/script-runner/Dockerfile -t ai-evo-script-runner:ci .
 
       - name: Scan main image (ai-evo)
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.28.0
         with:
           image-ref: ai-evo:ci
           format: table
@@ -153,7 +154,7 @@ jobs:
           ignore-unfixed: true
 
       - name: Scan script-runner image
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.28.0
         with:
           image-ref: ai-evo-script-runner:ci
           format: table
