@@ -79,6 +79,7 @@ resolve_mount_source 白名单（越界/伪造拒绝，两侧单一事实源）�
 """
 import logging
 import os
+import stat
 import subprocess
 import time
 import uuid
@@ -678,6 +679,45 @@ def get_sandbox_driver() -> SandboxDriver:
 
 # ---------------- 容器内执行（驱动无关编排，ARCH-1-2） ----------------
 
+def relax_tree_for_sandbox_uid(*roots: Path) -> None:
+    """容器模式挂载树放宽 others rX（沙箱 uid 10001 非属主，D6 0o750 下无法遍历）
+
+    仅容器模式、仅本次运行的工作区树（ephemeral，评完即清）追加 others
+    读+目录遍历位；不追加 w（entry wrapper 只读消费，stdout 出 JSON 不落盘）。
+    secure_mkdir 的 0o750 创建口径不变（tests/security/test_runtime_dir_permissions.py
+    仍绿），本函数只在 driver 受理前对三棵树做执行期放宽。
+    """
+    for root in roots:
+        if not root:
+            continue
+        try:
+            st = os.stat(root)
+        except OSError:
+            continue  # 不存在（None/空/已被并发清理）：跳过该树
+        try:
+            if stat.S_ISDIR(st.st_mode):
+                os.chmod(root, stat.S_IMODE(st.st_mode) | 0o005)  # others r-x
+            else:
+                os.chmod(root, stat.S_IMODE(st.st_mode) | 0o004)  # others r
+        except OSError:
+            continue
+        if not stat.S_ISDIR(st.st_mode):
+            continue
+        # os.walk 缺省忽略遍历错误；chmod 单点失败（并发清理竞态
+        # FileNotFoundError 等 OSError）跳过该条继续
+        for dirpath, _dirnames, filenames in os.walk(root):
+            try:
+                os.chmod(dirpath, stat.S_IMODE(os.stat(dirpath).st_mode) | 0o005)
+            except OSError:
+                continue
+            for file_name in filenames:
+                file_path = os.path.join(dirpath, file_name)
+                try:
+                    os.chmod(file_path, stat.S_IMODE(os.stat(file_path).st_mode) | 0o004)
+                except OSError:
+                    continue
+
+
 def execute_script_in_container(
     script: Dict[str, Any],
     staged_dir_host: Path,
@@ -732,6 +772,10 @@ def execute_script_in_container(
     user = runner_user()
     paths = build_container_paths(run_dir_host, cwd_host, staged_dir_host)
     container_name = _new_container_name(str(script_key))
+
+    # 沙箱挂载树执行期放宽（others rX）：沙箱 uid 非属主，secure_mkdir 0o750
+    # 口径下无法遍历/读取工作区（CI docker run 退出码 125 根因）；不加 w
+    relax_tree_for_sandbox_uid(Path(run_dir_host), Path(cwd_host), Path(staged_dir_host))
 
     # stdin 里的宿主工作区路径全部重写为容器路径（脚本在容器内按 /workspace 取值）
     container_stdin = rewrite_stdin_paths(stdin, paths.run_dir_host, paths.run_dir_container)
@@ -898,6 +942,10 @@ def execute_harness_in_container(
     except OSError as e:
         return _result(script_id, name, "fail", error=f"agent 载荷落盘工作区失败: {e}",
                        finish_reason="error", started_at=started)
+
+    # 沙箱挂载树执行期放宽（others rX）：与脚本通道同口径（沙箱 uid 非属主
+    # 读不到 0o750 工作区）；不加 w，语义见 relax_tree_for_sandbox_uid
+    relax_tree_for_sandbox_uid(Path(run_dir), Path(cwd))
 
     spec = SandboxRunSpec(
         image=image,

@@ -447,6 +447,9 @@ def _run_smoke_test_in_container(entry: Path, limit: float) -> Dict[str, Any]:
         shutil.copytree(script_dir, staged, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
 
         stdin = script_container.rewrite_stdin_paths(build_smoke_stdin(run_dir), str(run_dir))
+        # 沙箱挂载树执行期放宽（others rX）：沙箱 uid 非属主读不到 0o750 工作区
+        # （CI docker run 退出码 125 / PermissionError 根因）；不加 w
+        script_container.relax_tree_for_sandbox_uid(run_dir, staged)
         paths = script_container.build_container_paths(run_dir, run_dir, staged)
         image = script_container.runner_image()
         spec = script_container.SandboxRunSpec(
