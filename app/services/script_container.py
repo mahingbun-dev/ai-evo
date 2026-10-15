@@ -148,7 +148,7 @@ RUNNER_IMAGE_PACKAGES: List[str] = [
     "numpy==2.2.6",
     "openpyxl==3.1.5",
     "xlrd==2.0.2",
-    "Pillow==12.1.1",
+    "Pillow==12.3.0",
     "PyYAML==6.0.3",
     "jsonpath-ng==1.7.0",
 ]

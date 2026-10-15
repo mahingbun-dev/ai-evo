@@ -27,7 +27,7 @@ ARG PIP_INDEX_URL=https://pypi.org/simple
 
 # Web 框架（版本与仓库 requirements.txt 钉死一致）
 RUN pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" \
-    fastapi==0.128.6 uvicorn==0.40.0
+    fastapi==0.133.1 uvicorn==0.40.0
 
 # docker CLI（sock 客户端；daemon 在宿主侧，镜像内不装也不跑 daemon——
 # Debian 13 起 docker.io 不再捆绑客户端，docker-cli 是独立包，官方源自带、
