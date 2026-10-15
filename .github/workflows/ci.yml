@@ -61,6 +61,13 @@ jobs:
         env:
           AIEVO_DATABASE_URL: postgresql://ai_evo:ai_evo@127.0.0.1:5432/ai_evo
 
+      # ARCH-1-4/3-3 口径：SCRIPT_EXEC_MODE 缺省已是 container，契约冒烟与
+      # debug 试跑链走 docker run（worker docker-CLI 回退通道）——runner 上
+      # 必须先有 ai-evo-script-runner 镜像，否则安全门禁用例报「入口脚本
+      # 退出码 125」（本地预载过镜像所以门禁时绿，CI 干净环境才暴露）
+      - name: Build script-runner sandbox image
+        run: docker build -f docker/script-runner/Dockerfile -t ai-evo-script-runner:latest .
+
       - name: Run test suite
         run: .venv/bin/pytest
 
