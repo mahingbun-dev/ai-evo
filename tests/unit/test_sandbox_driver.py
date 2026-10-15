@@ -24,6 +24,10 @@ script_container 抽 SandboxDriver 接口（run/wait/kill/status），实现 doc
   归位 cwd + 结果解析与 local 同构）；running→done 轮询；非零退出码；
   failed 态；kill 为 1-1 契约下的显式 no-op（无远端端点，不触传输层）
 - DockerCliDriver 驱动级生命周期（run/wait/status/kill 用假 docker CLI 走通）
+- bind 源宿主根映射（SANDBOX_WORKSPACE_HOST_ROOT 命名卷部署）：worker 侧
+  derive_mount_source 推导/缺省 None（同路径 bind 现状）/越界 fail-loud；
+  编排层受理 try 内派生并转 fail 条目；CLI 驱动 -v 左值与 HTTP 请求体
+  mount_source 字段一律用 spec.mount_source（未配置不带字段，行为不变）
 
 mock executor 说明：executor_client._http_open 是唯一网络 I/O 出口，本文件以
 MockExecutor 替换（记录请求 + 脚本化响应），不经真实网络——unit 分层成立。
@@ -352,6 +356,126 @@ class TestHttpDriverRequests:
         mock_executor.post_responses.append(urllib.error.URLError("connection refused"))
         with pytest.raises(SandboxDriverError, match="不可达"):
             HttpExecutorDriver().run(_spec(tmp_path))
+
+
+# ---------------- bind 源宿主根映射（SANDBOX_WORKSPACE_HOST_ROOT，命名卷部署） ----------------
+
+class TestMountSourceMapping:
+    """worker 侧映射推导：未配置 → None（同路径 bind 缺省不变）；配置 →
+    host_root + 工作区相对 /app/uploads/script_runs 的后缀；越界 fail-loud；
+    两驱动 -v 挂载源一律用 spec.mount_source"""
+
+    def test_unset_returns_none_default_unchanged(self, tmp_path, monkeypatch):
+        """未配置：derive 返回 None，spec.mount_source 缺省 = workspace_host"""
+        monkeypatch.delenv("SANDBOX_WORKSPACE_HOST_ROOT", raising=False)
+        run_dir, _, _ = _workspace(tmp_path)
+        assert script_container.derive_mount_source(str(run_dir)) is None
+
+    def test_configured_derives_host_root_suffix(self, tmp_path, monkeypatch):
+        """配置后按后缀派生：host_root + workspace 相对 WORKSPACE_ROOT 的后缀"""
+        from executor import sandbox_params
+
+        base = tmp_path / "app_uploads" / "script_runs"
+        run_dir = base / "t1" / "d1"
+        run_dir.mkdir(parents=True)
+        monkeypatch.setattr(sandbox_params, "WORKSPACE_ROOT", str(base))
+        monkeypatch.setenv("SANDBOX_WORKSPACE_HOST_ROOT", "/volume1/docker/ai-evo/uploads-data")
+        assert script_container.derive_mount_source(str(run_dir)) == \
+            "/volume1/docker/ai-evo/uploads-data/t1/d1"
+
+    def test_configured_out_of_base_rejected(self, tmp_path, monkeypatch):
+        """越界（工作区不在 WORKSPACE_ROOT 子树）：fail-loud 拒绝——命名卷部署
+        下映射不到宿主路径的挂载必然静默错（daemon 自动建空目录）"""
+        from executor import sandbox_params
+
+        base = tmp_path / "app_uploads" / "script_runs"
+        base.mkdir(parents=True)
+        outside = tmp_path / "elsewhere" / "t1"
+        outside.mkdir(parents=True)
+        monkeypatch.setattr(sandbox_params, "WORKSPACE_ROOT", str(base))
+        monkeypatch.setenv("SANDBOX_WORKSPACE_HOST_ROOT", "/volume1/docker/ai-evo/uploads-data")
+        with pytest.raises(SandboxDriverError, match="SANDBOX_WORKSPACE_HOST_ROOT"):
+            script_container.derive_mount_source(str(outside))
+
+    def test_cli_driver_dash_v_uses_mount_source(self, tmp_path, monkeypatch):
+        """CLI 驱动：-v 左值 = spec.mount_source（宿主路径），不再用容器视角
+        workspace_host；未配置时缺省回退 workspace_host（现状不变）"""
+        run_dir, _, cwd = _workspace(tmp_path)
+        argv_out = tmp_path / "argv.json"
+        fake_cli = tmp_path / "fake_docker.py"
+        fake_cli.write_text(
+            f"#!{sys.executable}\n"
+            "import json, sys\n"
+            f"open({str(argv_out)!r}, 'w').write(json.dumps(sys.argv))\n"
+            "sys.stdin.read()\n"
+            "print('{\"status\": \"ok\"}')\n",
+            encoding="utf-8")
+        fake_cli.chmod(0o755)
+        monkeypatch.setattr(script_container, "docker_binary", lambda: str(fake_cli))
+        driver = DockerCliDriver()
+
+        host_mount = "/volume1/docker/ai-evo/uploads-data/t1/d1"
+        spec = _spec(tmp_path)
+        spec.mount_source = host_mount
+        st = driver.wait(driver.run(spec), timeout=10)
+        assert st.state == "done"
+        argv = json.loads(argv_out.read_text("utf-8"))
+        assert argv[argv.index("-v") + 1] == f"{host_mount}:/workspace"
+
+        # 缺省回退：未派生 mount_source 时 -v = workspace_host（同路径 bind 现状）
+        argv_out.unlink()
+        st = driver.wait(driver.run(_spec(tmp_path)), timeout=10)
+        assert st.state == "done"
+        argv = json.loads(argv_out.read_text("utf-8"))
+        assert argv[argv.index("-v") + 1] == f"{run_dir}:/workspace"
+
+    def test_http_driver_body_carries_mount_source_only_when_set(
+            self, tmp_path, mock_executor, monkeypatch):
+        """HTTP 驱动：派生出 mount_source 时请求体携带（executor 按宿主根
+        白名单校验）；未配置形态不带字段——既有调用方行为逐字节不变"""
+        from executor import sandbox_params
+
+        # _spec 的工作区在 tmp_path/runs 下（_workspace 布局）：WORKSPACE_ROOT 对齐
+        monkeypatch.setattr(sandbox_params, "WORKSPACE_ROOT", str(tmp_path / "runs"))
+        monkeypatch.setenv("SANDBOX_WORKSPACE_HOST_ROOT", "/volume1/docker/ai-evo/uploads-data")
+        spec = _spec(tmp_path)
+        spec.mount_source = script_container.derive_mount_source(spec.workspace_host)
+        HttpExecutorDriver().run(spec)
+        body = mock_executor.posts()[0]["body"]
+        assert body["mount_source"] == "/volume1/docker/ai-evo/uploads-data/t1/d1"
+
+        # 未配置：不带字段（test_run_posts_whitelist_shaped_payload 的字段集断言
+        # 依赖这一缺省——两断言互为护栏）
+        monkeypatch.delenv("SANDBOX_WORKSPACE_HOST_ROOT", raising=False)
+        HttpExecutorDriver().run(_spec(tmp_path))
+        assert "mount_source" not in mock_executor.posts()[1]["body"]
+
+    def test_orchestration_derives_and_sends_mount_source(
+            self, tmp_path, mock_executor, monkeypatch):
+        """编排层（execute_script_in_container）受理 try 内派生：HTTP 请求体
+        mount_source = host_root + 工作区后缀（真实任务链路全接线）"""
+        from executor import sandbox_params
+
+        # _workspace 布局在 tmp_path/runs 下：把 WORKSPACE_ROOT 对齐到该子树
+        monkeypatch.setattr(sandbox_params, "WORKSPACE_ROOT", str(tmp_path / "runs"))
+        monkeypatch.setenv("SANDBOX_WORKSPACE_HOST_ROOT", "/volume1/docker/ai-evo/uploads-data")
+        result, (run_dir, staged, cwd) = _run_in_container(tmp_path)
+        assert result["status"] == "ok"
+        body = mock_executor.posts()[0]["body"]
+        assert body["mount_source"] == f"/volume1/docker/ai-evo/uploads-data/t1/d1"
+
+    def test_orchestration_out_of_base_becomes_fail_result(
+            self, tmp_path, mock_executor, monkeypatch):
+        """编排层越界：SandboxDriverError 转 fail 条目（finish_reason=error），
+        绝不带病进沙箱（与 SANDBOX_RUNTIME 非法值同口径）"""
+        from executor import sandbox_params
+
+        monkeypatch.setattr(sandbox_params, "WORKSPACE_ROOT", "/nonexistent-base")
+        monkeypatch.setenv("SANDBOX_WORKSPACE_HOST_ROOT", "/volume1/docker/ai-evo/uploads-data")
+        result, _ = _run_in_container(tmp_path)
+        assert result["status"] == "fail"
+        assert result["finish_reason"] == "error"
+        assert "SANDBOX_WORKSPACE_HOST_ROOT" in result["error"]
 
 
 class TestThreeNetProfilesViaOrchestration:

@@ -17,6 +17,10 @@ executor 健康/白名单拒绝（privileged/越界 volume/未知镜像/未知�
   * timeout 越界（0/负/超上限）→ 422
   * workdir 越界：挂载根之外、../ 穿越、前缀仿冒、相对路径、flag 样值、空串、
     NUL → 400（仅 /workspace 子树，单一事实源 resolve_container_workdir）
+  * mount_source（bind 源宿主根映射，SANDBOX_WORKSPACE_HOST_ROOT 命名卷部署）：
+    配置时越界/根本身/../ 穿越/前缀仿冒/旗标 → 400（字符串前缀口径，daemon
+    路径 executor 容器内看不见不能 realpath）；未配置时伪造值（≠ workspace
+    解析结果）→ 400、等值透传放行
 - 受理与生命周期（FakeDocker 按子命令分发）：
   * 202 + run_id；docker run 参数全套加固位（--user 10001:10001、--cap-drop
     ALL、no-new-privileges、--read-only、--network none、唯一 -v 落在
@@ -280,6 +284,51 @@ class TestWhitelistRejects:
         assert resp.status_code == 400
         assert "workdir" in resp.json()["detail"]
 
+    @pytest.mark.parametrize("bad_mount_source", [
+        "/etc/passwd",                                   # 宿主根之外（越界 bind mount）
+        "{root}",                                        # 宿主根本身（挂载面过宽）
+        "{root}/t1/../../etc",                           # .. 穿越（normpath 后逃出宿主根）
+        "{evil}/t1",                                     # 前缀仿冒（uploads-data-evil 非子路径）
+        "-v",                                            # 旗标样值（防被 docker CLI 解析成旗标）
+    ])
+    def test_mount_source_outside_host_root_rejected_400(
+            self, client, ws_root, tmp_path, monkeypatch, bad_mount_source):
+        """命名卷模式（SANDBOX_WORKSPACE_HOST_ROOT 配置）：mount_source 必须严格
+        落在宿主根之下（字符串前缀 + 无 ..——daemon 路径 executor 容器内看不见，
+        不能 realpath），越界/根本身/穿越/仿冒/旗标 → 400"""
+        host_root = tmp_path / "uploads-data"
+        host_root.mkdir()
+        monkeypatch.setenv(sandbox_params.SANDBOX_WORKSPACE_HOST_ROOT_ENV, str(host_root))
+        evil_root = tmp_path / "uploads-data-evil"
+        value = bad_mount_source.format(root=host_root, evil=evil_root)
+        payload = _valid_request(ws_root, mount_source=value)
+        resp = client.post("/sandbox/run", json=payload, headers=_auth())
+        assert resp.status_code == 400
+        assert "mount_source" in resp.json()["detail"]
+
+    def test_mount_source_forged_rejected_when_host_root_unset(
+            self, client, ws_root, tmp_path):
+        """未配置形态：bind 源 = workspace 本身（缺省行为不变），显式携带的
+        mount_source 必须与工作区解析结果完全一致——无从校验任意宿主路径
+        合法性，伪造值一律拒绝"""
+        forged = str(tmp_path / "elsewhere" / "t1" / "d1")
+        payload = _valid_request(ws_root, mount_source=forged)
+        resp = client.post("/sandbox/run", json=payload, headers=_auth())
+        assert resp.status_code == 400
+        assert "mount_source" in resp.json()["detail"]
+
+    def test_mount_source_matching_workspace_accepted_when_host_root_unset(
+            self, client, ws_root, fake_docker):
+        """未配置形态的等价透传：mount_source == workspace realpath → 受理且
+        -v 与缺省行为逐字节一致（既有调用方带等值字段不受影响）"""
+        ws_real = os.path.realpath(str(ws_root / "t1" / "d1"))
+        payload = _valid_request(ws_root, mount_source=ws_real)
+        resp = client.post("/sandbox/run", json=payload, headers=_auth())
+        assert resp.status_code == 202
+        run_cmd = next(c for c in fake_docker.calls if c[1] == "run")
+        binds = [run_cmd[i + 1] for i, a in enumerate(run_cmd) if a == "-v"]
+        assert binds == [f"{ws_real}:/workspace"]
+
 
 # ---------------- 受理与生命周期 ----------------
 
@@ -413,6 +462,51 @@ class TestRunLifecycle:
     def test_get_unknown_run_404(self, client, ws_root):
         resp = client.get("/sandbox/runs/deadbeef", headers=_auth())
         assert resp.status_code == 404
+
+
+# ---------------- bind 源宿主根映射（SANDBOX_WORKSPACE_HOST_ROOT，命名卷部署） ----------------
+
+class TestNamedVolumeMountSource:
+    """命名卷部署形态：docker daemon 按宿主路径解析 -v 源，与 executor 容器
+    视角（日志落盘/尾部读取寻址）分离——RunRecord.mount_host 仅作 -v 左值"""
+
+    def test_valid_mount_source_used_as_dash_v_and_logs_stay_in_executor_view(
+            self, client, ws_root, fake_docker, tmp_path, monkeypatch):
+        """合法 mount_source：-v 左值 = 宿主根映射路径；监督线程日志仍落
+        executor 容器视角工作区（workspace_real）——宿主路径容器内不存在"""
+        host_root = tmp_path / "uploads-data"
+        host_root.mkdir()
+        monkeypatch.setenv(sandbox_params.SANDBOX_WORKSPACE_HOST_ROOT_ENV, str(host_root))
+        host_mount = str(host_root / "t1" / "d1")
+        resp = client.post("/sandbox/run", json=_valid_request(
+            ws_root, mount_source=host_mount), headers=_auth())
+        assert resp.status_code == 202
+        run_id = resp.json()["run_id"]
+
+        run_cmd = next(c for c in fake_docker.calls if c[1] == "run")
+        binds = [run_cmd[i + 1] for i, a in enumerate(run_cmd) if a == "-v"]
+        assert binds == [f"{host_mount}:/workspace"]
+
+        # 日志/GET 尾部按 executor 视角工作区寻址（宿主路径本容器不可写/不可读）
+        ws = ws_root / "t1" / "d1"
+        assert (ws / "stdout.log").read_bytes() == fake_docker.logs_stdout
+        assert not (Path(host_mount) / "stdout.log").exists()
+        resp2 = client.get(f"/sandbox/runs/{run_id}", headers=_auth())
+        assert resp2.status_code == 200
+        assert '"status"' in resp2.json()["stdout_tail"]
+
+    def test_mount_source_absent_derived_from_suffix(
+            self, client, ws_root, fake_docker, tmp_path, monkeypatch):
+        """未带 mount_source：按后缀规则兜底派生（host_root + workspace 相对
+        WORKSPACE_ROOT 后缀）——兼容未升级的旧 worker 客户端"""
+        host_root = tmp_path / "uploads-data"
+        host_root.mkdir()
+        monkeypatch.setenv(sandbox_params.SANDBOX_WORKSPACE_HOST_ROOT_ENV, str(host_root))
+        resp = client.post("/sandbox/run", json=_valid_request(ws_root), headers=_auth())
+        assert resp.status_code == 202
+        run_cmd = next(c for c in fake_docker.calls if c[1] == "run")
+        binds = [run_cmd[i + 1] for i, a in enumerate(run_cmd) if a == "-v"]
+        assert binds == [f"{host_root / 't1' / 'd1'}:/workspace"]
 
 
 # ---------------- 审计日志 ----------------

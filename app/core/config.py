@@ -145,6 +145,19 @@ class Settings(BaseSettings):
     # 的 bind mount 对任意 uid 可写；Linux 部署机需与挂载目录属主匹配或预 chown
     SCRIPT_RUNNER_USER: str = "10001:10001"
 
+    # 沙箱 bind 源宿主根（SANDBOX_WORKSPACE_HOST_ROOT）：docker daemon 按**宿主
+    # 路径**解析 -v 挂载源，而 spec.workspace_host 是 worker 容器内视角路径
+    # （/app/uploads/script_runs/...）。uploads 以 bind 且宿主/容器路径一致
+    # 部署（./uploads:/app/uploads）时留空（缺省）即现状；命名卷部署
+    # （compose 文档化的群晖形态 UPLOADS_VOLUME=uploads）下宿主不存在
+    # /app/uploads/...，daemon 会静默新建空 root 目录——沙箱空工作区、
+    # stdout/stderr 日志永远回不来，故该形态必填（如
+    # /volume1/docker/ai-evo/uploads-data）。配置后 SandboxRunSpec.mount_source
+    # = host_root + 工作区相对 /app/uploads/script_runs 的后缀（派生见
+    # script_container.derive_mount_source）；executor 侧同名 env 校验白名单
+    # （sandbox_params.resolve_mount_source，两侧单一事实源）
+    SANDBOX_WORKSPACE_HOST_ROOT: str = ""
+
     # executor 沙箱服务调用地址（ARCH-1-2，设计 §2.3 D1）：worker → executor 的
     # compose 内网 HTTP 地址（如 http://executor:8300）。已配置时 container 模式
     # 走 HttpExecutorDriver（目标通道）；留空回退 docker-CLI 驱动（W15 既有单机

@@ -373,6 +373,11 @@ services:
         condition: service_completed_successfully
     environment:
       - EXECUTOR_TOKEN=${EXECUTOR_TOKEN:-}
+      # bind 源宿主根（命名卷部署必填）：docker daemon 按宿主路径解析 -v 源，
+      # UPLOADS_VOLUME=uploads 形态下须经它把 /app/uploads/script_runs/... 映射
+      # 回宿主（校验白名单在 executor/sandbox_params.resolve_mount_source；
+      # 未配置 = 同路径 bind 部署行为不变。docs/build-pipeline.md 部署变量表）
+      - SANDBOX_WORKSPACE_HOST_ROOT=${SANDBOX_WORKSPACE_HOST_ROOT:-}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${UPLOADS_VOLUME:-./uploads}:/app/uploads

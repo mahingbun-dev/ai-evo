@@ -116,10 +116,13 @@ class TestExecutorService:
 
     def test_token_via_interpolation_without_env_file(self, services):
         """凭证边界：不挂 env_file（DATABASE_URL/Redis 等平台凭证不进容器），
-        EXECUTOR_TOKEN 仅经插值注入；未配置 = fail-closed（executor/app.py）"""
+        EXECUTOR_TOKEN 仅经插值注入；未配置 = fail-closed（executor/app.py）。
+        SANDBOX_WORKSPACE_HOST_ROOT 同通道插值（命名卷部署 bind 源宿主根，
+        sandbox_params.resolve_mount_source 白名单）"""
         assert "env_file" not in services["executor"]
         env = _env_map(services["executor"])
         assert env.get("EXECUTOR_TOKEN") == "${EXECUTOR_TOKEN:-}"
+        assert env.get("SANDBOX_WORKSPACE_HOST_ROOT") == "${SANDBOX_WORKSPACE_HOST_ROOT:-}"
 
     def test_docker_group_gid_supplementary_group(self, services):
         """非 root 访问 sock：部署机 docker 组 gid 经 .env 插值为补充组

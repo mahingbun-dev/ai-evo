@@ -235,9 +235,12 @@ class TestScaleExecutor:
 
     def test_no_env_file_token_via_interpolation(self, services):
         """凭证边界与主控机同款：不挂 env_file（中心 DB/Redis 凭证不进
-        容器），EXECUTOR_TOKEN 仅经插值注入（未配置 = fail-closed）"""
+        容器），EXECUTOR_TOKEN 仅经插值注入（未配置 = fail-closed）；
+        SANDBOX_WORKSPACE_HOST_ROOT 同通道插值（命名卷部署 bind 源宿主根）"""
         assert "env_file" not in services["executor"]
-        assert _env_map(services["executor"]).get("EXECUTOR_TOKEN") == "${EXECUTOR_TOKEN:-}"
+        env = _env_map(services["executor"])
+        assert env.get("EXECUTOR_TOKEN") == "${EXECUTOR_TOKEN:-}"
+        assert env.get("SANDBOX_WORKSPACE_HOST_ROOT") == "${SANDBOX_WORKSPACE_HOST_ROOT:-}"
 
     def test_docker_group_gid_supplementary(self, services):
         assert "${DOCKER_GROUP_GID:-999}" in services["executor"].get("group_add", [])

@@ -465,6 +465,9 @@ def _run_smoke_test_in_container(entry: Path, limit: float) -> Dict[str, Any]:
         )
         driver = script_container.get_sandbox_driver()
         try:
+            # bind 源宿主根映射（命名卷部署）：SANDBOX_WORKSPACE_HOST_ROOT 配置时
+            # 派生 mount_source（映射失败 SandboxDriverError → 冒烟失败，fail-loud）
+            spec.mount_source = script_container.derive_mount_source(spec.workspace_host)
             handle = driver.run(spec)
             status = driver.wait(handle, limit)
         except script_container.SandboxDriverError as e:

@@ -95,8 +95,13 @@ executor 的沙箱参数白名单（`executor/sandbox_params.py` `WORKSPACE_ROOT
    4.6 节一致）。SMB/CIFS 需按挂载 uid 映射（`uid=10002`）。
 3. **script_runs 必须落本机盘**：缺省 bind `./script_runs`；若评测机部署目录
    本身在 NFS 上，显式设 `SCRIPT_RUNS_VOLUME=script_runs` 用命名卷（docker 卷根
-   `/var/lib/docker/volumes` 在本机盘）。本机盘水位需自行监控（工作区评完即清、
-   任务级归档后删除，常态占用低，长任务积压时才涨）。
+   `/var/lib/docker/volumes` 在本机盘）。**该命名卷形态必须同时配
+   `SANDBOX_WORKSPACE_HOST_ROOT=/var/lib/docker/volumes/script_runs/_data`**
+   （docker daemon 按宿主路径解析沙箱 `-v` 源，executor/worker 容器视角的
+   `/app/uploads/script_runs/...` 在宿主不存在——不配则 daemon 静默新建空目录，
+   沙箱空工作区、stdout/stderr 日志回不来；主控机 `UPLOADS_VOLUME=uploads`
+   命名卷形态同理由，见 build-pipeline.md 部署变量表）。本机盘水位需自行监控
+   （工作区评完即清、任务级归档后删除，常态占用低，长任务积压时才涨）。
 4. **同一台评测机内严禁混用**：worker-eval 与 executor 的两层挂载由同一份
    compose 变量驱动，天然一致；不要给其中任何一个服务单独改挂载。
 

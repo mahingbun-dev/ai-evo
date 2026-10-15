@@ -186,6 +186,11 @@ class HttpExecutorDriver(SandboxDriver):
             "timeout": spec.timeout,
             "entrypoint": ["sh", "-c", shell_command],
         }
+        # bind 源（命名卷部署，SANDBOX_WORKSPACE_HOST_ROOT）：仅在派生出
+        # mount_source 时携带——executor 按宿主根白名单校验；未配置形态不带
+        # 字段，缺省行为与既有调用方逐字节一致（workspace 本身即 bind 源）
+        if spec.mount_source:
+            body["mount_source"] = spec.mount_source
         resp = _executor_request("POST", "/sandbox/run", body, POST_TIMEOUT_SECONDS)
         run_id = str(resp.get("run_id") or "")
         if not run_id:

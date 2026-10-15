@@ -63,6 +63,18 @@ ARCH-3-4（设计 §3 Phase 3 表 3-4 行「gVisor 可选运行时档」）：�
 行为不变）。HTTP executor 驱动的客户端透传（请求体带 runtime 字段）属后续
 批次接线（executor 侧字段与校验本批已开，见 executor/app.py.SandboxRunRequest）。
 
+bind 源宿主根映射（SANDBOX_WORKSPACE_HOST_ROOT，命名卷部署缺陷修复）：
+docker daemon 按**宿主路径**解析 ``-v`` 挂载源，而 ``SandboxRunSpec.
+workspace_host`` 一直是 worker 容器内视角路径（/app/uploads/script_runs/...）。
+uploads 以 bind 且宿主/容器路径一致部署时两者碰巧相同（缺省行为，完全不变）；
+命名卷部署（UPLOADS_VOLUME=uploads，群晖 compose 文档化形态）下宿主不存在
+该路径，daemon 会静默新建空 root 目录——沙箱空工作区、日志回不来且无报错。
+配置 SANDBOX_WORKSPACE_HOST_ROOT 后，``derive_mount_source`` 按
+host_root + 工作区相对 /app/uploads/script_runs 的后缀派生 ``mount_source``，
+CLI/HTTP 两驱动的 -v 挂载源一律改用之（workspace 字段语义不变：executor
+视角校验与 stdin 落盘点）；executor 侧同名 env + sandbox_params.
+resolve_mount_source 白名单（越界/伪造拒绝，两侧单一事实源）。
+
 执行返回结构与 local 模式完全一致（pre_script_results 标准条目）。
 """
 import logging
@@ -96,8 +108,10 @@ from executor.sandbox_params import (  # noqa: F401
     CONTAINER_WORKSPACE,
     DEFAULT_RUNTIME,
     NET_PROFILES as _EXECUTOR_NET_PROFILES,
+    SANDBOX_WORKSPACE_HOST_ROOT_ENV as _WORKSPACE_HOST_ROOT_ENV,
     SandboxParamError as _SandboxParamError,
     build_docker_run_args as _build_sandbox_docker_run_args,
+    derive_mount_source_from_host_root as _derive_host_root_mount_source,
     docker_binary,
     validate_container_runtime as _validate_container_runtime,
 )
@@ -184,6 +198,44 @@ def runner_user() -> str:
     if raw:
         return raw
     return (get_settings().SCRIPT_RUNNER_USER or "10001:10001").strip()
+
+
+# ---------------- bind 源宿主根映射（SANDBOX_WORKSPACE_HOST_ROOT，命名卷部署） ----------------
+
+def sandbox_workspace_host_root() -> str:
+    """bind 源宿主根（SANDBOX_WORKSPACE_HOST_ROOT；环境变量实时读优先于 Settings）
+
+    缺省空串 = 未配置 = 同路径 bind 部署现状（spec.mount_source 缺省）。
+    与 executor 侧同名 env 共用一份配置语义（两侧各自实时读，compose 经
+    env_file / 插值分别注入 worker 与 executor）。
+    """
+    raw = (os.environ.get(_WORKSPACE_HOST_ROOT_ENV) or "").strip()
+    if raw:
+        return raw
+    return (get_settings().SANDBOX_WORKSPACE_HOST_ROOT or "").strip()
+
+
+def derive_mount_source(workspace_host: str) -> Optional[str]:
+    """worker 视角工作区路径 → 宿主 bind 源（SANDBOX_WORKSPACE_HOST_ROOT 配置时）
+
+    - 未配置 → None（spec.mount_source 缺省 = workspace_host，同路径 bind
+      部署行为完全不变）；
+    - 已配置（命名卷部署）→ host_root + workspace 相对 /app/uploads/
+      script_runs（sandbox_params.WORKSPACE_ROOT，worker 容器同路径挂载）的
+      后缀；派生核心与 executor 侧兜底共用同一函数（单一事实源）；
+    - 工作区不在 WORKSPACE_ROOT 子树内 → SandboxParamError fail-loud：
+      命名卷部署下映射不到宿主路径的挂载必然静默错（daemon 自动建空目录），
+      宁可拒绝成脚本 fail 条目（调用点在受理 try 内，与 SANDBOX_RUNTIME
+      的错误口径一致），绝不带病进沙箱。
+    """
+    host_root = sandbox_workspace_host_root()
+    if not host_root:
+        return None
+    ws_real = os.path.realpath(workspace_host)
+    try:
+        return _derive_host_root_mount_source(ws_real, host_root)
+    except _SandboxParamError as e:
+        raise SandboxDriverError(f"SANDBOX_WORKSPACE_HOST_ROOT 映射失败: {e}") from e
 
 
 # ---------------- 沙箱容器运行时档（ARCH-3-4，设计 §3 表 3-4 行） ----------------
@@ -460,6 +512,12 @@ class SandboxRunSpec:
     # 容器运行时档（ARCH-3-4：runc 默认|runsc 加固；sandbox_runtime 读取，
     # 白名单校验后进驱动；既有 spec 构造面缺省 runc 不变）
     runtime: str = DEFAULT_RUNTIME
+    # bind 源（docker daemon 宿主路径口径）：SANDBOX_WORKSPACE_HOST_ROOT 配置
+    # （命名卷部署）时 derive_mount_source 派生的宿主绝对路径，受理 try 内
+    # 赋值（与 runtime 同模式）；缺省 None = workspace_host（同路径 bind 部署，
+    # daemon 直接按容器内视角路径解析——现状不变）。workspace 字段语义不变
+    # （executor 视角校验、stdin 落盘点）
+    mount_source: Optional[str] = None
 
 
 @dataclass
@@ -529,7 +587,9 @@ class DockerCliDriver(SandboxDriver):
         args = [docker_binary(), *_build_sandbox_docker_run_args(
             image=spec.image,
             user=spec.user,
-            mount_host=spec.workspace_host,
+            # bind 源：daemon 按宿主路径解析 -v 左值——命名卷部署下用
+            # derive_mount_source 派生的 mount_source，缺省回退 workspace_host
+            mount_host=spec.mount_source or spec.workspace_host,
             mount_container=spec.workspace_container,
             workdir_container=spec.workdir_container,
             network_name=_worker_network_name(spec.net_profile),
@@ -694,6 +754,10 @@ def execute_script_in_container(
     sandbox_driver = driver or get_sandbox_driver()
 
     try:
+        # bind 源宿主根映射（命名卷部署）：SANDBOX_WORKSPACE_HOST_ROOT 配置时
+        # 派生 mount_source；越界（SandboxDriverError）与运行时档同口径转
+        # 脚本 fail 条目，不炸编排
+        spec.mount_source = derive_mount_source(spec.workspace_host)
         # ARCH-3-4：运行时档读取（SANDBOX_RUNTIME）与白名单校验在受理 try 内
         # ——非法配置（SandboxDriverError）按驱动错误转脚本 fail 条目，不炸编排
         spec.runtime = sandbox_runtime()
@@ -852,6 +916,9 @@ def execute_harness_in_container(
     sandbox_driver = driver or get_sandbox_driver()
 
     try:
+        # bind 源宿主根映射 + 运行时档读取与脚本通道同口径（受理 try 内，
+        # 非法配置/映射越界转 fail 条目）
+        spec.mount_source = derive_mount_source(spec.workspace_host)
         # ARCH-3-4：运行时档读取与脚本通道同口径（受理 try 内，非法配置转 fail 条目）
         spec.runtime = sandbox_runtime()
         # ARCH-2-3：受理延迟打点口径与脚本通道一致（driver 标签区分通道）

@@ -291,6 +291,7 @@ api/worker 容器。部署相关变量一览（✅ 必填、⛔ 严禁设置；�
 | `IMAGE_TAG` | 自动 | CI 部署时自动写入当前短 sha；手工回滚即改回旧值 |
 | `TMPFS_TMP_SIZE` / `TMPFS_HOME_SIZE` | 可选 | `/tmp`、`/home/app` 两个 tmpfs 的容量上限（ARCH-0-1，默认各 1g，只按实际写入占内存） |
 | `LOGS_VOLUME` / `UPLOADS_VOLUME` | 可选 | 日志/上传卷形态切换（默认 bind 到 compose 目录下；群晖等经代理工具执行 compose 的场景设为命名卷 `logs` / `uploads`） |
+| `SANDBOX_WORKSPACE_HOST_ROOT` | 命名卷部署必填 | 沙箱 bind 源宿主根：docker daemon 按**宿主路径**解析沙箱 `-v` 挂载源，而 worker 视角工作区路径是 `/app/uploads/script_runs/...`——uploads 用 bind 且宿主/容器路径一致时可留空（缺省 = 现状）；`UPLOADS_VOLUME=uploads`（命名卷形态，见上行）时宿主不存在该路径，daemon 会静默新建空目录（沙箱空工作区、stdout/stderr 日志回不来），必填 uploads 命名卷的宿主真实根，如 `/volume1/docker/ai-evo/uploads-data`（映射与白名单单一事实源 `executor/sandbox_params.resolve_mount_source`） |
 | `AIEVO_PORT` | 可选 | api 对外端口（默认 8100） |
 | `COMPOSE_PROFILES` | 可选 | 逗号组合：`bundled-db` 一并启动内置 PostgreSQL；`sandbox` 启动沙箱面 executor + egress 与 aievo-sandbox-egress 内网（ARCH-1-3，见第十节；生产 CI 部署默认都不设） |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` / `POSTGRES_PORT` | 可选 | 仅 `bundled-db` profile 生效 |

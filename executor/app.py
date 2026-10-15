@@ -17,7 +17,10 @@ token 的 HTTP 调用（1-2 起由 SandboxDriver 的 HTTP 驱动接入）。
 - 镜像仅 script-runner 系清单；``--user 10001:10001``、资源上限/read-only/
   tmpfs/cap-drop=ALL/no-new-privileges 固定；网络档仅 none|egress；
   运行时档仅 runc|runsc（runsc = gVisor 加固档，高危脚本专用，ARCH-3-4）；
-  bind mount 仅 /app/uploads/script_runs 子树（realpath 校验）；
+  bind mount 仅 /app/uploads/script_runs 子树（realpath 校验）；bind 源
+  （-v 左值，docker daemon 宿主路径口径）经可选 mount_source 字段映射
+  （SANDBOX_WORKSPACE_HOST_ROOT 命名卷部署，sandbox_params.resolve_mount_source
+  ——严格落在宿主根之下，越界/伪造 400；未配置 = workspace 本身，行为不变）；
   容器内工作目录（``workdir`` → ``-w``）仅 /workspace 子树（缺省挂载根；worker
   的 per-script cwd /workspace/{script_id} 经此透传——harness 三件套与脚本
   artifacts 按 cwd 相对寻址，硬编码挂载根会让 agent 通道必然 FileNotFound）；
@@ -128,6 +131,12 @@ class SandboxRunRequest(BaseModel):
     image: str = Field(min_length=1, max_length=256)
     # 宿主（executor 视角）工作区绝对路径，须在 /app/uploads/script_runs 子树内
     workspace: str = Field(min_length=1, max_length=4096)
+    # bind 源（docker daemon 宿主路径口径，命名卷部署）：SANDBOX_WORKSPACE_HOST_ROOT
+    # 配置时由 worker 按后缀规则派生（script_container.derive_mount_source）；
+    # 白名单校验在 sandbox_params.resolve_mount_source（单一事实源）——必须严格
+    # 落在宿主根之下，越界 400。缺省 None = 未配置形态由 executor 按工作区
+    # 解析结果兜底（同路径 bind 部署行为不变，此时显式携带必须与 workspace 一致）
+    mount_source: Optional[str] = Field(default=None, max_length=4096)
     # 容器内工作目录（docker run -w）：worker 侧 per-script cwd = /workspace/{script_id}
     # （script_container.build_container_paths 推导，harness 通道的三件套与脚本通道
     # 的 artifacts 都按 cwd 相对寻址）。白名单校验在 sandbox_params.
@@ -151,7 +160,8 @@ class RunRecord:
     run_id: str
     container_name: str
     request: Dict[str, Any]   # 全量请求参数（审计/查询回显）
-    mount_host: str           # 白名单 realpath 解析后的挂载源（审计/日志落盘用）
+    mount_host: str           # docker daemon 的 bind 源（-v 左值；命名卷部署 = 宿主根映射后路径，审计用）
+    workspace_real: str       # 工作区 executor 容器视角真实路径（resolve_workspace_mount 产物；日志落盘/尾部读取寻址）
     started_at: float
     state: str = "running"    # running|done|timeout|failed
     exit_code: Optional[int] = None
@@ -244,12 +254,14 @@ def _supervise_run(record: RunRecord, timeout: float) -> None:
     except OSError as e:
         error = f"docker wait 调用失败: {e}"
 
-    # 日志收集并落工作区（worker 侧按 stdout.log/stderr.log 文件口径解析）
+    # 日志收集并落工作区（worker 侧按 stdout.log/stderr.log 文件口径解析）。
+    # 落盘点是 executor 容器视角的 workspace_real——命名卷部署下 mount_host
+    # 是宿主路径，本容器内不存在，日志必须写进自己挂得到的卷内路径
     try:
         logs = _run_cli([docker, "logs", name], LOGS_TIMEOUT_SECONDS)
         for fname, data in ((LOG_FILE_STDOUT, logs.stdout), (LOG_FILE_STDERR, logs.stderr)):
             try:
-                (Path(record.mount_host) / fname).write_bytes(data)
+                (Path(record.workspace_real) / fname).write_bytes(data)
             except OSError as e:
                 logger.warning(f"[sandbox:{record.run_id}] 工作区日志落盘失败 {fname}: {e}")
     except (OSError, subprocess.TimeoutExpired) as e:
@@ -294,7 +306,11 @@ def sandbox_run(
     # ---- 参数白名单（全部在 sandbox_params——与 worker 通道同一事实源） ----
     try:
         image = sandbox_params.validate_runner_image(req.image)
-        mount_host = sandbox_params.resolve_workspace_mount(req.workspace)
+        # 工作区：executor 容器视角定位（realpath 校验）——日志落盘/尾部读取按它寻址
+        ws_real = sandbox_params.resolve_workspace_mount(req.workspace)
+        # bind 源：docker daemon 按宿主路径解析 -v 左值（命名卷部署经
+        # SANDBOX_WORKSPACE_HOST_ROOT 映射；未配置 = workspace 本身，行为不变）
+        mount_host = sandbox_params.resolve_mount_source(ws_real, req.mount_source)
         # 容器内工作目录白名单：须在 /workspace 子树内（缺省挂载根）；worker 的
         # per-script cwd 经此透传到 -w——harness 三件套/脚本 artifacts 按 cwd 寻址
         workdir_container = sandbox_params.resolve_container_workdir(req.workdir)
@@ -326,6 +342,7 @@ def sandbox_run(
     record = RunRecord(
         run_id=run_id, container_name=container_name,
         request=req.model_dump(), mount_host=mount_host,
+        workspace_real=ws_real,
         started_at=time.time(),
     )
     with _runs_lock:
@@ -378,8 +395,10 @@ def sandbox_run_status(
             "request": record.request,
             "started_at": record.started_at,
             "finished_at": record.finished_at,
-            "stdout_tail": _tail_bytes(Path(record.mount_host) / LOG_FILE_STDOUT),
-            "stderr_tail": _tail_bytes(Path(record.mount_host) / LOG_FILE_STDERR),
+            # 尾部读取同日志落盘：按 executor 容器视角工作区寻址（命名卷部署
+            # 下 mount_host 是宿主路径，容器内不可读）
+            "stdout_tail": _tail_bytes(Path(record.workspace_real) / LOG_FILE_STDOUT),
+            "stderr_tail": _tail_bytes(Path(record.workspace_real) / LOG_FILE_STDERR),
         }
 
 

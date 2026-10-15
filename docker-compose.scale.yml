@@ -174,6 +174,12 @@ services:
         condition: service_completed_successfully
     environment:
       - EXECUTOR_TOKEN=${EXECUTOR_TOKEN:-}
+      # bind source host root (required for named volume/NFS script_runs deployments): the daemon resolves
+      # the -v source according to the host path, which must be mapped back to the host via
+      # SANDBOX_WORKSPACE_HOST_ROOT (= the host mount source of SCRIPT_RUNS_VOLUME/UPLOADS_VOLUME
+      # in named volume form). For validation, see executor/sandbox_params.resolve_mount_source
+      # (not configured = bind deployment with consistent paths, behavior unchanged)
+      - SANDBOX_WORKSPACE_HOST_ROOT=${SANDBOX_WORKSPACE_HOST_ROOT:-}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${UPLOADS_VOLUME:?须在 .env.scale 配置共享存储挂载源(如 NFS 挂载点)，缺省本地目录会造成脚本库/数据集缓存与主控机分叉}:/app/uploads

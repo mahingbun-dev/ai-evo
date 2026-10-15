@@ -132,8 +132,12 @@ def resolve_workspace_mount(workspace: str) -> str:
     - realpath 解析符号链接后必须严格落在 WORKSPACE_ROOT **之下**（不含根本
       身——挂整个 script_runs 面过宽），防 ``../`` 字面穿越与 symlink 逃逸；
     - 必须是已存在的目录（worker 先准备工作区再来请求，不存在即拒绝）；
-    - 返回解析后的真实路径作为挂载源（残余 TOCTOU 窗口由「仅 token 内网
-      调用方」的信任边界兜底，Phase 1-3 compose 收口监听面）。
+    - 返回解析后的真实路径（executor 容器视角的工作区定位——日志落盘/
+      GET 尾部读取按它寻址，与 docker daemon 的 bind 源是两个口径，见
+      resolve_mount_source）。
+
+    残余 TOCTOU 窗口由「仅 token 内网调用方」的信任边界兜底，Phase 1-3
+    compose 收口监听面。
     """
     _require_flag_safe("workspace", workspace)
     root_real = os.path.realpath(WORKSPACE_ROOT)
@@ -149,6 +153,83 @@ def resolve_workspace_mount(workspace: str) -> str:
     if not os.path.isdir(ws_real):
         raise SandboxParamError(f"工作区 {ws_real!r} 不存在或不是目录（须先准备工作区）")
     return ws_real
+
+
+# ---------------- bind 源宿主根映射（SANDBOX_WORKSPACE_HOST_ROOT，命名卷部署） ----------------
+
+# bind 源宿主根配置（executor env，与 worker 侧 Settings 字段同名）。缺省空串
+# = 未配置 = 现状：uploads 卷以 bind 形态挂载且宿主/容器路径一致（如
+# ./uploads:/app/uploads），docker daemon 直接按 executor 容器视角路径解析
+# -v 源即可。命名卷部署（compose 文档化的群晖形态 UPLOADS_VOLUME=uploads）
+# 下 -v 源在宿主不存在，daemon 会静默新建空 root 目录——沙箱拿到空工作区、
+# stdout/stderr 日志永远回不来且无任何报错，故该形态必须显式配置宿主根
+# （示例 /volume1/docker/ai-evo/uploads-data，docs/build-pipeline.md 部署
+# 变量表「命名卷部署必填」）。
+SANDBOX_WORKSPACE_HOST_ROOT_ENV = "SANDBOX_WORKSPACE_HOST_ROOT"
+
+
+def sandbox_workspace_host_root() -> str:
+    """bind 源宿主根配置读取（executor env 实时读；缺省空 = 未配置）
+
+    executor 不挂 env_file（凭证边界，compose 经插值注入本变量），与
+    EXECUTOR_TOKEN 同通道读 os.environ。
+    """
+    return (os.environ.get(SANDBOX_WORKSPACE_HOST_ROOT_ENV) or "").strip()
+
+
+def derive_mount_source_from_host_root(ws_real: str, host_root: str) -> str:
+    """工作区（realpath 解析后）→ 宿主 bind 源：host_root + WORKSPACE_ROOT 相对后缀
+
+    worker 侧构造 spec.mount_source 与 executor 侧兜底派生共用本函数（单一
+    事实源）。注意入参须已通过 realpath 解析（两侧语义：worker 容器视角 /
+    executor 容器视角解析结果一致——同一 uploads 卷同路径挂载）。
+    """
+    _require_flag_safe("SANDBOX_WORKSPACE_HOST_ROOT", host_root)
+    root_real = os.path.realpath(WORKSPACE_ROOT)
+    if not ws_real.startswith(root_real + "/"):
+        raise SandboxParamError(
+            f"工作区 {ws_real!r} 不在 {WORKSPACE_ROOT} 子树内：无法映射宿主 bind 源")
+    suffix = ws_real[len(root_real):]
+    if any(part == ".." for part in suffix.split("/")):
+        # realpath 之后理论不可能（解析已消除 ..），纵深防御
+        raise SandboxParamError("工作区后缀含 .. 分量，拒绝映射宿主 bind 源")
+    return host_root.rstrip("/") + suffix
+
+
+def resolve_mount_source(ws_real: str, mount_source: Optional[str]) -> str:
+    """docker daemon 的 bind 源解析（-v 左值；与 resolve_workspace_mount 分离）
+
+    daemon 按**宿主路径**解析 -v 源，而 executor 容器内只能看见自己的
+    /app/uploads 视角——命名卷部署下两者不同，bind 源必须显式映射：
+
+    - SANDBOX_WORKSPACE_HOST_ROOT 未配置（缺省，bind 同路径部署）：bind 源 =
+      workspace 解析结果本身；请求显式携带 mount_source 时必须与之完全一致
+      （未配置即无从校验宿主路径合法性，伪造值一律拒绝）；
+    - 已配置（命名卷部署）：bind 源 = 请求 mount_source，按字符串前缀严格
+      落在 host_root 之下校验（不含根本身——挂整个 uploads 根过宽；无 ..
+      分量）。daemon 路径 executor 容器内看不见，不能用 os.path.realpath，
+      只能做字符串口径的规范化+前缀判断；请求未带 mount_source 时按后缀
+      规则兜底派生（与 worker 侧同一函数，兼容未升级的旧 worker 客户端）。
+    """
+    host_root = sandbox_workspace_host_root()
+    if not host_root:
+        if mount_source is None:
+            return ws_real
+        if posixpath.normpath(mount_source) != ws_real:
+            raise SandboxParamError(
+                f"SANDBOX_WORKSPACE_HOST_ROOT 未配置：mount_source 必须与工作区一致（{ws_real!r}），拒绝伪造")
+        return ws_real
+    if mount_source is None:
+        return derive_mount_source_from_host_root(ws_real, host_root)
+    _require_flag_safe("mount_source", mount_source)
+    normalized = posixpath.normpath(mount_source)
+    root = host_root.rstrip("/")
+    if normalized == root or not normalized.startswith(root + "/"):
+        raise SandboxParamError(
+            f"mount_source {mount_source!r} 不在宿主根 {host_root!r} 子树内（越界 bind mount）")
+    if any(part == ".." for part in normalized.split("/")):
+        raise SandboxParamError(f"mount_source {mount_source!r} 含 .. 穿越分量，拒绝")
+    return normalized
 
 
 # ---------------- 容器内工作目录白名单（executor 请求 workdir 字段） ----------------
