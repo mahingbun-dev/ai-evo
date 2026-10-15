@@ -11,7 +11,7 @@
    残留互斥锁一并清除；新鲜 running 仍拒绝重试。
 
 环境约定（tests/integration/conftest.py）：PG 用 W4 会话级临时库（runtime_db，
-自建自清）；Redis 用本地 6379（local_redis，不可达明确 skip，不假绿）。
+自建自清）；Redis 跟随 settings.REDIS_URL（local_redis，不可达明确 skip，不假绿）。
 测试数据一律 w11 前缀、用例内唯一（uuid 后缀），只删自建数据。
 """
 import threading

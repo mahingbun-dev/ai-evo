@@ -149,10 +149,16 @@ class PgAdmin:
 
 # ---- W4 临时库供给（导入期执行，见模块 docstring）
 
-# 共享开发库基线 DSN（可用 W4_BASE_DSN 覆盖；只读复制结构，绝不做迁移）
-BASE_DSN = os.environ.get(
-    "W4_BASE_DSN",
-    "postgresql://ai_evo:ai_evo@127.0.0.1:5432/ai_evo",
+# 共享开发库基线 DSN（只读复制结构，绝不做迁移）。解析优先级：
+# W4_BASE_DSN 显式覆盖 > DATABASE_URL（环境变量，缺省时上方 W5 预设置
+# 已从主仓 .env 探测回填）> 历史缺省（与 CI 一致的 ai_evo:ai_evo）。
+# 此前硬编码 ai_evo:ai_evo 与本地 dev 栈口令（docker-compose.dev.yml 为
+# ai_evo_dev）不符时探测必失败——W4 临时库供给静默降级为共享库直跑，
+# SIGKILL 子进程用例仍把（连不上的）TEMP_DSN 注入子进程而假红。
+BASE_DSN = (
+    os.environ.get("W4_BASE_DSN", "").strip()
+    or os.environ.get("DATABASE_URL", "").strip()
+    or "postgresql://ai_evo:ai_evo@127.0.0.1:5432/ai_evo"
 )
 TEMP_DB_PREFIX = "w4t_cfgsnap_"
 
@@ -345,14 +351,27 @@ def w5_test_data_guard():
 
 @pytest.fixture
 def local_redis():
-    """本地 Redis（推送链路用）；不可达时明确 skip（不假绿）"""
+    """被测代码实际连接的本地 Redis（推送链路用）；不可达时明确 skip（不假绿）
+
+    跟随应用同源解析（settings.REDIS_URL：环境变量 > 主仓 .env）。此前硬编码
+    127.0.0.1:6379 与 CI 一致，但本地 dev 栈常把 Redis 映射到非 6379 端口
+    （docker-compose.dev.yml 用 6380，6379 被其他项目占用）——PubSubListener/
+    EvalTaskLock 等被测代码都连 settings.REDIS_URL，测试若查另一台 Redis，
+    订阅可见性/锁状态断言必假红（两台实例间永远看不到对方的写入）。
+    """
     import redis as redis_lib
 
+    from app.core.config import get_settings
+
+    url = get_settings().REDIS_URL
     try:
-        client = redis_lib.Redis(host="127.0.0.1", port=6379, db=0, decode_responses=True)
+        client = redis_lib.from_url(url, decode_responses=True)
         client.ping()
     except Exception as e:  # noqa: BLE001 - 探测失败统一 skip
-        pytest.skip(f"本地 Redis 6379 不可达（{e}），推送链路用例跳过（§5.1：跑不了明确 skip）")
+        pytest.skip(
+            f"Redis {urlparse(url).netloc or url} 不可达（{e}），"
+            "推送链路用例跳过（§5.1：跑不了明确 skip，不许假绿）"
+        )
     yield client
     client.close()
 

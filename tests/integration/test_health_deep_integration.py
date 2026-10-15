@@ -1,7 +1,7 @@
 """深健康检查集成测试（W13）
 
-真实 PG（conftest 临时库，含 alembic 迁移）+ 真实 Redis（本地 6379）+
-真实文件系统，验证全绿路径与端点 200。
+真实 PG（conftest 临时库，含 alembic 迁移）+ 真实 Redis（settings.REDIS_URL
+同源，local_redis）+ 真实文件系统，验证全绿路径与端点 200。
 
 degraded / 探针分支按 §3 W13 测试约定用 monkeypatch 覆盖，
 见 tests/unit/test_health_deep.py（人为停 PG 场景本地难做）。
