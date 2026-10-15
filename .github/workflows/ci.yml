@@ -112,6 +112,16 @@ jobs:
           --build-arg NPM_REGISTRY=https://registry.npmjs.org
           -t ai-evo:ci .
 
+      # 镜像导入冒烟（NAS 真机冒烟缺陷回归门禁）：主镜像曾漏 COPY executor/
+      # → app/core/config.py 顶层 import executor.sandbox_params 直接
+      # ModuleNotFoundError，api/worker 容器启动即崩；pytest 在源码目录跑
+      # （executor/ 天然在场）测不出来——必须在镜像里真跑一次导入。这一步
+      # 在 Dockerfile 漏 COPY 场景会直接红。
+      - name: 镜像导入冒烟（防 COPY 缺失）
+        run: >-
+          docker run --rm --entrypoint python ai-evo:ci
+          -c "from app.core.config import get_settings; import executor.sandbox_params; print('image-import-ok')"
+
       # ARCH-3-3（设计 §3 表 3-3 行）：构建一次、下游 image-scan job 复用
       # （docker save 打包上传 artifact，扫描 job load 回来跑 trivy——
       # GitHub runner 间不共享 docker daemon，重复构建主镜像太浪费）

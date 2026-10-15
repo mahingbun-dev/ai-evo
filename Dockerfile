@@ -41,6 +41,10 @@ ENV CLAUDE_CODE_PATH=/usr/local/bin/claude
 
 # 复制应用代码
 COPY app/ app/
+# executor 小包（纯标准库）：app/core/config.py 顶层 import executor.sandbox_params
+# （CONTAINER_RUNTIMES 白名单同源）——主镜像漏 COPY 会让 api/worker 启动即
+# ModuleNotFoundError（NAS 冒烟实测缺陷，CI 镜像导入冒烟步防回归）
+COPY executor/ executor/
 # vendored anc-hub 插件 SDK（app/hub_plugin 的运行时骨架；来源与升级方式见
 # hubkit/README-vendored.md；`python -m app.hub_plugin` 从 /app 直接 import）
 COPY hubkit/ hubkit/

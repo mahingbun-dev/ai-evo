@@ -20,6 +20,10 @@ ARCH-1-5 扩（设计 §3 Phase 1 表 1-5 行）：
 - 镜像 digest 钉扎：SCRIPT_RUNNER_IMAGE 可填 <repo>@sha256:<64hex>，
   Settings 解析层格式校验 + docker-CLI 通道原样透传
 
+NAS 真机冒烟回归扩：
+- SANDBOX_DISABLE_CPU_LIMIT 开关（DSM 等无 CPU CFS 内核）：缺省拼
+  ``--cpus``（逐字节不变），开关置 1 仅摘 --cpus、其余旗标不动
+
 docker 实机探针（读 env/读宿主路径/网络/资源限制）在
 tests/integration/test_w15_container_probe.py（本机 docker 不可用时 skip）；
 实机逃逸攻击集（import app/读 /proc/1/environ/fork 炸弹/写越界路径/超长
@@ -222,6 +226,88 @@ class TestHardeningFlags:
         from executor import sandbox_params
         assert sandbox_params.CONTAINER_CAP_DROP == "ALL"
         assert sandbox_params.CONTAINER_SECURITY_OPT == "no-new-privileges:true"
+
+
+class TestCpuLimitSwitch:
+    """SANDBOX_DISABLE_CPU_LIMIT 开关（NAS 真机冒烟缺陷回归）
+
+    Synology DSM 内核未启用 CPU CFS scheduler：docker run --cpus 被 daemon
+    硬拒绝（exit 125："NanoCPUs can not be set, as your kernel does not
+    support CPU CFS scheduler"），沙箱容器一个都起不来；同机 --memory/
+    --memory-swap 正常、--pids-limit 仅 WARNING（被丢弃不失败）。开关生效时
+    单一事实源（executor/sandbox_params.build_docker_run_args）不拼 --cpus，
+    其余资源上限与加固位全部保持；worker 通道（script_container 薄封装调
+    同一构造函数）零改动自动获益。缺省（env 未设）行为与历史逐字节一致。
+    """
+
+    def _sandbox_args(self):
+        """executor 通道形态直接调公共构造函数（单一事实源）"""
+        from executor import sandbox_params
+
+        return sandbox_params.build_docker_run_args(
+            image="ai-evo-script-runner:latest",
+            user=sandbox_params.SANDBOX_USER,
+            mount_host="/srv/uploads/script_runs/t1/d1",
+            mount_container=sandbox_params.CONTAINER_WORKSPACE,
+            workdir_container=sandbox_params.CONTAINER_WORKSPACE,
+            network_name="none",
+            container_name="aievo-sbx-abc123",
+            tail_command=["python", "/opt/runner/pre_judge_entry.py",
+                          "/workspace/scripts/s1", "main.py"],
+        )
+
+    def test_default_env_keeps_cpus_flag(self, monkeypatch):
+        """缺省拼 --cpus（企业主线默认形态；未设/空串/非生效值同）"""
+        from executor import sandbox_params
+
+        for unset in (None, "", "0", "false", "off", "yes-no"):
+            if unset is None:
+                monkeypatch.delenv("SANDBOX_DISABLE_CPU_LIMIT", raising=False)
+            else:
+                monkeypatch.setenv("SANDBOX_DISABLE_CPU_LIMIT", unset)
+            assert sandbox_params.sandbox_cpu_limit_disabled() is False
+            args = self._sandbox_args()
+            assert args[args.index("--cpus") + 1] == "0.5"
+
+    def test_switch_drops_cpus_and_keeps_everything_else(self, monkeypatch):
+        """开关置 1：args 无 --cpus（含 = 形态）且其余旗标逐字节不变——
+        从缺省 args 精确摘掉 ["--cpus", "0.5"] 两项后应完全相等"""
+        from executor import sandbox_params
+
+        monkeypatch.delenv("SANDBOX_DISABLE_CPU_LIMIT", raising=False)
+        default_args = self._sandbox_args()
+        monkeypatch.setenv("SANDBOX_DISABLE_CPU_LIMIT", "1")
+        on_args = self._sandbox_args()
+        assert "--cpus" not in on_args
+        assert not any(a.startswith("--cpus=") for a in on_args)
+        i = default_args.index("--cpus")
+        assert on_args == default_args[:i] + default_args[i + 2:]
+        # DSM 上可用/仅告警的资源上限保持：memory/swap/pids-limit 原样在场
+        assert on_args[on_args.index("--memory") + 1] == "1g"
+        assert on_args[on_args.index("--memory-swap") + 1] == "1g"
+        assert on_args[on_args.index("--pids-limit") + 1] == "128"
+        # 加固位同样不动（开关只让步 CPU 一项）
+        assert on_args[on_args.index("--cap-drop") + 1] == "ALL"
+
+    @pytest.mark.parametrize("value", ["1", "true", " TRUE ", "True"])
+    def test_switch_truthy_values(self, monkeypatch, value):
+        """生效取值白名单：1/true（strip + 大小写不敏感）"""
+        from executor import sandbox_params
+
+        monkeypatch.setenv("SANDBOX_DISABLE_CPU_LIMIT", value)
+        assert sandbox_params.sandbox_cpu_limit_disabled() is True
+        assert "--cpus" not in self._sandbox_args()
+
+    def test_worker_channel_inherits_switch_unchanged(self, tmp_path, monkeypatch):
+        """worker 通道零改动自动获益（同一构造函数）：开关置 1 → docker-CLI
+        通道构造参数同样无 --cpus"""
+        monkeypatch.setenv("SANDBOX_DISABLE_CPU_LIMIT", "1")
+        args = script_container.build_docker_run_args(
+            image="ai-evo-script-runner:latest", user="10001:10001",
+            paths=_make_paths(tmp_path), entry_rel="main.py",
+            container_name="aievo-script-s1-abc", network=False)
+        assert "--cpus" not in args
+        assert args[args.index("--memory") + 1] == "1g"
 
 
 class TestRunnerImageDigestPinning:

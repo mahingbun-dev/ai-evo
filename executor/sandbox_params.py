@@ -312,6 +312,31 @@ def network_profile_to_docker(net_profile: str) -> str:
     return NET_PROFILES[net_profile]
 
 
+# ---------------- CPU 限额跳过开关（SANDBOX_DISABLE_CPU_LIMIT，无 CFS 内核） ----------------
+
+# 环境变量名（executor/worker 同名，实时读）。缺省空 = 不生效 = 拼 --cpus
+# （企业主线默认形态，行为与历史逐字节一致）。
+SANDBOX_DISABLE_CPU_LIMIT_ENV = "SANDBOX_DISABLE_CPU_LIMIT"
+
+# 开关生效取值（strip + 大小写不敏感）：1 / true
+_CPU_LIMIT_DISABLED_VALUES = ("1", "true")
+
+
+def sandbox_cpu_limit_disabled() -> bool:
+    """SANDBOX_DISABLE_CPU_LIMIT 读取（os.environ 实时读，与 SANDBOX_WORKSPACE_HOST_ROOT 同风格）
+
+    供 Synology DSM 等内核未启用 CPU CFS scheduler 的部署形态用：这类内核上
+    docker daemon 对 ``--cpus``（NanoCPUs）硬拒绝（exit 125："NanoCPUs can not
+    be set, as your kernel does not support CPU CFS scheduler"，NAS 真机实测），
+    沙箱容器一个都起不来。开关生效时 build_docker_run_args 不拼 ``--cpus``；
+    ``--memory``/``--memory-swap``/``--pids-limit`` 保持不变（DSM 上前者可用、
+    后者仅 WARNING 被丢弃不失败）。企业主线默认仍带 ``--cpus``（更优内核上
+    CPU 限额照常生效），仅在明确声明该 env 的部署上让步。
+    """
+    value = (os.environ.get(SANDBOX_DISABLE_CPU_LIMIT_ENV) or "").strip().lower()
+    return value in _CPU_LIMIT_DISABLED_VALUES
+
+
 # ---------------- docker run 参数构造（纯函数，两侧共用——单一事实源） ----------------
 
 def build_docker_run_args(
@@ -338,7 +363,9 @@ def build_docker_run_args(
     - ``--name``      唯一容器名（超时兜底 ``docker rm -f`` 依赖）
     - ``--user``      非 root 运行（uid:gid；executor 侧恒为 SANDBOX_USER）
     - ``--memory``/``--memory-swap``/``--cpus``/``--pids-limit`` 资源上限
-      （memory-swap = memory：禁用 swap 扩展，超限 OOM kill 而非拖垮宿主）
+      （memory-swap = memory：禁用 swap 扩展，超限 OOM kill 而非拖垮宿主）。
+      ``--cpus`` 受 SANDBOX_DISABLE_CPU_LIMIT 开关控制：仅 DSM 等无 CPU CFS
+      内核的部署形态生效跳过（见 sandbox_cpu_limit_disabled），缺省始终拼接
     - ``--cap-drop ALL`` + ``--security-opt no-new-privileges:true``（ARCH-1-1：
       设计 D1 固定加固位，剥夺全部 capabilities 且禁止提权）
     - ``--read-only`` 根文件系统只读；可写面仅 bind mount 工作区 + tmpfs
@@ -383,7 +410,13 @@ def build_docker_run_args(
         "--user", user,
         "--memory", CONTAINER_MEMORY,
         "--memory-swap", CONTAINER_MEMORY,
-        "--cpus", CONTAINER_CPUS,
+    ])
+    # CPU 限额开关（SANDBOX_DISABLE_CPU_LIMIT）：仅 DSM 等无 CPU CFS 内核的
+    # 部署形态生效（daemon 对 --cpus 硬拒绝 exit 125）——跳过 --cpus，其余
+    # 资源上限与加固位全部保持；缺省路径参数与历史逐字节一致
+    if not sandbox_cpu_limit_disabled():
+        args.extend(["--cpus", CONTAINER_CPUS])
+    args.extend([
         "--pids-limit", str(CONTAINER_PIDS_LIMIT),
         "--cap-drop", CONTAINER_CAP_DROP,
         "--security-opt", CONTAINER_SECURITY_OPT,
