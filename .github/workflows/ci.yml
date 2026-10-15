@@ -152,7 +152,7 @@ jobs:
         run: docker build -f docker/script-runner/Dockerfile -t ai-evo-script-runner:ci .
 
       - name: Scan main image (ai-evo)
-        uses: aquasecurity/trivy-action@0.36.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ai-evo:ci
           format: table
@@ -161,7 +161,7 @@ jobs:
           ignore-unfixed: true
 
       - name: Scan script-runner image
-        uses: aquasecurity/trivy-action@0.36.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ai-evo-script-runner:ci
           format: table

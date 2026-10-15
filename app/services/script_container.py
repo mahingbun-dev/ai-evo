@@ -685,7 +685,9 @@ def relax_tree_for_sandbox_uid(*roots: Path) -> None:
     仅容器模式、仅本次运行的工作区树（ephemeral，评完即清）追加 others
     读+目录遍历位；不追加 w（entry wrapper 只读消费，stdout 出 JSON 不落盘）。
     secure_mkdir 的 0o750 创建口径不变（tests/security/test_runtime_dir_permissions.py
-    仍绿），本函数只在 driver 受理前对三棵树做执行期放宽。
+    仍绿），本函数只在 driver 受理前对传入树做执行期放宽。调用方以挂载源
+    公共祖先树为根传入（挂载根本身也要有 others r-x——漏放宽挂载根，沙箱
+    在 /workspace 顶层即 EACCES）。
     """
     for root in roots:
         if not root:
@@ -773,9 +775,10 @@ def execute_script_in_container(
     paths = build_container_paths(run_dir_host, cwd_host, staged_dir_host)
     container_name = _new_container_name(str(script_key))
 
-    # 沙箱挂载树执行期放宽（others rX）：沙箱 uid 非属主，secure_mkdir 0o750
-    # 口径下无法遍历/读取工作区（CI docker run 退出码 125 根因）；不加 w
-    relax_tree_for_sandbox_uid(Path(run_dir_host), Path(cwd_host), Path(staged_dir_host))
+    # 沙箱挂载树执行期放宽（others rX）：以挂载源（run_dir/cwd 公共祖先）为根
+    # ——debug 链 cwd 在 run_dir 外时挂载根比 run_dir 高，漏放宽挂载根本身
+    # 沙箱在 /workspace 顶层即 EACCES（CI 实测 uid 10001）；不加 w
+    relax_tree_for_sandbox_uid(Path(paths.run_dir_host))
 
     # stdin 里的宿主工作区路径全部重写为容器路径（脚本在容器内按 /workspace 取值）
     container_stdin = rewrite_stdin_paths(stdin, paths.run_dir_host, paths.run_dir_container)
@@ -943,9 +946,10 @@ def execute_harness_in_container(
         return _result(script_id, name, "fail", error=f"agent 载荷落盘工作区失败: {e}",
                        finish_reason="error", started_at=started)
 
-    # 沙箱挂载树执行期放宽（others rX）：与脚本通道同口径（沙箱 uid 非属主
-    # 读不到 0o750 工作区）；不加 w，语义见 relax_tree_for_sandbox_uid
-    relax_tree_for_sandbox_uid(Path(run_dir), Path(cwd))
+    # 沙箱挂载树执行期放宽（others rX）：与脚本通道同口径，以挂载源
+    # （run_dir/cwd 公共祖先）为根——漏放宽挂载根本身沙箱在 /workspace 顶层
+    # 即 EACCES；不加 w，语义见 relax_tree_for_sandbox_uid
+    relax_tree_for_sandbox_uid(Path(paths.run_dir_host))
 
     spec = SandboxRunSpec(
         image=image,

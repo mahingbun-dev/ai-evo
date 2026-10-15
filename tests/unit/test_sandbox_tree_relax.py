@@ -87,3 +87,44 @@ class TestRelaxTreeForSandboxUid:
         for sub in roots:
             assert _mode(sub) & 0o005 == 0o005
             assert _mode(sub / "x.py") & 0o004 == 0o004
+
+    def test_relax_covers_mount_root_above_subtrees(self, tmp_path):
+        """debug 链布局：挂载根（公共祖先父目录）下两棵子树，relax(父) 连父一起放宽
+
+        build_container_paths 的挂载源是 run_dir/cwd 的 commonpath——debug 链
+        cwd 在 run_dir 之外时挂载根比 run_dir 高（如 uploads/script_runs/debug）。
+        以父目录为根调用后：父目录本身 0o005 位到位、深层文件 0o004 位到位、
+        无 w 位增加（CI EACCES 回归：uid 10001 在 /workspace 顶层即被 0o700
+        父目录挡住）。
+        """
+        parent = tmp_path / "mount-root"
+        parent.mkdir()
+        os.chmod(parent, 0o700)
+        trees = []
+        for name in ("run_dir", "debug_cwd"):
+            sub = parent / name
+            sub.mkdir()
+            os.chmod(sub, 0o750)
+            mid = sub / "scripts"
+            mid.mkdir()
+            os.chmod(mid, 0o750)
+            deep = mid / "pkg"  # 深两层子目录
+            deep.mkdir()
+            os.chmod(deep, 0o750)
+            deep_file = deep / "main.py"
+            deep_file.write_text("print(1)\n", encoding="utf-8")
+            os.chmod(deep_file, 0o600)
+            trees.append((sub, mid, deep, deep_file))
+
+        relax_tree_for_sandbox_uid(parent)
+
+        # 挂载根本身（0o700 父目录）others r-x 到位——CI 实测漏掉它即 EACCES
+        assert _mode(parent) & 0o005 == 0o005
+        for sub, mid, deep, deep_file in trees:
+            assert _mode(sub) & 0o005 == 0o005
+            assert _mode(mid) & 0o005 == 0o005
+            assert _mode(deep) & 0o005 == 0o005
+            assert _mode(deep_file) & 0o004 == 0o004  # 深层文件 others r 到位
+        # 无 w 位增加（父目录 + 两棵树全部条目）
+        for path in [parent] + [p for quad in trees for p in quad]:
+            assert _mode(path) & 0o022 == 0
