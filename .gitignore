@@ -40,6 +40,10 @@ docs/*.md
 !docs/alerts-and-health.md
 # 分支治理纪律（整改计划 §0 约定，W18），必须入库
 !docs/branch-discipline.md
+# 多机扩容部署手册（ARCH-3-1，docker-compose.scale.yml 与单测引用），必须入库
+!docs/deploy-scale.md
+# gVisor 可选运行时档手册（ARCH-3-4，app/core/config.py 与 executor/sandbox_params 注释引用），必须入库
+!docs/sandbox-runtime-gvisor.md
 docs/superpowers/
 logs/
 # 脚手架模板源码里的样例日志属于模板交付物，必须入库（否则全新 clone 重建 zip 会与提交版不一致）

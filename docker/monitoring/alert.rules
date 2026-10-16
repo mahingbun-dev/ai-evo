@@ -1,0 +1,33 @@
+# ARCH-2-3：最小告警规则（设计 §3 Phase 2 表 2-3 行验收：队列积压/失败率）
+#
+# 只放两条 P1 告警，阈值是首版经验值（wiki 化调优属运维迭代）：
+#   - 队列积压：eval 吞吐受 team 并发配额（TEAM_MAX_CONCURRENT 默认 8）约束，
+#     深度 > 50 持续 10 分钟 ≈ 排队滞后 > 1 小时量级，该出手了；
+#   - 任务失败率：失败计数增速 / 完成计数增速（时长直方图 _count 即完成数，
+#     成功失败都观察）> 20% 持续 10 分钟；clamp_min 防 0 除（分母 0 → 比值 0，
+#     不触发）。分母聚合按 job（worker 实例维度），分子同维。
+# 指标名与 app/celery_app.py 的定义同源，tests/unit/test_prometheus_metrics.py
+# 钉同步（改名必须两边一起动）。
+groups:
+  - name: ai-evo
+    rules:
+      - alert: AiEvoQueueBacklog
+        expr: max by (queue) (aievo_celery_queue_depth) > 50
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "队列积压：{{ $labels.queue }} 深度 {{ $value }} 持续 10 分钟"
+          description: "队列 {{ $labels.queue }} 等待消费消息数持续超过 50（api 进程 Redis llen 口径）；检查对应 worker 存活与消费速率，必要时扩 worker 副本或调整团队并发配额。"
+
+      - alert: AiEvoTaskFailureRateHigh
+        expr: >-
+          sum by (job) (rate(aievo_celery_task_failures_total[15m]))
+            / clamp_min(sum by (job) (rate(aievo_celery_task_duration_seconds_count[15m])), 1e-9)
+          > 0.2
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "任务失败率高：{{ $labels.job }} 15 分钟窗口失败率 {{ $value | humanizePercentage }}"
+          description: "worker 任务失败率持续超过 20%；结合失败计数按 queue 维度的曲线定位是评测（eval）还是导入（ingest）侧，再看 worker 日志与裁判失败标记（W2）。"

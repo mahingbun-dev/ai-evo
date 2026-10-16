@@ -366,9 +366,12 @@ def run_smoke_test(entry_path: Path, timeout: Optional[float] = None) -> Dict[st
       pre_judge_entry.py 调起（run(stdin) 函数式 / __main__ 传统式自动适配，
       与生产执行 _execute_script_subprocess 完全同路径），cwd 隔离到临时目录
       （样例文件也落在该目录，_run_dir 指向它，跑完即清理）
-    - W15 灰度：SCRIPT_EXEC_MODE=container 时冒烟改走 docker run --rm 容器
-      （与生产执行同通道同镜像同隔离边界；入口包先拷进临时工作区 scripts/
-      smoke/ 从副本执行——上传目录不进挂载面，仍符合「挂载仅本次工作区」）
+    - W15 灰度 / ARCH-1-2：SCRIPT_EXEC_MODE=container 时冒烟与生产执行同经
+      get_sandbox_driver() 分流（EXECUTOR_URL → executor HTTP 通道；未配置 →
+      docker-CLI 单机回退），同镜像同隔离边界；工作区建在 uploads/script_runs/
+      smoke/ 下（executor bind mount 白名单子树；/tmp 过不了 WORKSPACE_ROOT
+      白名单），入口包拷进工作区 scripts/smoke/ 从副本执行——上传目录不进
+      挂载面，仍符合「挂载仅本次工作区」
     - 超时（默认 SMOKE_TIMEOUT_SECONDS=10s）kill 并抛中文错误
     - 退出码非 0 / stdout 最后一个非空行非 JSON / 非对象 → 抛 ValueError，
       错误信息回显 stdout/stderr 尾部输出，便于上传者定位
@@ -416,59 +419,95 @@ def run_smoke_test(entry_path: Path, timeout: Optional[float] = None) -> Dict[st
 
 
 def _run_smoke_test_in_container(entry: Path, limit: float) -> Dict[str, Any]:
-    """契约冒烟的 container 通道（W15）：docker run --rm 跑入口，与生产同构
+    """契约冒烟的 container 通道（W15 / ARCH-1-2）：经 SandboxDriver 跑沙箱，与生产同驱动
 
     与 local 冒烟的差异：
-    - 入口包先拷进临时工作区 scripts/smoke/ 副本（上传目录不进容器挂载面）；
-    - stdin 内工作区路径重写为容器 /workspace 路径后经 -i 传入；
-    - 镜像不可用等启动失败给出运维提示（预载属 D-3）。
+    - 工作区建在 uploads/script_runs/smoke/ 下（build_run_dir 同口径，secure mkdir）：
+      /tmp 临时目录过不了 executor 的 WORKSPACE_ROOT=/app/uploads/script_runs
+      bind mount 白名单（executor/sandbox_params.resolve_workspace_mount），且
+      api 容器的 /tmp 对 executor 不可见——工作区必须落在两侧共享的 uploads 卷；
+    - 入口包拷进工作区 scripts/smoke/ 副本（上传目录不进容器挂载面）；
+    - stdin 内工作区路径重写为容器 /workspace 路径；stdout/stderr 经驱动归位
+      到工作区 stdout.log/stderr.log 后读取（两驱动统一口径）；
+    - 执行经 get_sandbox_driver() 分流（EXECUTOR_URL → http-executor 目标通道，
+      api 容器无 docker CLI/socket 也可冒烟；未配置 → docker-CLI 单机回退）——
+      与生产 execute_script 同开关同驱动同容器口径（docs/build-pipeline.md 第九节）。
+    镜像不可用（CLI 退出码 125）等启动失败给出运维提示（预载属 D-3）。
     结果解析与 local 完全同一套断言（_smoke_assert_returncode/_smoke_parse_stdout）。
     """
+    # 懒加载 pre_judge_runner（其模块顶层 import 本模块，顶层互引会循环）
     from app.services import script_container
+    from app.services.pre_judge_runner import build_run_dir
 
     script_dir = entry.parent
     entry_rel = entry.name
-    with tempfile.TemporaryDirectory(prefix="pjs_smoke_") as tmp:
-        run_dir = Path(tmp).absolute()
+    run_dir = build_run_dir("smoke", f"smoke_{uuid.uuid4().hex[:12]}")
+    try:
         staged = run_dir / "scripts" / "smoke"
         shutil.copytree(script_dir, staged, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
 
         stdin = script_container.rewrite_stdin_paths(build_smoke_stdin(run_dir), str(run_dir))
-        payload = json.dumps(stdin, ensure_ascii=False, default=str).encode("utf-8")
         paths = script_container.build_container_paths(run_dir, run_dir, staged)
-        args = [
-            script_container.docker_binary(),
-            *script_container.build_docker_run_args(
-                image=script_container.runner_image(),
-                user=script_container.runner_user(),
-                paths=paths,
-                entry_rel=entry_rel,
-                container_name=script_container._new_container_name("smoke"),
-                network=False,
-            ),
-        ]
+        # 沙箱挂载树执行期放宽（others rX）：以挂载源（paths.run_dir_host，
+        # run_dir/cwd 公共祖先）为根——漏放宽挂载根本身沙箱在 /workspace 顶层
+        # 即 EACCES（CI docker run 退出码 125 / PermissionError 根因）；不加 w
+        script_container.relax_tree_for_sandbox_uid(Path(paths.run_dir_host))
+        image = script_container.runner_image()
+        spec = script_container.SandboxRunSpec(
+            image=image,
+            user=script_container.runner_user(),
+            workspace_host=paths.run_dir_host,
+            workspace_container=paths.run_dir_container,
+            workdir_container=paths.cwd_container,
+            cwd_host=paths.cwd_host,
+            net_profile="none",
+            container_name=script_container._new_container_name("smoke"),
+            entrypoint=[script_container.CONTAINER_PYTHON, script_container.CONTAINER_ENTRY_WRAPPER,
+                        paths.staged_dir_container, entry_rel],
+            stdin_payload=json.dumps(stdin, ensure_ascii=False, default=str).encode("utf-8"),
+            timeout=limit,
+        )
+        driver = script_container.get_sandbox_driver()
         try:
-            proc = subprocess.run(args, input=payload, capture_output=True,
-                                  timeout=limit, cwd=str(run_dir))
-        except subprocess.TimeoutExpired:
+            # bind 源宿主根映射（命名卷部署）：SANDBOX_WORKSPACE_HOST_ROOT 配置时
+            # 派生 mount_source（映射失败 SandboxDriverError → 冒烟失败，fail-loud）
+            spec.mount_source = script_container.derive_mount_source(spec.workspace_host)
+            handle = driver.run(spec)
+            status = driver.wait(handle, limit)
+        except script_container.SandboxDriverError as e:
+            # 驱动层失败（CLI 缺失/不可执行、executor 不可达/白名单拒绝等）
+            raise ValueError(f"契约冒烟执行失败（{driver.name} 驱动）: {e}")
+
+        stdout_text = _read_smoke_log(Path(paths.cwd_host) / "stdout.log")
+        stderr_text = _read_smoke_log(Path(paths.cwd_host) / "stderr.log")
+        if status.state == "timeout":
             raise ValueError(
                 f"契约冒烟未通过：入口执行超时（>{limit:.0f} 秒）。"
                 "请检查脚本是否阻塞等待输入或存在死循环"
             )
-        except OSError as e:
-            raise ValueError(f"契约冒烟执行失败（无法启动 docker run）: {e}")
-
-        stdout_text = proc.stdout.decode("utf-8", errors="replace")
-        stderr_text = proc.stderr.decode("utf-8", errors="replace")
-        if proc.returncode != 0:
+        if status.state == "failed":
+            raise ValueError(
+                "契约冒烟执行失败："
+                + (status.error or f"沙箱执行失败（{driver.name} 驱动）")[:2000]
+            )
+        if status.exit_code != 0:
             tail = _smoke_tail(stdout_text, stderr_text)
-            hint = script_container._docker_failure_hint(proc.returncode, stderr_text,
-                                                         script_container.runner_image())
+            hint = script_container._docker_failure_hint(status.exit_code, stderr_text, image)
             raise ValueError(
                 "契约冒烟未通过：入口脚本退出码 "
-                f"{proc.returncode}。尾部输出：\n{tail}{hint}"
+                f"{status.exit_code}。尾部输出：\n{tail}{hint}"
             )
         return _smoke_parse_stdout(stdout_text, stderr_text)
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+
+def _read_smoke_log(path: Path) -> str:
+    """读驱动归位后的冒烟日志文件（缺失/不可读返回空串，按空输出口径报错）"""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
 
 
 def _smoke_assert_returncode(returncode: int, stdout_text: str, stderr_text: str) -> None:

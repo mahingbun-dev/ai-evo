@@ -28,6 +28,25 @@ from app.middleware.auth_middleware import AuthMiddleware
 pytestmark = pytest.mark.unit  # W8 分类门禁：补打标
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_jwt_secret(monkeypatch):
+    """固定显式 JWT 密钥，脱离所在机器的 .env（ARCH-0-2）。
+
+    JWT 密钥不再默认从 DATABASE_URL 派生（缺密钥即抛错），本文件原有测试
+    隐式依赖「部署机/开发机 .env 或空 DSN 派生」拿到密钥——CI 干净环境
+    （无 .env）会必红。统一 patch 为显式密钥，保持测试密闭。
+    """
+    from app.core.config import Settings
+    monkeypatch.setattr(
+        jwt_service, "get_settings",
+        lambda: Settings(
+            _env_file=None,
+            DATABASE_URL="postgresql://unit-test",
+            AUTH_JWT_SECRET="unit-test-jwt-secret",
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # password_service
 # ---------------------------------------------------------------------------

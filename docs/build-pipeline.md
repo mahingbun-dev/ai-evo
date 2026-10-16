@@ -48,6 +48,8 @@ GitLab push main
          ├─ docker run ai-evo-builder（挂载 docker.sock）
          │    ├─ pnpm install --offline && pnpm build   → frontend/dist
          │    └─ docker build -t ai-evo:<短sha>         → 宿主 daemon
+         ├─ trivy 镜像扫描（ARCH-3-3）：HIGH+ 且有修复版本 → 构建失败
+         │    （不写 release 记录，有漏洞的镜像不可部署/回滚，见第十一节）
          └─ deploy：同步 docker-compose.yml → 写 .env 的 IMAGE_TAG
                      → docker compose up -d → 校验容器与接口
                      → 同步 frontend/dist 到 nginx 静态根（宿主机目录）
@@ -227,8 +229,10 @@ cd /apps/qa-code/ai-evo
 cp -a .env ".env.bak.$(date +%Y%m%d%H%M%S)"          # 先备份
 grep -nE '^[A-Za-z_][A-Za-z0-9_]* +=' .env           # 列出格式有问题的行
 vi .env                                              # 改成 KEY=value；
-                                                     # 确认有 DATABASE_URL 与
+                                                     # 确认有 DATABASE_URL、
                                                      # REDIS_URL=redis://redis:6379/0
+                                                     # 与 AUTH_JWT_SECRET（见下）；
+                                                     # 变量清单见 4.4.1
 chmod 600 .env
 docker compose config >/dev/null && echo ".env 格式校验通过"
 ```
@@ -243,6 +247,12 @@ docker compose config >/dev/null && echo ".env 格式校验通过"
 > 文件，`compose up` 随即失败，而 compose 已经被仓库版本覆盖——等于把正在运行的服务
 > 搞坏。build-service 已加前置校验（`validate_env_file`），缺 `DATABASE_URL` 或
 > `REDIS_URL` 时会在动任何文件之前直接失败。
+>
+> ⚠️ **`AUTH_JWT_SECRET` 必须显式配置（ARCH-0-2）**：JWT 签名密钥已不再从
+> `DATABASE_URL` 派生。`.env` 缺这项时 api 容器启动即 fail-fast（该校验在应用层；
+> build-service 的前置护栏只查 `DATABASE_URL`/`REDIS_URL`，缺密钥会在容器启动阶段
+> 暴露为 crash loop，被部署校验「容器未全部 running」拦截）。生成方式见
+> 下文「JWT 密钥配置与轮换」。
 
 ```bash
 # 5. 启动 build-service
@@ -263,10 +273,81 @@ curl -s http://localhost:8181/api/v1/health
 # 期望: {"status":"ok","time":...}
 ```
 
+### 4.4.1 部署 .env 变量清单（ARCH-0-4）
+
+服务器 `.env` 由部署方维护（不入库、600 权限），compose 经 `env_file` 整体注入
+api/worker 容器。部署相关变量一览（✅ 必填、⛔ 严禁设置；标注 ARCH-* 的条目为
+2026-10 架构改造新增变量或本次收口强调项）：
+
+| 变量 | 必填 | 说明 |
+|---|---|---|
+| `DATABASE_URL` | ✅ | PostgreSQL 连接串（build-service 前置护栏也校验它） |
+| `REDIS_URL` | ✅ | compose 网络内通常为 `redis://redis:6379/0` |
+| `AUTH_JWT_SECRET` | ✅ | JWT 签名密钥（ARCH-0-2）。缺失即拒启，生成与轮换见「JWT 密钥配置与轮换」 |
+| `AUTH_JWT_ALLOW_DERIVED` | ⛔ | **企业部署严禁开启**（ARCH-0-2）。仅开发机 `.env_local` 可显式设 true 保留派生回退 |
+| `SCRIPT_EXEC_MODE` | 见「九」 | 前处理脚本执行模式（ARCH-0-4；ARCH-1-4 起缺省 `container`，`local` 仅开发机显式 env）——灰度与回退步骤见第九节 9.1 |
+| `SCRIPT_RUNNER_IMAGE` | 可选 | `container` 模式 runner 镜像（默认 `ai-evo-script-runner:latest`），离线预载见 `docker/script-runner/README.md`；自 ARCH-1-5 支持 digest 钉扎 `<repo>@sha256:<64hex>`（取法与通道限制见 11.4，ARCH-3-3 对齐口径） |
+| `SCRIPT_RUNNER_USER` | 可选 | `container` 模式容器内运行用户（默认 `10001:10001`）；Linux 部署机需与挂载目录属主匹配 |
+| `IMAGE_TAG` | 自动 | CI 部署时自动写入当前短 sha；手工回滚即改回旧值 |
+| `TMPFS_TMP_SIZE` / `TMPFS_HOME_SIZE` | 可选 | `/tmp`、`/home/app` 两个 tmpfs 的容量上限（ARCH-0-1，默认各 1g，只按实际写入占内存） |
+| `LOGS_VOLUME` / `UPLOADS_VOLUME` | 可选 | 日志/上传卷形态切换（默认 bind 到 compose 目录下；群晖等经代理工具执行 compose 的场景设为命名卷 `logs` / `uploads`） |
+| `SANDBOX_WORKSPACE_HOST_ROOT` | 命名卷部署必填 | 沙箱 bind 源宿主根：docker daemon 按**宿主路径**解析沙箱 `-v` 挂载源，而 worker 视角工作区路径是 `/app/uploads/script_runs/...`——uploads 用 bind 且宿主/容器路径一致时可留空（缺省 = 现状）；`UPLOADS_VOLUME=uploads`（命名卷形态，见上行）时宿主不存在该路径，daemon 会静默新建空目录（沙箱空工作区、stdout/stderr 日志回不来），必填 uploads 命名卷的宿主真实根，如 `/volume1/docker/ai-evo/uploads-data`（映射与白名单单一事实源 `executor/sandbox_params.resolve_mount_source`） |
+| `AIEVO_PORT` | 可选 | api 对外端口（默认 8100） |
+| `COMPOSE_PROFILES` | 可选 | 逗号组合：`bundled-db` 一并启动内置 PostgreSQL；`sandbox` 启动沙箱面 executor + egress 与 aievo-sandbox-egress 内网（ARCH-1-3，见第十节；生产 CI 部署默认都不设） |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` / `POSTGRES_PORT` | 可选 | 仅 `bundled-db` profile 生效 |
+| `EXECUTOR_TOKEN` | 沙箱面必填 | worker↔executor 共享鉴权 token（ARCH-1-3/D6）。留空 = executor fail-closed；`openssl rand -hex 32` 生成，仅存 `.env` |
+| `EXECUTOR_URL` | 沙箱面必填 | worker 侧 HTTP 驱动（ARCH-1-2）访问地址，启用沙箱面后设 `http://executor:8300`（compose 内网服务名）；留空 = 驱动不可用 |
+| `DOCKER_GROUP_GID` | 沙箱面必填 | 部署机 docker 组 gid（ARCH-1-3）：executor 以补充组访问 docker.sock。查法 `stat -c %g /var/run/docker.sock`，默认 999 仅 Debian 系常见值 |
+| `EXECUTOR_IMAGE_TAG` / `EGRESS_IMAGE` | 可选 | 沙箱面镜像 tag/源覆盖（默认 `latest` / `ubuntu/squid:latest`）；离线部署机需预载，见第十节 |
+| `EGRESS_SQUID_CONF` / `EGRESS_WHITELIST_FILE` | 可选 | egress 策略/域名白名单文件路径覆盖（默认仓库 `docker/egress/` 模板，企业清单用后者指向服务器自有文件，见 10.4） |
+| `WORKER_EGRESS_PROXY` / `WORKER_NO_PROXY` | 可选 | worker 外呼（模型测连/OSS）走 egress 代理的灰度开关（ARCH-1-3）：留空不走；启用设 `http://egress:3128`，内网例外经 `WORKER_NO_PROXY` 追加 |
+| `BACKUP_DIR` / `RETENTION_DAYS` / `UPLOADS_RETENTION_DAYS` | 可选 | 备份输出与保留策略（见「备份与恢复」） |
+| `REMOTE_DATABASE_URL` / `LOCAL_DATABASE_URL` | 可选 | `scripts/sync_database.py` 手动运维用 |
+| `AIEVO_HUB_ADDR` / `AIEVO_HUB_ADVERTISE_ADDR` / `AIEVO_API_BASE` | 可选 | hub-plugin 拓扑变化时覆盖（同机默认回环直连） |
+| `NODE_IMAGE` / `PY_IMAGE` / `PIP_INDEX_URL` / `NPM_REGISTRY` | 可选 | 自建在线构建（`Dockerfile.online`）的构建期换源参数 |
+
+应用层可选项（`AUTH_TOKEN_EXPIRE_HOURS`、`AUTH_REGISTER_ENABLED`、`OSS_*`、
+`LANGFUSE_*`、`ANC_HUB_MCP_ENDPOINT`、`ANC_HUB_BEARER_TOKEN`、`HUB_SSO_COOKIE_NAME`、
+`UPLOAD_MAX_BYTES`、`DB_ASSERT_READONLY_DSN`、`DEEPEVAL_*` 等）的完整清单见
+`.env.example` 与 `app/core/config.py`。
+
 ### 4.5 首次流水线
 
 在 GitLab 上发起一次 Web 触发（CI/CD → Pipelines → Run pipeline，选 `main` 分支），
 两个 job 手动点击执行。第一次会同步离线快照（数百 MB），耗时较长。
+
+### 4.6 首次部署的卷属主迁移（volume-init，ARCH-0-1）
+
+主镜像以 uid/gid **10002**（app 用户）+ `cap_drop ALL` 运行（设计 0-1），进程自身
+无法 chown；而 `uploads/`、`logs/` 两个写面是运行时挂卷，属主不跟随镜像——
+docker 自动创建的缺失 bind 目录是 root:root，历史部署的卷内容也是 root 写入的。
+因此**无需（也不应）手工 chown**：每次 `docker compose up -d` 时由 compose 的
+`volume-init` 一次性服务在主服务之前自动完成迁移：
+
+- 它以 root 运行但只保留 `CHOWN` / `DAC_OVERRIDE` 两个能力，无网络、根文件系统
+  只读、不挂 `.env`（凭证与本服务无关）——迁移逻辑在 `docker-entrypoint.sh` 的
+  volume-init 分支；
+- 把两个卷的属主递归纠正为 `10002:10002`；已全部是 10002 时只读遍历、零写入秒退
+  （幂等，每次 up 都跑一遍，代价可忽略）；
+- api/worker 通过 `depends_on: service_completed_successfully` 等它成功退出再启动；
+- **`docker compose ps` 里 `ai-evo-volume-init` 显示 `exited(0)` 属正常**，一次性
+  服务本该退出，不是故障、不需要重启它。
+
+历史部署升级到本版本同样自动迁移：旧 root 属主内容会在下一次 `compose up -d` 时
+被纠正；`uploads/` 内容较多时递归 chown 需要时间，建议低峰期执行首次升级。
+
+**SMB/NFS 等禁止 chown 的卷**：volume-init 对 chown 失败只告警不阻断（这类卷按
+挂载 uid 映射本就可能可写）；真实可写性由 api/worker 的启动预检把关——不可写时
+容器立即退出并打印修复命令，而不是起来之后在第一次写日志/上传时抛
+PermissionError。手动修复等价于预检提示的两条命令：
+
+```bash
+# bind 挂载目录（宿主执行）
+chown -R 10002:10002 /apps/qa-code/ai-evo/uploads /apps/qa-code/ai-evo/logs
+
+# 命名卷（经临时容器执行）
+docker run --rm -v <卷名>:/d alpine chown -R 10002:10002 /d
+```
 
 ---
 
@@ -420,6 +501,32 @@ W6-3 已把明文口令从 `alembic.ini`、`alembic_local.ini`（已删除）、
 4. `docker compose up -d` 重启 api/worker，跑一遍冒烟（登录 + 建任务）确认连通；
 5. 通知全组：仓库 git 历史里的两个旧口令已作废，入库残留变为无害字符串。
 
+### JWT 密钥配置与轮换（AUTH_JWT_SECRET，ARCH-0-2）
+
+整改前 JWT 签名密钥在未配置时从 `DATABASE_URL` 派生（config.py 旧逻辑）——数据库
+口令与登录态凭证耦合：轮换 DB 口令会静默作废全员登录态，且拿到 DSN 的任何一方
+都能本地伪造用户 token。现改为**密钥独立、缺失即拒启**：
+
+- **必填**：`.env` 缺 `AUTH_JWT_SECRET` 时 api 启动直接 fail-fast（uvicorn 日志
+  可见「AUTH_JWT_SECRET 未配置」，报错自带生成示例），部署校验拦 crash loop。
+- **生成**（部署机无外网也没关系，openssl 是基础工具）：
+
+  ```bash
+  openssl rand -hex 32   # 输出写入 .env 的 AUTH_JWT_SECRET= 行
+  chmod 600 .env         # .env 含 DB 口令与 JWT 密钥，保持 600
+  docker compose up -d   # 重启生效
+  ```
+
+- **首次升级到本版本前必须先补密钥**，否则升级后服务起不来。步骤：
+  生成 → 写入部署机 `/apps/qa-code/ai-evo/.env` → 再触发部署/重启。
+- **轮换**：换成新生成的值后 `docker compose up -d`。全部已签发 token 立即失效
+  （用户需重新登录，WebSocket 连接同理），worker 在跑的长任务不受影响（任务链路
+  不校验用户 JWT）。建议低峰期执行并提前公告，这与设计验收「轮换演练一次」对应。
+- **本地开发**：开发机可在 `.env_local` 显式设 `AUTH_JWT_ALLOW_DERIVED=true`
+  保留「由 DATABASE_URL 派生」的回退（启动日志会告警留痕）。该开关仅限开发机，
+  企业部署的 `.env` 严禁开启——开启后缺密钥不再拒启，等于退回耦合状态。
+
+
 ### 部署时的任务中断行为
 
 `worker` 服务设置了 `stop_grace_period: 900s`。部署触发 `docker compose up -d` 时：
@@ -549,6 +656,10 @@ docker run --rm --network=none --platform linux/amd64 \
 | 上传快照报 401 | Deploy Token **只认 Basic 鉴权**，用 `PRIVATE-TOKEN` 头会返回 401（实测确认）。脚本已改用 Basic，用户名默认 `gitlab+deploy-token-173`，可用 `GITLAB_UPLOAD_USER` 覆盖。 |
 | 快照解出来文件数翻倍、多出 `._xxx` 文件 | macOS 的 `bsdtar` 默认附带 AppleDouble 元数据。脚本已用 `COPYFILE_DISABLE=1` 关闭，不要绕过脚本手工 `tar` 打包。 |
 | 部署报「部署目录缺少 .env」/「缺少必需变量: DATABASE_URL」 | build-service 的前置护栏拦住了。按第 4.4 节把 `.env` 建好再部署——这是为了不在缺配置时覆盖 compose、把线上服务搞坏。 |
+| api 容器反复退出，日志报「AUTH_JWT_SECRET 未配置」（ARCH-0-2） | JWT 密钥缺失的应用层 fail-fast（build-service 护栏不查这一项）。按「JWT 密钥配置与轮换」一节：`openssl rand -hex 32` 生成后写入 `.env` 的 `AUTH_JWT_SECRET=`，`docker compose up -d` 重启。 |
+| `docker compose ps` 里 `ai-evo-volume-init` 显示 `Exited (0)` | 正常现象：一次性卷属主迁移服务（ARCH-0-1，见 4.6），迁移完成即退出，不是故障、不需要处理。 |
+| api/worker 启动即退出，日志报「以下挂卷目录不可写」（ARCH-0-1） | 卷属主非 10002 且 volume-init 的 chown 失败（SMB/NFS 等禁止 chown 的卷）。按日志提示修复：宿主 `chown -R 10002:10002 <uploads/logs 目录>`，命名卷经 alpine 容器执行，详见 4.6。 |
+| container 模式任务失败，worker 日志报找不到 docker / 连不上 Docker daemon | ARCH-1-4 起缺省即 container：沙箱面未启用（未设 `COMPOSE_PROFILES=sandbox`、未配 `EXECUTOR_URL`）时 worker 容器内无 docker 通道，任务明确失败（fail-loud）。按第十节启用沙箱面；过渡期可在 `.env` 显式设 `SCRIPT_EXEC_MODE=local` 重启回退（口径见 9.1）。 |
 | `docker compose up -d` 卡很久 | worker 正在跑长任务，等它优雅退出。超过 900s 会强杀。 |
 | 部署校验报「容器在 180s 内未全部 running」 | 登录服务器 `docker compose logs <service>` 看启动失败原因。 |
 | 部署校验报「HTTP 探活失败」 | api 容器起来了但接口不通。先看 `docker logs ai-evo-api`。**另一种常见原因**：build-service 没有用 `--network host` 启动——默认 bridge 网络下容器内的 `127.0.0.1:8100` 指向它自己，永远连不上，必须用宿主网络。 |
@@ -583,3 +694,268 @@ Dockerfile 里旧的「apt install curl + 在线跑 install.sh」在服务器必
   走代理时加 `PROXY=http://host.docker.internal:7897`）→ 提交更新的
   `claude-bin.json` → 服务器构建自动换新版本。
 
+---
+
+## 九、脚本执行模式：local 仅限开发机，企业部署禁止（ARCH-0-4；ARCH-1-4 缺省切 container）
+
+评测前处理脚本是平台内唯一的用户代码执行面，`SCRIPT_EXEC_MODE` 决定其执行通道：
+
+| 维度 | `local`（仅开发机显式 env） | `container`（W15 沙箱，ARCH-1-4 起代码默认） |
+|---|---|---|
+| 运行位置 | worker 容器内子进程直跑 | `docker run --rm` 独立容器 |
+| 运行身份与资源 | 与 worker 同身份：ARCH-0-1 后为 uid 10002 + `cap_drop ALL` + 只读根文件系统，可写面收敛 uploads/logs 两卷与 tmpfs；**无 mem/cpu/pids 上限** | 镜像内独立非 root 用户，mem 1g / cpu 0.5 / pids 128 |
+| 网络 | 继承 worker 网络（compose bridge，可触达内网） | 默认 `--network none` |
+| 平台 import 面 | **PYTHONPATH 注入项目根，脚本可 `import app.*` 拿到平台代码与 DB session**（W1-3 的环境变量白名单只挡 env 泄漏，挡不住 import 面） | 裁剪镜像不含平台代码、无 PYTHONPATH 注入 |
+
+**政策：`SCRIPT_EXEC_MODE=local` 仅限开发机；企业部署禁止以 local 模式执行前处理脚本。**
+理由：local 通道里用户代码与平台控制面在同一进程边界内——恶意或失陷脚本可经
+import 面拿到 DB session、无资源限制地占死 worker、经 worker 网络触达内网。
+ARCH-0-1 的非 root 化收紧了文件系统爆炸半径，但不改变「同边界」这一本质。
+compose 里 worker 段的 ARCH-0-1 注释对 local 的描述（过渡期最低隔离）即指此现状。
+
+**企业部署的落地方式（ARCH-1-4 起缺省即合规态）**：
+
+1. 合规状态是 `SCRIPT_EXEC_MODE=container`，且自 ARCH-1-4（设计 §3 Phase 1
+   表 1-4 行）起就是**代码默认值**（`app/core/config.py`）——漏配落在
+   container，不再有「忘配即 local」的敞口；`local` 仅显式 env 可用（开发机
+   `.env_local`、部署机 `.env` 显式声明）。compose 的 worker 段已显式写
+   `SCRIPT_EXEC_MODE=${SCRIPT_EXEC_MODE:-container}`：`environment` 优先级
+   高于 `env_file`，插值缺省即 container，`.env` 显式设值可覆盖（即回退
+   开关，见 9.1）。
+2. container 模式有两个前置（与 ARCH-1-4 之前相同）：
+   - **部署机离线预载 runner 镜像**（D-3 运维事项）：开发机
+     `docker build -f docker/script-runner/Dockerfile` + `docker save` 传输 +
+     部署机 `docker load`，步骤见 `docker/script-runner/README.md`「离线预载」；
+     换 tag 经 `SCRIPT_RUNNER_IMAGE` 指向，不必改代码；
+   - **worker 侧执行通道**：compose 的沙箱面（executor 服务 + egress 出口，
+     `COMPOSE_PROFILES=sandbox`）已随 ARCH-1-1/1-3 就位，worker 容器本身
+     **永不挂 docker.sock**——container 模式经 worker→executor 的 HTTP 调用
+     （条目 1-2 的 SandboxDriver HTTP 驱动 + `EXECUTOR_TOKEN`，启用步骤见
+     第十节）。**缺省切换后的行为变化**：沙箱面未启用（未设
+     `COMPOSE_PROFILES=sandbox`、未配 `EXECUTOR_URL`）时，含前处理脚本的
+     任务会因 worker 容器内无 docker 通道而**明确失败**（fail-loud），不再
+     静默落 local 执行；脚本上传校验链的冒烟、debug 试跑与任务执行同开关
+     分流，所在容器（api/worker）同口径。
+3. **灰度与回退**：缺省切换不等于一步到位全量——按 9.1 的「内测团队 →
+   全量」路径推进，任一环节出问题改 env 重启即回退。
+
+### 9.1 灰度与回退（ARCH-1-4）
+
+缺省切 container 后的放量路径（设计 §3 Phase 1 表 1-4 行验收口径）：
+
+1. **前置就绪**：按第十节 10.2 启用沙箱面（`COMPOSE_PROFILES=sandbox` +
+   `EXECUTOR_TOKEN` + `EXECUTOR_URL=http://executor:8300` + 镜像预载），
+   确认 `ai-evo-executor` / `ai-evo-egress` 两个容器 healthy。
+2. **第一步：内测团队**：内测团队所在部署机保持缺省 container，跑通至少
+   一个**含前处理脚本的真实评测**；按 W15 逃逸测试集口径抽查（import 平台
+   代码、读 `/proc/1/environ`、fork 炸弹、写越界路径、超长运行均被沙箱
+   拦截——单测门禁 `tests/unit/test_w15_container_isolation.py`，实机探针
+   `tests/integration/test_w15_container_probe.py`）；观察一个完整业务周期
+   的沙箱失败率与任务延迟（executor `/health`、worker 日志）。
+3. **第二步：全量**：内测无回归后，其余部署机同步骤启用沙箱面；worker env
+   显式 `SCRIPT_EXEC_MODE=container` 与代码缺省一致，无需逐机改 env。
+4. **回退（过渡期止损）**：任一环节出问题，`.env` 显式设
+   `SCRIPT_EXEC_MODE=local` 后 `docker compose up -d worker api` 重启——
+   模式是环境变量实时读，**改 env 重启即回退**，不需要改 compose、回滚
+   镜像或代码。回退只是止损：local 的同边界风险（上文政策段）在回退期间
+   重新敞开，问题定位修复后应尽快删掉该行恢复 container。
+
+开发机本地开发要继续用 local：`.env_local` 显式写 `SCRIPT_EXEC_MODE=local`
+（缺省已是 container，不再隐式 local）；要灰度验证 container 时删掉该行或
+shell export 覆盖（环境变量实时读，重启 worker 生效）。W15 门禁
+`tests/integration/test_w15_container_probe.py` 与
+`tests/unit/test_w15_container_isolation.py` 在开发机有 docker 时可复跑验证隔离语义。
+
+---
+
+## 十、沙箱面部署：executor 与 egress 出口（ARCH-1-3）
+
+设计依据：`plans/2026-10-15-企业级评测系统架构设计.md` §2.2 拓扑 / §2.3 D1-D2 /
+§3 Phase 1 条目 1-3。compose 新增两个服务与一个内网，**整体挂在 profile
+`sandbox` 后面**——部署机不设 `COMPOSE_PROFILES` 时行为与原部署完全一致
+（不会因为没预载新镜像而在 `up` 时失败），这是灰度总开关。
+
+### 10.1 拓扑与角色
+
+| 组件 | 形态 | 说明 |
+|---|---|---|
+| `executor` | `ai-evo-executor` 镜像（`docker/Dockerfile.executor`，ARCH-1-1） | compose 内**唯一**挂 `/var/run/docker.sock` 的角色；非 root（uid 10002 + 补充组 = 部署机 docker 组 gid）；不发布宿主端口，仅 compose 内网 `http://executor:8300`；健康探活 `/health`。**不挂 env_file**：DB/Redis 凭证不进该容器，只经 `${EXECUTOR_TOKEN}` 插值注入共享 token（未配置 = fail-closed 拒绝全部沙箱请求） |
+| `egress` | `ubuntu/squid`（Canonical 官方镜像，内网镜像源可拉；`squid:alpine` 非官方、内网源不可拉，等价选型） | 全部服务端外呼的统一出口：域名白名单（`docker/egress/squid.conf` + 清单文件）+ 内网目的地址一律拒绝（SSRF 收口）；不发布宿主端口 |
+| `aievo-sandbox-egress` | compose bridge 网络，`internal: true`，网络名**钉死**为裸名 | 沙箱 `egress` 档唯一可达网段：internal 网络没有出网网关/NAT，沙箱直连外网在设计上不可达，唯一出路是同网段的 egress 代理（白名单 + access 审计）。网络名与 `executor/sandbox_params.py` `NET_PROFILES["egress"]` 必须逐字一致（compose 默认加项目前缀，已用 `name:` 钉死；`tests/unit/test_compose_topology.py` 断言同步） |
+
+### 10.2 启用步骤（部署机）
+
+1. **预载镜像**（离线机）：开发机 `docker pull ubuntu/squid:latest` +
+   `docker save` 传输 + 部署机 `docker load`；executor 镜像
+   `docker build -t ai-evo-executor:latest -f docker/Dockerfile.executor .`（或
+   经 `EXECUTOR_IMAGE_TAG` 指向 CI 构建的 tag——build-service 接线 executor
+   镜像构建属后续条目，手工预载先行）。
+2. **同步沙箱面配置文件**：`docker/egress/squid.conf` 与
+   `docker/egress/whitelist.txt` 必须与 `docker-compose.yml` 同级可寻址
+   （compose 按相对路径 `./docker/egress/…` 挂载）。离线部署目录若只同步了
+   `docker-compose.yml`，把 `docker/egress/` 目录一并放过去；或用 `.env` 的
+   `EGRESS_SQUID_CONF` / `EGRESS_WHITELIST_FILE` 指向自有路径。
+3. **核对 sock 组 gid**：`stat -c %g /var/run/docker.sock`，写入 `.env` 的
+   `DOCKER_GROUP_GID`（默认 999 只是 Debian 系常见值；群晖等自定 gid 必查）。
+4. **生成 token 与接线地址**：`openssl rand -hex 32` 写入 `.env` 的
+   `EXECUTOR_TOKEN`，并设 `EXECUTOR_URL=http://executor:8300`（worker 侧
+   ARCH-1-2 HTTP 驱动经 .env 的 env_file 注入读取，compose 无需再加行）。
+5. `.env` 设 `COMPOSE_PROFILES=sandbox`，`docker compose up -d`；确认
+   `ai-evo-executor` / `ai-evo-egress` 两个容器 healthy。
+6. （可选灰度）worker 外呼切 egress：`.env` 设
+   `WORKER_EGRESS_PROXY=http://egress:3128` 后 `docker compose up -d worker`。
+   留空 = 不走 proxy，与既有行为一致。
+
+沙箱面启用并配好 `EXECUTOR_URL` 后，ARCH-1-4 的缺省 `container`（worker env
+显式声明同值，见第九节）即有完整执行通道——本节步骤是第九节 9.1 灰度
+路径第 1 步「前置就绪」的全部内容。
+
+### 10.3 SCRIPT_NET_PROFILE 网络档位 ↔ compose 网络（与条目 1-2 的对应关系）
+
+沙箱网络档位的**单一事实源**是 `executor/sandbox_params.py` 的
+`NET_PROFILES`（executor 受理请求时按此白名单校验并映射为 docker
+`--network` 取值；worker 侧由 ARCH-1-2 的 SandboxDriver 以 `SCRIPT_NET_PROFILE`
+环境变量表达同一批档位，缺省 `none`，映射见
+`script_container.WORKER_NET_PROFILE_TO_DOCKER`）：
+
+| 档位（SCRIPT_NET_PROFILE） | executor 通道 docker `--network` | 前置 | 出网能力 |
+|---|---|---|---|
+| `none`（默认，离线档） | `none` | 无 | 零出网——沙箱连 compose 内网都不可达 |
+| `egress`（白名单档） | `aievo-sandbox-egress`（即本节钉死的 compose 网络） | `COMPOSE_PROFILES=sandbox` 已启用（网络随 egress 服务创建） | 仅白名单域名经 egress 代理出网（内网目的地址被 proxy 拒绝；直连路由不存在） |
+| `open`（直出档） | **executor 通道拒绝**（`NET_PROFILES` 无此键 → 400，设计 D2：仅超管脚本 + 审批，Phase 1 未开放） | —— | worker docker-CLI 通道（开发机直跑 docker 的过渡通道）映射默认 bridge 直出；企业 executor 通道无此能力 |
+
+注意：沙箱容器在 `egress` 档内**不注入平台 env**（含 proxy 地址）——脚本要
+出网需自带 `http://egress:3128`（沙箱 env 白名单的扩展属后续条目）；平台侧
+worker 的模型测连/OSS 外呼走的是第 6 步的 `WORKER_EGRESS_PROXY`，两者同一
+出口、同一份域名白名单。
+
+### 10.4 域名白名单运维
+
+- 仓库模板 `docker/egress/whitelist.txt` 只是示例（常见模型厂商/OSS/pip 源），
+  **不是审核过的企业清单**；企业部署在服务器维护自己的清单文件，`.env` 设
+  `EGRESS_WHITELIST_FILE` 指向它（dstdomain 语法：`.example.com` 匹配
+  example.com 及全部子域，一行一条）。
+- 改清单 / 改 `docker/egress/squid.conf` 后 `docker compose restart egress`
+  生效（squid 配置不热加载）。
+- 审计：`docker exec ai-evo-egress tail -n 50 /var/log/squid/access.log`
+  （每次放行/拒绝一行，含客户端、域名、判定）。
+- SSRF 回归验证（设计 §3 条目 1-3 验收口径）：从 worker 容器内以
+  `HTTP_PROXY=http://egress:3128` 访问内网地址（如 `http://127.0.0.1:8100/`、
+  `http://192.168.x.x/`）应得 403；访问非白名单域名同为 403。策略语义由
+  `tests/unit/test_compose_topology.py` 静态断言（deny 内网段先于 allow 白名单、
+  末条 deny all）持续看守。
+
+
+---
+
+## 十一、镜像漏洞扫描与 digest 钉扎（ARCH-3-3）
+
+设计依据：`plans/2026-10-15-企业级评测系统架构设计.md` §3 Phase 3 表 3-3 行——
+「CI 加 trivy 镜像扫描；script-runner 镜像 digest 钉扎进配置」。两条产线的
+门禁口径完全一致：**trivy 扫描主镜像与 script-runner 镜像，HIGH 及以上
+（`HIGH,CRITICAL`）且有修复版本的 CVE 卡门禁（exit-code 1）**。
+
+### 11.1 两条产线的扫描接入点
+
+| 产线 | 接入点 | 行为 |
+|---|---|---|
+| GitHub CI | `.github/workflows/ci.yml` 的 `image-scan` job | `docker-image` job 构建主镜像后 `docker save` 成 artifact；scan job load 回来 + 现场构建 script-runner 镜像（`docker/script-runner/Dockerfile`），trivy 各扫一遍，HIGH+ fail |
+| 企业 GitLab 线 | `build-service` 构建钩子（`tools/build-service/build_service.py` 的 `scan_image`，`config.toml` 的 `[scan]` 段） | 构建产物落 daemon 之后、写 release 记录**之前**扫描；不过 → 构建任务 failed，有漏洞的镜像不进可部署/可回滚列表 |
+
+为什么 GitLab 线扫在 build-service 里：GitLab runner 只做 curl + 轮询
+（见第一节），CI 侧没有构建现场；镜像只存在于部署机 daemon 里，扫描必须
+在产物所在地跑——build-service 就是企业线的等价构建钩子。
+
+`ignore-unfixed` 的取舍（两线同参）：Debian slim 基座常态带着「无修复版本」
+的 HIGH CVE，一律卡会把门禁变成永久红灯；这类由镜像基座升级
+（`python:3.12-slim` 的 `FROM` 变更时）解决。**有修复版本的 HIGH/CRITICAL
+仍然卡**——11.3 的门禁演练用的就是这类。
+
+### 11.2 离线扫描器镜像的预载（部署机一次性 + 周期更新）
+
+部署机不能下载任何东西，扫描器（trivy + 漏洞库）必须预烘焙成镜像运过去：
+
+```bash
+# 开发机（联网）：构建含离线漏洞库的扫描器镜像。
+# DB 烘焙进镜像后，扫描时 --skip-db-update --offline-scan 零外呼。
+cat > Dockerfile.trivy <<'EOF'
+FROM aquasec/trivy:latest
+RUN trivy image --download-db-only
+EOF
+docker build --platform linux/amd64 -t ai-evo-trivy:latest -f Dockerfile.trivy .
+
+# 传输 + 部署机加载（与 runner 镜像同一离线预载流程，见 docker/script-runner/README.md）
+docker save ai-evo-trivy:latest | gzip > ai-evo-trivy.tar.gz
+# scp 到部署机后：
+gunzip -c ai-evo-trivy.tar.gz | docker load
+```
+
+- **上线顺序**：先预载 `ai-evo-trivy`，再部署含扫描门禁的新版
+  `ai-evo-build-service` 镜像。门禁 fail-closed（与 `AUTH_JWT_SECRET` /
+  `EXECUTOR_TOKEN` 同整改纪律）：`[scan].enabled` 缺省 `true`，扫描器镜像
+  缺失时构建同样失败（报错文案带本节指引），不会静默放行。
+- **漏洞库更新**：库烘焙在镜像里、随镜像更新。建议每月在开发机重跑上面
+  的构建（`--download-db-only` 拉新库）并重新预载，节奏与基座镜像升级对齐。
+- **配置**：`build-service/config.toml` 的 `[scan]` 段（`enabled` / `image` /
+  `severity` / `timeout_sec`，模板与注释见 `tools/build-service/config.example.toml`）。
+  `enabled=false` 仅限扫描器未就绪的过渡期，需安全负责人知情，修完预载即恢复。
+
+### 11.3 门禁演练（验收口径：高危 CVE 卡门禁演练触发一次）
+
+门禁必须证明「真的会拦」，否则形同虚设。演练方式（开发机即可，不动部署机）：
+
+```bash
+# 找一个带「有修复版本 HIGH CVE」的镜像——最现成的是数月前构建的旧版
+# ai-evo 应用镜像（pip 依赖老化必然命中）；没有旧 tag 就专门钉旧依赖构建一个。
+# 命令与 build-service scan_image 完全同参（同口径）：
+docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+  ai-evo-trivy:latest image \
+  --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed \
+  --skip-db-update --offline-scan ai-evo:<旧tag>
+echo "exit=$?"   # 期望非 0，且表格式输出里可见 HIGH/CRITICAL 条目
+```
+
+GitHub CI 线等价演练：临时把 `image-scan` job 的 `severity` 加宽一档
+（如 `MEDIUM,HIGH,CRITICAL`）推一个分支，确认 job 红灯后还原。
+演练记录（日期、命中的 CVE、处置动作）归档到安全检查单。
+
+### 11.4 script-runner 镜像 digest 钉扎（SCRIPT_RUNNER_IMAGE@sha256）
+
+`SCRIPT_RUNNER_IMAGE`（默认浮动 tag `ai-evo-script-runner:latest`，`.env`/
+环境变量可覆盖）自 ARCH-1-5 起支持 digest 钉扎，ARCH-3-3 对齐口径：默认
+tag、env 覆盖、钉扎可选（文法校验见 `app/core/config.py` 的
+`validate_runner_image_ref`，格式错在配置解析层 fail-fast）：
+
+```bash
+# 浮动引用（缺省）
+SCRIPT_RUNNER_IMAGE=ai-evo-script-runner:latest
+# digest 钉扎：镜像内容寻址——同 tag 被覆盖/缓存投毒对钉扎引用无效
+SCRIPT_RUNNER_IMAGE=harbor.internal:5000/ai-evo/script-runner@sha256:<64 位十六进制>
+```
+
+钉扎值的取法（离线机注意）：**digest 只有经 registry 中转才有**——
+`docker build` / `docker load` 出来的本地镜像 `RepoDigests` 为空，取不到
+digest。企业有内网 registry（如 harbor）时：
+
+```bash
+# 开发机：推到内网 registry，读回 RepoDigests
+docker tag ai-evo-script-runner:latest harbor.internal:5000/ai-evo/script-runner:2026-10-15
+docker push harbor.internal:5000/ai-evo/script-runner:2026-10-15
+docker inspect --format '{{json .RepoDigests}}' \
+  harbor.internal:5000/ai-evo/script-runner:2026-10-15
+# 取 "repo@sha256:..." 中的 sha256 段写入部署机 .env：
+#   SCRIPT_RUNNER_IMAGE=harbor.internal:5000/ai-evo/script-runner@sha256:<64hex>
+docker compose up -d worker   # 改 env 重启即生效（镜像引用环境变量实时读）
+```
+
+- 换版本：push 新 tag → 取新 digest → 改 `.env` 重启；registry 里旧 digest
+  长期保留即回滚目标（改回旧 digest 行再重启）。
+- **通道现状**：worker docker-CLI 通道（无 executor 的形态）原样把引用交给
+  `docker run`，daemon 原生按 digest 内容寻址校验；**executor 通道（第十节
+  沙箱面）的镜像白名单尚未放开 digest 引用**（`executor/sandbox_params.py`
+  对含 `@` 的引用仍拒绝），企业 executor 形态暂以「registry 固化 tag +
+  registry 侧不可变 tag 策略」替代，白名单放开属后续条目（放开时两侧同步，
+  见该文件注释）。
+- 与镜像扫描的关系：扫描保证「构建出的镜像没有高危漏洞」，钉扎保证
+  「部署跑的镜像就是扫过的那份内容」——把部署侧的镜像漂移面（同 tag
+  被覆盖）收掉，两者合起来才是供应链闭环。

@@ -627,6 +627,8 @@ class PreScriptOutput(BaseModel):
 
 Python 3.10+ / PostgreSQL / Redis。登录为本地账号密码（JWT），首个注册用户自动成为超级管理员。本地开发推荐 `scripts/run_local_dev.py`；生产部署使用 Docker 镜像（离线包含前端 dist、后端代码、docs 文档与配图、claude CLI）。
 
+部署安全基线（详见 `docs/build-pipeline.md`）：生产 `.env` 必须显式配置 `AUTH_JWT_SECRET`（缺失即拒启；`AUTH_JWT_ALLOW_DERIVED` 派生回退仅限开发机，企业部署严禁开启）；前处理脚本执行模式 `SCRIPT_EXEC_MODE=local` 仅限开发机，企业部署禁止 local（合规通道为 container 沙箱模式）。Docker Compose 首次部署时 `volume-init` 一次性服务会自动把 `uploads/`、`logs/` 卷属主迁移为运行用户（uid 10002），无需手工 chown。
+
 ```bash
 # 本地开发
 pip install -r requirements.txt

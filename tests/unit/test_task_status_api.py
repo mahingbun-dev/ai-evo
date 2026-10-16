@@ -11,6 +11,26 @@ from app.api.task_status_api import router, websocket_endpoint
 pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_jwt_secret(monkeypatch):
+    """固定显式 JWT 密钥，脱离所在机器的 .env（ARCH-0-2）。
+
+    JWT 密钥不再默认从 DATABASE_URL 派生（缺密钥即抛错），本文件的
+    mock_websocket 调真实 create_token 签发——CI 干净环境（无 .env）会必红，
+    统一 patch 为显式密钥保持密闭。
+    """
+    from app.core.config import Settings
+    from app.services import jwt_service
+    monkeypatch.setattr(
+        jwt_service, "get_settings",
+        lambda: Settings(
+            _env_file=None,
+            DATABASE_URL="postgresql://unit-test",
+            AUTH_JWT_SECRET="unit-test-jwt-secret",
+        ),
+    )
+
+
 class TestWebSocketAPI:
     """WebSocket API 端点测试类"""
 

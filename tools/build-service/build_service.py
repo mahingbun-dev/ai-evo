@@ -103,6 +103,23 @@ KEEP_RELEASES = int(CFG.get("deploy", {}).get("keep_releases", 5))
 BUILD_TIMEOUT = int(CFG.get("timeouts", {}).get("build_sec", 3600))
 DEPLOY_TIMEOUT = int(CFG.get("timeouts", {}).get("deploy_sec", 1800))
 
+# 构建后镜像漏洞扫描门禁（ARCH-3-3，设计 §3 Phase 3 表 3-3 行：CI 加 trivy
+# 镜像扫描——本服务是企业 GitLab 线的等价构建钩子，GitLab runner 只 curl
+# 触发，扫描必须发生在构建产物落 daemon 之后、写 release 记录之前）。
+#
+# 离线约束：部署机不能下载任何东西，扫描器是**预烘焙**镜像（aquasec/trivy
+# + 离线漏洞库，构建/预载步骤见 docs/build-pipeline.md 第十一节），扫描时
+# 挂宿主 docker.sock 读取刚构建的镜像，--skip-db-update 不联网。
+#
+# fail-closed（与 AUTH_JWT_SECRET / EXECUTOR_TOKEN 同整改纪律）：门禁默认
+# 开启，扫描器镜像缺失/扫描超时/高危 CVE（HIGH 及以上）一律构建失败——
+# 有漏洞的镜像不进 releases 记录，也就无法被部署或回滚。上线新版
+# build-service 镜像前必须先预载扫描器镜像（或显式 enabled=false 过渡）。
+SCAN_ENABLED = bool(CFG.get("scan", {}).get("enabled", True))
+SCAN_IMAGE = CFG.get("scan", {}).get("image", "ai-evo-trivy:latest")
+SCAN_SEVERITY = CFG.get("scan", {}).get("severity", "HIGH,CRITICAL")
+SCAN_TIMEOUT = int(CFG.get("scan", {}).get("timeout_sec", 900))
+
 GIT_REMOTE = CFG.get("gitlab", {}).get("repo_url", "origin")
 
 GL_HOST = CFG.get("gitlab", {}).get("host", "https://gitlab.example.com")
@@ -491,6 +508,64 @@ def _publish_progress(job_id: str, board_file: Path):
             message=str(sidecar.get("detail") or ""))
 
 
+def scan_image(image_ref: str, logf) -> None:
+    """构建后镜像漏洞扫描门禁（ARCH-3-3）：HIGH 及以上 CVE 卡构建
+
+    在预烘焙扫描器容器（SCAN_IMAGE，trivy + 离线漏洞库）里扫描刚构建出的
+    镜像：挂宿主 docker.sock 让 trivy 直接读 daemon 里的本地镜像（trivy
+    官方离线扫描形态）；--skip-db-update + --offline-scan 保证不外呼。
+
+    结果语义（fail-closed，验收口径「高危 CVE 卡门禁演练触发一次」）：
+    - 退出码 0            ：无门槛级漏洞，放行；
+    - 退出码 1            ：存在 HIGH,CRITICAL 级（且有修复版本的）漏洞，
+                            抛 RuntimeError → 构建任务 failed，不写 release
+                            记录（有漏洞的镜像不可部署、不可回滚）；
+    - 扫描器镜像缺失/崩溃 ：docker run 非零退出，同样失败——门禁不在扫描器
+                            缺位时静默放行；
+    - 超时                ：转明确报错（subprocess.TimeoutExpired 不裸抛，
+                            任务 message 里给出处理指引）。
+    ignore-unfixed：无修复版本的基座 CVE（Debian slim 常态）由镜像基座升级
+    解决，不永久卡门禁；有修复的高危 CVE 仍卡——GitHub CI 的 trivy job
+    （.github/workflows/ci.yml image-scan）同一口径，两线阈值一致。
+    """
+    if not SCAN_ENABLED:
+        logf.write("[scan] [scan].enabled=false，镜像扫描门禁已关闭（高危 CVE 不再卡构建）\n")
+        return
+    cmd = [
+        "docker", "run", "--rm",
+        "-v", "/var/run/docker.sock:/var/run/docker.sock",
+        SCAN_IMAGE, "image",
+        "--exit-code", "1",
+        "--severity", SCAN_SEVERITY,
+        "--ignore-unfixed",
+        "--skip-db-update",
+        "--offline-scan",
+        image_ref,
+    ]
+    logf.write(f"[scan] $ {' '.join(cmd)}\n")
+    logf.flush()
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=SCAN_TIMEOUT)
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(
+            f"镜像扫描超时（>{SCAN_TIMEOUT}s）：{image_ref}。检查扫描器镜像 "
+            f"{SCAN_IMAGE} 是否正常预载（docs/build-pipeline.md 第十一节），"
+            "或按需调大 [scan].timeout_sec"
+        ) from e
+    if proc.stdout:
+        logf.write(proc.stdout)
+    if proc.stderr:
+        logf.write(proc.stderr)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"镜像扫描门禁未通过（退出码 {proc.returncode}）：{image_ref} 存在 "
+            f"{SCAN_SEVERITY} 级（有修复版本的）漏洞，或扫描器镜像 "
+            f"{SCAN_IMAGE} 不可用。修复依赖/基座后重新构建；扫描器问题见 "
+            "docs/build-pipeline.md 第十一节的预载步骤"
+        )
+    logf.write(f"[scan] 扫描通过，无 {SCAN_SEVERITY} 级（有修复版本的）漏洞: {image_ref}\n")
+
+
 def run_build_thread(job_id: str, branch: str, sha: Optional[str]):
     try:
         set_job(job_id, status="running", stage="checkout", progress=2, message="拉取源码...")
@@ -552,6 +627,12 @@ def run_build_thread(job_id: str, branch: str, sha: Optional[str]):
             raise RuntimeError("构建结束但未找到 .build-image（镜像 tag）")
         image = image_file.read_text().strip()
         image_tag = image.split(":")[-1]
+
+        # ARCH-3-3：漏洞门禁在写 release 记录**之前**——扫描不过的镜像
+        # 不进可部署/可回滚列表（job 亦 failed，_resolve_deploy_tag 拒绝）
+        set_job(job_id, stage="scan", progress=92, message="镜像漏洞扫描（trivy）...")
+        with open(job_log_path(job_id), "a") as lf:
+            scan_image(image, lf)
 
         record = {
             "image": image, "tag": image_tag, "commit": head,

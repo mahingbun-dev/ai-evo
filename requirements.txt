@@ -1,8 +1,10 @@
 # ============ Web Framework ============
-fastapi==0.128.6
+# trivy 安全升级（CVE 见各 commit）：fastapi 0.133 起解除 starlette<1.0.0
+# 上界，取允许 starlette 1.3.1 的最低 minor 的最新补丁
+fastapi==0.133.1
 uvicorn==0.40.0
-starlette==0.52.1
-python-multipart==0.0.22
+starlette==1.3.1
+python-multipart==0.0.30
 
 # ============ Database & ORM ============
 SQLAlchemy==2.0.46
@@ -15,7 +17,7 @@ pandas==3.0.0
 openpyxl==3.1.5
 et-xmlfile==2.0.0
 xlrd==2.0.2
-Pillow==12.1.1
+Pillow==12.3.0
 pdfplumber==0.11.9
 beautifulsoup4==4.14.3
 jsonpath-ng==1.7.0
@@ -34,7 +36,7 @@ APScheduler==3.11.2
 # ============ HTTP Clients & WebSocket ============
 httpx==0.28.1
 requests==2.32.5
-aiohttp==3.13.3
+aiohttp==3.14.3
 websockets==16.0
 
 # ============ anc-hub 插件（app/hub_plugin，vendored hubkit 的运行时下限） ============
@@ -49,7 +51,9 @@ anthropic==0.83.0
 # langgraph/langfuse/deepeval 三者此前用范围声明（>=），与 requirements.lock /
 # tools/prod-constraints.txt 的钉版漂移（本地装出的版本和离线镜像不一致）。
 # W18 收紧为与 lock 一致的精确版本——下次 pip-compile 结果不变。
-langgraph==1.2.2
+# langgraph==1.2.2 钉死 langgraph-sdk<0.4.0，trivy 扫出 sdk CVE-2026-104873
+# （fixed 0.4.4）后联动升至允许 sdk 0.4.4 的最低版本（venv 已验证兼容组合）。
+langgraph==1.2.11
 langfuse==4.14.4
 ragas==0.4.3
 deepeval==4.1.8
@@ -57,6 +61,10 @@ deepeval==4.1.8
 claude-agent-sdk==0.2.163
 # DeepSeek Harness Agent 裁判引擎（捆绑 linux/amd64 原生运行时 wheel，无需 Node.js）
 deepseek-harness-sdk==0.1.5rc1
+
+# ============ Observability ============
+# ARCH-2-3：Prometheus 指标埋点（/metrics 端点 + celery signals 任务指标）
+prometheus-client==0.26.0
 
 # ============ Template & Formatting ============
 Jinja2==3.1.6

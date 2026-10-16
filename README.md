@@ -68,9 +68,19 @@ docker compose up -d --build
 
 - `api` serves both the REST API and the built frontend on port 8100 (`AIEVO_PORT` to change)
 - `worker` runs Celery evaluation tasks; `logs/` and `uploads/` are persisted via volumes
+- on the first `up -d`, the one-shot `volume-init` service automatically migrates the
+  `uploads/` and `logs/` volume ownership to the container runtime user (uid 10002) —
+  no manual `chown` needed (`docker compose ps` showing it as `exited(0)` is normal)
 - set `COMPOSE_PROFILES=bundled-db` in `.env` to also start a bundled PostgreSQL
+- pre-evaluation script execution mode `SCRIPT_EXEC_MODE`: the default `local` is
+  **for development machines only** (scripts run as plain subprocesses next to the
+  platform); production/enterprise deployments must not use `local` — set
+  `SCRIPT_EXEC_MODE=container` once the sandbox channel is in place, see
+  section 9 of [docs/build-pipeline.md](docs/build-pipeline.md)
 
-The full offline/CI pipeline (locked wheels, bundled Claude Code CLI) is described in [docs/build-pipeline.md](docs/build-pipeline.md).
+The full `.env` variable reference is in section 4.4.1 of
+[docs/build-pipeline.md](docs/build-pipeline.md) and `.env.example`;
+the offline/CI pipeline (locked wheels, bundled Claude Code CLI) is described in [docs/build-pipeline.md](docs/build-pipeline.md).
 
 ## Evaluation types
 
@@ -91,7 +101,13 @@ The full offline/CI pipeline (locked wheels, bundled Claude Code CLI) is describ
 
 ## Security notes
 
-- Set a strong `AUTH_JWT_SECRET` in production (missing values fall back to a derived key, local development only)
+- `AUTH_JWT_SECRET` must be set to a strong random value (`openssl rand -hex 32`):
+  startup fails fast when it is missing; the "derive from DATABASE_URL" fallback
+  requires explicitly setting `AUTH_JWT_ALLOW_DERIVED=true`, is for local development
+  only, and must never be enabled in enterprise deployments
+- `SCRIPT_EXEC_MODE=local` (pre-evaluation scripts run as plain subprocesses) is for
+  development machines only and forbidden in enterprise deployments; the compliant
+  path is `container` sandbox mode — see section 9 of [docs/build-pipeline.md](docs/build-pipeline.md)
 - anc-hub endpoints use strict TLS verification by default; self-signed internal endpoints can opt out with `AIEVO_HUB_TLS_INSECURE=1`
 - This platform intentionally calls user-configured model endpoints (including internal gateways) — deploy it inside a trust boundary you control
 

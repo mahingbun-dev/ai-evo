@@ -11,8 +11,10 @@ task.pre_scripts 旧配置。支持 exec_type：
   统一经 app/services/pre_judge_entry.py wrapper 调起（run(stdin) 函数式 /
   __main__ 传统式自动适配），PYTHONPATH 注入项目根（支持
   `from app.db.session import SessionLocal` 等平台侧 import；W15 起 local
-  模式专用——SCRIPT_EXEC_MODE=container 时改走 docker run --rm 容器内
-  隔离执行，不注入 PYTHONPATH，脚本无法 import 平台代码），
+  模式专用——SCRIPT_EXEC_MODE=container 时改经 SandboxDriver 沙箱执行
+  （ARCH-1-2：executor HTTP 驱动或 docker-CLI 驱动，见
+  app/services/script_container.py），不注入 PYTHONPATH，脚本无法 import
+  平台代码），
   cwd 隔离到 uploads/script_runs/{task_id}/{data_id}/{script_id}/，
   标准输入 JSON 走 stdin，取标准输出最后一行 JSON 作为脚本标准输出，
   超时（timeout_seconds）kill，标准输出读取有上限截断
@@ -21,8 +23,13 @@ task.pre_scripts 旧配置。支持 exec_type：
   执行（脚本对自身包目录的写操作只影响本条副本，不污染脚本库与其它数据条）；
   local/上传文件与 hub_file 执行包目录解析时拷进工作区 inputs/ 下，stdin
   一律给工作区内副本路径（inline 值本就落盘工作区）
-- claude_agent / deepseek_agent：由 HarnessAdapter 阶段接入，到达此处明确 fail
-  （on_fail 默认 continue，裁判可见失败事实）
+- claude_agent / deepseek_agent：ARCH-3-2 起（设计 §2.3 D8）经 SandboxDriver 在
+  沙箱内拉起被测 agent——与前处理脚本同级对待（同一 executor 驱动、同一
+  script_runs 工作区与结果条目结构），镜像按 exec_type 选 Dockerfile.harness
+  变体（claude 变体含离线 claude-local CLI），出网恒 egress 档；指令文本取
+  entrypoint，凭据/参数经 app/services/harness_adapter.py 组装（harness.json 随
+  工作区落盘，评完即清），编排见 app/services/script_container.py
+  的 execute_harness_in_container（on_fail 默认 continue，与 script 类型一致）
 
 扩展点（设计：docs/design/pre-judge-scripts.md §九.3，挂载点规范化命名）：
 - EXTENSION_POINT_PRE_JUDGE = "evaluation/pre-judge"（已启用）
@@ -70,7 +77,7 @@ from app.core.config import get_settings
 from app.db.session import SessionLocal
 from app.models.pre_judge_models import PreJudgeScript
 from app.services import pre_judge_script_service
-from app.utils.path_safety import ensure_within
+from app.utils.path_safety import PathEscapeError, ensure_within, secure_mkdir
 from app.services import script_container
 from app.services.hub_file_service import (
     HubFileError,
@@ -332,10 +339,13 @@ def build_run_dir(task_id: str, data_id: str) -> Path:
     隔离目录，相对路径会被错误拼到子进程 cwd 下导致产物写丢。
     同时创建工作区直下 outputs/（脚本产物目录，没有则建）——真实任务、
     试跑（debug）共用本函数，脚本侧按规范写 {run_dir}/outputs/ 时目录已就绪。
+    ARCH-0-3：task_id/data_id 来自评测负载，与 build_script_run_dir 同口径走
+    ensure_within 兜底（.. 穿越/symlink 越界一律拒绝建目录）；目录创建统一
+    secure_mkdir（显式 0o750 权限，权限收紧见设计 §3 条目 0-3）。
     """
-    run_dir = (SCRIPT_RUN_BASE / str(task_id) / str(data_id)).absolute()
-    run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / OUTPUTS_DIR_NAME).mkdir(exist_ok=True)
+    run_dir = Path(ensure_within(SCRIPT_RUN_BASE, str(task_id), str(data_id))).absolute()
+    secure_mkdir(run_dir)
+    secure_mkdir(run_dir / OUTPUTS_DIR_NAME)
     return run_dir
 
 
@@ -345,10 +355,11 @@ def build_script_run_dir(task_id: str, data_id: str, script_id: str) -> Path:
     uploads/script_runs/{task_id}/{data_id}/{script_id}/：脚本进程的 cwd，
     其相对路径写盘的文件（含 stdout/stderr 重定向）都落在该目录，随任务清理。
     返回绝对路径（Popen cwd 与日志展示均按绝对路径更稳）。
+    ARCH-0-3：目录创建统一 secure_mkdir（显式 0o750 权限）。
     """
     # task_id/data_id 来自评测负载，realpath 兜底确保运行目录不逃出 SCRIPT_RUN_BASE
     run_dir = Path(ensure_within(SCRIPT_RUN_BASE, str(task_id), str(data_id), _safe_name(script_id))).absolute()
-    run_dir.mkdir(parents=True, exist_ok=True)
+    secure_mkdir(run_dir)
     return run_dir
 
 
@@ -547,6 +558,11 @@ def _run_step(
                 fields[field_name] = value
     except PreScriptInputError as e:
         return _result(script_id, name, "fail", error=str(e), finish_reason="error", started_at=started)
+    except PathEscapeError as e:
+        # ARCH-0-3：运行目录路径越界（.. 穿越/symlink 逃出 SCRIPT_RUN_BASE）
+        # 按该脚本 fail 处理，绝不越出根目录建目录/落盘
+        return _result(script_id, name, "fail", error=f"运行目录路径越界: {e}",
+                       finish_reason="error", started_at=started)
 
     stdin: Dict[str, Any] = {
         "task_id": task_id,
@@ -560,7 +576,8 @@ def _run_step(
         "upstream": upstream,
         "_run_dir": str(run_dir),
     }
-    # W15 任务级网络开关：step.network=true 时容器改用 bridge（仅 container 模式生效）
+    # W15 任务级网络开关 + ARCH-1-2 三档档位：step.network=true 经
+    # resolve_net_profile 归一为 open 档，未声明取 SCRIPT_NET_PROFILE（默认 none）
     network_flag = bool(step.get("network"))
     return execute_script(script, stdin, timeout_seconds=script.get("timeout_seconds"),
                           network=network_flag)
@@ -588,8 +605,10 @@ def execute_script(
     {script_id, name, exec_type, entrypoint, timeout_seconds}。
 
     network（W15 任务级网络开关，仅 container 模式生效）：编排 step 声明
-    ``network: true`` 时容器改用 bridge 网络（脚本要访问被测系统的场景），
-    默认 False → --network none 完全离网；local 模式忽略该开关。
+    ``network: true`` 时按 open 档（docker-CLI 驱动 → 默认 bridge 直出；
+    executor 驱动白名单未放开 open 档，请求即拒并透传错误——见
+    script_container.resolve_net_profile），默认 False → 取 SCRIPT_NET_PROFILE
+    （默认 none 档，完全离网）；local 模式忽略该开关。
     """
     started = time.time()
     script_id = str(script.get("script_id") or script.get("id") or "")
@@ -602,12 +621,57 @@ def execute_script(
         stdin = _inject_builtin_db_dsn(script, stdin)
         return _execute_script_subprocess(script, stdin, timeout, started, network=network)
 
+    if exec_type in ("claude_agent", "deepseek_agent"):
+        # ARCH-3-2（设计 §2.3 D8 / §3 表 3-2 行）：被测 agent 进沙箱——
+        # 经 SandboxDriver 在 harness 变体镜像内执行，指令文本 = entrypoint，
+        # 凭据/参数经 harness_adapter 组装；agent 步骤无 local 子进程等价通道
+        # （裁判 judge 链路的 SDK 直跑不受影响），恒走沙箱
+        return _execute_harness_agent(script, stdin, timeout, started, exec_type=exec_type)
+
     return _result(
         script_id, name, "fail",
-        error=(f"暂不支持 exec_type={exec_type}（claude_agent/deepseek_agent 类型由 HarnessAdapter 阶段接入）"
-               if exec_type in ("claude_agent", "deepseek_agent")
-               else f"exec_type={exec_type} 已废除（builtin 进程内执行已统一为子进程 script 执行）"),
+        error=f"exec_type={exec_type} 已废除（builtin 进程内执行已统一为子进程 script 执行）",
         finish_reason="error", started_at=started,
+    )
+
+
+def _execute_harness_agent(
+    script: Dict[str, Any],
+    stdin: Dict[str, Any],
+    timeout: float,
+    started: float,
+    exec_type: str,
+) -> Dict[str, Any]:
+    """exec_type=claude_agent/deepseek_agent：组装 harness 载荷并经沙箱执行（ARCH-3-2）
+
+    职责边界：本函数只做 harness 语义组装（变体/指令/凭据，见
+    harness_adapter.build_harness_agent_config），docker 编排（镜像选择/egress 档/
+    载荷三件套落盘/产物回收）在 script_container.execute_harness_in_container。
+    组装失败（未配置全局凭据/缺指令文本）按该步骤 fail 处理（on_fail 语义与
+    script 类型一致），错误消息面向配置方。
+    """
+    # 懒加载：harness_adapter 引 claude/deepseek 配置服务，随用随引避免顶层依赖扩散
+    from app.services import harness_adapter
+
+    script_id = str(script.get("script_id") or script.get("id") or "")
+    name = script.get("name") or script_id
+    try:
+        variant = harness_adapter.harness_variant_for(exec_type)
+        instruction = harness_adapter.build_harness_instruction(script)
+        harness_config = harness_adapter.build_harness_agent_config(
+            variant, script=script, timeout=timeout)
+    except harness_adapter.HarnessConfigError as e:
+        return _result(script_id, name, "fail", error=str(e),
+                       finish_reason="error", started_at=started)
+
+    return script_container.execute_harness_in_container(
+        script=script,
+        stdin=stdin,
+        timeout=timeout,
+        started=started,
+        variant=variant,
+        instruction=instruction,
+        harness_config=harness_config,
     )
 
 
@@ -686,11 +750,12 @@ def _execute_script_subprocess(
     - env 为白名单环境（build_script_env，W1-3）：不继承平台进程全量环境
       变量；PYTHONPATH 注入项目根（M1 保留，local 模式专用——W15 起 container
       模式不注入 PYTHONPATH，脚本无法 import 平台代码）
-    - W15 灰度：SCRIPT_EXEC_MODE=container 时改走 docker run --rm
-      （script_container.execute_script_in_container：非 root、--memory 1g
-      --cpus 0.5 --pids-limit、--read-only + tmpfs、剥离平台 env、默认
-      --network none、挂载仅本次 script_runs 工作目录），前置准备
-      （入口解析/静态扫描/工作区与脚本包副本）与 local 完全共用
+    - W15 灰度 / ARCH-1-2：SCRIPT_EXEC_MODE=container 时分流点按 SandboxDriver
+      驱动选择（executor HTTP 驱动为目标通道，EXECUTOR_URL 未配置回退 W15
+      docker-CLI 驱动；非 root/--memory 1g --cpus 0.5 --pids-limit/
+      --read-only + tmpfs/剥离平台 env/默认离网/挂载仅本次 script_runs 工作
+      目录——隔离参数与 executor 同一事实源），前置准备（入口解析/静态扫描/
+      工作区与脚本包副本）与 local 完全共用
     - cwd 隔离到 uploads/script_runs/{task_id}/{data_id}/{script_id}/
     - 标准输入 JSON 走 stdin（ensure_ascii=False + default=str 容错）
     - stdout/stderr 重定向到 cwd 下文件；stdout 只读尾部 SCRIPT_STDOUT_LIMIT
@@ -737,7 +802,8 @@ def _execute_script_subprocess(
             str(stdin.get("data_id") or "item"),
             script_id or name,
         )
-    except OSError as e:
+    except (OSError, PathEscapeError) as e:
+        # ARCH-0-3：含路径越界（PathEscapeError）——绝不越出 SCRIPT_RUN_BASE 建目录
         return _result(script_id, name, "fail", error=f"创建脚本运行目录失败: {e}",
                        finish_reason="error", started_at=started, static_check=static_check)
 
@@ -759,11 +825,14 @@ def _execute_script_subprocess(
     timed_out = False
     returncode: Optional[int] = None
 
-    # W15 容器化隔离灰度：container 模式改走 docker run --rm（非 root、资源
-    # 限制、只读根文件系统、剥离平台 env、默认离网、挂载仅本次 script_runs
-    # 工作目录；stdin 内宿主工作区路径重写为容器 /workspace 路径）。
-    # 前置准备（入口解析、静态扫描、工作区、脚本包副本）与 local 完全共用，
-    # 返回条目结构与 local 同构。
+    # W15 容器化隔离灰度 / ARCH-1-2 分流点改按 SandboxDriver 驱动选择：
+    # SCRIPT_EXEC_MODE=container 时经 get_sandbox_driver() 解析驱动——
+    # EXECUTOR_URL 已配置 → HttpExecutorDriver（目标通道：worker 与 executor
+    # 之间是 compose 内网 + token 的 HTTP 调用，设计 §2.3 D1）；未配置 →
+    # DockerCliDriver（W15 既有 docker run --rm 单机通道回退）。前置准备
+    # （入口解析、静态扫描、工作区、脚本包副本）与 local 完全共用，
+    # 返回条目结构与 local 同构；local 模式不进本分支（下方 subprocess
+    # 通道原样保留）。
     if script_container.container_mode_enabled():
         return script_container.execute_script_in_container(
             script=script,
@@ -776,6 +845,7 @@ def _execute_script_subprocess(
             started=started,
             static_check=static_check,
             network=network,
+            driver=script_container.get_sandbox_driver(),
         )
 
     env = build_script_env()  # W1-3：白名单环境，替代 os.environ.copy()
@@ -942,6 +1012,10 @@ def _load_script(script_id: str) -> Optional[Dict[str, Any]]:
             "exec_type": row.exec_type,
             "entrypoint": row.entrypoint,
             "timeout_seconds": row.timeout_seconds if row.timeout_seconds is not None else 120,
+            # ARCH-3-2：agent 类型专用字段透传（allowed_tools=CC 工具白名单 /
+            # harness_extra=DSH 参数覆盖），harness_adapter 组装 harness.json 时消费
+            "allowed_tools": row.allowed_tools,
+            "harness_extra": row.harness_extra,
         }
 
 
@@ -1055,8 +1129,9 @@ def write_inline_value(field: str, value: Any, run_dir: Path) -> str:
 
     dict/list 写 .json（ensure_ascii=False），其余写 .txt（UTF-8）。
     """
+    # ARCH-0-3：inputs/ 目录显式 0o750 权限创建
     inputs_dir = Path(run_dir) / "inputs"
-    inputs_dir.mkdir(parents=True, exist_ok=True)
+    secure_mkdir(inputs_dir)
     if isinstance(value, (dict, list)):
         target = inputs_dir / f"{_safe_name(field)}.json"
         target.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1077,8 +1152,9 @@ def copy_into_workspace(src: str, run_dir: Path, name: str) -> str:
     inputs/{name}{ext}。拷贝失败抛 OSError，由调用方按该脚本 fail 处理。
     """
     src_path = Path(src).absolute()
+    # ARCH-0-3：inputs/ 目录显式 0o750 权限创建
     inputs_dir = Path(run_dir) / "inputs"
-    inputs_dir.mkdir(parents=True, exist_ok=True)
+    secure_mkdir(inputs_dir)
     base = inputs_dir / _safe_name(name)
     if src_path.is_dir():
         if base.exists():

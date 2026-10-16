@@ -9,6 +9,11 @@ Harness 适配层：裁判引擎统一执行契约
 - ClaudeCodeAdapter：claude-agent-sdk 实现（执行逻辑收敛自 ClaudeCodeJudgeAgent，
   后者对外接口保持不变，见 app/services/claude_code_judge_agent.py）
 - DeepSeekAdapter：deepseek-harness-sdk 实现（见 app/services/deepseek_adapter.py）
+- 沙箱被测 agent 执行（ARCH-3-2，设计 §2.3 D8 / §3 表 3-2 行）：exec_type=
+  claude_agent/deepseek_agent 的前处理步骤经 SandboxDriver 在沙箱内拉起被测
+  agent——本模块负责 harness 语义（变体解析/指令文本/凭据与参数组装），
+  docker 编排在 app/services/script_container.execute_harness_in_container，
+  调度接线在 app/services/pre_judge_runner._execute_harness_agent
 
 统一返回结构（与 JudgeLangGraphAgent 裁判结果兼容，另加 finish_reason）：
   {score, feedback, dimension_scores, finish_reason}
@@ -246,3 +251,130 @@ class ClaudeCodeAdapter(HarnessAdapter):
         if not raw:
             raise RuntimeError("Claude Code 裁判无返回内容")
         return raw, "completed"
+
+
+# ---------------- 沙箱被测 agent 执行（ARCH-3-2，设计 §2.3 D8 / §3 表 3-2 行） ----------------
+
+# exec_type → 沙箱 harness 变体键（镜像/入口脚本按变体选择）。
+# D8：被测 agent 与前处理脚本同级对待，同一 executor 驱动、同一镜像族
+# （ai-evo-script-runner 系，变体镜像见 docker/script-runner/Dockerfile.harness）。
+SANDBOX_HARNESS_VARIANTS: Dict[str, str] = {
+    "claude_agent": "claude",
+    "deepseek_agent": "deepseek",
+}
+
+
+class HarnessConfigError(ValueError):
+    """被测 agent 步骤组装失败（未配置凭据/缺指令文本），按该步骤 fail 处理"""
+
+
+def harness_variant_for(exec_type: str) -> str:
+    """exec_type → harness 变体（claude|deepseek）；未知类型明确拒绝"""
+    variant = SANDBOX_HARNESS_VARIANTS.get(str(exec_type or ""))
+    if not variant:
+        raise HarnessConfigError(
+            f"exec_type={exec_type!r} 不在沙箱 harness 支持清单: {sorted(SANDBOX_HARNESS_VARIANTS)}")
+    return variant
+
+
+def build_harness_instruction(script: Dict[str, Any]) -> str:
+    """取 agent 步骤的自然语言指令文本（exec_type=*_agent 的 entrypoint 字段）
+
+    契约见 PreJudgeScript.entrypoint 注释（agent 类型存指令文本而非文件路径）。
+    空指令明确拒绝（沙箱内 agent 无事可做，不如 fail-fast 让编排方修正配置）。
+    """
+    text = str(script.get("entrypoint") or "").strip()
+    if not text:
+        raise HarnessConfigError(
+            "claude_agent/deepseek_agent 步骤缺少指令文本（entrypoint 为空，"
+            "agent 类型的 entrypoint 存自然语言指令）")
+    return text
+
+
+def build_harness_agent_config(
+    variant: str,
+    script: Optional[Dict[str, Any]] = None,
+    timeout: float = 300.0,
+) -> Dict[str, Any]:
+    """组装沙箱内被测 agent 的运行配置（工作区 staged harness.json 的内容）
+
+    凭据经全局配置服务收集（claude → ClaudeCodeConfigService / deepseek →
+    DeepSeekHarnessConfigService），随 harness.json 落本次 script_runs 工作区：
+    工作区 secure_mkdir 0o750、评完即清（D6 口径：不进镜像、不进日志、不进
+    容器 env 白名单——容器内由 /opt/runner/harness_entry.py 加载后注入子进程）。
+
+    - claude 变体：ANTHROPIC_BASE_URL/AUTH_TOKEN 必备（未配置 fail-fast）；
+      model/max_turns 取 CC 全局配置，allowed_tools 取脚本记录声明（缺省不
+      限制——被测 agent 的工具面由沙箱边界约束，不套用裁判的保守白名单）；
+    - deepseek 变体：api_key 必备；官方协议 base_url/api_key 直传 SDK kwargs，
+      网关协议 key 经 DSH_PROVIDER_API_KEY 环境变量引用（不落 patch 文件，
+      与 DeepSeekAdapter.get_sdk_env 同口径）；脚本记录 harness_extra 覆盖
+      全局默认（provider/model/profile/max_tokens/reasoning_effort）。
+
+    Raises:
+        HarnessConfigError: 全局配置缺失或必备凭据不全（调用方转 fail 条目）
+    """
+    if variant == "claude":
+        from app.services.claude_code_config_service import ClaudeCodeConfigService
+
+        config = ClaudeCodeConfigService.get_active_config() or {}
+        env = ClaudeCodeConfigService.get_sdk_env()
+        if not (env.get("ANTHROPIC_BASE_URL") and env.get("ANTHROPIC_AUTH_TOKEN")):
+            raise HarnessConfigError(
+                "claude_agent 步骤需要 Claude Code 全局配置（模型配置页），"
+                "当前未配置或缺少 base_url/auth_token，无法在沙箱内拉起被测 agent")
+        allowed_tools = (script or {}).get("allowed_tools")
+        return {
+            "variant": "claude",
+            "env": env,
+            "model": config.get("model"),
+            "max_turns": config.get("max_turns") or 30,
+            "allowed_tools": [str(t) for t in allowed_tools if str(t).strip()]
+            if isinstance(allowed_tools, list) else None,
+            "request_timeout_seconds": float(timeout),
+        }
+
+    if variant == "deepseek":
+        from app.services.deepseek_adapter import (
+            PROVIDER_API_KEY_ENV,
+            is_native_deepseek_protocol,
+        )
+        from app.services.deepseek_harness_config_service import DeepSeekHarnessConfigService
+
+        config = DeepSeekHarnessConfigService.get_active_config()
+        if not config:
+            raise HarnessConfigError(
+                "deepseek_agent 步骤需要 DeepSeek Harness 全局配置（模型配置页），"
+                "当前未配置，无法在沙箱内拉起被测 agent")
+        api_key = str(config.get("api_key") or "").strip()
+        if not api_key:
+            raise HarnessConfigError("DeepSeek Harness 全局配置缺少 api_key")
+        env = DeepSeekHarnessConfigService.get_sdk_env()
+        merged = {
+            "provider": config.get("provider"),
+            "model": config.get("model"),
+            "profile": config.get("profile"),
+            "max_tokens": config.get("max_tokens"),
+            "protocol": config.get("protocol") or "deepseek",
+            "base_url": config.get("base_url"),
+        }
+        # 脚本级 harness_extra 覆盖全局默认（DSH 专用字段，见 PreJudgeScript 注释）
+        extra = (script or {}).get("harness_extra")
+        if isinstance(extra, dict):
+            merged.update({k: v for k, v in extra.items() if v is not None})
+        harness: Dict[str, Any] = {
+            "variant": "deepseek",
+            "env": env,
+            "request_timeout_seconds": float(timeout),
+            "initialize_timeout_seconds": min(30.0, float(timeout)),
+            **{k: v for k, v in merged.items() if v is not None},
+        }
+        if is_native_deepseek_protocol(merged):
+            # 官方协议：base_url/api_key 直传 SDK（与 DeepSeekAdapter._build_harness_kwargs 同口径）
+            harness["api_key"] = api_key
+        else:
+            # 网关协议：key 不落 patch 文件，经环境变量引用（镜像内 harness_entry 生成 patch）
+            env[PROVIDER_API_KEY_ENV] = api_key
+        return harness
+
+    raise HarnessConfigError(f"未知 harness 变体 {variant!r}（可选: {'/'.join(sorted(set(SANDBOX_HARNESS_VARIANTS.values())))}）")

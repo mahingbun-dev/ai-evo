@@ -15,8 +15,9 @@
   payload 中所有以 run_dir 为前缀的宿主绝对路径重写为容器路径（脚本拿
   到的 fields/inputs/_run_dir 路径在容器内有效）。
 - 网络：默认 ``--network none``（完全离网）；编排 step 声明
-  ``network: true`` 时改用默认 bridge 网络池（「脚本要访问被测系统」
-  需求的任务级开关；受限内网网段的精细化控制属后续迭代）。
+  ``network: true`` 时按 ARCH-1-2 三档归一为 open 档（docker-CLI 通道 →
+  默认 bridge 直出，「脚本要访问被测系统」需求的任务级开关；受限内网网段
+  的精细化控制属后续迭代）。
 - 依赖校验：container 模式下依赖声明对照 ``RUNNER_IMAGE_PACKAGES``
   静态清单（runner 镜像内已装集合），缺失即阻断——镜像不可变，无
   运行时 pip install 路径。清单与 docker/script-runner/packages.txt
@@ -28,47 +29,112 @@
   基于平台镜像裁剪：同基 python:3.12-slim，只装脚本常用依赖集合，不
   含平台代码与平台重依赖）。镜像离线预载到部署机是 D-3 运维事项。
 
+ARCH-1-1（设计 plans/2026-10-15-企业级评测系统架构设计.md §2.3 D1）：docker run
+参数构造（隔离常量 + 纯构造函数 + docker_binary）已抽到公共模块
+executor/sandbox_params.py——worker docker-CLI 通道（本模块）与 executor 沙箱
+服务（executor/app.py）共用同一份「单一事实源」，并随抽取获得 --cap-drop ALL
+与 no-new-privileges 加固位（预对齐 Phase 1-5 门禁）。两侧约束演进必须改公共
+模块并同步两侧注释，严禁任一侧私增 docker 参数（白名单语义）。
+
+ARCH-1-2（设计 §2.3 D1 / §3 表 1-2 行 / 「远期 K8s」预留扩展点）：执行通道抽
+``SandboxDriver`` 接口（run/wait/kill/status），两个实现——
+- ``DockerCliDriver``（本模块）：W15 既有 docker run --rm 前台通道整体迁移；
+- ``HttpExecutorDriver``（app/services/executor_client.py）：POST/GET 走
+  EXECUTOR_URL+EXECUTOR_TOKEN 的 executor 沙箱服务（目标通道）。
+``get_sandbox_driver()`` 按 EXECUTOR_URL 选择（未配置回退 docker-CLI 单机通道）；
+``execute_script_in_container`` 收敛为驱动无关编排（路径映射/stdin 重写/结果
+解析共用，差异全部下沉到驱动）。接入 K8s Job 驱动时 worker/api 零改动（§3
+远期扩展点 1）。网络三档（设计 D2）：``SCRIPT_NET_PROFILE``（none|egress|open，
+默认 none）+ step.network:true → open 档，映射见 WORKER_NET_PROFILE_TO_DOCKER。
+
+ARCH-3-2（设计 §2.3 D8 / §3 表 3-2 行）：被测 agent 与前处理脚本同级进沙箱。
+``execute_harness_in_container`` 复用同一 SandboxDriver 与工作区语义（差异只有
+三点：镜像按 exec_type 选 Dockerfile.harness 变体、出网恒 egress 档（模型外呼
+是刚需，不走 step.network 的 open 档语义）、载荷改工作区三件套落盘——
+instruction.md/stdin.json/harness.json，agent 侧不依赖 -i 管道）。harness 语义
+（变体/指令/凭据组装）在 app/services/harness_adapter.py，调度接线在
+app/services/pre_judge_runner.py。
+
+ARCH-3-4（设计 §3 Phase 3 表 3-4 行「gVisor 可选运行时档」）：沙箱可选
+``--runtime runsc`` 加固档（gVisor 应用层内核，高危脚本专用），档位经
+``SANDBOX_RUNTIME``（app/core/config.py，默认 runc）配置，由 ``sandbox_runtime``
+读取后经 SandboxRunSpec.runtime 透传到驱动；白名单（runc|runsc）与旗标构造的
+单一事实源在 executor/sandbox_params（两侧一致，缺省 runc 不拼旗标——默认
+行为不变）。HTTP executor 驱动的客户端透传（请求体带 runtime 字段）属后续
+批次接线（executor 侧字段与校验本批已开，见 executor/app.py.SandboxRunRequest）。
+
+bind 源宿主根映射（SANDBOX_WORKSPACE_HOST_ROOT，命名卷部署缺陷修复）：
+docker daemon 按**宿主路径**解析 ``-v`` 挂载源，而 ``SandboxRunSpec.
+workspace_host`` 一直是 worker 容器内视角路径（/app/uploads/script_runs/...）。
+uploads 以 bind 且宿主/容器路径一致部署时两者碰巧相同（缺省行为，完全不变）；
+命名卷部署（UPLOADS_VOLUME=uploads，群晖 compose 文档化形态）下宿主不存在
+该路径，daemon 会静默新建空 root 目录——沙箱空工作区、日志回不来且无报错。
+配置 SANDBOX_WORKSPACE_HOST_ROOT 后，``derive_mount_source`` 按
+host_root + 工作区相对 /app/uploads/script_runs 的后缀派生 ``mount_source``，
+CLI/HTTP 两驱动的 -v 挂载源一律改用之（workspace 字段语义不变：executor
+视角校验与 stdin 落盘点）；executor 侧同名 env + sandbox_params.
+resolve_mount_source 白名单（越界/伪造拒绝，两侧单一事实源）。
+
 执行返回结构与 local 模式完全一致（pre_script_results 标准条目）。
 """
 import logging
 import os
+import stat
 import subprocess
+import time
 import uuid
-from dataclasses import dataclass
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
+from prometheus_client import Histogram
+
 from app.core.config import get_settings
+from app.utils.path_safety import PathEscapeError
+
+# ARCH-1-1：单一事实源 re-export（保持既有调用面不变；noqa 见下——本模块
+# 对外仍暴露这些名字，pre_judge_script_service 与单测直接引用）
+from executor.sandbox_params import (  # noqa: F401
+    CONTAINER_CPUS,
+    CONTAINER_ENTRY_WRAPPER,
+    CONTAINER_ENV_ALLOWLIST,
+    CONTAINER_MEMORY,
+    CONTAINER_PIDS_LIMIT,
+    CONTAINER_PYTHON,
+    CONTAINER_RUNTIMES,
+    CONTAINER_TMPFS_HOME,
+    CONTAINER_TMPFS_SIZE,
+    CONTAINER_TMPFS_TMP,
+    CONTAINER_WORKSPACE,
+    DEFAULT_RUNTIME,
+    NET_PROFILES as _EXECUTOR_NET_PROFILES,
+    SANDBOX_WORKSPACE_HOST_ROOT_ENV as _WORKSPACE_HOST_ROOT_ENV,
+    SandboxParamError as _SandboxParamError,
+    build_docker_run_args as _build_sandbox_docker_run_args,
+    derive_mount_source_from_host_root as _derive_host_root_mount_source,
+    docker_binary,
+    validate_container_runtime as _validate_container_runtime,
+)
 
 logger = logging.getLogger(__name__)
 
-# 宿主工作区（uploads/script_runs/{task}/{data}/）在容器内的挂载点
-CONTAINER_WORKSPACE = "/workspace"
-# 容器内 tmpfs：/tmp（Python tempfile 缺省位）与容器用户 home（HOME/.cache 可写面）
-CONTAINER_TMPFS_TMP = "/tmp"
-CONTAINER_TMPFS_HOME = "/home/runner"
-# runner 镜像内 wrapper 路径（构建时 COPY app/services/pre_judge_entry.py）
-CONTAINER_ENTRY_WRAPPER = "/opt/runner/pre_judge_entry.py"
-# 容器内 python 解释器（镜像 PATH 内）
-CONTAINER_PYTHON = "python"
+# ARCH-2-3：沙箱启动（受理）延迟直方图（设计 §2.3 D7「沙箱启动延迟」/
+# §3 Phase 2 表 2-3 行）。口径 = execute_script_in_container 内 driver.run()
+# 从发起到受理完成：executor HTTP 通道即 POST /sandbox/run 往返（含 docker
+# run detach 冷启动，设计 §2.4 的 0.3-0.8s 量级）；docker-CLI 前台通道为
+# 子进程 spawn 耗时（受理与执行一体，无独立启动阶段，亚毫秒档）。driver
+# 标签区分两条通道；受理失败（SandboxDriverError）不观察——失败归任务
+# 失败指标与日志，不进延迟分布。
+SANDBOX_START_LATENCY = Histogram(
+    "aievo_sandbox_start_latency_seconds",
+    "沙箱启动（受理）延迟：driver.run() 发起→受理完成（秒）",
+    ["driver"],
+    buckets=(0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30),
+)
 
-# 资源限制（W15 方案要点：--memory 1g --cpus 0.5；--pids-limit 为
-# forkbomb 验收项的资源面强化）
-CONTAINER_MEMORY = "1g"
-CONTAINER_CPUS = "0.5"
-CONTAINER_PIDS_LIMIT = 128
-CONTAINER_TMPFS_SIZE = "64m"
 # 超时后 SIGTERM docker CLI 的宽限期（秒）：给容器优雅退出与 --rm 收尾的时间
 CONTAINER_TERM_GRACE_SECONDS = 5.0
-
-# 容器内显式注入的最小 env（白名单语义：无宿主 env 透传，docker run 不带
-# --env 就没有宿主环境）——只给 Python 运行必需项
-CONTAINER_ENV_ALLOWLIST: Dict[str, str] = {
-    "PYTHONIOENCODING": "utf-8",
-    "PYTHONUNBUFFERED": "1",
-    "LANG": "C.UTF-8",
-    "HOME": CONTAINER_TMPFS_HOME,
-}
 
 # 依赖声明校验（W15）：container 模式改为「runner 镜像内已装集合」静态清单。
 # 单一事实源是本常量；docker/script-runner/packages.txt 必须逐行一致，
@@ -82,7 +148,7 @@ RUNNER_IMAGE_PACKAGES: List[str] = [
     "numpy==2.2.6",
     "openpyxl==3.1.5",
     "xlrd==2.0.2",
-    "Pillow==12.1.1",
+    "Pillow==12.3.0",
     "PyYAML==6.0.3",
     "jsonpath-ng==1.7.0",
 ]
@@ -133,6 +199,153 @@ def runner_user() -> str:
     if raw:
         return raw
     return (get_settings().SCRIPT_RUNNER_USER or "10001:10001").strip()
+
+
+# ---------------- bind 源宿主根映射（SANDBOX_WORKSPACE_HOST_ROOT，命名卷部署） ----------------
+
+def sandbox_workspace_host_root() -> str:
+    """bind 源宿主根（SANDBOX_WORKSPACE_HOST_ROOT；环境变量实时读优先于 Settings）
+
+    缺省空串 = 未配置 = 同路径 bind 部署现状（spec.mount_source 缺省）。
+    与 executor 侧同名 env 共用一份配置语义（两侧各自实时读，compose 经
+    env_file / 插值分别注入 worker 与 executor）。
+    """
+    raw = (os.environ.get(_WORKSPACE_HOST_ROOT_ENV) or "").strip()
+    if raw:
+        return raw
+    return (get_settings().SANDBOX_WORKSPACE_HOST_ROOT or "").strip()
+
+
+def derive_mount_source(workspace_host: str) -> Optional[str]:
+    """worker 视角工作区路径 → 宿主 bind 源（SANDBOX_WORKSPACE_HOST_ROOT 配置时）
+
+    - 未配置 → None（spec.mount_source 缺省 = workspace_host，同路径 bind
+      部署行为完全不变）；
+    - 已配置（命名卷部署）→ host_root + workspace 相对 /app/uploads/
+      script_runs（sandbox_params.WORKSPACE_ROOT，worker 容器同路径挂载）的
+      后缀；派生核心与 executor 侧兜底共用同一函数（单一事实源）；
+    - 工作区不在 WORKSPACE_ROOT 子树内 → SandboxParamError fail-loud：
+      命名卷部署下映射不到宿主路径的挂载必然静默错（daemon 自动建空目录），
+      宁可拒绝成脚本 fail 条目（调用点在受理 try 内，与 SANDBOX_RUNTIME
+      的错误口径一致），绝不带病进沙箱。
+    """
+    host_root = sandbox_workspace_host_root()
+    if not host_root:
+        return None
+    ws_real = os.path.realpath(workspace_host)
+    try:
+        return _derive_host_root_mount_source(ws_real, host_root)
+    except _SandboxParamError as e:
+        raise SandboxDriverError(f"SANDBOX_WORKSPACE_HOST_ROOT 映射失败: {e}") from e
+
+
+# ---------------- 沙箱容器运行时档（ARCH-3-4，设计 §3 表 3-4 行） ----------------
+
+def sandbox_runtime() -> str:
+    """沙箱容器运行时档（SANDBOX_RUNTIME，默认 runc；白名单 runc|runsc）
+
+    环境变量实时读取（与 runner_image 同语义：改 env 重启 worker 即切换或
+    回退）；非法值抛 SandboxDriverError 拒绝——与 SCRIPT_NET_PROFILE 的
+    fail-safe 回退方向不同：网络档回退是收紧（不出网），运行时档回退是放松
+    （加固档悄悄降回 runc，高危脚本看似在 gVisor 下跑实际没有），必须
+    fail-loud。白名单同源 executor/sandbox_params.CONTAINER_RUNTIMES；
+    Settings 层同闸（app/core/config.py field_validator，启动即拒）。
+    """
+    raw = (os.environ.get("SANDBOX_RUNTIME") or "").strip()
+    value = raw or (get_settings().SANDBOX_RUNTIME or DEFAULT_RUNTIME).strip()
+    try:
+        return _validate_container_runtime(value)
+    except _SandboxParamError as e:
+        raise SandboxDriverError(f"SANDBOX_RUNTIME 非法: {e}") from e
+
+
+# ---------------- 被测 agent harness 变体镜像（ARCH-3-2，设计 D8） ----------------
+
+# 变体 → 缺省镜像引用。变体镜像由 docker/script-runner/Dockerfile.harness 构建
+# （claude 变体含离线 claude-local CLI 的 COPY，目录不入 git，真实构建留部署机）；
+# 基名仍落 executor 镜像白名单 RUNNER_IMAGE_BASES（sandbox_params，单一事实源），
+# 不开放 registry 前缀/digest 引用（与 3-3 注明的 digest 白名单现状同批约束）。
+# Settings 字段扩展不在本批边界（app/core/config.py 未动），故镜像引用只有
+# 「环境变量覆盖 + 缺省钉 tag」两级，读取语义与 runner_image 的 env 实时读一致。
+DEFAULT_HARNESS_IMAGES: Dict[str, str] = {
+    "claude": "ai-evo-script-runner:harness-claude",
+    "deepseek": "ai-evo-script-runner:harness-deepseek",
+}
+# 变体 → 镜像覆盖环境变量（部署机切换变体镜像 tag 用）
+HARNESS_IMAGE_ENV_VARS: Dict[str, str] = {
+    "claude": "HARNESS_CLAUDE_IMAGE",
+    "deepseek": "HARNESS_DEEPSEEK_IMAGE",
+}
+
+# 沙箱内 harness 入口（Dockerfile.harness 构建时 heredoc 写入镜像，契约：
+# argv = [variant, instruction.md, stdin.json, harness.json]，三件套由
+# execute_harness_in_container staged 到 workdir，容器内相对路径引用）
+CONTAINER_HARNESS_ENTRY = "/opt/runner/harness_entry.py"
+# 工作区 staged 三件套文件名（cwd 直下，与下方 HARNESS_* 常量一一对应）
+HARNESS_INSTRUCTION_FILE = "instruction.md"
+HARNESS_STDIN_FILE = "stdin.json"
+HARNESS_CONFIG_FILE = "harness.json"
+# harness 产物目录名：容器内 harness_entry 把工具调用记录/转录写 workdir 下
+# 该目录（D8「被测 agent 的工具调用记录由 harness 采集回工作区」），worker
+# 侧执行后回收为结果条目 files（宿主路径）
+HARNESS_ARTIFACTS_DIR = "artifacts"
+
+
+def harness_image(variant: str) -> str:
+    """harness 变体镜像引用（HARNESS_CLAUDE_IMAGE/HARNESS_DEEPSEEK_IMAGE 覆盖）
+
+    环境变量实时读 + 缺省钉 tag；未知变体明确拒绝（fail-fast，不猜镜像）。
+    """
+    env_var = HARNESS_IMAGE_ENV_VARS.get(variant)
+    if not env_var:
+        raise SandboxDriverError(
+            f"未知 harness 变体 {variant!r}（可选: {'/'.join(sorted(DEFAULT_HARNESS_IMAGES))}）")
+    raw = (os.environ.get(env_var) or "").strip()
+    return raw or DEFAULT_HARNESS_IMAGES[variant]
+
+
+# ---------------- 网络三档（ARCH-1-2，设计 D2） ----------------
+
+_VALID_NET_PROFILES = ("none", "egress", "open")
+
+
+def get_script_net_profile() -> str:
+    """平台级网络档位 SCRIPT_NET_PROFILE（none|egress|open，默认 none）
+
+    环境变量实时读取（与 get_script_exec_mode 同语义）；非法值告警并回退
+    none（fail-safe：不认识的档位绝不给出网）。
+    """
+    raw = (os.environ.get("SCRIPT_NET_PROFILE") or "").strip().lower()
+    if raw:
+        if raw in _VALID_NET_PROFILES:
+            return raw
+        logger.warning(f"SCRIPT_NET_PROFILE 非法值 {raw!r}，回退 none（可选: {'/'.join(_VALID_NET_PROFILES)}）")
+        return "none"
+    profile = (get_settings().SCRIPT_NET_PROFILE or "none").strip().lower()
+    return profile if profile in _VALID_NET_PROFILES else "none"
+
+
+def resolve_net_profile(network_flag: bool = False) -> str:
+    """编排步骤网络开关 + 平台档位 → 三档档位（none|egress|open）
+
+    - step.network=true（W15「脚本要访问被测系统」语义）→ open 档（docker-CLI
+      通道映射默认 bridge 直出；executor 通道白名单未放开 open 档，请求即拒——
+      错误透传给脚本结果，见 HttpExecutorDriver）；
+    - 未声明 → 取 SCRIPT_NET_PROFILE（默认 none）。
+    """
+    return "open" if network_flag else get_script_net_profile()
+
+
+# worker docker-CLI 通道的「三档档位 → docker --network 取值」映射（ARCH-1-2）。
+# egress 网络名与 executor 白名单 sandbox_params.NET_PROFILES 同源（单一事实源：
+# 1-3 compose 建同名网络）；open 档 = 默认 bridge 直出（设计 D2：超管审批流程
+# 属后续条目）。executor 通道的档位白名单在 sandbox_params.NET_PROFILES（open
+# 无映射，请求即拒），与本表是两个不同通道的取值面。
+WORKER_NET_PROFILE_TO_DOCKER: Dict[str, str] = {
+    "none": "none",
+    "egress": _EXECUTOR_NET_PROFILES["egress"],
+    "open": "bridge",
+}
 
 
 # ---------------- 路径映射与 stdin 重写 ----------------
@@ -203,6 +416,43 @@ def rewrite_stdin_paths(value: Any, run_dir_host: str, container_root: str = CON
 
 # ---------------- docker run 命令构造（纯函数，可单测） ----------------
 
+def build_docker_run_args_for_profile(
+    image: str,
+    user: str,
+    paths: ContainerPaths,
+    entry_rel: str,
+    container_name: str,
+    net_profile: str,
+) -> List[str]:
+    """构造 docker run 参数列表（不含执行，纯构造）——三档网络档位版（ARCH-1-2）
+
+    隔离参数的单一事实源在 executor/sandbox_params.py（与 executor 沙箱服务
+    共用，worker 通道随抽取获得 --cap-drop ALL / no-new-privileges 加固位）；
+    完整隔离清单与旗标顺序见公共模块 build_docker_run_args 的 docstring。
+    本函数只做 worker 通道特有映射：
+    - 挂载源/容器路径取自 ContainerPaths（挂载仅本次 script_runs 工作目录）；
+    - 尾部命令与 local 同构：[python, pre_judge_entry.py, staged_dir, entry_rel]，
+      wrapper 在镜像内 /opt/runner/pre_judge_entry.py（构建时 COPY）；
+    - net_profile 三档映射 WORKER_NET_PROFILE_TO_DOCKER（none|egress|open；
+      executor 侧档位语义见 sandbox_params.network_profile_to_docker）；
+    - 前台运行 ``-i``：stdin 载荷经 docker CLI 传入容器。
+    """
+    if net_profile not in WORKER_NET_PROFILE_TO_DOCKER:
+        raise ValueError(f"未知网络档位 {net_profile!r}（可选: {'/'.join(WORKER_NET_PROFILE_TO_DOCKER)}）")
+    return _build_sandbox_docker_run_args(
+        image=image,
+        user=user,
+        mount_host=paths.run_dir_host,
+        mount_container=paths.run_dir_container,
+        workdir_container=paths.cwd_container,
+        network_name=WORKER_NET_PROFILE_TO_DOCKER[net_profile],
+        container_name=container_name,
+        tail_command=[CONTAINER_PYTHON, CONTAINER_ENTRY_WRAPPER,
+                      paths.staged_dir_container, entry_rel],
+        interactive=True,
+    )
+
+
 def build_docker_run_args(
     image: str,
     user: str,
@@ -211,53 +461,17 @@ def build_docker_run_args(
     container_name: str,
     network: bool = False,
 ) -> List[str]:
-    """构造 docker run 参数列表（不含执行，纯构造）
+    """构造 docker run 参数列表——W15 既有布尔开关面（ARCH-1-2 起为兼容薄封装）
 
-    隔离清单（整改计划 §4 W15 方案要点逐项落位）：
-    - ``--rm``        退出即清理容器
-    - ``--name``      唯一容器名（超时兜底 ``docker rm -f`` 依赖）
-    - ``--user``      非 root 运行（uid:gid）
-    - ``--memory``/``--memory-swap``/``--cpus``/``--pids-limit`` 资源上限
-      （memory-swap = memory：禁用 swap 扩展，超限 OOM kill 而非拖垮宿主）
-    - ``--read-only`` 根文件系统只读；可写面仅 bind mount 工作区 + tmpfs
-    - ``--tmpfs``     /tmp 与容器用户 home（nosuid,noexec，限 64m）
-    - ``--network``   默认 none（完全离网）；network=True 时 bridge
-    - ``-i``          stdin 载荷经 docker CLI 传入容器（-t 不加：无 TTY）
-    - ``-e``          仅注入 CONTAINER_ENV_ALLOWLIST 最小集合（平台 env 剥离）
-    - ``-v``          仅挂载本次 script_runs 工作目录（run_dir → /workspace）
-    - ``-w``          容器内 cwd（工作区下 script_id 子目录，与 local 一致）
-
-    尾部命令与 local 同构：[python, pre_judge_entry.py, staged_dir, entry_rel]，
-    wrapper 在镜像内 /opt/runner/pre_judge_entry.py（构建时 COPY）。
+    冒烟链路（pre_judge_script_service._run_smoke_test_in_container）与既有
+    单测仍按布尔开关调用：network=True → open 档（默认 bridge 直出），
+    False → none 档。生产执行通道（execute_script_in_container → 驱动）已改
+    三档档位版 build_docker_run_args_for_profile。
     """
-    args: List[str] = [
-        "run", "--rm",
-        "--name", container_name,
-        "--user", user,
-        "--memory", CONTAINER_MEMORY,
-        "--memory-swap", CONTAINER_MEMORY,
-        "--cpus", CONTAINER_CPUS,
-        "--pids-limit", str(CONTAINER_PIDS_LIMIT),
-        "--read-only",
-        "--tmpfs", f"{CONTAINER_TMPFS_TMP}:rw,nosuid,noexec,size={CONTAINER_TMPFS_SIZE}",
-        "--tmpfs", f"{CONTAINER_TMPFS_HOME}:rw,nosuid,noexec,size={CONTAINER_TMPFS_SIZE}",
-        "--network", ("bridge" if network else "none"),
-    ]
-    for key, val in CONTAINER_ENV_ALLOWLIST.items():
-        args.extend(["-e", f"{key}={val}"])
-    args.extend([
-        "-i",
-        "-v", f"{paths.run_dir_host}:{paths.run_dir_container}",
-        "-w", paths.cwd_container,
-        image,
-        CONTAINER_PYTHON, CONTAINER_ENTRY_WRAPPER, paths.staged_dir_container, entry_rel,
-    ])
-    return args
-
-
-def docker_binary() -> str:
-    """docker CLI 可执行文件（PATH 解析，可被环境变量覆盖兜底）"""
-    return os.environ.get("DOCKER_BINARY") or "docker"
+    return build_docker_run_args_for_profile(
+        image=image, user=user, paths=paths, entry_rel=entry_rel,
+        container_name=container_name, net_profile=("open" if network else "none"),
+    )
 
 
 def _new_container_name(script_key: str) -> str:
@@ -267,7 +481,244 @@ def _new_container_name(script_key: str) -> str:
     return f"aievo-script-{safe[:40]}-{tag}"
 
 
-# ---------------- 容器内执行 ----------------
+# ---------------- SandboxDriver 抽象（ARCH-1-2，设计 §2.3 D1 / 远期 K8s 预留） ----------------
+
+class SandboxDriverError(RuntimeError):
+    """沙箱驱动层错误（受理失败/白名单拒绝/连接失败等）
+
+    execute_script_in_container 统一捕获并转脚本 fail 条目（finish_reason=
+    error），错误消息面向运维定位（含驱动名与原因）。
+    """
+
+
+@dataclass
+class SandboxRunSpec:
+    """一次沙箱执行的驱动无关参数（ARCH-1-2）
+
+    由 execute_script_in_container 统一组装（路径映射与 stdin 重写共用），
+    驱动只负责「按 spec 起沙箱、收状态」——差异（前台 -i vs 后台受理+轮询、
+    stdin 管道 vs 工作区落盘）全部下沉到驱动实现。
+    """
+    image: str                     # runner 镜像引用
+    user: str                      # 容器内运行用户 uid:gid（非 root）
+    workspace_host: str            # 挂载源（宿主工作区，executor 白名单子树）
+    workspace_container: str       # 容器内挂载点（恒 /workspace）
+    workdir_container: str         # 容器内工作目录
+    cwd_host: str                  # 宿主 cwd（stdout/stderr 日志归位目标）
+    net_profile: str               # 三档档位（resolve_net_profile 归一）
+    container_name: str            # 唯一容器名（超时兜底回收依赖）
+    entrypoint: List[str]          # exec 形式容器 argv（[python, wrapper, staged, entry_rel]）
+    stdin_payload: bytes           # stdin 载荷（CLI：管道传入；executor：驱动落盘工作区）
+    timeout: float                 # 执行超时秒数
+    # 容器运行时档（ARCH-3-4：runc 默认|runsc 加固；sandbox_runtime 读取，
+    # 白名单校验后进驱动；既有 spec 构造面缺省 runc 不变）
+    runtime: str = DEFAULT_RUNTIME
+    # bind 源（docker daemon 宿主路径口径）：SANDBOX_WORKSPACE_HOST_ROOT 配置
+    # （命名卷部署）时 derive_mount_source 派生的宿主绝对路径，受理 try 内
+    # 赋值（与 runtime 同模式）；缺省 None = workspace_host（同路径 bind 部署，
+    # daemon 直接按容器内视角路径解析——现状不变）。workspace 字段语义不变
+    # （executor 视角校验、stdin 落盘点）
+    mount_source: Optional[str] = None
+
+
+@dataclass
+class SandboxHandle:
+    """run 受理后的执行句柄（wait/kill/status 的寻址凭据）"""
+    run_id: str                    # 驱动内标识（CLI=容器名；executor=run_id）
+    container_name: str
+    extra: Dict[str, Any] = field(default_factory=dict)  # 驱动私有状态（如 Popen）
+
+
+@dataclass
+class SandboxRunStatus:
+    """沙箱执行状态（wait 阻塞收口与 status 非阻塞查询共用）"""
+    state: str                     # running|done|timeout|failed
+    exit_code: Optional[int] = None
+    error: str = ""
+
+
+class SandboxDriver(ABC):
+    """沙箱执行驱动接口（ARCH-1-2）
+
+    设计 §3「远期 K8s 驱动」预留的扩展点：现有 docker-CLI / HTTP-executor 两个
+    实现之外，接入 K8s 时新增 Job 驱动即可（沙箱 = Pod，egress 档位由
+    NetworkPolicy 表达），worker/api 零改动。语义契约：
+    - ``run``     受理执行（不阻塞到完成）；失败抛 SandboxDriverError；
+    - ``wait``    阻塞等待终态（done/timeout/failed）；超时收口在驱动内部完成
+                  （CLI：SIGTERM→SIGKILL+docker rm -f；executor：服务端监督线程
+                  docker wait 超时 rm -f，客户端轮询带死线兜底）；
+    - ``kill``    尽力终止（异常路径的人工收口；wait 的超时路径内部也会调用）；
+    - ``status``  非阻塞查询（纯读，无副作用）。
+    """
+
+    name: str = "sandbox"
+
+    @abstractmethod
+    def run(self, spec: SandboxRunSpec) -> SandboxHandle:
+        """发起沙箱执行，返回句柄"""
+
+    @abstractmethod
+    def wait(self, handle: SandboxHandle, timeout: float) -> SandboxRunStatus:
+        """阻塞等待执行完成（超时由驱动内部收口并返回 state=timeout）"""
+
+    @abstractmethod
+    def kill(self, handle: SandboxHandle) -> None:
+        """尽力终止该执行（幂等）"""
+
+    @abstractmethod
+    def status(self, handle: SandboxHandle) -> SandboxRunStatus:
+        """非阻塞查询当前状态"""
+
+
+class DockerCliDriver(SandboxDriver):
+    """本地 docker-CLI 驱动：W15 既有 ``docker run --rm`` 前台通道整体迁移（ARCH-1-2）
+
+    - run：前台 ``-i`` 起容器，stdout/stderr 重定向到 cwd 下日志文件，stdin
+      载荷经 docker CLI 管道传入；
+    - wait：proc.wait(timeout)；超时经 kill（SIGTERM CLI → 宽限 → SIGKILL +
+      ``docker rm -f`` 按容器名兜底，见 _terminate_docker_run）收口；
+    - 本驱动即 SCRIPT_EXEC_MODE=container 在 EXECUTOR_URL 未配置时的回退通道
+      （本机灰度/单机部署形态），隔离参数与 executor 通道同一事实源。
+    """
+    name = "docker-cli"
+
+    def run(self, spec: SandboxRunSpec) -> SandboxHandle:
+        stdout_file = Path(spec.cwd_host) / "stdout.log"
+        stderr_file = Path(spec.cwd_host) / "stderr.log"
+        args = [docker_binary(), *_build_sandbox_docker_run_args(
+            image=spec.image,
+            user=spec.user,
+            # bind 源：daemon 按宿主路径解析 -v 左值——命名卷部署下用
+            # derive_mount_source 派生的 mount_source，缺省回退 workspace_host
+            mount_host=spec.mount_source or spec.workspace_host,
+            mount_container=spec.workspace_container,
+            workdir_container=spec.workdir_container,
+            network_name=_worker_network_name(spec.net_profile),
+            container_name=spec.container_name,
+            tail_command=spec.entrypoint,
+            runtime=spec.runtime,  # ARCH-3-4：运行时档透传（runc|runsc）
+            interactive=True,
+        )]
+        try:
+            out_f = open(stdout_file, "wb")
+            try:
+                err_f = open(stderr_file, "wb")
+            except OSError:
+                out_f.close()
+                raise
+            try:
+                proc = subprocess.Popen(
+                    args,
+                    cwd=spec.cwd_host,
+                    stdin=subprocess.PIPE,
+                    stdout=out_f,
+                    stderr=err_f,
+                )
+            finally:
+                # 子进程持有 dup 后的 fd，父侧句柄即可关闭（与原 with 块语义一致）
+                out_f.close()
+                err_f.close()
+        except OSError as e:
+            # 含 docker CLI 缺失等启动失败（CLI 退出码 125 场景在 wait 的退出码分支）
+            raise SandboxDriverError(f"容器执行启动失败: {e}")
+        try:
+            proc.stdin.write(spec.stdin_payload)
+            proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass  # 容器未读完 stdin 即退出，按退出码/输出处理
+        return SandboxHandle(run_id=spec.container_name, container_name=spec.container_name,
+                             extra={"proc": proc})
+
+    def wait(self, handle: SandboxHandle, timeout: float) -> SandboxRunStatus:
+        proc: subprocess.Popen = handle.extra["proc"]
+        try:
+            returncode = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self.kill(handle)
+            returncode = proc.wait()
+            return SandboxRunStatus(state="timeout", exit_code=returncode)
+        except OSError as e:
+            raise SandboxDriverError(f"容器执行启动失败: {e}")
+        return SandboxRunStatus(state="done", exit_code=returncode)
+
+    def kill(self, handle: SandboxHandle) -> None:
+        _terminate_docker_run(handle.extra["proc"], handle.container_name)
+
+    def status(self, handle: SandboxHandle) -> SandboxRunStatus:
+        proc: subprocess.Popen = handle.extra["proc"]
+        returncode = proc.poll()
+        if returncode is None:
+            return SandboxRunStatus(state="running")
+        return SandboxRunStatus(state="done", exit_code=returncode)
+
+
+def _worker_network_name(net_profile: str) -> str:
+    """三档档位 → docker --network 取值（worker CLI 通道；未知档位拒绝）"""
+    try:
+        return WORKER_NET_PROFILE_TO_DOCKER[net_profile]
+    except KeyError:
+        raise SandboxDriverError(
+            f"未知网络档位 {net_profile!r}（可选: {'/'.join(WORKER_NET_PROFILE_TO_DOCKER)}）")
+
+
+def get_sandbox_driver() -> SandboxDriver:
+    """container 模式的沙箱驱动选择（ARCH-1-2，设计 §2.3 D1 目标通道）
+
+    - EXECUTOR_URL 已配置（环境变量实时读，优先于 Settings）→ HttpExecutorDriver
+      （worker 与 executor 之间是 compose 内网 + token 的 HTTP 调用，实现见
+      app/services/executor_client.py）；
+    - 未配置 → DockerCliDriver（W15 既有 docker-CLI 单机通道回退：本机灰度、
+      冒烟链路同构依赖与无 executor 的部署形态；隔离参数同一事实源，仅执行
+      位置不同）。驱动实例无状态，每次调用新建（配置实时读，测试可 env 切换）。
+    """
+    from app.services.executor_client import executor_url, HttpExecutorDriver  # 懒加载避免顶层互引
+    if executor_url():
+        return HttpExecutorDriver()
+    return DockerCliDriver()
+
+
+# ---------------- 容器内执行（驱动无关编排，ARCH-1-2） ----------------
+
+def relax_tree_for_sandbox_uid(*roots: Path) -> None:
+    """容器模式挂载树放宽 others rX（沙箱 uid 10001 非属主，D6 0o750 下无法遍历）
+
+    仅容器模式、仅本次运行的工作区树（ephemeral，评完即清）追加 others
+    读+目录遍历位；不追加 w（entry wrapper 只读消费，stdout 出 JSON 不落盘）。
+    secure_mkdir 的 0o750 创建口径不变（tests/security/test_runtime_dir_permissions.py
+    仍绿），本函数只在 driver 受理前对传入树做执行期放宽。调用方以挂载源
+    公共祖先树为根传入（挂载根本身也要有 others r-x——漏放宽挂载根，沙箱
+    在 /workspace 顶层即 EACCES）。
+    """
+    for root in roots:
+        if not root:
+            continue
+        try:
+            st = os.stat(root)
+        except OSError:
+            continue  # 不存在（None/空/已被并发清理）：跳过该树
+        try:
+            if stat.S_ISDIR(st.st_mode):
+                os.chmod(root, stat.S_IMODE(st.st_mode) | 0o005)  # others r-x
+            else:
+                os.chmod(root, stat.S_IMODE(st.st_mode) | 0o004)  # others r
+        except OSError:
+            continue
+        if not stat.S_ISDIR(st.st_mode):
+            continue
+        # os.walk 缺省忽略遍历错误；chmod 单点失败（并发清理竞态
+        # FileNotFoundError 等 OSError）跳过该条继续
+        for dirpath, _dirnames, filenames in os.walk(root):
+            try:
+                os.chmod(dirpath, stat.S_IMODE(os.stat(dirpath).st_mode) | 0o005)
+            except OSError:
+                continue
+            for file_name in filenames:
+                file_path = os.path.join(dirpath, file_name)
+                try:
+                    os.chmod(file_path, stat.S_IMODE(os.stat(file_path).st_mode) | 0o004)
+                except OSError:
+                    continue
+
 
 def execute_script_in_container(
     script: Dict[str, Any],
@@ -280,8 +731,13 @@ def execute_script_in_container(
     started: float,
     static_check: Optional[List[str]] = None,
     network: bool = False,
+    driver: Optional[SandboxDriver] = None,
 ) -> Dict[str, Any]:
-    """container 模式执行：docker run --rm 跑脚本，返回结构与 local 完全一致
+    """container 模式执行：经 SandboxDriver 跑沙箱，返回结构与 local 完全一致
+
+    ARCH-1-2 起为驱动无关编排：路径映射、stdin 宿主路径重写、结果解析归一化
+    全部共用（本函数），执行差异（docker-CLI 前台通道 / executor HTTP 受理+
+    轮询）下沉到驱动；接入新驱动（如 K8s Job）本函数零改动。
 
     Args:
         script: 脚本定义 {script_id, name, ...}
@@ -293,7 +749,8 @@ def execute_script_in_container(
         timeout: 超时秒数（超时终止容器）
         started: 计时起点 time.time()
         static_check: 运行前静态风险扫描结果（提示级透传）
-        network: 任务级网络开关（默认关 → --network none）
+        network: 任务级网络开关（W15 语义；经 resolve_net_profile 归一为三档）
+        driver: 显式驱动（分流点注入）；缺省按 get_sandbox_driver() 解析
 
     返回 pre_script_results 标准条目（_normalize_stdout 组装，复用
     pre_judge_runner 的解析与归一化，保证两条通道语义一致）。
@@ -318,55 +775,72 @@ def execute_script_in_container(
     paths = build_container_paths(run_dir_host, cwd_host, staged_dir_host)
     container_name = _new_container_name(str(script_key))
 
+    # 沙箱挂载树执行期放宽（others rX）：以挂载源（run_dir/cwd 公共祖先）为根
+    # ——debug 链 cwd 在 run_dir 外时挂载根比 run_dir 高，漏放宽挂载根本身
+    # 沙箱在 /workspace 顶层即 EACCES（CI 实测 uid 10001）；不加 w
+    relax_tree_for_sandbox_uid(Path(paths.run_dir_host))
+
     # stdin 里的宿主工作区路径全部重写为容器路径（脚本在容器内按 /workspace 取值）
     container_stdin = rewrite_stdin_paths(stdin, paths.run_dir_host, paths.run_dir_container)
     stdin_payload = _dump_stdin(container_stdin)
 
-    args = [docker_binary(), *build_docker_run_args(
-        image=image, user=user, paths=paths, entry_rel=entry_rel,
-        container_name=container_name, network=network,
-    )]
+    spec = SandboxRunSpec(
+        image=image,
+        user=user,
+        workspace_host=paths.run_dir_host,
+        workspace_container=paths.run_dir_container,
+        workdir_container=paths.cwd_container,
+        cwd_host=paths.cwd_host,
+        net_profile=resolve_net_profile(network),
+        container_name=container_name,
+        entrypoint=[CONTAINER_PYTHON, CONTAINER_ENTRY_WRAPPER,
+                    paths.staged_dir_container, entry_rel],
+        stdin_payload=stdin_payload,
+        timeout=timeout,
+    )
+    sandbox_driver = driver or get_sandbox_driver()
 
-    stdout_file = Path(cwd_host) / "stdout.log"
-    stderr_file = Path(cwd_host) / "stderr.log"
-    timed_out = False
-    returncode: Optional[int] = None
     try:
-        with open(stdout_file, "wb") as out_f, open(stderr_file, "wb") as err_f:
-            proc = subprocess.Popen(
-                args,
-                cwd=str(cwd_host),
-                stdin=subprocess.PIPE,
-                stdout=out_f,
-                stderr=err_f,
-            )
-            try:
-                proc.stdin.write(stdin_payload)
-                proc.stdin.close()
-            except (BrokenPipeError, OSError):
-                pass  # 容器未读完 stdin 即退出，按退出码/输出处理
-            try:
-                returncode = proc.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                _terminate_docker_run(proc, container_name)
-                returncode = proc.wait()
-    except OSError as e:
-        # 含镜像缺失等启动失败（docker CLI 退出码 125 场景在 returncode 分支）
-        return _result(script_id, name, "fail", error=f"容器执行启动失败: {e}",
+        # bind 源宿主根映射（命名卷部署）：SANDBOX_WORKSPACE_HOST_ROOT 配置时
+        # 派生 mount_source；越界（SandboxDriverError）与运行时档同口径转
+        # 脚本 fail 条目，不炸编排
+        spec.mount_source = derive_mount_source(spec.workspace_host)
+        # ARCH-3-4：运行时档读取（SANDBOX_RUNTIME）与白名单校验在受理 try 内
+        # ——非法配置（SandboxDriverError）按驱动错误转脚本 fail 条目，不炸编排
+        spec.runtime = sandbox_runtime()
+        # ARCH-2-3：沙箱启动（受理）延迟打点——只观察受理成功（口径见
+        # SANDBOX_START_LATENCY 注释）
+        _sandbox_start = time.monotonic()
+        handle = sandbox_driver.run(spec)
+        SANDBOX_START_LATENCY.labels(driver=sandbox_driver.name).observe(
+            time.monotonic() - _sandbox_start)
+        status = sandbox_driver.wait(handle, timeout)
+    except SandboxDriverError as e:
+        # 驱动层错误（CLI 启动失败/executor 白名单拒绝/连接失败）：面向运维定位
+        return _result(script_id, name, "fail", error=str(e),
                        finish_reason="error", started_at=started, static_check=static_check)
 
+    # 两条驱动的日志统一归位到 cwd 下（CLI：Popen 重定向已在位；executor：
+    # wait 收口时把工作区根的 docker logs 落盘文件挪到 cwd，见 _relocate_logs）
+    stdout_file = Path(cwd_host) / "stdout.log"
+    stderr_file = Path(cwd_host) / "stderr.log"
     stdout_tail = _read_file_tail(stdout_file, SCRIPT_STDOUT_LIMIT)
     stderr_tail = _read_file_tail(stderr_file, SCRIPT_STDERR_LIMIT)
 
-    if timed_out:
+    if status.state == "timeout":
+        detail = f"；{status.error}" if status.error else ""
         return _result(script_id, name, "fail",
-                       error=f"脚本执行超时被终止（>{timeout:.0f}秒，容器已回收）",
+                       error=f"脚本执行超时被终止（>{timeout:.0f}秒，容器已回收）{detail}",
                        finish_reason="timeout", started_at=started, static_check=static_check)
 
-    if returncode != 0:
-        hint = _docker_failure_hint(returncode, stderr_tail, image)
-        error = f"脚本退出码 {returncode}: {(stderr_tail.strip() or '无 stderr 输出')[:4000]}{hint}"
+    if status.state == "failed":
+        return _result(script_id, name, "fail",
+                       error=(status.error or f"沙箱执行失败（{sandbox_driver.name} 驱动）")[:4000],
+                       finish_reason="error", started_at=started, static_check=static_check)
+
+    if status.exit_code != 0:
+        hint = _docker_failure_hint(status.exit_code, stderr_tail, image)
+        error = f"脚本退出码 {status.exit_code}: {(stderr_tail.strip() or '无 stderr 输出')[:4000]}{hint}"
         return _result(script_id, name, "fail", error=error[:4000],
                        finish_reason="error", started_at=started, static_check=static_check)
 
@@ -377,6 +851,211 @@ def execute_script_in_container(
                        finish_reason="error", started_at=started, static_check=static_check)
 
     return _normalize_stdout(script_id, name, stdout, started, static_check=static_check)
+
+
+# ---------------- 被测 agent 沙箱执行（ARCH-3-2，设计 §2.3 D8 / §3 表 3-2 行） ----------------
+
+def execute_harness_in_container(
+    script: Dict[str, Any],
+    stdin: Dict[str, Any],
+    timeout: float,
+    started: float,
+    variant: str,
+    instruction: str,
+    harness_config: Dict[str, Any],
+    driver: Optional[SandboxDriver] = None,
+) -> Dict[str, Any]:
+    """exec_type=claude_agent/deepseek_agent：经 SandboxDriver 在沙箱内拉起被测 agent
+
+    与 execute_script_in_container 同构的驱动无关编排（同一 SandboxDriver、同一
+    script_runs 工作区语义、同一 stdout/stderr 日志位与结果条目结构），差异：
+
+    - 镜像：按 variant 选 Dockerfile.harness 变体（harness_image，env 可覆盖）；
+    - 网络：恒 egress 档（D8「沙箱内出网走 egress 档」——模型 API 外呼是 agent
+      刚需，白名单域名经 egress 网络，不受 step.network/SCRIPT_NET_PROFILE 影响）；
+    - 载荷：无脚本包副本，改在工作区 staged 三件套（instruction.md 指令文本 /
+      stdin.json 容器路径版 payload / harness.json 凭据与参数），容器入口
+      /opt/runner/harness_entry.py 按相对文件名读取（stdin_payload 为空——
+      两条驱动通道对空载荷均兼容：CLI 空写即关管道，executor 落盘空文件重定向）；
+    - 回收：agent 结果 JSON 的 files 路径是容器路径（/workspace/...），统一逆
+      映射回宿主工作区路径；artifacts/ 目录内产物（工具调用记录等）自动并入
+      files——产物只落工作区（D5 工作区语义），评完即清。
+
+    Args:
+        script: 脚本定义 {script_id, name, exec_type, ...}（agent 类型）
+        stdin: stdin payload（宿主路径版；函数内重写为容器路径后落盘 stdin.json）
+        timeout: 超时秒数（超时终止容器）
+        started: 计时起点 time.time()
+        variant: harness 变体（claude|deepseek，harness_adapter.harness_variant_for）
+        instruction: 指令文本（harness_adapter.build_harness_instruction 产物）
+        harness_config: 凭据与参数（harness_adapter.build_harness_agent_config 产物；
+            含敏感 env，随工作区 0o750 目录落盘、评完即清，不进日志）
+        driver: 显式驱动（测试注入）；缺省按 get_sandbox_driver() 解析
+
+    返回 pre_script_results 标准条目（复用 _normalize_stdout，另加 harness 元信息：
+    variant/image/artifacts_dir 供结果页与排障区分执行通道）。
+    """
+    # 延迟 import：与 execute_script_in_container 同口径避免模块顶层互引
+    from app.services.pre_judge_runner import (
+        _normalize_stdout,
+        _parse_last_json_line,
+        _read_file_tail,
+        _result,
+        build_script_run_dir,
+        SCRIPT_STDERR_LIMIT,
+        SCRIPT_STDOUT_LIMIT,
+    )
+
+    script_id = str(script.get("script_id") or script.get("id") or "")
+    name = script.get("name") or script_id
+    script_key = script_id or name or "agent"
+
+    try:
+        image = harness_image(variant)
+    except SandboxDriverError as e:
+        return _result(script_id, name, "fail", error=str(e),
+                       finish_reason="error", started_at=started)
+
+    # 工作区：与 script 类型同构（uploads/script_runs/{task}/{data}/{script_id}/）
+    try:
+        cwd = build_script_run_dir(
+            str(stdin.get("task_id") or "unknown"),
+            str(stdin.get("data_id") or "item"),
+            script_key,
+        )
+    except (OSError, PathEscapeError) as e:
+        # ARCH-0-3 口径：路径越界（.. 穿越/symlink 逃出 SCRIPT_RUN_BASE）绝不越界建目录
+        return _result(script_id, name, "fail", error=f"创建 agent 运行目录失败: {e}",
+                       finish_reason="error", started_at=started)
+    run_dir_value = stdin.get("_run_dir")
+    run_dir = Path(str(run_dir_value)) if run_dir_value else Path(cwd).parent
+    paths = build_container_paths(run_dir, cwd, cwd)
+
+    # 载荷三件套 staged 到 workdir：stdin 宿主路径先重写为容器路径（脚本通道
+    # 同口径），harness.json 原样落盘（凭据只进工作区，不进日志/env 白名单）
+    container_stdin = rewrite_stdin_paths(stdin, paths.run_dir_host, paths.run_dir_container)
+    staged: Dict[str, str] = {
+        HARNESS_INSTRUCTION_FILE: instruction,
+        HARNESS_STDIN_FILE: _dump_stdin_json(container_stdin),
+        HARNESS_CONFIG_FILE: _dump_stdin_json(harness_config),
+    }
+    try:
+        for file_name, content in staged.items():
+            (Path(cwd) / file_name).write_text(content, encoding="utf-8")
+    except OSError as e:
+        return _result(script_id, name, "fail", error=f"agent 载荷落盘工作区失败: {e}",
+                       finish_reason="error", started_at=started)
+
+    # 沙箱挂载树执行期放宽（others rX）：与脚本通道同口径，以挂载源
+    # （run_dir/cwd 公共祖先）为根——漏放宽挂载根本身沙箱在 /workspace 顶层
+    # 即 EACCES；不加 w，语义见 relax_tree_for_sandbox_uid
+    relax_tree_for_sandbox_uid(Path(paths.run_dir_host))
+
+    spec = SandboxRunSpec(
+        image=image,
+        user=runner_user(),
+        workspace_host=paths.run_dir_host,
+        workspace_container=paths.run_dir_container,
+        workdir_container=paths.cwd_container,
+        cwd_host=paths.cwd_host,
+        net_profile="egress",
+        container_name=_new_container_name(f"harness-{script_key}"),
+        entrypoint=[CONTAINER_PYTHON, CONTAINER_HARNESS_ENTRY, variant,
+                    HARNESS_INSTRUCTION_FILE, HARNESS_STDIN_FILE, HARNESS_CONFIG_FILE],
+        stdin_payload=b"",
+        timeout=timeout,
+    )
+    sandbox_driver = driver or get_sandbox_driver()
+
+    try:
+        # bind 源宿主根映射 + 运行时档读取与脚本通道同口径（受理 try 内，
+        # 非法配置/映射越界转 fail 条目）
+        spec.mount_source = derive_mount_source(spec.workspace_host)
+        # ARCH-3-4：运行时档读取与脚本通道同口径（受理 try 内，非法配置转 fail 条目）
+        spec.runtime = sandbox_runtime()
+        # ARCH-2-3：受理延迟打点口径与脚本通道一致（driver 标签区分通道）
+        _sandbox_start = time.monotonic()
+        handle = sandbox_driver.run(spec)
+        SANDBOX_START_LATENCY.labels(driver=sandbox_driver.name).observe(
+            time.monotonic() - _sandbox_start)
+        status = sandbox_driver.wait(handle, timeout)
+    except SandboxDriverError as e:
+        return _result(script_id, name, "fail", error=str(e),
+                       finish_reason="error", started_at=started)
+
+    # 日志归位：两条驱动的 stdout/stderr 统一在 cwd 下（agent 通道同理）
+    stdout_file = Path(cwd) / "stdout.log"
+    stderr_file = Path(cwd) / "stderr.log"
+    stdout_tail = _read_file_tail(stdout_file, SCRIPT_STDOUT_LIMIT)
+    stderr_tail = _read_file_tail(stderr_file, SCRIPT_STDERR_LIMIT)
+
+    if status.state == "timeout":
+        detail = f"；{status.error}" if status.error else ""
+        return _result(script_id, name, "fail",
+                       error=f"agent 执行超时被终止（>{timeout:.0f}秒，容器已回收）{detail}",
+                       finish_reason="timeout", started_at=started)
+
+    if status.state == "failed":
+        return _result(script_id, name, "fail",
+                       error=(status.error or f"沙箱执行失败（{sandbox_driver.name} 驱动）")[:4000],
+                       finish_reason="error", started_at=started)
+
+    if status.exit_code != 0:
+        hint = _docker_failure_hint(status.exit_code, stderr_tail, image)
+        error = f"agent 容器退出码 {status.exit_code}: {(stderr_tail.strip() or '无 stderr 输出')[:4000]}{hint}"
+        return _result(script_id, name, "fail", error=error[:4000],
+                       finish_reason="error", started_at=started)
+
+    try:
+        stdout = _parse_last_json_line(stdout_tail)
+    except ValueError as e:
+        return _result(script_id, name, "fail", error=str(e),
+                       finish_reason="error", started_at=started)
+
+    result = _normalize_stdout(script_id, name, stdout, started)
+    # 产物回收：agent 声明的 files 是容器路径，逆映射回宿主工作区路径；artifacts/
+    # 目录（工具调用记录/转录）自动并入 files（宿主路径），评分输入与结果页可直接引用
+    result["files"] = _recover_harness_artifacts(result.get("files") or {}, paths.run_dir_host, Path(cwd))
+    result["harness"] = {
+        "variant": variant,
+        "image": image,
+        "artifacts_dir": str(Path(cwd) / HARNESS_ARTIFACTS_DIR),
+    }
+    return result
+
+
+def _dump_stdin_json(value: Any) -> str:
+    """staged 载荷序列化（文本形态落盘；与 _dump_stdin 同口径的容错）"""
+    import json
+    return json.dumps(value, ensure_ascii=False, default=str, indent=2)
+
+
+def _recover_harness_artifacts(
+    files: Dict[str, Any],
+    mount_host: str,
+    cwd_host: Path,
+) -> Dict[str, Any]:
+    """agent 结果 files 的容器路径逆映射回宿主 + artifacts/ 目录自动回收
+
+    - 容器路径（/workspace/... 前缀）→ 挂载源宿主路径（mount_host + 后缀），
+      挂载面外/非字符串值原样保留（与 rewrite_stdin_paths 的边界匹配口径一致）；
+    - artifacts/ 目录下全部文件按相对名并入 files（agent 未声明的转录/工具
+      调用记录也进结果，setdefault 不覆盖 agent 显式声明）。
+    """
+    prefix = CONTAINER_WORKSPACE.rstrip("/")
+    boundary = prefix + "/"
+    recovered: Dict[str, Any] = {}
+    for key, value in files.items():
+        if isinstance(value, str) and (value == prefix or value.startswith(boundary)):
+            recovered[str(key)] = mount_host.rstrip("/") + value[len(prefix):]
+        else:
+            recovered[str(key)] = value
+    artifacts_dir = cwd_host / HARNESS_ARTIFACTS_DIR
+    if artifacts_dir.is_dir():
+        for path in sorted(artifacts_dir.rglob("*")):
+            if path.is_file():
+                recovered.setdefault(path.relative_to(artifacts_dir).as_posix(), str(path))
+    return recovered
 
 
 def _dump_stdin(value: Any) -> bytes:

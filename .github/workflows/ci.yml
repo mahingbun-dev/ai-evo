@@ -16,6 +16,7 @@ jobs:
     env:
       DATABASE_URL: postgresql://ai_evo:ai_evo@127.0.0.1:5432/ai_evo
       REDIS_URL: redis://127.0.0.1:6379/0
+      AUTH_JWT_SECRET: ci-fixed-test-secret-0123456789abcdef
     services:
       postgres:
         image: postgres:16
@@ -60,6 +61,13 @@ jobs:
         env:
           AIEVO_DATABASE_URL: postgresql://ai_evo:ai_evo@127.0.0.1:5432/ai_evo
 
+      # ARCH-1-4/3-3 口径：SCRIPT_EXEC_MODE 缺省已是 container，契约冒烟与
+      # debug 试跑链走 docker run（worker docker-CLI 回退通道）——runner 上
+      # 必须先有 ai-evo-script-runner 镜像，否则安全门禁用例报「入口脚本
+      # 退出码 125」（本地预载过镜像所以门禁时绿，CI 干净环境才暴露）
+      - name: Build script-runner sandbox image
+        run: docker build -f docker/script-runner/Dockerfile -t ai-evo-script-runner:latest .
+
       - name: Run test suite
         run: .venv/bin/pytest
 
@@ -103,3 +111,70 @@ jobs:
           --build-arg PIP_INDEX_URL=https://pypi.org/simple
           --build-arg NPM_REGISTRY=https://registry.npmjs.org
           -t ai-evo:ci .
+
+      # 镜像导入冒烟（NAS 真机冒烟缺陷回归门禁）：主镜像曾漏 COPY executor/
+      # → app/core/config.py 顶层 import executor.sandbox_params 直接
+      # ModuleNotFoundError，api/worker 容器启动即崩；pytest 在源码目录跑
+      # （executor/ 天然在场）测不出来——必须在镜像里真跑一次导入。这一步
+      # 在 Dockerfile 漏 COPY 场景会直接红。
+      - name: 镜像导入冒烟（防 COPY 缺失）
+        run: >-
+          docker run --rm --entrypoint python ai-evo:ci
+          -c "from app.core.config import get_settings; import executor.sandbox_params; print('image-import-ok')"
+
+      # ARCH-3-3（设计 §3 表 3-3 行）：构建一次、下游 image-scan job 复用
+      # （docker save 打包上传 artifact，扫描 job load 回来跑 trivy——
+      # GitHub runner 间不共享 docker daemon，重复构建主镜像太浪费）
+      - name: Save image for scan
+        run: docker save ai-evo:ci | gzip > /tmp/ai-evo-ci.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: main-image
+          path: /tmp/ai-evo-ci.tar.gz
+          retention-days: 1
+
+  # ARCH-3-3（设计 §3 Phase 3 表 3-3 行）：镜像漏洞扫描门禁——主镜像与
+  # script-runner 沙箱镜像（docker/script-runner/Dockerfile）各扫一遍，
+  # HIGH 及以上（HIGH,CRITICAL）exit-code 1 卡门禁。企业 GitLab 线的等价
+  # 扫描在 build-service 构建钩子里（tools/build-service/，[scan] 配置段），
+  # 两端口径一致：同 severity 阈值 + ignore-unfixed（无修复版本的基座 CVE
+  # 由基座升级解决，不永久卡门禁；有修复的高危 CVE 仍卡——演练口径即此类）。
+  image-scan:
+    name: Image vulnerability scan (trivy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: docker-image
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: main-image
+          path: /tmp
+
+      - name: Load main image
+        run: docker load -i /tmp/ai-evo-ci.tar.gz
+
+      # script-runner 镜像轻（python:3.12-slim + packages.txt 少量依赖），
+      # 直接在本 job 内构建；沙箱是用户代码执行面，必须与主镜像同口径过闸
+      - name: Build script-runner image
+        run: docker build -f docker/script-runner/Dockerfile -t ai-evo-script-runner:ci .
+
+      - name: Scan main image (ai-evo)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ai-evo:ci
+          format: table
+          exit-code: '1'
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+
+      - name: Scan script-runner image
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ai-evo-script-runner:ci
+          format: table
+          exit-code: '1'
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true

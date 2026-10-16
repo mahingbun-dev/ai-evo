@@ -1,0 +1,27 @@
+# ai-evo egress 出口域名白名单（ARCH-1-3）——squid dstdomain 清单
+#
+# 语义：一行一条；".example.com" 同时匹配 example.com 本身与其全部子域；
+#       不带前导点只匹配精确主机名（少用，子域漏匹配易踩坑）。
+#
+# ⚠️ 这是仓库内的示例模板，不是「审核过的企业清单」：默认内容只覆盖
+#    常见模型厂商/OSS/pip 源，供开发机与首次部署起容器用。企业部署
+#    应在服务器上维护自己的清单文件（如部署目录下 egress-whitelist.txt），
+#    并在 .env 设 EGRESS_WHITELIST_FILE 指向它，compose 即改挂你那份
+#    文件、仓库模板不再生效。新增出网域名 = 改服务器清单文件 +
+#    docker compose restart egress。
+#
+# ---------- 模型厂商（model_configs 测连与评测调用） ----------
+.openai.com
+.anthropic.com
+.bigmodel.cn
+.deepseek.com
+.moonshot.cn
+.aliyuncs.com
+.volces.com
+# ---------- 对象存储 / OSS 媒体拉取 ----------
+.myqcloud.com
+.tencentcloudapi.com
+# ---------- pip 源（镜像构建换源 PIP_INDEX_URL 同源） ----------
+.pypi.org
+.files.pythonhosted.org
+.pypi.tuna.tsinghua.edu.cn

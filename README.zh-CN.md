@@ -66,8 +66,16 @@ docker compose up -d --build
 
 - `api` 在 8100 端口同时承载 REST API 与前端构建产物（`AIEVO_PORT` 可改端口）
 - `worker` 执行 Celery 评测任务；`logs/` 与 `uploads/` 经卷持久化
+- 首次 `up -d` 时 `volume-init` 一次性服务会自动把 `uploads/`、`logs/` 卷属主
+  迁移为容器运行用户（uid 10002），无需手工 chown（`docker compose ps` 里它显示
+  exited(0) 属正常）
 - `.env` 里设 `COMPOSE_PROFILES=bundled-db` 可一并启动内置 PostgreSQL
+- 评测前处理脚本执行模式 `SCRIPT_EXEC_MODE`：默认 `local` **仅限开发机**
+  （脚本与平台进程同环境直跑），生产/企业部署禁止 local——container 沙箱通道
+  就绪后须显式设 `SCRIPT_EXEC_MODE=container`，现状与步骤见
+  [docs/build-pipeline.md](docs/build-pipeline.md) 第九节
 
+完整环境变量清单见 [docs/build-pipeline.md](docs/build-pipeline.md) 4.4.1 与 `.env.example`；
 离线/CI 构建流水线（锁定 wheel、内置 Claude Code CLI）见 [docs/build-pipeline.md](docs/build-pipeline.md)。
 
 ## 评测类型
@@ -89,7 +97,11 @@ docker compose up -d --build
 
 ## 安全说明
 
-- 生产必须显式配置强随机的 `AUTH_JWT_SECRET`（缺省派生密钥仅限本地开发）
+- `AUTH_JWT_SECRET` 必须显式配置强随机值（`openssl rand -hex 32`）：缺失时服务启动
+  直接失败（fail-fast）；「由 DATABASE_URL 派生」的回退需显式设
+  `AUTH_JWT_ALLOW_DERIVED=true`，仅限本地开发机，企业部署严禁开启
+- `SCRIPT_EXEC_MODE=local`（前处理脚本直跑）仅限开发机，企业部署禁止；合规通道为
+  `container` 沙箱模式，见 [docs/build-pipeline.md](docs/build-pipeline.md) 第九节
 - anc-hub 端点默认严格校验 TLS 证书；自签名内网端点可显式设 `AIEVO_HUB_TLS_INSECURE=1` 跳过
 - 本平台按设计会调用用户配置的模型端点（含内网网关）——请部署在你控制的信任边界内
 

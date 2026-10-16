@@ -100,7 +100,14 @@ class TestTouchHeartbeat:
 
 class TestFailStaleRunningTasks:
     def test_reaps_only_stale_heartbeat(self, db_session):
-        """heartbeat 超 15 分钟 → failed；新鲜/NULL/执行序号不匹配 → 保持 running"""
+        """heartbeat 超 15 分钟 → failed；新鲜/NULL/执行序号不匹配 → 保持 running
+
+        断言口径为成员断言而非精确全量列表：fail_stale_running_tasks 是生产
+        reaper，全表扫描当前库的 running 任务——共享开发库（或临时库模板副本）
+        可能残留历史测试会话的 running 任务，其心跳一旦越过 15 分钟窗口即会
+        被一并收尸，`reaped == [stale_task.id]` 的全量相等断言因此不是本用例
+        可独占声明的性质（残留何时越窗取决于历史会话时刻，跨会话不稳定）。
+        本用例只声明：自己构造的四种任务判定正确。"""
         stale_task = _make_running_task(db_session, "w10it_stale", heartbeat=STALE)
         fresh_task = _make_running_task(db_session, "w10it_fresh", heartbeat=FRESH)
         null_task = _make_running_task(db_session, "w10it_null", heartbeat=None)
@@ -112,7 +119,10 @@ class TestFailStaleRunningTasks:
         reaped = EvaluationTaskService(db_session).fail_stale_running_tasks()
 
         db_session.expire_all()
-        assert reaped == [stale_task.id]
+        assert stale_task.id in reaped
+        assert fresh_task.id not in reaped
+        assert null_task.id not in reaped
+        assert mismatch_task.id not in reaped
         assert db_session.get(type(stale_task), stale_task.id).status == "failed"
         assert db_session.get(type(fresh_task), fresh_task.id).status == "running"
         assert db_session.get(type(null_task), null_task.id).status == "running"

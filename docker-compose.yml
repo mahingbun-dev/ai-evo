@@ -38,6 +38,29 @@ services:
     networks:
       - ai-evo-net
 
+  # ARCH-0-1：uploads/logs 卷属主一次性迁移（逻辑在 docker-entrypoint.sh 的
+  # volume-init 分支）。api/worker 以 uid 10002 + cap_drop ALL 运行，容器内无法
+  # 自行 chown；bind 挂载目录由 docker 以 root 创建、历史部署的卷内容也是 root
+  # 属主，故由这个以 root 运行、只保留 CHOWN/DAC_OVERRIDE 两个能力的一次性容器在
+  # 主服务启动前把卷属主纠正为 10002 后退出（已是 10002 时零写入秒退；chown 失败
+  # 只告警不阻断，真实可写性由 api/worker 启动预检把关）。无网络、根文件系统只读、
+  # 不挂 .env（凭证与本服务无关）。`docker compose ps` 里它显示 exited(0) 属正常。
+  volume-init:
+    image: ai-evo:${IMAGE_TAG:-latest}
+    container_name: ai-evo-volume-init
+    user: "0:0"
+    environment:
+      - SERVICE_TYPE=volume-init
+    volumes:
+      - ${LOGS_VOLUME:-./logs}:/app/logs
+      - ${UPLOADS_VOLUME:-./uploads}:/app/uploads
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    network_mode: none
+    restart: "no"
+
   api:
     image: ai-evo:${IMAGE_TAG:-latest}
     build:
@@ -50,7 +73,11 @@ services:
         - NPM_REGISTRY=${NPM_REGISTRY:-https://registry.npmmirror.com}
     container_name: ai-evo-api
     depends_on:
-      - redis
+      redis:
+        condition: service_started
+      # ARCH-0-1：等卷属主迁移完成再起（见上方 volume-init）
+      volume-init:
+        condition: service_completed_successfully
     env_file:
       - .env
     environment:
@@ -69,6 +96,27 @@ services:
       # 重建，丢失后必须重新人工上传，故挂卷持久化（api 与 worker 共享
       # 同一卷；首次部署为空，历史包需重新导入，见部署文档）
       - ${UPLOADS_VOLUME:-./uploads}:/app/uploads
+    # ARCH-0-1：运行期加固（设计 D3）。镜像已 USER 10002，这里再收容器能力面：
+    #   - cap_drop ALL + no-new-privileges：进程拿不到任何 capability，也不能经
+    #     setuid/文件能力再获得（uvicorn :8100 为非特权端口，无需 NET_BIND_SERVICE）
+    #   - read_only：根文件系统只读，代码/依赖/前端产物运行期不可改写；写面只剩
+    #     uploads/logs 两个卷与下面两个 tmpfs
+    #   - tmpfs /tmp：Python tempfile 缺省位（xlsx 导入导出、hub 会话导入工作区、
+    #     DeepSeek harness 一次性 dsh_home/workspace、OSS 媒体落盘前的临时文件，
+    #     均用完即删）
+    #   - tmpfs /home/app：HOME，Claude Code CLI 的 ~/.claude 配置与会话转录在此；
+    #     与此前落容器可写层一样随容器重建清空，区别是 RAM 承载且有上限
+    #   上限可在 .env 用 TMPFS_TMP_SIZE / TMPFS_HOME_SIZE 调整（默认 1g，只按实际
+    #   写入占内存）。不加 noexec：裁判引擎原生运行时（Claude Code 单文件 CLI /
+    #   DeepSeek harness）在 HOME、TMPDIR 下落配置与辅助文件，noexec 是否影响其
+    #   子进程未经实机验证，Phase 0 不赌；nosuid + no-new-privileges + cap_drop ALL
+    #   已封掉提权路径，noexec 对本就能执行任意 Python 的进程增量防护有限。
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,exec,nosuid,nodev,size=${TMPFS_TMP_SIZE:-1g}
+      - /home/app:rw,exec,nosuid,nodev,uid=10002,gid=10002,mode=0750,size=${TMPFS_HOME_SIZE:-1g}
     # W13：日志轮转（json-file 50m×3，防止 docker 日志撑爆部署机磁盘）+
     # healthcheck（真实依赖探测：DB/Redis/迁移版本/uploads 全绿才 healthy）。
     # 探活 URL 在鉴权白名单内，无需 cookie；镜像内无 curl，用 python 探测。
@@ -89,6 +137,22 @@ services:
     networks:
       - ai-evo-net
 
+  # ARCH-2-1：worker 按队列拆分（设计 §2.3 决策 D4 / §3 Phase 2 表 2-1 行）——
+  # 本服务只消费 eval（评测）队列；hub 导入类任务路由到 ingest 队列、由下方
+  # worker-ingest 独立消费，消除单队列互相争抢（hub 导入高峰不再拖慢评测）
+  # 与单 worker SPOF。队列归属的路由表单一事实源在 app/celery_app.py
+  # （TASK_ROUTES）；本处只声明 worker 消费哪条队列：
+  #   - entrypoint 的 worker 分支固定 celery 命令、不接 -Q，队列绑定经配置面
+  #     表达——celery worker 未指定 -Q 时消费 task_queues 全集，本容器经
+  #     CELERY_WORKER_QUEUES 把 task_queues 收敛为 eval（多队列用逗号分隔）；
+  #   - 队列名拼错会在容器启动时 fail-fast（celery_app._resolve_task_queues
+  #     校验只认 eval/ingest/maint），不会静默消费错队列；
+  #   - maint（清理/迁移）队列当前无任务也无消费者，随条目 2-4 归档清理落地
+  #     时再增补 worker-maint 服务与 app.tasks.maintenance.* 任务。
+  # 本服务名/容器名保持 worker / ai-evo-worker 不变：scripts/ensure_worker.sh
+  # （部署机 cron 每 5 分钟保活）与 scripts/do_deploy.sh（应急旁路脚本）均点名
+  # ai-evo-worker 容器名，改名会破坏保活链路（worker-ingest 暂只有
+  # restart: unless-stopped 自愈，保活 cron 覆盖面维持现状）。
   worker:
     image: ai-evo:${IMAGE_TAG:-latest}
     build:
@@ -101,14 +165,60 @@ services:
         - NPM_REGISTRY=${NPM_REGISTRY:-https://registry.npmmirror.com}
     container_name: ai-evo-worker
     depends_on:
-      - redis
+      redis:
+        condition: service_started
+      # ARCH-0-1：等卷属主迁移完成再起（见上方 volume-init）
+      volume-init:
+        condition: service_completed_successfully
     env_file:
       - .env
     environment:
       - SERVICE_TYPE=worker
+      # ARCH-2-1：本 worker 只消费 eval 队列（机制见上方 ARCH-2-1 注释块）
+      - CELERY_WORKER_QUEUES=eval
       - LANGFUSE_ENABLED=false
       - OPENBLAS_CORETYPE=GENERIC
       - MKL_DEBUG_CPU_TYPE=5
+      # ARCH-1-4：前处理脚本执行模式缺省切 container（设计 §3 Phase 1 表
+      # 1-4 行）——合规态即缺省态，代码默认（app/core/config.py）与本条
+      # compose 显式声明一致。经插值给 .env 留显式覆盖口（environment
+      # 优先级高于 env_file，插值缺省即 container）：过渡期回退在 .env 显式
+      # 设 SCRIPT_EXEC_MODE=local 后 docker compose up -d worker 重启生效
+      # （改 env 即回退，无需改 compose/回滚镜像；local 同边界风险见
+      # docs/build-pipeline.md 第九节，仅限过渡期止损）。注意 container 的
+      # 前置是沙箱面（executor + egress，第十节）：未启用
+      # COMPOSE_PROFILES=sandbox 且未配 EXECUTOR_URL 时，含前处理脚本的任务
+      # 会因 worker 容器内无 docker 通道而明确失败（fail-loud，不静默落
+      # local）。
+      - SCRIPT_EXEC_MODE=${SCRIPT_EXEC_MODE:-container}
+      # ARCH-1-3：worker 服务端外呼（模型测连/OSS 媒体拉取）统一切 egress
+      # 出口代理（设计 D2，SSRF 面收口）。只经 compose 接线、不改代码：进程
+      # 内遵守 *_PROXY 环境变量的 HTTP 客户端（requests/httpx/urllib）统一
+      # 收口，内网目标由 NO_PROXY 直连。灰度开关：WORKER_EGRESS_PROXY 缺省
+      # 空 = 不走 proxy（与既有部署行为一致）；启用沙箱面
+      # （COMPOSE_PROFILES=sandbox）且 egress 服务健康后，.env 设
+      # WORKER_EGRESS_PROXY=http://egress:3128。大小写各设一份：不同客户端
+      # 读取口径不一（urllib/getproxies 跳过空值，空串 = 该方向不代理）。
+      - HTTP_PROXY=${WORKER_EGRESS_PROXY:-}
+      - HTTPS_PROXY=${WORKER_EGRESS_PROXY:-}
+      - http_proxy=${WORKER_EGRESS_PROXY:-}
+      - https_proxy=${WORKER_EGRESS_PROXY:-}
+      # 内网目标不走 proxy：compose 服务名 + 回环（Celery/PG/Redis 的连接
+      # 非协议本就不吃 HTTP_PROXY，这里是 api 调用等 HTTP 面的兜底）；
+      # 企业内网域名/私有 OSS 由部署侧在 WORKER_NO_PROXY 追加覆盖
+      - NO_PROXY=${WORKER_NO_PROXY:-localhost,127.0.0.1,::1,api,redis,postgres,executor,egress}
+      - no_proxy=${WORKER_NO_PROXY:-localhost,127.0.0.1,::1,api,redis,postgres,executor,egress}
+      # ARCH-2-3：worker 指标暴露（设计 §2.3 D7）——PROMETHEUS_WORKER_
+      # METRICS_PORT 启用 worker 进程内 Prometheus 指标 server（监听 compose
+      # 内网，不发布宿主端口；monitoring profile 的 Prometheus 经
+      # worker:9108 抓取，未启用 profile 时 server 空转、开销可忽略）。
+      # PROMETHEUS_MULTIPROC_DIR 让 prefork 子进程的任务时长/失败指标经
+      # per-pid mmap 文件聚合到该端口（fork 安全由 prometheus_client 自身
+      # 的 pid 变更检测保证，见 app/celery_app.py ARCH-2-3 注释块）；目录
+      # 落在既有 /tmp tmpfs 上，容器重建即清零（Counter 重计不影响
+      # Prometheus rate/increase）。
+      - PROMETHEUS_WORKER_METRICS_PORT=9108
+      - PROMETHEUS_MULTIPROC_DIR=/tmp/prometheus_multiproc
     # 停止时给 Celery 优雅退出的时间：收到 SIGTERM 后跑完当前任务再退出，
     # 排队中的任务保留在 Redis 队列由新 worker 接手（部署脚本不再清空队列）。
     # W10-3：900s → 7200s，与 celery task_time_limit（单任务最长 2h）对齐——
@@ -120,6 +230,18 @@ services:
       # 与 api 共享同一卷（worker 的 Celery 任务也读写 uploads：执行包
       # 解包、评测镜像、脚本运行产物）
       - ${UPLOADS_VOLUME:-./uploads}:/app/uploads
+    # ARCH-0-1：运行期加固，与 api 同一套（理由见 api 段注释）。worker 额外说明：
+    # SCRIPT_EXEC_MODE=local 时前处理脚本是本容器内子进程，同样被非 root +
+    # cap_drop + read_only 约束——脚本只能写 uploads 卷（script_runs 工作区）、/tmp
+    # 与 HOME 两个 tmpfs，这正是 W15 容器化之前过渡期要的最低隔离；裁判引擎
+    # （Claude Code CLI / DeepSeek harness）主要在 worker 跑，/home/app 的 tmpfs
+    # 上限按 .env TMPFS_HOME_SIZE 调整。
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,exec,nosuid,nodev,size=${TMPFS_TMP_SIZE:-1g}
+      - /home/app:rw,exec,nosuid,nodev,uid=10002,gid=10002,mode=0750,size=${TMPFS_HOME_SIZE:-1g}
     # W13：日志轮转 + healthcheck（celery inspect ping 定点问本 worker，
     # 无响应 = 进程僵死/丢注册；Redis 不可达时同样失败）
     logging:
@@ -136,6 +258,197 @@ services:
     restart: unless-stopped
     networks:
       - ai-evo-net
+
+  # ARCH-2-1：ingest 队列 worker（hub 导入/数据集处理）——与上方 worker 同口径
+  # 定义（镜像/卷/加固/优雅退出/日志轮转/健康探活全部一致，见 worker 段各注释），
+  # 差异仅两点：CELERY_WORKER_QUEUES=ingest（只消费 ingest 队列）与容器名。
+  # hub 导入的清洗脚本（_run_clean_script → pre_judge_runner）在本容器执行，
+  # 故 SCRIPT_EXEC_MODE / executor / egress proxy 接线与 worker 完全同款。
+  # maint 队列无消费者属预期（见上方 ARCH-2-1 注释，随条目 2-4 落地）。
+  worker-ingest:
+    image: ai-evo:${IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile.online
+      args:
+        - NODE_IMAGE=${NODE_IMAGE:-node:24-slim}
+        - PY_IMAGE=${PY_IMAGE:-python:3.12-slim}
+        - PIP_INDEX_URL=${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+        - NPM_REGISTRY=${NPM_REGISTRY:-https://registry.npmmirror.com}
+    container_name: ai-evo-worker-ingest
+    depends_on:
+      redis:
+        condition: service_started
+      # ARCH-0-1：等卷属主迁移完成再起（见上方 volume-init）
+      volume-init:
+        condition: service_completed_successfully
+    env_file:
+      - .env
+    environment:
+      - SERVICE_TYPE=worker
+      # ARCH-2-1：本 worker 只消费 ingest 队列（机制见上方 ARCH-2-1 注释块）
+      - CELERY_WORKER_QUEUES=ingest
+      - LANGFUSE_ENABLED=false
+      - OPENBLAS_CORETYPE=GENERIC
+      - MKL_DEBUG_CPU_TYPE=5
+      # ARCH-1-4：清洗脚本执行模式与 worker 同款（缺省 container、.env 可回退，
+      # 完整说明见上方 worker 段同名注释）
+      - SCRIPT_EXEC_MODE=${SCRIPT_EXEC_MODE:-container}
+      # ARCH-1-3：外呼代理接线与 worker 同款（完整说明见上方 worker 段同名注释）
+      - HTTP_PROXY=${WORKER_EGRESS_PROXY:-}
+      - HTTPS_PROXY=${WORKER_EGRESS_PROXY:-}
+      - http_proxy=${WORKER_EGRESS_PROXY:-}
+      - https_proxy=${WORKER_EGRESS_PROXY:-}
+      - NO_PROXY=${WORKER_NO_PROXY:-localhost,127.0.0.1,::1,api,redis,postgres,executor,egress}
+      - no_proxy=${WORKER_NO_PROXY:-localhost,127.0.0.1,::1,api,redis,postgres,executor,egress}
+      # ARCH-2-3：指标暴露接线与 worker 同款（完整说明见上方 worker 段
+      # PROMETHEUS_WORKER_METRICS_PORT 注释）
+      - PROMETHEUS_WORKER_METRICS_PORT=9108
+      - PROMETHEUS_MULTIPROC_DIR=/tmp/prometheus_multiproc
+    # 停止时给 Celery 优雅退出的时间（W10-3，与 worker 同款）：task_time_limit
+    # 为全局配置（7200s）对 ingest 任务同样生效，900s 窗口内跑不完的长导入会被
+    # docker 强杀（SIGKILL），消息未 ACK 重投。
+    stop_grace_period: 7200s
+    volumes:
+      - ${LOGS_VOLUME:-./logs}:/app/logs
+      # 与 api/worker 共享同一卷（导入任务读写 uploads：执行包解包区
+      # hub_datasets/、清洗脚本工作区 script_runs/hub_import/）
+      - ${UPLOADS_VOLUME:-./uploads}:/app/uploads
+    # ARCH-0-1：运行期加固，与 api/worker 同一套（理由见 api 段注释）
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,exec,nosuid,nodev,size=${TMPFS_TMP_SIZE:-1g}
+      - /home/app:rw,exec,nosuid,nodev,uid=10002,gid=10002,mode=0750,size=${TMPFS_HOME_SIZE:-1g}
+    # W13：日志轮转 + healthcheck（celery inspect ping 定点问本 worker，
+    # 与 worker 同款；容器名不同、各自探各自的）
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.celery_app inspect ping -d celery@$$HOSTNAME --timeout 10"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+      start_period: 90s
+    restart: unless-stopped
+    networks:
+      - ai-evo-net
+
+  # ARCH-1-3：executor 沙箱服务（设计 §2.2 拓扑/§2.3 D1）——compose 内唯一
+  # 挂 docker.sock 的角色。镜像 docker/Dockerfile.executor（python:3.12-slim +
+  # fastapi/uvicorn + docker-cli，USER 10002，ARCH-1-1）。
+  #   - 灰度开关：profile "sandbox"。沙箱面整体上线（executor + egress 同
+  #     profile）；既有部署不设 COMPOSE_PROFILES 时 compose 行为与原来完全
+  #     一致——离线部署机未预载 ai-evo-executor / squid 镜像也不受影响。
+  #   - 凭证边界（设计 D1）：不挂 env_file——.env 里的 DATABASE_URL/Redis
+  #     凭证不进本容器（executor 无凭证、无 DB 依赖）；仅经插值注入
+  #     EXECUTOR_TOKEN（worker↔executor 共享 token，D6 走 .env 不入库）。
+  #     未配置 token = executor fail-closed 拒绝全部沙箱请求（executor/app.py），
+  #     compose 与健康探活不受影响。
+  #   - docker.sock 非 root 访问：宿主 sock 属主 root:docker（0660），靠
+  #     group_add 把部署机 docker 组 gid（.env DOCKER_GROUP_GID，默认 999 为
+  #     Debian 系常见值）加为补充组——数字 gid 不要求容器内存在同名组；
+  #     群晖等自定 gid 的部署机必查（stat -c %g /var/run/docker.sock）。
+  #     sock 只挂这一份、只给这一个角色；worker 永不挂 sock。
+  #   - 仅 compose 内网监听：不发布宿主端口，worker 经 http://executor:8300
+  #     访问（HTTP 驱动接线属条目 1-2，ARCH 注释同批落）。
+  #   - 与 api/worker 共挂同一 uploads 卷（沙箱工作区 stdout/stderr 由监督
+  #     线程落盘到该卷），同样等 volume-init 属主迁移完成再起。
+  executor:
+    image: ai-evo-executor:${EXECUTOR_IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.executor
+      args:
+        - PIP_INDEX_URL=${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+    profiles: ["sandbox"]
+    container_name: ai-evo-executor
+    depends_on:
+      # 工作区日志要写 uploads 卷：等属主迁移到 10002 完成（同 api/worker）
+      volume-init:
+        condition: service_completed_successfully
+    environment:
+      - EXECUTOR_TOKEN=${EXECUTOR_TOKEN:-}
+      # bind 源宿主根（命名卷部署必填）：docker daemon 按宿主路径解析 -v 源，
+      # UPLOADS_VOLUME=uploads 形态下须经它把 /app/uploads/script_runs/... 映射
+      # 回宿主（校验白名单在 executor/sandbox_params.resolve_mount_source；
+      # 未配置 = 同路径 bind 部署行为不变。docs/build-pipeline.md 部署变量表）
+      - SANDBOX_WORKSPACE_HOST_ROOT=${SANDBOX_WORKSPACE_HOST_ROOT:-}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${UPLOADS_VOLUME:-./uploads}:/app/uploads
+    group_add:
+      - "${DOCKER_GROUP_GID:-999}"
+    # ARCH-1-3：与 api/worker 同口径加固。docker CLI 经 unix sock 与 daemon
+    # 通信不需要任何 capability；运行期写面只有 uploads 卷与两个 tmpfs
+    # （审计日志走 stdout，随容器 json-file 日志采集）
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,exec,nosuid,nodev,size=${TMPFS_TMP_SIZE:-1g}
+      - /home/app:rw,exec,nosuid,nodev,uid=10002,gid=10002,mode=0750,size=${TMPFS_HOME_SIZE:-1g}
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    # /health 无鉴权探针（executor/app.py，ARCH-1-1）；镜像内无 curl，用 python
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8300/health', timeout=5)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - ai-evo-net
+
+  # ARCH-1-3：egress 出口代理（squid 域名白名单，设计 D2）——worker 外呼
+  # （模型测连/OSS）与沙箱 egress 档出网的统一出口、SSRF 收口点。
+  #   - 镜像 ubuntu/squid（Canonical 官方维护；squid:alpine 非官方镜像且不
+  #     在内网镜像源白名单内——等价选型为官方镜像，可经 .env EGRESS_IMAGE
+  #     换源/换 tag）
+  #   - 策略只读挂载 docker/egress/squid.conf（默认拒绝 + 域名白名单 +
+  #     内网目的地址拒绝，改配置后 restart egress 生效）；域名清单
+  #     docker/egress/whitelist.txt 是仓库模板，部署侧经 .env
+  #     EGRESS_WHITELIST_FILE 指向自己的清单整体替换。离线 CI 部署目录若
+  #     只同步了 docker-compose.yml，须把 docker/egress/ 一并放过去（见
+  #     docs/build-pipeline.md ARCH-1-3 节）
+  #   - 双网络：ai-evo-net（服务 worker 外呼 + 自身出网）+ aievo-sandbox-egress
+  #     （internal，见底部网络定义）
+  #   - 不发布宿主端口；不套 cap_drop/read_only：镜像内 squid 以 root 起再
+  #     降权 proxy 用户（需 CAP_SETUID/CHOWN 建 spool/pid），只读根会挡
+  #     /run/squid.pid。第三方官方镜像、无凭证无数据卷（只读配置除外），
+  #     安全边界落在「白名单 + internal 网络 + 不对外发布」
+  egress:
+    image: ${EGRESS_IMAGE:-ubuntu/squid:latest}
+    profiles: ["sandbox"]
+    container_name: ai-evo-egress
+    volumes:
+      - ${EGRESS_SQUID_CONF:-./docker/egress/squid.conf}:/etc/squid/squid.conf:ro
+      - ${EGRESS_WHITELIST_FILE:-./docker/egress/whitelist.txt}:/etc/squid/whitelist.txt:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    # 镜像内无 curl/python；用 squid 自带的进程状态检查（对 /run/squid.pid
+    # 发信号 0——PID 文件在且进程活即退出码 0，ARCH-1-3 本机冒烟已验证）
+    healthcheck:
+      test: ["CMD", "squid", "-k", "check"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - ai-evo-net
+      - aievo-sandbox-egress
 
   # anc-hub 插件 sidecar：把 ai-evo 核心能力暴露为 MCP 工具（见 docs/hub-plugin.md）。
   # 与 hub 家族其他插件一致走 host 网络——hub（同机）经回环拨插件 :9500，
@@ -170,13 +483,115 @@ services:
       start_period: 30s
     restart: unless-stopped
     network_mode: host
+    # ARCH-0-1：cap_drop ALL + no-new-privileges 与 api/worker 同一口径（:9500 为
+    # 非特权端口，host 网络下同样不需要任何 capability）。不加 read_only+tmpfs：
+    # 设计 D3 明确 hub-plugin 形态不变——它是 host 网络 sidecar，与 hub 家族其他
+    # 插件同形；不挂 uploads/logs 卷、不落盘，容器可写层里没有需要保护的持久
+    # 内容，非 root + cap_drop 已拿到主要收益；read_only 只会多一个未经 hub 联调
+    # 验证的故障面（hubkit/gRPC 运行时若有临时写入会直接起不来）。
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+
+  # ======================================================================
+  # ARCH-2-3：监控编排（设计 §2.3 决策 D7 / §3 Phase 2 表 2-3 行）——
+  # profile "monitoring" 可选启用（.env COMPOSE_PROFILES=monitoring 或
+  # --profile monitoring），既有部署不设 profile 时行为完全不变（离线部署机
+  # 未预载监控镜像不受影响）。三件套只挂 ai-evo-net 内网：
+  #   - prometheus：抓 api:8100/metrics（队列深度 gauge）+ worker:9108（任务
+  #     时长/失败/沙箱指标，worker 容器统一注入的 PROMETHEUS_WORKER_
+  #     METRICS_PORT），规则评估经 alert.rules → alertmanager:9093；
+  #   - alertmanager：占位 receiver（不外发通知，见
+  #     docker/monitoring/alertmanager.yml），UI :9093 查告警分组；
+  #   - grafana：数据源已 provisioning（docker/monitoring/grafana/），dashboard
+  #     占位见同目录 README；唯一发布宿主端口的监控服务（:3000 面板要人看，
+  #     端口/口令经 GRAFANA_PORT/GRAFANA_ADMIN_PASSWORD 调整）。
+  # 加固口径与 egress 同款：第三方官方镜像、无业务凭证（grafana 管理口令经
+  # .env），不套 cap_drop/read_only——prometheus/grafana 需写各自数据卷，
+  # 硬化收益有限而联调风险在前；安全边界落在「仅内网 + 不发布宿主端口
+  # （grafana 除外）+ profile 可选」。镜像 tag 为官方源稳定版，内网源缺货
+  # 经 PROMETHEUS_IMAGE/GRAFANA_IMAGE/ALERTMANAGER_IMAGE 换源（同
+  # POSTGRES_IMAGE 机制）。注意：离线 CI 部署目录若只同步了
+  # docker-compose.yml，须把 docker/monitoring/ 一并放过去（挂载源在仓库）。
+  # ======================================================================
+  prometheus:
+    image: ${PROMETHEUS_IMAGE:-prom/prometheus:v2.53.5}
+    profiles: ["monitoring"]
+    container_name: ai-evo-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=15d
+    volumes:
+      - ./docker/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./docker/monitoring/alert.rules:/etc/prometheus/alert.rules:ro
+      - prometheus-data:/prometheus
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    restart: unless-stopped
+    networks:
+      - ai-evo-net
+
+  alertmanager:
+    image: ${ALERTMANAGER_IMAGE:-prom/alertmanager:v0.28.1}
+    profiles: ["monitoring"]
+    container_name: ai-evo-alertmanager
+    volumes:
+      - ./docker/monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    restart: unless-stopped
+    networks:
+      - ai-evo-net
+
+  grafana:
+    image: ${GRAFANA_IMAGE:-grafana/grafana:11.6.0}
+    profiles: ["monitoring"]
+    container_name: ai-evo-grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - ./docker/monitoring/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - grafana-data:/var/lib/grafana
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    restart: unless-stopped
+    networks:
+      - ai-evo-net
 
 volumes:
   pgdata:
   # 群晖等部署通过 .env 设 UPLOADS_VOLUME/LOGS_VOLUME 指向这两个命名卷
   uploads:
   logs:
+  # ARCH-2-3：监控栈数据卷（TSDB/告警静默态/grafana 库；容器重建不丢历史）
+  prometheus-data:
+  alertmanager-data:
+  grafana-data:
 
 networks:
   ai-evo-net:
     driver: bridge
+  # ARCH-1-3：沙箱 egress 档网络（设计 D2）。两处硬约束：
+  #   - name: 钉死实际网络名——compose 默认会给网络加项目前缀
+  #     （<project>_aievo-sandbox-egress），而 executor 起沙箱容器用的是
+  #     宿主侧 docker CLI 的裸网络名，必须与
+  #     executor/sandbox_params.py NET_PROFILES["egress"] 完全一致
+  #     （单一事实源，tests/unit/test_compose_topology.py 断言同步）；
+  #   - internal: 不装默认网关/NAT——挂进来的沙箱容器没有任何直连出网
+  #     路由，唯一出路是同网段的 egress 代理（域名白名单 + access 审计），
+  #     出网收口在网络层不可绕过。
+  aievo-sandbox-egress:
+    name: aievo-sandbox-egress
+    driver: bridge
+    internal: true

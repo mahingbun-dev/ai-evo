@@ -1,0 +1,18 @@
+# ARCH-2-3：alertmanager 最小可用配置（设计 §2.3 D7）
+#
+# 占位接收器：alertmanager 必须有路由 receiver 才能启动；当前不外发通知
+# （告警只在 :9093 UI 可见），企业侧接入 W13 告警通道（邮件/webhook）时在
+# 部署目录覆盖本文件（或经 compose 换挂载源）——路由键沿 alertname/queue/job
+# 分组即可与 alert.rules 对齐。
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: placeholder
+  group_by: ["alertname", "queue", "job"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+receivers:
+  - name: placeholder

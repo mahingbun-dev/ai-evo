@@ -8,7 +8,7 @@ aiohappyeyeballs==2.7.1
     # via
     #   -c /src/prod-constraints.txt
     #   aiohttp
-aiohttp==3.13.3
+aiohttp==3.14.3
     # via
     #   -c /src/prod-constraints.txt
     #   -r /src/requirements.txt
@@ -186,7 +186,7 @@ execnet==2.1.2
     # via
     #   -c /src/prod-constraints.txt
     #   pytest-xdist
-fastapi==0.128.6
+fastapi==0.133.1
     # via
     #   -c /src/prod-constraints.txt
     #   -r /src/requirements.txt
@@ -354,7 +354,7 @@ langfuse==4.14.4
     # via
     #   -c /src/prod-constraints.txt
     #   -r /src/requirements.txt
-langgraph==1.2.2
+langgraph==1.2.11
     # via
     #   -c /src/prod-constraints.txt
     #   -r /src/requirements.txt
@@ -368,7 +368,7 @@ langgraph-prebuilt==1.1.0
     # via
     #   -c /src/prod-constraints.txt
     #   langgraph
-langgraph-sdk==0.3.15
+langgraph-sdk==0.4.4
     # via
     #   -c /src/prod-constraints.txt
     #   langgraph
@@ -511,7 +511,7 @@ pdfplumber==0.11.9
     # via
     #   -c /src/prod-constraints.txt
     #   -r /src/requirements.txt
-pillow==12.1.1
+pillow==12.3.0
     # via
     #   -c /src/prod-constraints.txt
     #   -r /src/requirements.txt
@@ -534,6 +534,10 @@ posthog==7.39.1
     # via
     #   -c /src/prod-constraints.txt
     #   deepeval
+prometheus-client==0.26.0
+    # via
+    #   -c /src/prod-constraints.txt
+    #   -r /src/requirements.txt
 prompt-toolkit==3.0.53
     # via
     #   -c /src/prod-constraints.txt
@@ -648,7 +652,7 @@ python-dotenv==1.2.1
     #   -r /src/requirements.txt
     #   deepeval
     #   pydantic-settings
-python-multipart==0.0.22
+python-multipart==0.0.30
     # via
     #   -c /src/prod-constraints.txt
     #   -r /src/requirements.txt
@@ -754,7 +758,7 @@ sqlalchemy==2.0.46
     #   langchain-community
 sse-starlette==3.5.0
     # via mcp
-starlette==0.52.1
+starlette==1.3.1
     # via
     #   -c /src/prod-constraints.txt
     #   -r /src/requirements.txt

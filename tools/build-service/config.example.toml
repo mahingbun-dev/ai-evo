@@ -61,6 +61,26 @@ build_sec = 3600
 # 若部署时正好有长任务在执行，compose 会等它跑完，因此这里要留足
 deploy_sec = 1800
 
+# 构建后镜像漏洞扫描门禁（ARCH-3-3，设计 §3 Phase 3 表 3-3 行）
+# 在构建产物落 daemon 之后、写 release 记录之前跑 trivy：HIGH 及以上
+# （severity 档位）且有修复版本的 CVE → 构建失败，有漏洞的镜像不可部署。
+# 与 GitHub CI 的 image-scan job（.github/workflows/ci.yml）同一口径。
+#
+# 离线约束：扫描器是预烘焙镜像（aquasec/trivy + 离线漏洞库），部署机不能
+# 下载任何东西——**上线含本功能的 build-service 镜像前必须先预载它**，
+# 构建与传输步骤见 docs/build-pipeline.md 第十一节。门禁 fail-closed：
+# 扫描器镜像缺失时构建同样失败（不会静默放行）。
+[scan]
+# 门禁开关。默认 true；仅过渡期可显式 false（高危 CVE 不再卡构建，需安全
+# 负责人知情），修完扫描器预载后应立即恢复
+enabled = true
+# 预烘焙的 trivy 扫描器镜像（含离线漏洞库，见 docs/build-pipeline.md 第十一节）
+image = "ai-evo-trivy:latest"
+# 卡门禁的严重级别（trivy severity 子集，逗号分隔）。「HIGH 及以上」即此默认
+severity = "HIGH,CRITICAL"
+# 单次扫描超时（秒）
+timeout_sec = 900
+
 [gitlab]
 host = "https://gitlab.example.com"
 # 克隆地址必须内嵌 Deploy Token，否则 build-service 从远端 clone 构建工作区时

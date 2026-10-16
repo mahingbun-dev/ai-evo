@@ -1,0 +1,262 @@
+# ARCH-3-1：多机扩容 compose 模板——评测机专用（设计 §3 Phase 3 表 3-1 行 /
+# §2.3 D1-D4）。完整部署步骤、双机拓扑与共享存储边界见 docs/deploy-scale.md。
+#
+# 形态：本文件跑在「评测机」上（N 台中的任意一台，模板完全相同），与主控机
+# （docker-compose.yml：api + worker + worker-ingest + executor + egress +
+# 中心 PG/Redis）组成多机拓扑。评测机只跑评测车道（eval 队列）的执行面：
+#
+#   worker-eval + executor 成对部署（同机成对是硬约束：executor 起的沙箱
+#   容器挂载的工作区必须与 worker 眼中 /app/uploads/script_runs 是同一份
+#   本机盘目录，跨机则 stdout/stderr 落盘与 realpath 白名单校验全部漂移）。
+#
+# 三个与主控机 docker-compose.yml 的关键差异（其余接线——沙箱面 profile、
+# executor 加固口径、egress 双网络、aievo-sandbox-egress 钉死裸名——与
+# ARCH-1-3 逐条一致，见各服务段注释）：
+#
+#   1. 无本地 redis/postgres/api/worker-ingest：中心数据面全在主控机，
+#      worker-eval 经 .env.scale 的 DATABASE_URL / REDIS_URL 占位指向
+#      主控机（env_file 注入，本文件不再重复声明——与主控机 compose 同一
+#      口径）；
+#   2. uploads 根挂共享存储（NFS 等，脚本库 pre_judge_scripts/、数据集缓存
+#      datasets/ hub_files/ media/、任务归档 archives/ 与主控机同一份），
+#      但 uploads/script_runs 用嵌套挂载遮蔽为本机盘——热 IO 不走网络
+#      （设计 3-1）。两层挂载 worker-eval 与 executor 必须完全一致；
+#   3. worker-eval 只消费 eval 队列：CELERY_WORKER_QUEUES=eval（ARCH-2-1
+#      的配置面 -Q 等价物——entrypoint 的 worker 分支固定 celery 命令不接
+#      -Q，队列绑定经该 env 收敛，拼错队列名容器启动即 fail-fast）。
+#      ingest/maint 车道留在主控机，评测机不摊导入/维护流量。
+#
+# 启动命令（评测机部署目录，两处都要 --env-file 让插值与 env_file 同源）：
+#   cp .env.scale.example .env.scale && vim .env.scale   # 填中心地址/共享挂载
+#   docker compose --env-file .env.scale -f docker-compose.scale.yml up -d
+#
+# 评测机不跑 build-service：镜像沿用主控机 build-service/LAN tar 交付流程
+# 预载（docker save → 内网传输 → docker load，见 docs/deploy-scale.md §5）。
+services:
+  # ARCH-3-1：卷属主迁移一次性服务，与主控机 volume-init（ARCH-0-1）同一
+  # entrypoint 分支、同一口径：root + 仅 CHOWN/DAC_OVERRIDE、无网络、只读
+  # 根文件系统、不挂 .env.scale（凭证与本服务无关）。差异仅在挂载视图：
+  # 评测机的 uploads 是共享存储（NFS），script_runs/logs 是本机盘——它把
+  # 三者都按 worker-eval 的最终视角挂进来递归纠属主。NFS（sec=sys）chown
+  # 可用时照常迁移；SMB/禁止 chown 的共享卷只告警不阻断（真实可写性由
+  # worker-eval 启动预检把关，与主控机语义一致）。共享树全量属主正确时
+  # 只读遍历零写入秒退；大缓存首扫较慢，建议低峰首次 up。
+  volume-init:
+    image: ai-evo:${IMAGE_TAG:-latest}
+    container_name: ai-evo-volume-init
+    user: "0:0"
+    environment:
+      - SERVICE_TYPE=volume-init
+    volumes:
+      - ${LOGS_VOLUME:-./logs}:/app/logs
+      - ${UPLOADS_VOLUME:?须在 .env.scale 配置共享存储挂载源(如 NFS 挂载点)，缺省本地目录会造成脚本库/数据集缓存与主控机分叉}:/app/uploads
+      - ${SCRIPT_RUNS_VOLUME:-./script_runs}:/app/uploads/script_runs
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    network_mode: none
+    restart: "no"
+
+  # ARCH-3-1：评测机 eval 队列 worker。与主控机 worker（docker-compose.yml
+  # 同名服务）同镜像、同加固、同优雅退出/日志轮转/健康探活口径，差异：
+  #   - CELERY_WORKER_QUEUES=eval：与主控机 worker 同一队列（两机 worker
+  #     经中心 Redis broker 同队列竞争消费，任务自动分流到空闲机）；
+  #   - 无本地 redis depends_on：broker/结果后端在主控机，网络不通时
+  #     celery 自身重连 + restart: unless-stopped 兜底；
+  #   - EVAL_NODE_NAME（hostname）：celery 节点名 celery@<hostname>，多机
+  #     时用于区分任务被哪台评测机接走（日志/事件流/拔机演练排障）；
+  #   - SCRIPT_RUNNER_IMAGE / SCRIPT_EXEC_MODE / 沙箱面接线不变：评测机
+  #     需预载 script-runner 镜像（docs/deploy-scale.md §5），executor
+  #     走本机成对实例（.env.scale 的 EXECUTOR_URL=http://executor:8300）。
+  worker-eval:
+    image: ai-evo:${IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile.online
+      args:
+        - NODE_IMAGE=${NODE_IMAGE:-node:24-slim}
+        - PY_IMAGE=${PY_IMAGE:-python:3.12-slim}
+        - PIP_INDEX_URL=${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+        - NPM_REGISTRY=${NPM_REGISTRY:-https://registry.npmmirror.com}
+    container_name: ai-evo-worker-eval
+    hostname: ${EVAL_NODE_NAME:-ai-evo-eval-node}
+    depends_on:
+      # 等卷属主迁移完成再起（同主控机 ARCH-0-1）
+      volume-init:
+        condition: service_completed_successfully
+    env_file:
+      - .env.scale
+    environment:
+      - SERVICE_TYPE=worker
+      # ARCH-2-1/3-1：只消费 eval 队列（机制见文件头第 3 点差异说明）
+      - CELERY_WORKER_QUEUES=eval
+      - LANGFUSE_ENABLED=false
+      - OPENBLAS_CORETYPE=GENERIC
+      - MKL_DEBUG_CPU_TYPE=5
+      # ARCH-1-4：缺省 container（合规态即缺省态，与主控机 worker 同款，
+      # 完整说明见 docker-compose.yml worker 段同名注释）
+      - SCRIPT_EXEC_MODE=${SCRIPT_EXEC_MODE:-container}
+      # ARCH-1-3：外呼代理接线与主控机 worker 同款。NO_PROXY 默认清单不同：
+      # 评测机本地只有 executor/egress 两个 compose 服务名（api/redis/
+      # postgres 在主控机，经 IP 直连且 PG/Redis 非协议本就不吃 HTTP_PROXY；
+      # 启用 proxy 后如需 worker 侧 HTTP 直达主控机，在 WORKER_NO_PROXY
+      # 追加主控机地址）。
+      - HTTP_PROXY=${WORKER_EGRESS_PROXY:-}
+      - HTTPS_PROXY=${WORKER_EGRESS_PROXY:-}
+      - http_proxy=${WORKER_EGRESS_PROXY:-}
+      - https_proxy=${WORKER_EGRESS_PROXY:-}
+      - NO_PROXY=${WORKER_NO_PROXY:-localhost,127.0.0.1,::1,executor,egress}
+      - no_proxy=${WORKER_NO_PROXY:-localhost,127.0.0.1,::1,executor,egress}
+      # ARCH-2-3：指标暴露与主控机 worker 同款（主控机 monitoring profile
+      # 的 Prometheus 可经局域网抓评测机 :9108，需自行加抓取目标）
+      - PROMETHEUS_WORKER_METRICS_PORT=9108
+      - PROMETHEUS_MULTIPROC_DIR=/tmp/prometheus_multiproc
+    # 优雅退出与主控机 worker 同款（W10-3：7200s 对齐 task_time_limit）——
+    # 这也是「拔掉一台评测机，任务被另一台接手」验收的机制基础：SIGTERM 后
+    # 跑完当前任务再退，排队/未 ACK 消息留在中心 Redis 由其余 worker 消费。
+    stop_grace_period: 7200s
+    volumes:
+      - ${LOGS_VOLUME:-./logs}:/app/logs
+      # ARCH-3-1 共享存储边界（设计 3-1）：uploads 根 = 共享存储（脚本库
+      # pre_judge_scripts/、数据集缓存 datasets/ hub_files/ media/、任务级
+      # 归档 archives/——归档由本机 worker 从本机 script_runs 打包写回共享
+      # 面，主控机 api 可读）；script_runs = 本机盘（嵌套挂载遮蔽共享面，
+      # 每行数据的脚本热 IO 不走网络）。挂载源必须配（无缺省，配错即起不来
+      # ——缺省本地目录会让脚本库静默分叉，比 fail-loud 危险得多）。
+      - ${UPLOADS_VOLUME:?须在 .env.scale 配置共享存储挂载源(如 NFS 挂载点)，缺省本地目录会造成脚本库/数据集缓存与主控机分叉}:/app/uploads
+      - ${SCRIPT_RUNS_VOLUME:-./script_runs}:/app/uploads/script_runs
+    # ARCH-0-1：运行期加固，与主控机 worker 同一套（理由见主控机 compose
+    # worker 段注释；worker 永不挂 docker.sock——sock 只给成对的 executor）
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,exec,nosuid,nodev,size=${TMPFS_TMP_SIZE:-1g}
+      - /home/app:rw,exec,nosuid,nodev,uid=10002,gid=10002,mode=0750,size=${TMPFS_HOME_SIZE:-1g}
+    # W13：日志轮转 + 健康探活，与主控机 worker 同款
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.celery_app inspect ping -d celery@$$HOSTNAME --timeout 10"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+      start_period: 90s
+    restart: unless-stopped
+    networks:
+      - ai-evo-net
+
+  # ARCH-3-1：评测机 executor——与主控机 executor（ARCH-1-3）逐条同口径：
+  # profile sandbox 灰度开关、无 env_file（凭证不进容器，仅插值
+  # EXECUTOR_TOKEN，未配置 fail-closed）、唯一挂 docker.sock、group_add
+  # docker 组 gid、非 root + cap_drop ALL + read_only + tmpfs、/health 探活、
+  # 等 volume-init。差异仅挂载视图：uploads 根为共享存储、script_runs 为
+  # 本机盘，两层必须与 worker-eval 完全一致——executor 的沙箱参数白名单
+  # realpath 校验（executor/sandbox_params.py WORKSPACE_ROOT）以
+  # /app/uploads/script_runs 子树为界，视图分叉 = 沙箱写盘与 worker 读盘
+  # 各说各话。docker.sock 属主 gid 每台评测机独立核对（DOCKER_GROUP_GID）。
+  executor:
+    image: ai-evo-executor:${EXECUTOR_IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.executor
+      args:
+        - PIP_INDEX_URL=${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+    profiles: ["sandbox"]
+    container_name: ai-evo-executor
+    depends_on:
+      # 工作区日志要写 script_runs 本机盘：等属主迁移到 10002 完成
+      volume-init:
+        condition: service_completed_successfully
+    environment:
+      - EXECUTOR_TOKEN=${EXECUTOR_TOKEN:-}
+      # bind source host root (required for named volume/NFS script_runs deployments): the daemon resolves
+      # the -v source according to the host path, which must be mapped back to the host via
+      # SANDBOX_WORKSPACE_HOST_ROOT (= the host mount source of SCRIPT_RUNS_VOLUME/UPLOADS_VOLUME
+      # in named volume form). For validation, see executor/sandbox_params.resolve_mount_source
+      # (not configured = bind deployment with consistent paths, behavior unchanged)
+      - SANDBOX_WORKSPACE_HOST_ROOT=${SANDBOX_WORKSPACE_HOST_ROOT:-}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${UPLOADS_VOLUME:?须在 .env.scale 配置共享存储挂载源(如 NFS 挂载点)，缺省本地目录会造成脚本库/数据集缓存与主控机分叉}:/app/uploads
+      - ${SCRIPT_RUNS_VOLUME:-./script_runs}:/app/uploads/script_runs
+    group_add:
+      - "${DOCKER_GROUP_GID:-999}"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,exec,nosuid,nodev,size=${TMPFS_TMP_SIZE:-1g}
+      - /home/app:rw,exec,nosuid,nodev,uid=10002,gid=10002,mode=0750,size=${TMPFS_HOME_SIZE:-1g}
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8300/health', timeout=5)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - ai-evo-net
+
+  # ARCH-3-1：评测机 egress 出口代理——与主控机 egress（ARCH-1-3）同款。
+  # 评测机的沙箱 egress 档在本机闭环：本机 executor 用宿主侧 docker CLI
+  # 起的沙箱容器加入本机 daemon 上的 aievo-sandbox-egress 网络（下方钉死
+  # 裸名），唯一出路是本机 egress 代理（域名白名单 + 内网目的地址拒绝，
+  # 与主控机同一份策略模板 docker/egress/，随部署目录同步）。评测机
+  # worker 自身外呼（模型测连/OSS）缺省不走 proxy（WORKER_EGRESS_PROXY
+  # 留空直出，与主控机灰度口径一致），需要收口时同样设
+  # WORKER_EGRESS_PROXY=http://egress:3128。
+  egress:
+    image: ${EGRESS_IMAGE:-ubuntu/squid:latest}
+    profiles: ["sandbox"]
+    container_name: ai-evo-egress
+    volumes:
+      - ${EGRESS_SQUID_CONF:-./docker/egress/squid.conf}:/etc/squid/squid.conf:ro
+      - ${EGRESS_WHITELIST_FILE:-./docker/egress/whitelist.txt}:/etc/squid/whitelist.txt:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "squid", "-k", "check"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - ai-evo-net
+      - aievo-sandbox-egress
+
+volumes:
+  # ARCH-3-1：script_runs 本机盘卷（SCRIPT_RUNS_VOLUME 缺省 bind ./script_runs，
+  # 可切命名卷）。注意：bind 路径必须落在本机盘——部署目录本身在 NFS 上时
+  # 缺省会退化成网络盘，此时显式设 SCRIPT_RUNS_VOLUME=script_runs 用命名卷
+  # （docker 卷根 /var/lib/docker/volumes 在本机盘）。
+  script_runs:
+  # 本机日志卷（LOGS_VOLUME 切命名卷用；缺省 bind ./logs）
+  logs:
+
+networks:
+  ai-evo-net:
+    driver: bridge
+  # ARCH-1-3（评测机同款）：沙箱 egress 档网络。name: 钉死裸名——executor
+  # 用宿主侧 docker CLI 的裸网络名起沙箱容器，必须与
+  # executor/sandbox_params.py NET_PROFILES["egress"] 逐字一致（单一事实源，
+  # tests/unit/test_compose_scale_topology.py 断言同步）。internal: 无默认
+  # 网关/NAT，沙箱唯一出路是同网段的 egress 代理。各评测机 docker daemon
+  # 相互独立，同名网络互不相干（沙箱 egress 档天然按机隔离）。
+  aievo-sandbox-egress:
+    name: aievo-sandbox-egress
+    driver: bridge
+    internal: true
