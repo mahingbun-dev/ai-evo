@@ -20,11 +20,15 @@ from app.services.redis_stop_signal import (
 
 pytestmark = pytest.mark.integration
 
-# 子进程源码：真实 Redis 写入互斥锁（hostname:pid），打印 LOCKED 后长睡模拟执行中
+# 子进程源码：真实 Redis 写入互斥锁（hostname:pid），打印 LOCKED 后长睡模拟执行中。
+# Redis 地址经 argv 注入（host/port 来自测试进程所用 local_redis 连接参数）——
+# 不能硬编码端口：本地 dev 栈常把 Redis 映射到非 6379 端口（如 6380），
+# 测试进程侧 monkeypatch 后连 settings.REDIS_URL 指向的实例，子进程必须写
+# 同一实例，否则「存活时拒绝」断言查不到子进程的锁而假红。
 _CHILD_SRC = """
 import os, socket, sys, time
 import redis
-r = redis.Redis(host='127.0.0.1', port=6379, db=0, decode_responses=True)
+r = redis.Redis(host=sys.argv[2], port=int(sys.argv[3]), db=0, decode_responses=True)
 r.set(sys.argv[1], f"{socket.gethostname()}:{os.getpid()}", nx=True, ex=3600)
 print("LOCKED", flush=True)
 time.sleep(120)
@@ -58,8 +62,17 @@ def test_takeover_after_holder_kill9(app_lock_on_local_redis):
     lock_key = "eval_task_lock:w10-kill9"
     task_id = "w10-kill9"
 
+    # 自建自清：历史失败运行可能残留本测试专属锁（原持锁 pytest 进程已死，
+    # 不清理会让「存活时拒绝」走成接管路径而假红）
+    redis_client.delete(lock_key)
+
+    conn_kwargs = redis_client.connection_pool.connection_kwargs
     proc = subprocess.Popen(
-        [sys.executable, "-c", _CHILD_SRC, lock_key],
+        [
+            sys.executable, "-c", _CHILD_SRC, lock_key,
+            str(conn_kwargs.get("host", "127.0.0.1")),
+            str(conn_kwargs.get("port", 6379)),
+        ],
         stdout=subprocess.PIPE,
     )
     try:

@@ -10,7 +10,8 @@ W5 PubSub 订阅竞态回归测试（整改计划 §2「W5 测试设计」竞态
 sleep（patch _get_redis_connection 放大 _listen 重建窗口）复现旧竞态窗口，
 断言消息可收到。
 
-真实本地 Redis 6379（频道用 w5race_ 前缀避免与并行测试互扰）；
+真实 Redis 跟随 settings.REDIS_URL 解析（频道用 w5race_ 前缀避免与并行
+测试互扰；本地 dev 栈常为 6380，CI 为 6379，与被测监听器同实例）；
 Redis 不可达时明确 skip（§5.1：跑不了明确 skip，不许假绿）。
 """
 import asyncio
@@ -33,12 +34,23 @@ REBUILD_SLEEP_SECONDS = 0.3
 
 @pytest.fixture
 def race_redis():
-    """本地真实 Redis；不可达明确 skip（不假绿）"""
+    """被测 PubSubListener 实际连接的 Redis（settings.REDIS_URL 同源解析：
+    环境变量 > 主仓 .env）；不可达明确 skip（不假绿）
+
+    不能硬编码端口：本地 dev 栈常把 Redis 映射到非 6379 端口（6379 可能
+    被其他项目占用），PubSubListener 连 settings.REDIS_URL 指向的实例，
+    本 fixture 必须查同一实例，否则订阅可见性检查永远看不到对端写入。
+    """
+    from urllib.parse import urlparse
+
+    from app.core.config import get_settings
+
+    url = get_settings().REDIS_URL
     try:
-        client = redis_lib.Redis(host="127.0.0.1", port=6379, db=0, decode_responses=True)
+        client = redis_lib.from_url(url, decode_responses=True)
         client.ping()
     except Exception as e:  # noqa: BLE001 - 探测失败统一 skip
-        pytest.skip(f"本地 Redis 6379 不可达，竞态回归无法执行（{e}）")
+        pytest.skip(f"Redis {urlparse(url).netloc or url} 不可达，竞态回归无法执行（{e}）")
     yield client
     client.close()
 

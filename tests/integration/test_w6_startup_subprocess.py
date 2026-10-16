@@ -31,8 +31,16 @@ def _free_port() -> int:
 
 
 def test_startup_without_dsn_fails_fast():
-    """unset DATABASE_URL 启动 API → 非零退出 + stderr 可读报错。"""
-    env = {k: v for k, v in os.environ.items() if k != "DATABASE_URL"}
+    """无 DSN 启动 API → 非零退出 + stderr 可读报错。
+
+    置空而非从 env 剔除 DATABASE_URL：主仓 .env 会经 pydantic-settings
+    兜底注入（env_file 锚定 PROJECT_ROOT，与子进程 cwd 无关，换目录躲不开；
+    开发机 .env 常年带 DSN，剔除后服务照常启动、用例超时假红）。空串
+    环境变量优先级高于 .env 文件值，才能真正制造「无 DSN」的世界，
+    与 CI（无 .env、unset 等价于空）行为一致。
+    """
+    env = dict(os.environ)
+    env["DATABASE_URL"] = ""
     port = _free_port()
     r = subprocess.run(
         [PY, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", str(port)],

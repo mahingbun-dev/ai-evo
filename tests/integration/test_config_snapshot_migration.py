@@ -16,14 +16,13 @@ create_all + stamp head 供给——W4 迁移的真实 upgrade/downgrade 语义�
 
 探针库结束 DROP（自建自清）。
 """
-import os
 import uuid
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 import pytest
 
-from tests.integration.conftest import SKIP_REASON
+from tests.integration.conftest import BASE_DSN, SKIP_REASON
 
 if SKIP_REASON:
     pytest.skip(SKIP_REASON, allow_module_level=True)
@@ -31,10 +30,10 @@ if SKIP_REASON:
 pytestmark = pytest.mark.integration
 
 WORKTREE_ROOT = Path(__file__).resolve().parents[2]
-BASE_DSN = os.environ.get(
-    "W4_BASE_DSN",
-    "postgresql://ai_evo:ai_evo@127.0.0.1:5432/ai_evo",
-)
+# 探针库基线 DSN 复用 conftest 同一解析源（W4_BASE_DSN > DATABASE_URL >
+# 历史缺省）——本文件此前自带 ai_evo:ai_evo 硬编码缺省，与本地 dev 栈
+# 口令不符时连接直接被拒；且 conftest 探测可达（不再置 SKIP_REASON）后
+# 本模块从「整体 skip」变为实跑，硬编码立即暴露
 _parts = urlsplit(BASE_DSN)
 _ADMIN_DSN = urlunsplit(_parts._replace(path="/postgres"))
 W4_REVISION = "f8e1d4c7a2b6"

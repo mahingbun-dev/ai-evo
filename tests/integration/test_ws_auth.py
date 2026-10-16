@@ -10,7 +10,7 @@ W5 WebSocket 鉴权与归属校验集成测试（整改计划 §2「W5 测试设
 4. 已禁用账号 → 4403（W19 同口径）。
 
 测试用户/任务行自建自清（conftest 的 w5_test_data_guard 按 w5it_/W5IT_
-前缀清理）；Redis 用本地 6379（local_redis fixture）。
+前缀清理）；Redis 跟随 settings.REDIS_URL（local_redis fixture）。
 """
 import json
 import time
