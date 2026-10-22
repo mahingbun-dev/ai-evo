@@ -219,5 +219,12 @@ class TestEvaluateSingle:
         ev = ConsistencyEvaluator(model_config={})
         ev.engine._call_model = AsyncMock(return_value={"success": False, "error": "fail"})
         result = await ev.evaluate_single("hello", repeat_count=3, use_judge=False)
-        assert result.metrics == {}  # no successful results means no metrics
+        # M2 QE2-3 pass^k 口径：全失败仍产出确定性统计（pass_at_1=0、pass^k=0），
+        # 相似度类指标无成功样本才缺省——旧断言 metrics=={} 已随口径升级失效
+        assert result.metrics["trials"] == 3
+        assert result.metrics["pass_count"] == 0
+        assert result.metrics["pass_at_1"] == 0.0
+        assert result.metrics["pass_pow_k"] == 0
+        assert result.metrics["score_mean"] == 0.0
+        assert "text_similarity" not in result.metrics
         assert result.judge_assessment == {}

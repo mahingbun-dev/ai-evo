@@ -166,6 +166,14 @@ class SuccessRateEvaluator:
         total_calls = repeat_count
         success_rate = successful_calls / total_calls if total_calls > 0 else 0.0
 
+        # pass^k 指标（M2 QE2-3，语义对齐 τ-bench）：repeat_count 次 trial
+        # 的通过序列 → pass@1 / pass^k 与分数标准差/标准误（0/1 二值分数）。
+        from app.services.pass_k import score_stats, trial_pass_stats
+
+        passes = [bool(r.get("success")) for r in repeat_results]
+        pass_k_metrics = trial_pass_stats(passes)
+        pass_k_metrics.update(score_stats([1.0 if p else 0.0 for p in passes]))
+
         metrics = {
             "total_calls": total_calls,
             "successful_calls": successful_calls,
@@ -174,6 +182,7 @@ class SuccessRateEvaluator:
             "min_response_time": round(min(response_times), 2) if response_times else 0,
             "max_response_time": round(max(response_times), 2) if response_times else 0,
         }
+        metrics.update(pass_k_metrics)
 
         # 错误分析
         error_analysis = {}

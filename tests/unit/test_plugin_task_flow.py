@@ -253,6 +253,13 @@ class TestPluginTraceValidation:
         task.score_details = None
         task.evaluation_metrics = None
         task.judge_variable_config = None
+        # M2 QE2-1/2/3/4 起编辑路径按列读终态校验器/轨迹/多 Trial/裁判治理
+        # 的任务级现值：MagicMock 自动属性会被误当成已配置，显式置空
+        task.verifiers = None
+        task.trajectory_config = None
+        task.trials = None
+        task.judge_guard_disabled = False
+        task.judge_canary = False
         with patch.object(EvaluationTaskService, "get_task", return_value=task), \
              patch.object(EvaluationTaskService, "_validate_targets_required"), \
              patch.object(EvaluationTaskService, "_validate_script_targets"), \

@@ -27,8 +27,10 @@ class ABTestService:
         duration_b: Optional[float] = None,
         name: Optional[str] = None,
         created_by: Optional[str] = None,
+        significance: Optional[Dict] = None,
     ) -> ABTestSession:
-        """保存一次 A/B 测试记录（W19：created_by 盖创建人）"""
+        """保存一次 A/B 测试记录（W19：created_by 盖创建人；M2 QE2-3：
+        significance 为多轮显著性统计，单轮为 None）"""
         session_id = f"abtest_{uuid.uuid4().hex[:12]}"
         session = ABTestSession(
             id=session_id,
@@ -44,6 +46,7 @@ class ABTestService:
             duration_a=duration_a,
             duration_b=duration_b,
             created_by=created_by,
+            significance=significance,
         )
         self.db.add(session)
         self.db.commit()

@@ -174,6 +174,13 @@ def run_evaluation_async(task_id: str, stop_event: Optional[StopEventProtocol] =
             # "idx" 为保留键——裁判 prompt 变量与结果平铺均显式排除该键
             _payload["idx"] = _orig_pos
 
+        # M2 QE2-4 裁判金丝雀：judge/agent 任务开启 judge_canary 时，在真实
+        # 行之后追加约 2%（至少 1 行）空/乱码探针行（行序号续号，落库键不与
+        # 真实行冲突；聚合整行剥离不进均分，见 judge_canary.py）
+        from app.services.judge_canary import inject_canary_payloads
+
+        payloads = inject_canary_payloads(payloads, task)
+
         # ========== 步骤5: 并发执行评测 ==========
         # 执行前检查是否已被停止（可能在排队期间被停止）
         if stop_event.is_set():

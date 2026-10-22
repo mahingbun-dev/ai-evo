@@ -12,7 +12,7 @@ import re
 import logging
 from typing import Dict, Any, List
 from app.services.model_caller import ModelCallerSync
-from app.services.prompt_guard import EMPTY_VALUE_RULES, PROMPT_INJECTION_GUARD, wrap_eval_data
+from app.services.prompt_guard import EMPTY_VALUE_RULES, injection_guard_clause, wrap_eval_data
 from app.services.metric_scoring import (
     format_score_range,
     metric_max_score,
@@ -39,8 +39,9 @@ def _call_llm(prompt: str, state: JudgeAgentState) -> str:
         raise RuntimeError("judge_model_config 为空，无法调用裁判模型")
 
     messages = [
-        # W12-5：system 层声明 <eval_data> 分隔符内是数据非指令（最小 prompt 注入防护）
-        {"role": "system", "content": f"你是一个专业的 AI 评测裁判。{PROMPT_INJECTION_GUARD}"},
+        # W12-5：system 层声明 <eval_data> 分隔符内是数据非指令（最小 prompt 注入防护）；
+        # M2 QE2-4 模板级配置：任务显式声明关闭消毒时不拼接该声明
+        {"role": "system", "content": f"你是一个专业的 AI 评测裁判。{injection_guard_clause()}"},
         {"role": "user", "content": prompt},
     ]
 

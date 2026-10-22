@@ -8,6 +8,7 @@ from datetime import datetime
 
 from app.services.judge_evaluation_engine import JudgeEvaluationResult
 from app.services.evaluators import evaluator_registry
+from app.services.pass_k import aggregate_pass_k_rows
 
 
 def _row_index(result: Dict[str, Any], fallback: int) -> int:
@@ -23,6 +24,33 @@ def _row_index(result: Dict[str, Any], fallback: int) -> int:
         return orig
     idx = result.get("idx", fallback) if isinstance(result, dict) else fallback
     return idx if isinstance(idx, int) else fallback
+
+
+def _aggregate_status_rate(results: List[Dict[str, Any]], key: str) -> Optional[Dict[str, Any]]:
+    """行级 {status: pass|fail|error} 结构的任务级通过率聚合（M2 共用口径）
+
+    QE2-1（verification_result）与 QE2-2（trajectory_match）同构：分母为
+    携带该键的行（模型调用失败等未到该步骤的行不计入——已按 failed 计入
+    success_rate）；任务无任何该键行返回 None（聚合不写对应键，门禁引用
+    相应 metric 按「不可用 → error」处理）。
+    """
+    statuses = [
+        row.get(key)
+        for row in results
+        if isinstance(row, dict) and isinstance(row.get(key), dict)
+    ]
+    if not statuses:
+        return None
+    passed = sum(1 for s in statuses if s.get("status") == "pass")
+    failed = sum(1 for s in statuses if s.get("status") == "fail")
+    errored = sum(1 for s in statuses if s.get("status") == "error")
+    return {
+        "total": len(statuses),
+        "passed": passed,
+        "failed": failed,
+        "errored": errored,
+        "pass_rate": round(passed / len(statuses), 4),
+    }
 
 
 class ResultAggregator:
@@ -187,6 +215,16 @@ class ResultAggregator:
                 "items": [],
             }
 
+        # M2 QE2-4 金丝雀探针行整行剥离：不计入任何任务级统计（均分/行通过率/
+        # 维度分/校验/轨迹/pass^k），单独聚合为 judge_governance.canary——
+        # 探针是给裁判的对抗样本，混入均分会把「裁判被欺骗」摊薄成正常分
+        canary_rows = [r for r in results if isinstance(r, dict) and r.get("judge_canary")]
+        if canary_rows:
+            results = [
+                r for r in results
+                if not (isinstance(r, dict) and r.get("judge_canary"))
+            ]
+
         # 过滤成功的结果
         successful_results = [r for r in results if r.get("success", False)]
         failed_results = [r for r in results if not r.get("success", False)]
@@ -221,7 +259,94 @@ class ResultAggregator:
             "completed_at": datetime.now().isoformat(),
         }
 
+        # 终态校验器聚合（M2 QE2-1）：有校验行的任务才写（无校验任务聚合结构
+        # 不变，门禁引用 verification_pass_rate 仍按 metric 不可用 → error）
+        verification_stats = self._aggregate_verification(results)
+        if verification_stats is not None:
+            aggregated["verification"] = verification_stats
+            aggregated["verification_pass_rate"] = verification_stats["pass_rate"]
+
+        # 轨迹匹配聚合（M2 QE2-2）：有匹配行的任务才写（口径与校验器聚合一致）
+        trajectory_stats = self._aggregate_trajectory(results)
+        if trajectory_stats is not None:
+            aggregated["trajectory"] = trajectory_stats
+            aggregated["trajectory_match_rate"] = trajectory_stats["pass_rate"]
+
+        # pass^k 聚合（M2 QE2-3，judge 行级多 trial）：有携带 pass_at_1 的
+        # 合并行才写（trials=1/存量任务聚合结构不变）
+        pass_k_stats = aggregate_pass_k_rows(successful_results)
+        if pass_k_stats is not None:
+            aggregated["pass_k"] = pass_k_stats
+
+        # 裁判治理聚合（M2 QE2-4）：金丝雀探针行单独成块（结果页裁判治理
+        # 面板消费；无探针任务聚合结构不变）
+        canary_stats = self._aggregate_canary(canary_rows)
+        if canary_stats is not None:
+            aggregated["judge_governance"] = {"canary": canary_stats}
+
         return aggregated
+
+    def _aggregate_canary(self, canary_rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """金丝雀探针行聚合（M2 QE2-4，空样本对抗自检）
+
+        行口径：result.judge_canary（{kind, content}，执行器打标）；裁判分
+        ≥ 满分 × CANARY_HIGH_SCORE_RATIO（0.7）即「高分」——空/乱码拿到
+        高分说明裁判可被欺骗，risk=true（结果页风险徽标）。
+        无探针行返回 None（聚合不写 judge_governance 键）。
+        """
+        if not canary_rows:
+            return None
+        from app.services.judge_canary import CANARY_HIGH_SCORE_RATIO
+
+        threshold = round((self.max_score or 10) * CANARY_HIGH_SCORE_RATIO, 4)
+        items = []
+        high_score_count = 0
+        for row in canary_rows:
+            marker = row.get("judge_canary") if isinstance(row.get("judge_canary"), dict) else {}
+            score = row.get("average_score")
+            is_high = isinstance(score, (int, float)) and score >= threshold
+            if is_high:
+                high_score_count += 1
+            items.append({
+                "idx": _row_index(row, len(items)),
+                "kind": marker.get("kind", ""),
+                "success": bool(row.get("success")),
+                "score": score,
+                "high": is_high,
+                "error": row.get("error", ""),
+            })
+        scored = [i for i in items if i["score"] is not None]
+        return {
+            "rows": len(items),
+            "scored": len(scored),
+            "high_score_count": high_score_count,
+            "max_canary_score": max((i["score"] for i in scored), default=None),
+            "threshold": threshold,
+            # 任一探针高分即风险（宁可误报不可漏报——裁判治理面板主口径）
+            "risk": high_score_count > 0,
+            "items": items,
+        }
+
+    @staticmethod
+    def _aggregate_verification(results: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """终态校验器任务级聚合（M2 QE2-1）
+
+        行口径：result.verification_result.status（pass/fail/error）；
+        分母为「已运行校验器的行」（verification_result 存在的行）——模型调用
+        失败等未到校验步骤的行不计入（这些行已按 failed 计入 success_rate）。
+        任务无任何校验行返回 None（聚合不写 verification 键）。
+        """
+        return _aggregate_status_rate(results, "verification_result")
+
+    @staticmethod
+    def _aggregate_trajectory(results: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """轨迹匹配任务级聚合（M2 QE2-2，口径与校验器聚合一致）
+
+        行口径：result.trajectory_match.status（pass/fail/error）；分母为
+        「已运行匹配的行」。任务无任何匹配行返回 None（聚合不写 trajectory 键，
+        门禁引用 trajectory_match_rate 按 metric 不可用 → error）。
+        """
+        return _aggregate_status_rate(results, "trajectory_match")
 
     def _aggregate_dimension_scores(
         self,
@@ -324,6 +449,11 @@ class ResultAggregator:
             "idx", "success", "judge_scores", "average_score", "model_output",
             "feedback", "dimension_scores", "input_data", "model_raw_response",
             "pre_script_results", "row_status", "judge_count", "failed_judge_count",
+            "verification_result", "trajectory_match",
+            # 行级多 trial 字段（M2 QE2-3）：下方显式写入，避免平铺重复
+            "trials_count", "trials_detail", "trial_scores", "trial_passes",
+            "pass_at_1", "pass_pow_k", "pass_count", "trials",
+            "score_mean", "score_std", "score_sem",
         }
 
         for idx, result in enumerate(results):
@@ -370,6 +500,23 @@ class ResultAggregator:
             # judge 与 agent 两种评测类型均生效
             if "pre_script_results" in result:
                 item["pre_script_results"] = result["pre_script_results"]
+            # 终态校验器结果（M2 QE2-1）：证据块展示用，judge 与 agent 均生效；
+            # 历史/未配置校验器的结果无该键，不写入（消费方按缺键跳过）
+            if "verification_result" in result:
+                item["verification_result"] = result["verification_result"]
+            # 轨迹匹配结果（M2 QE2-2）：轨迹时间线展示用，agent 类型生效；
+            # 历史/未配置轨迹断言的结果无该键，不写入
+            if "trajectory_match" in result:
+                item["trajectory_match"] = result["trajectory_match"]
+            # 行级多 trial 统计（M2 QE2-3，judge trials>1）：pass@1/pass^k 徽标
+            # 与 trial 明细展示用；trials=1/历史结果无该组键，不写入
+            if "trials_count" in result:
+                for key in ("trials_count", "trials_detail", "trial_scores",
+                            "trial_passes", "pass_at_1", "pass_pow_k",
+                            "pass_count", "trials", "score_mean", "score_std",
+                            "score_sem"):
+                    if key in result:
+                        item[key] = result[key]
             # 平铺输入变量（排除结构化字段、内部字段和空值字段）
             for k, v in result.items():
                 if k not in structured_keys and not k.startswith("_") and v is not None:
@@ -386,7 +533,8 @@ class ResultAggregator:
             "idx", "success", "error", "model_output", "model_raw_response",
             "judge_scores", "judge_details", "average_score", "feedback",
             "dimension_scores", "input_data", "row_status", "pre_script_results",
-            "judge_count", "failed_judge_count",
+            "judge_count", "failed_judge_count", "verification_result",
+            "trajectory_match",
         }
         items = []
 
@@ -404,6 +552,12 @@ class ResultAggregator:
             # on_fail=abort 失败的条目保留脚本结果，便于定位失败脚本
             if result.get("pre_script_results"):
                 item["pre_script_results"] = result["pre_script_results"]
+            # 终态校验器 abort 失败的条目保留校验证据（M2 QE2-1）
+            if result.get("verification_result"):
+                item["verification_result"] = result["verification_result"]
+            # 失败条目保留轨迹匹配证据（M2 QE2-2）
+            if result.get("trajectory_match"):
+                item["trajectory_match"] = result["trajectory_match"]
             # 平铺输入变量（与 _format_items 同口径：排除结构化字段、下划线开头与 None 值）
             for k, v in result.items():
                 if k not in structured_keys and not k.startswith("_") and v is not None:
@@ -548,6 +702,14 @@ class ResultAggregator:
                     "unique_result_count": metrics.get("unique_result_count", 0),
                     "total_calls": metrics.get("total_calls", 0),
                     "successful_calls": metrics.get("successful_calls", 0),
+                    # pass^k 行级口径（M2 QE2-3）：旧结果无该组键时取 None
+                    # （前端 pass^k 徽标按缺键跳过）
+                    "pass_at_1": metrics.get("pass_at_1"),
+                    "pass_pow_k": metrics.get("pass_pow_k"),
+                    "trials": metrics.get("trials"),
+                    "pass_count": metrics.get("pass_count"),
+                    "score_std": metrics.get("score_std"),
+                    "score_sem": metrics.get("score_sem"),
                 },
                 "judge_assessment": judge_assessment,
                 "dimension_scores": dimension_scores,  # 各维度评分（固定+自定义）
@@ -569,7 +731,11 @@ class ResultAggregator:
                 "count": len(scores),
             }
 
-        return {
+        # pass^k 聚合（M2 QE2-3）：行携带 pass_at_1（repeat 次数的通过统计）
+        # 才写；旧版一致性结果无该键，聚合结构不变
+        aggregated_pass_k = aggregate_pass_k_rows(results)
+
+        result = {
             "total_questions": len(results),
             "average_text_similarity": round(sum(text_similarities) / len(text_similarities), 4) if text_similarities else 0,
             "average_format_consistency": round(sum(format_consistencies) / len(format_consistencies), 4) if format_consistencies else 0,
@@ -578,6 +744,12 @@ class ResultAggregator:
             "custom_dimension_summary": aggregated_dims,  # 保持向后兼容
             "dimension_scores": aggregated_dims,  # 统一的维度评分汇总
         }
+        if aggregated_pass_k is not None:
+            result["pass_k"] = aggregated_pass_k
+            # 顶层便捷口径（结果卡片直读，嵌套块保留全量明细）
+            result["average_pass_at_1"] = aggregated_pass_k["average_pass_at_1"]
+            result["average_pass_pow_k"] = aggregated_pass_k["average_pass_pow_k"]
+        return result
 
     @staticmethod
     def aggregate_success_rate_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -613,6 +785,9 @@ class ResultAggregator:
             "average_success_rate": round(sum(success_rates) / len(success_rates), 4) if success_rates else 0,
             "total_calls": total_calls,
             "total_successes": total_successes,
+            # pass^k 聚合（M2 QE2-3）：行携带 pass_at_1 才写（旧版结果无该键，
+            # 聚合结构不变）；pass@1 与 overall_success_rate 互为校验
+            **({"pass_k": pass_k_stats} if (pass_k_stats := aggregate_pass_k_rows(results)) is not None else {}),
         }
 
 
@@ -1327,7 +1502,30 @@ class ResultAggregator:
             output_tokens=output_tokens_list,
         )
 
-        return {
+        # pass^k 聚合（M2 QE2-3）：同一样本（latency_config.repeat_count>1 时
+        # 展开的同 idx 重复行）k 次全过阈值的比例。存在重复行才写（k=1 的
+        # 存量聚合结构不变，pass_pow_k 此时与 pass_rate 同值无新信息）。
+        sample_passes: Dict[Any, List[bool]] = {}
+        for r in latency_results:
+            if not r.get("success") or r.get("duration") is None:
+                continue
+            sample_passes.setdefault(r.get("idx"), []).append(r.get("duration", 0) <= threshold)
+        pass_k_block = None
+        if any(len(passes) > 1 for passes in sample_passes.values()):
+            sample_count = len(sample_passes)
+            pass_k_block = {
+                "trials": max(len(p) for p in sample_passes.values()),
+                "rows": sample_count,
+                "average_pass_at_1": round(
+                    sum(sum(p) / len(p) for p in sample_passes.values()) / sample_count, 4
+                ),
+                "average_pass_pow_k": round(
+                    sum(1 for p in sample_passes.values() if all(p)) / sample_count, 4
+                ),
+                "all_pass_rows": sum(1 for p in sample_passes.values() if all(p)),
+            }
+
+        latency_metrics = {
             "total_count": result.total_count,
             "passed_count": result.passed_count,
             "failed_count": result.failed_count,
@@ -1352,6 +1550,9 @@ class ResultAggregator:
                 for r in result.records
             ],
         }
+        if pass_k_block is not None:
+            latency_metrics["pass_k"] = pass_k_block
+        return latency_metrics
 
 
 class ResultExporter:

@@ -340,3 +340,63 @@ def build_used_config_summary(task, db=None) -> Dict[str, Any]:
             )
 
     return summary
+
+
+# ---------------------------------------------------------------------------
+# 裁判治理快照（M2 QE2-4，task_execution_records.judge_config_snapshot）
+# ---------------------------------------------------------------------------
+
+def build_judge_config_snapshot(task, db=None) -> Optional[Dict[str, Any]]:
+    """本次裁决所用裁判配置快照（裁判治理面板「版本可追溯」面）
+
+    Berkeley Checklist 本地化：结果页可回答「这版分数是哪套裁判给的」——
+    - engine / judge_model：引擎与裁判模型摘要（掩码凭据，严禁明文出库）；
+    - prompt_template / score_details / evaluation_metrics / max_score：
+      prompt 模板与维度定义快照（评分口径的可追溯锚点）；
+    - guard / canary：输入消毒与金丝雀自检的本次开关状态（关闭消毒必须在
+      这里留痕——「审计可见」）。
+
+    非裁判类型（无裁判参与计分）返回 None（执行记录列保持 NULL）。
+    """
+    evaluation_type = getattr(task, "evaluation_type", "")
+    consistency_config = getattr(task, "consistency_config", None) or {}
+    uses_judge = evaluation_type in ("judge", "agent") or (
+        evaluation_type == "consistency"
+        and isinstance(consistency_config, dict)
+        and bool(consistency_config.get("use_judge"))
+    )
+    if not uses_judge:
+        return None
+
+    judge_engine = (getattr(task, "judge_engine", None) or "graph").lower()
+    if judge_engine == "claude_agent":
+        try:
+            from app.services.claude_code_config_service import ClaudeCodeConfigService
+
+            cc_config = ClaudeCodeConfigService.get_judge_llm_config()
+        except Exception as e:
+            logger.warning(f"裁判快照加载 CC 全局配置失败: {e}")
+            cc_config = None
+        judge_model = (
+            summarize_call_config(cc_config, "claude_code_global")
+            or {"source": "claude_code_global", "config_missing": True}
+        )
+    else:
+        judge_config, judge_source = resolve_judge_call_config(task, db)
+        judge_model = (
+            summarize_call_config(judge_config, judge_source)
+            or {"source": judge_source, "config_missing": True}
+        )
+
+    return {
+        "captured_at": _utc_now_iso(),
+        "engine": judge_engine,
+        "judge_model": judge_model,
+        "prompt_template": getattr(task, "judge_prompt", None),
+        "score_details": getattr(task, "score_details", None),
+        "evaluation_metrics": deepcopy(getattr(task, "evaluation_metrics", None) or []),
+        "max_score": getattr(task, "max_score", None),
+        # 治理开关留痕：关闭输入消毒必须可审计；金丝雀开关同记
+        "guard": {"injection_guard_disabled": bool(getattr(task, "judge_guard_disabled", False))},
+        "canary": {"enabled": bool(getattr(task, "judge_canary", False))},
+    }

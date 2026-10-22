@@ -154,6 +154,11 @@ class EvaluationTaskService:
         model_output_source: Optional[str] = None,
         model_output_field: Optional[str] = None,
         gate_config: Optional[Dict] = None,
+        verifiers: Optional[List[Dict]] = None,
+        trajectory_config: Optional[Dict] = None,
+        trials: Optional[int] = None,
+        judge_guard_disabled: Optional[bool] = False,
+        judge_canary: Optional[bool] = False,
     ) -> EvaluationTask:
         """创建评测任务"""
         # 验证评测类型
@@ -206,6 +211,14 @@ class EvaluationTaskService:
         # pre_scripts/steps 旧字段仅兼容接收，写路径一律置 None（targets 为唯一事实源，维度顺序即步骤）
         self._validate_targets_required(evaluation_type, consistency_config, evaluation_targets)
         self._validate_script_targets(evaluation_targets, dataset_id)
+        # 终态校验器配置校验（M2 QE2-1）：类型白名单/script 存在性/断言结构
+        self._validate_verifiers(verifiers)
+        # 轨迹断言配置校验（M2 QE2-2）：模式白名单/条目结构 + 仅 agent 类型
+        self._validate_trajectory_config(evaluation_type, trajectory_config)
+        # 行级多 trial 校验（M2 QE2-3）：仅 judge 类型、2-5 整数
+        self._validate_trials(evaluation_type, trials)
+        # 裁判治理校验（M2 QE2-4）：消毒关闭声明与金丝雀仅 judge/agent 类型
+        self._validate_judge_governance(evaluation_type, judge_guard_disabled, judge_canary)
         self._validate_reference_marks(
             score_details,
             evaluation_metrics,
@@ -289,6 +302,16 @@ class EvaluationTaskService:
             pre_scripts=None,
             # M1 QE1-6：门禁配置（{mode, thresholds}；None=未启用）
             gate_config=gate_config,
+            # M2 QE2-1：终态校验器配置（[{type, name, on_fail, config}]；None=未配置）
+            verifiers=verifiers,
+            # M2 QE2-2：轨迹断言配置（{mode, expected, forbidden}；None=未配置）
+            trajectory_config=trajectory_config,
+            # M2 QE2-3：行级多 trial 次数（judge 类型 2-5；None/1=不开启）
+            trials=trials if trials and trials > 1 else None,
+            # M2 QE2-4：裁判输入消毒显式关闭（默认 False=开启消毒，审计可见）
+            judge_guard_disabled=bool(judge_guard_disabled),
+            # M2 QE2-4：裁判金丝雀自检（默认关闭）
+            judge_canary=bool(judge_canary),
         )
 
         self.db.add(task)
@@ -361,6 +384,32 @@ class EvaluationTaskService:
         )
         self._validate_targets_required(effective_type, effective_consistency, effective_targets)
         self._validate_script_targets(effective_targets, kwargs.get("dataset_id") or task.dataset_id)
+        # 终态校验器校验（M2 QE2-1）：字段缺省时取任务既有值合并成最终态校验
+        effective_verifiers = (
+            kwargs.get("verifiers") if "verifiers" in kwargs else getattr(task, "verifiers", None)
+        )
+        self._validate_verifiers(effective_verifiers)
+        # 轨迹断言校验（M2 QE2-2）：字段缺省时取任务既有值合并成最终态校验
+        effective_trajectory = (
+            kwargs.get("trajectory_config") if "trajectory_config" in kwargs
+            else getattr(task, "trajectory_config", None)
+        )
+        self._validate_trajectory_config(effective_type, effective_trajectory)
+        # 行级多 trial 校验（M2 QE2-3）：字段缺省时取任务既有值合并成最终态校验
+        effective_trials = (
+            kwargs["trials"] if "trials" in kwargs else getattr(task, "trials", None)
+        )
+        self._validate_trials(effective_type, effective_trials)
+        # 裁判治理校验（M2 QE2-4）：字段缺省时取任务既有值合并成最终态校验
+        effective_guard_disabled = (
+            kwargs["judge_guard_disabled"] if "judge_guard_disabled" in kwargs
+            else bool(getattr(task, "judge_guard_disabled", False))
+        )
+        effective_canary = (
+            kwargs["judge_canary"] if "judge_canary" in kwargs
+            else bool(getattr(task, "judge_canary", False))
+        )
+        self._validate_judge_governance(effective_type, effective_guard_disabled, effective_canary)
         self._validate_reference_marks(
             kwargs.get("score_details") if "score_details" in kwargs else task.score_details,
             kwargs.get("evaluation_metrics") if "evaluation_metrics" in kwargs else task.evaluation_metrics,
@@ -450,6 +499,110 @@ class EvaluationTaskService:
         return task
 
     # ---------- 待评测数据配置校验（契约 v3 §五） ----------
+
+    def _validate_trajectory_config(
+        self,
+        evaluation_type: Optional[str],
+        trajectory_config: Optional[Dict],
+    ) -> None:
+        """轨迹断言配置校验（M2 QE2-2），失败抛 ValueError（API 层转 400）
+
+        形态白名单经 trajectory_matcher.validate_trajectory_shape（模式/条目
+        结构/args_contains/min_calls）；轨迹断言仅对 agent 类型任务有意义
+        （会话 session_messages 为轨迹来源），非 agent 类型配置非空即拒绝
+        （防静默不生效的配置）。
+        """
+        if not trajectory_config:
+            return
+        if evaluation_type != "agent":
+            raise ValueError(
+                f"轨迹断言仅支持 agent 类型任务（当前 {evaluation_type!r}）——"
+                "轨迹来源为会话数据的工具调用序列"
+            )
+        from app.services.trajectory_matcher import validate_trajectory_shape
+
+        validate_trajectory_shape(trajectory_config)
+
+    def _validate_verifiers(self, verifiers: Optional[List[Dict]]) -> None:
+        """终态校验器配置校验（M2 QE2-1），失败抛 ValueError（API 层转 400）
+
+        形态白名单经 verifier_runner.validate_verifier_shape（类型/on_fail/
+        断言结构/http URL 形态）；script 类型追加脚本存在性 + active 校验
+        （与 _validate_script_targets 同口径：停用/不存在均报错）。
+        """
+        if not verifiers:
+            return
+        from app.services.verifier_runner import validate_verifier_shape
+
+        validate_verifier_shape(verifiers)
+
+        script_ids = [
+            str((v.get("config") or {}).get("script_id") or "").strip()
+            for v in verifiers
+            if isinstance(v, dict) and v.get("type") == "script"
+        ]
+        if not script_ids:
+            return
+        from app.models.pre_judge_models import PreJudgeScript
+
+        rows = self.db.query(PreJudgeScript).filter(PreJudgeScript.id.in_(script_ids)).all()
+        by_id = {row.id: row for row in rows}
+        # builtin:<name> 前缀为历史引用兼容（按名称映射到 DB 记录）
+        names = [sid[len("builtin:"):] for sid in script_ids if sid.startswith("builtin:")]
+        if names:
+            for row in self.db.query(PreJudgeScript).filter(PreJudgeScript.name.in_(names)).all():
+                by_id.setdefault(f"builtin:{row.name}", row)
+        for script_id in script_ids:
+            row = by_id.get(script_id)
+            if row is None:
+                raise ValueError(f"校验器引用的脚本不存在: {script_id}")
+            if not row.is_active:
+                raise ValueError(f"校验器引用的脚本已停用: {script_id}（{row.name}）")
+
+    def _validate_trials(
+        self,
+        evaluation_type: Optional[str],
+        trials: Optional[int],
+    ) -> None:
+        """行级多 trial 配置校验（M2 QE2-3），失败抛 ValueError（API 层转 400）
+
+        仅 judge 类型支持（success_rate/consistency/latency 的多次重复走
+        各自 repeat_count 通道，两套 k 并存会互相打架）；取值须为 1-5 的
+        整数（1=不开启）。运行时另有 normalize_trials 宽容归一化兜底
+        （手写通道的存量任务不因脏值中断执行）。
+        """
+        if trials is None:
+            return
+        if isinstance(trials, bool) or not isinstance(trials, int):
+            raise ValueError(f"trials 必须为整数（1-5），当前 {trials!r}")
+        if not 1 <= trials <= 5:
+            raise ValueError(f"trials 须在 1-5 内（2-5 开启行级多 trial），当前 {trials}")
+        if trials > 1 and evaluation_type != "judge":
+            raise ValueError(
+                f"行级多 trial 仅支持 judge 类型任务（当前 {evaluation_type!r}）——"
+                "success_rate/consistency/latency 使用各自配置的重复次数"
+            )
+
+    def _validate_judge_governance(
+        self,
+        evaluation_type: Optional[str],
+        judge_guard_disabled: Optional[bool],
+        judge_canary: Optional[bool],
+    ) -> None:
+        """裁判治理配置校验（M2 QE2-4），失败抛 ValueError（API 层转 400）
+
+        输入消毒关闭声明与金丝雀自检都是裁判侧治理项，仅对裁判参与计分的
+        judge/agent 类型开放（success_rate/latency 等无裁判类型无意义且不
+        消费该配置，开启即拒绝——防静默不生效）。消毒默认开启，关闭属
+        显式降级动作，随 judge_config_snapshot 落执行记录（审计可见）。
+        """
+        if not judge_guard_disabled and not judge_canary:
+            return
+        if evaluation_type not in ("judge", "agent"):
+            raise ValueError(
+                f"裁判治理配置（输入消毒/金丝雀自检）仅支持 judge/agent 类型任务"
+                f"（当前 {evaluation_type!r}）——其余类型无裁判参与计分"
+            )
 
     def _validate_targets_required(
         self,
@@ -1518,6 +1671,9 @@ class TaskExecutionRecordService:
         )
         # W4：执行开始把创建时双快照写入 config_snapshot（归因锚点「应然」面）
         self._attach_start_config_snapshot(record)
+        # M2 QE2-4：执行开始写入裁判治理快照（引擎/裁判模型摘要/prompt 模板/
+        # 维度定义/消毒与金丝雀状态；非裁判类型不落，列保持 NULL）
+        self._attach_judge_config_snapshot(record)
         self.db.add(record)
         self.db.commit()
         return record
@@ -1562,6 +1718,24 @@ class TaskExecutionRecordService:
                 record.config_snapshot = build_execution_config_snapshot(task, self.db)
         except Exception as e:
             logger.warning(f"写入执行配置快照失败（task_id={record.task_id}）: {e}")
+
+    def _attach_judge_config_snapshot(self, record: TaskExecutionRecord):
+        """执行开始写入裁判治理快照（M2 QE2-4，失败仅告警不影响主流程）
+
+        快照即「本次裁决所用裁判配置」的事实源（结果页裁判治理面板回显）：
+        引擎 / 裁判模型摘要（掩码凭据）/ prompt 模板 / 维度定义 / 输入消毒
+        与金丝雀开关状态——关闭消毒的任务在这里留痕（审计可见）。
+        """
+        try:
+            from app.services.config_snapshot import build_judge_config_snapshot
+
+            task = self.db.query(EvaluationTask).filter(
+                EvaluationTask.id == record.task_id
+            ).first()
+            if task is not None:
+                record.judge_config_snapshot = build_judge_config_snapshot(task, self.db)
+        except Exception as e:
+            logger.warning(f"写入裁判治理快照失败（task_id={record.task_id}）: {e}")
 
     def _attach_used_config_summary(self, record: TaskExecutionRecord):
         """执行结束写入该次实际使用的配置摘要（归因锚点「实然」面）

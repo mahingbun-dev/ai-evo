@@ -31,6 +31,11 @@ class ABTestSession(Base):
     duration_a = Column(Float, nullable=True, comment="模型A耗时（秒）")
     duration_b = Column(Float, nullable=True, comment="模型B耗时（秒）")
 
+    # 显著性统计（M2 QE2-3）：多轮（同输入行配对）时由 ab_statistics 计算，
+    # 含耗时配对检验（Wilcoxon/配对 t/Cliff's delta）与成功比例 McNemar；
+    # 单轮/旧记录为 NULL。见 app/services/ab_statistics.py
+    significance = Column(JSON, nullable=True, comment="显著性统计（M2）：{duration_paired, success_mcnemar, rounds}，单轮为NULL")
+
     # W19 归属：创建人 user_code。历史行为 NULL——读对所有登录用户可见，
     # 删除仅创建人或超管（与 access_control 团队口径互补的轻量归属）。
     created_by = Column(String, nullable=True, comment="创建人 user_code（历史行为 NULL）")

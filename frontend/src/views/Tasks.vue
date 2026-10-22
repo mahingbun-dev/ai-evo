@@ -159,11 +159,39 @@
           <span style="margin-left: 10px; color: #909399; font-size: 12px;">同时发起多个裁判评分，最终结果取平均值</span>
         </el-form-item>
 
+        <!-- 行级多 Trial：仅 AI裁判员评测显示（M2 QE2-3，pass^k） -->
+        <el-form-item label="多 Trial 次数" v-if="form.evaluation_type === 'judge'">
+          <el-input-number v-model="form.trials" :min="1" :max="5" />
+          <span style="margin-left: 10px; color: #909399; font-size: 12px;">
+            &gt;1 时每条数据重复「模型调用+裁判+校验」k 次合并为一行，输出 pass@1 / pass^k（τ-bench 口径）；1=不开启
+          </span>
+        </el-form-item>
+
         <!-- 空值校验开关 -->
         <el-form-item label="空值校验" v-if="form.evaluation_type === 'judge'">
           <el-switch v-model="form.validation_enabled" />
           <span style="margin-left: 10px; color: #909399; font-size: 12px;">启用后，若评测目标内容为空则返回0分</span>
         </el-form-item>
+
+        <!-- 裁判治理（M2 QE2-4）：AI裁判员/长会话Agent评测显示 -->
+        <template v-if="form.evaluation_type === 'judge' || form.evaluation_type === 'agent'">
+          <el-divider content-position="left">裁判治理</el-divider>
+          <el-form-item label="裁判输入消毒">
+            <el-switch :model-value="!form.judge_guard_disabled" @update:model-value="form.judge_guard_disabled = !$event" />
+            <span style="margin-left: 10px; color: #909399; font-size: 12px;">
+              开启后裁判 prompt 中数据段以 &lt;eval_data&gt; 定界并声明「数据非指令」，抑制数据集内的 prompt 注入
+            </span>
+            <div v-if="form.judge_guard_disabled" style="color: #E6A23C; font-size: 12px; margin-top: 4px; width: 100%;">
+              已显式关闭输入消毒：数据集内容可能以指令形式影响裁判打分，该声明将随执行记录审计留痕，请确认数据来源可信
+            </div>
+          </el-form-item>
+          <el-form-item label="金丝雀自检">
+            <el-switch v-model="form.judge_canary" />
+            <span style="margin-left: 10px; color: #909399; font-size: 12px;">
+              开启后混入约 2% 空/乱码探针行直送裁判：探针行拿到高分会在结果页标记「裁判可被欺骗」风险徽标（探针行不计入均分）
+            </span>
+          </el-form-item>
+        </template>
 
         <!-- 重复次数：仅一致性评测显示 -->
         <el-form-item label="重复次数" v-if="form.evaluation_type === 'consistency'">
@@ -411,6 +439,70 @@
             :initial-data="form.agent_config || {}"
             @update="handleAgentConfigUpdate"
           />
+
+          <!-- M2 轨迹断言（QE2-2）：对会话工具调用序列做确定性匹配（独立于裁判计分） -->
+          <el-divider content-position="left">轨迹断言（确定性轨迹匹配）</el-divider>
+          <div class="trajectory-config-block">
+            <div class="gate-config-tip">
+              对会话（session_messages）的工具调用序列做确定性匹配，截断 trace 虚高等问题由硬证据暴露；
+              结果独立于裁判均分，聚合出「轨迹匹配率」（trajectory_match_rate，可挂门禁）
+            </div>
+            <el-radio-group v-model="trajectoryUi.mode" size="small" class="gate-mode-group" :disabled="dialogBusy">
+              <el-radio-button value="strict">严格序列（strict）</el-radio-button>
+              <el-radio-button value="unordered">乱序计数（unordered）</el-radio-button>
+              <el-radio-button value="subset">按序子序列（subset）</el-radio-button>
+              <el-radio-button value="superset">禁止多余（superset）</el-radio-button>
+            </el-radio-group>
+            <div class="gate-config-tip">
+              strict=顺序+全集+无多余；unordered=顺序无关计数；subset=期望按序出现（允许多余调用）；
+              superset=每条调用都须被期望覆盖（漏掉期望不算失败）；禁用工具任何模式下命中即失败
+            </div>
+
+            <div class="trajectory-sub-title">期望调用（expected）</div>
+            <el-table :data="trajectoryUi.expected" size="small">
+              <el-table-column label="工具名" min-width="140">
+                <template #default="{ row }">
+                  <el-input v-model="row.tool" size="small" placeholder="如 grep / Bash / Read" :disabled="dialogBusy" />
+                </template>
+              </el-table-column>
+              <el-table-column label="参数须包含（逗号分隔，可选）" min-width="200">
+                <template #default="{ row }">
+                  <el-input v-model="row.argsContainsStr" size="small" placeholder="如 git push,origin" :disabled="dialogBusy" />
+                </template>
+              </el-table-column>
+              <el-table-column label="最少次数" width="120">
+                <template #default="{ row }">
+                  <el-input-number v-model="row.min_calls" :min="1" :max="99" controls-position="right" style="width: 100%" :disabled="dialogBusy" />
+                </template>
+              </el-table-column>
+              <el-table-column width="60">
+                <template #default="{ $index }">
+                  <el-button type="danger" size="small" circle :icon="Delete" :disabled="dialogBusy" @click="trajectoryUi.expected.splice($index, 1)" />
+                </template>
+              </el-table-column>
+            </el-table>
+            <el-button size="small" :icon="Plus" class="gate-add-btn" :disabled="dialogBusy" @click="trajectoryUi.expected.push({ tool: '', argsContainsStr: '', min_calls: 1 })">添加期望</el-button>
+
+            <div class="trajectory-sub-title">禁用调用（forbidden，命中即失败）</div>
+            <el-table :data="trajectoryUi.forbidden" size="small">
+              <el-table-column label="工具名" min-width="140">
+                <template #default="{ row }">
+                  <el-input v-model="row.tool" size="small" placeholder="如 rm" :disabled="dialogBusy" />
+                </template>
+              </el-table-column>
+              <el-table-column label="参数须包含（逗号分隔，可选）" min-width="200">
+                <template #default="{ row }">
+                  <el-input v-model="row.argsContainsStr" size="small" placeholder="如 sudo（留空=工具名整体禁用）" :disabled="dialogBusy" />
+                </template>
+              </el-table-column>
+              <el-table-column width="60">
+                <template #default="{ $index }">
+                  <el-button type="danger" size="small" circle :icon="Delete" :disabled="dialogBusy" @click="trajectoryUi.forbidden.splice($index, 1)" />
+                </template>
+              </el-table-column>
+            </el-table>
+            <el-button size="small" :icon="Plus" class="gate-add-btn" :disabled="dialogBusy" @click="trajectoryUi.forbidden.push({ tool: '', argsContainsStr: '' })">添加禁用</el-button>
+          </div>
         </template>
 
         <!-- 安全评测配置 -->
@@ -1168,11 +1260,173 @@
             </template>
           </div>
         </el-form-item>
+
+        <!-- M2 终态校验器（QE2-1）：确定性终态校验优先——模型输出/被测 agent 执行之后运行，
+             独立于裁判计分；聚合 verification_pass_rate 可挂门禁 -->
+        <el-form-item label="终态校验器">
+          <div class="verifier-config-block">
+            <div class="gate-config-tip">
+              模型输出之后运行的确定性断言（script / db_assert / file_assert / http_assert），
+              证据随结果展示，聚合出「校验通过率」（verification_pass_rate，可挂门禁）；不配置则行为与旧版一致
+            </div>
+            <el-card
+              v-for="(verifier, vIdx) in verifiersUi"
+              :key="vIdx"
+              shadow="never"
+              class="verifier-card"
+            >
+              <template #header>
+                <div class="verifier-card-header">
+                  <el-select v-model="verifier.type" size="small" style="width: 150px" :disabled="dialogBusy" @change="onVerifierTypeChange(verifier)">
+                    <el-option v-for="t in VERIFIER_TYPES" :key="t.value" :label="t.label" :value="t.value" />
+                  </el-select>
+                  <el-input v-model="verifier.name" size="small" placeholder="名称（可选）" style="width: 160px" :disabled="dialogBusy" />
+                  <el-select v-model="verifier.on_fail" size="small" style="width: 130px" :disabled="dialogBusy">
+                    <el-option label="失败继续（continue）" value="continue" />
+                    <el-option label="失败中止（abort）" value="abort" />
+                  </el-select>
+                  <span class="verifier-header-spacer" />
+                  <el-button size="small" :loading="verifierDebugRunning" :disabled="dialogBusy" @click="openVerifierDebug(vIdx)">试跑</el-button>
+                  <el-button type="danger" size="small" circle :icon="Delete" :disabled="dialogBusy" @click="verifiersUi.splice(vIdx, 1)" />
+                </div>
+              </template>
+
+              <!-- script：复用前处理脚本库（沙箱通道，stdin 含模型输出与会话 trace） -->
+              <template v-if="verifier.type === 'script'">
+                <div class="verifier-row">
+                  <span class="verifier-label">脚本</span>
+                  <el-select v-model="verifier.config.script_id" filterable placeholder="选择脚本库脚本" style="width: 260px" :disabled="dialogBusy">
+                    <el-option v-for="script in preJudgeScripts" :key="script.id" :label="script.name" :value="script.id" />
+                  </el-select>
+                  <el-input-number v-model="verifier.config.timeout_seconds" :min="5" :max="600" placeholder="超时(秒)" controls-position="right" style="width: 120px" :disabled="dialogBusy" />
+                  <el-checkbox v-model="verifier.config.network" :disabled="dialogBusy">容器出网</el-checkbox>
+                </div>
+                <div class="gate-config-tip">复用前处理脚本沙箱通道与标准输出契约（stdin 带 kind=verifier、模型输出与会话摘要）；脚本输出 status=ok/skip 记 pass，fail 记未通过</div>
+              </template>
+
+              <!-- db_assert：原生只读 SQL 断言（复用内置 db_assert 只读约束） -->
+              <template v-else-if="verifier.type === 'db_assert'">
+                <el-table :data="verifier.config.assertions" size="small">
+                  <el-table-column label="名称" width="140">
+                    <template #default="{ row }"><el-input v-model="row.name" size="small" placeholder="断言名" :disabled="dialogBusy" /></template>
+                  </el-table-column>
+                  <el-table-column label="SQL（只读 SELECT/WITH）" min-width="260">
+                    <template #default="{ row }"><el-input v-model="row.sql" type="textarea" :rows="2" size="small" placeholder="SELECT count(*) AS cnt FROM orders" :disabled="dialogBusy" /></template>
+                  </el-table-column>
+                  <el-table-column label="期望（JSON）" min-width="200">
+                    <template #default="{ row }"><el-input v-model="row.expectedJson" type="textarea" :rows="2" size="small" placeholder='{"scalar": 3}' :disabled="dialogBusy" /></template>
+                  </el-table-column>
+                  <el-table-column width="60">
+                    <template #default="{ $index }">
+                      <el-button type="danger" size="small" circle :icon="Delete" :disabled="dialogBusy" @click="verifier.config.assertions.splice($index, 1)" />
+                    </template>
+                  </el-table-column>
+                </el-table>
+                <el-button size="small" :icon="Plus" class="gate-add-btn" :disabled="dialogBusy" @click="verifier.config.assertions.push({ name: '', sql: '', expectedJson: DB_ASSERT_EXPECTED_DEFAULT })">添加断言</el-button>
+                <div class="gate-config-tip">连接平台配置的只读 DSN（DB_ASSERT_READONLY_DSN），仅允许单条 SELECT/WITH；期望键：row_count / scalar / first_row / contains_row</div>
+              </template>
+
+              <!-- file_assert：工作区文件断言（exists/regex/jsonpath） -->
+              <template v-else-if="verifier.type === 'file_assert'">
+                <el-table :data="verifier.config.assertions" size="small">
+                  <el-table-column label="文件路径（工作区相对）" min-width="200">
+                    <template #default="{ row }"><el-input v-model="row.path" size="small" placeholder="outputs/result.json" :disabled="dialogBusy" /></template>
+                  </el-table-column>
+                  <el-table-column label="模式" width="120">
+                    <template #default="{ row }">
+                      <el-select v-model="row.mode" size="small" :disabled="dialogBusy">
+                        <el-option label="存在" value="exists" />
+                        <el-option label="正则" value="regex" />
+                        <el-option label="JSONPath" value="jsonpath" />
+                      </el-select>
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="参数（正则/JSONPath）" min-width="170">
+                    <template #default="{ row }">
+                      <el-input v-if="row.mode === 'regex'" v-model="row.pattern" size="small" placeholder="正则表达式" :disabled="dialogBusy" />
+                      <el-input v-else-if="row.mode === 'jsonpath'" v-model="row.jsonpath" size="small" placeholder="a.b[0].c" :disabled="dialogBusy" />
+                      <span v-else>-</span>
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="期望值" min-width="130">
+                    <template #default="{ row }">
+                      <el-input v-if="row.mode === 'jsonpath'" v-model="row.expected" size="small" placeholder="等于（可空）" :disabled="dialogBusy" />
+                      <span v-else>-</span>
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="取反" width="60">
+                    <template #default="{ row }"><el-checkbox v-model="row.negate" :disabled="dialogBusy" /></template>
+                  </el-table-column>
+                  <el-table-column width="60">
+                    <template #default="{ $index }">
+                      <el-button type="danger" size="small" circle :icon="Delete" :disabled="dialogBusy" @click="verifier.config.assertions.splice($index, 1)" />
+                    </template>
+                  </el-table-column>
+                </el-table>
+                <el-button size="small" :icon="Plus" class="gate-add-btn" :disabled="dialogBusy" @click="verifier.config.assertions.push({ path: '', mode: 'exists', pattern: '', jsonpath: '', expected: '', negate: false })">添加断言</el-button>
+                <div class="gate-config-tip">对该条数据的工作区（uploads/script_runs/…/）文件断言，含前处理脚本 stage 的执行包副本；JSONPath 为极简点路径子集（a.b[0].c）</div>
+              </template>
+
+              <!-- http_assert：回调端点断言（egress 守卫，默认仅公网） -->
+              <template v-else-if="verifier.type === 'http_assert'">
+                <div class="verifier-row">
+                  <el-input v-model="verifier.config.url" size="small" placeholder="回调端点 URL（http/https）" style="width: 300px" :disabled="dialogBusy" />
+                  <el-select v-model="verifier.config.method" size="small" style="width: 96px" :disabled="dialogBusy">
+                    <el-option v-for="m in ['GET', 'POST', 'PUT', 'PATCH', 'HEAD', 'DELETE']" :key="m" :label="m" :value="m" />
+                  </el-select>
+                  <el-input-number v-model="verifier.config.expect_status" :min="100" :max="599" controls-position="right" style="width: 110px" :disabled="dialogBusy" />
+                  <el-checkbox v-model="verifier.config.allow_private" :disabled="dialogBusy">允许内网目标</el-checkbox>
+                  <span v-if="verifier.config.allow_private" style="font-size: 12px; color: #909399;">
+                    还需管理员启用 HTTP_ASSERT_ALLOW_PRIVATE_TARGETS 才生效
+                  </span>
+                </div>
+                <div class="verifier-row">
+                  <el-input v-model="verifier.config.body_regex" size="small" placeholder="响应体正则（可选）" style="width: 240px" :disabled="dialogBusy" />
+                  <el-input v-model="verifier.config.jsonpath" size="small" placeholder="响应 JSONPath（可选，如 status）" style="width: 200px" :disabled="dialogBusy" />
+                  <el-input v-model="verifier.config.expected" size="small" placeholder="期望值（可选）" style="width: 140px" :disabled="dialogBusy" />
+                </div>
+                <div class="gate-config-tip">出网走平台 egress 守卫：默认仅公网目标（内网/环回/DNS 重绑定拒绝）；内网回调端点需显式勾选「允许内网目标」（任务配置可审计）</div>
+              </template>
+            </el-card>
+            <el-button size="small" :icon="Plus" class="gate-add-btn" :disabled="dialogBusy" @click="addVerifier">添加校验器</el-button>
+          </div>
+        </el-form-item>
       </el-form>
 
       <!-- 指令预览对话框 -->
       <el-dialog v-model="previewVisible" title="指令内容预览" width="700px">
         <pre class="prompt-preview">{{ previewPromptText }}</pre>
+      </el-dialog>
+
+      <!-- M2 校验器试跑对话框（复用脚本试跑通道语义：超管口径） -->
+      <el-dialog v-model="verifierDebugVisible" title="校验器试跑" width="640px">
+        <el-form label-width="90px">
+          <el-form-item label="模型输出">
+            <el-input
+              v-model="verifierDebugSample"
+              type="textarea" :rows="4"
+              placeholder="样例模型输出（script 类型校验器进脚本 stdin.model_output；原生类型忽略）"
+            />
+          </el-form-item>
+        </el-form>
+        <template #footer>
+          <el-button @click="verifierDebugVisible = false">关闭</el-button>
+          <el-button type="primary" :loading="verifierDebugRunning" @click="runVerifierDebug">试跑一次</el-button>
+        </template>
+        <el-descriptions v-if="verifierDebugResult" :column="2" border size="small" style="margin-top: 12px">
+          <el-descriptions-item label="结果">
+            <el-tag :type="verifierStatusTag(verifierDebugResult.result?.status).type" size="small">
+              {{ verifierStatusTag(verifierDebugResult.result?.status).label }}
+            </el-tag>
+          </el-descriptions-item>
+          <el-descriptions-item label="耗时">{{ verifierDebugResult.result?.duration_ms ?? '-' }} ms</el-descriptions-item>
+          <el-descriptions-item label="证据" :span="2">
+            <pre class="verifier-evidence-preview">{{ JSON.stringify(verifierDebugResult.result?.evidence || {}, null, 2) }}</pre>
+          </el-descriptions-item>
+          <el-descriptions-item v-if="verifierDebugResult.result?.error" label="错误" :span="2">
+            <span style="color: #F56C6C">{{ verifierDebugResult.result.error }}</span>
+          </el-descriptions-item>
+        </el-descriptions>
       </el-dialog>
 
       <!-- 保存为模板对话框 -->
@@ -1404,6 +1658,11 @@ const form = ref({
   // 裁判引擎：claude_agent（Claude Code Agent 引擎）/ deepseek_agent（DeepSeek Agent 引擎）/ graph（传统裁判图引擎）
   judge_engine: 'claude_agent',
   judge_count: 6,
+  // 行级多 Trial 次数（M2 QE2-3，judge 类型）：2-5 开启 pass@1/pass^k，1=不开启
+  trials: 1,
+  // 裁判治理（M2 QE2-4）：false=开启输入消毒（默认）；金丝雀默认关闭
+  judge_guard_disabled: false,
+  judge_canary: false,
   description: '',
   // 评测指令配置（steps/pre_scripts 已废弃：维度顺序即步骤，脚本在待评测数据行内编排，提交时一律发 null）
   template_id: '',
@@ -1499,12 +1758,22 @@ const gateMode = ref('all')
 const gateThresholds = ref([])
 
 // 指标口径与后端 gate_service 对齐：total_score=任务均分、pass_rate=行通过率(0-1)、
-// dimension:<维度名>=维度均分（维度列表随当前表单的评测维度联动）
+// dimension:<维度名>=维度均分（维度列表随当前表单的评测维度联动）；
+// verification_pass_rate=终态校验器行通过率（M2 QE2-1，配置校验器时可选）、
+// trajectory_match_rate=轨迹匹配行通过率（M2 QE2-2，配置轨迹断言时可选）
 const gateMetricOptions = computed(() => {
   const opts = [
     { value: 'total_score', label: '任务均分（total_score）' },
     { value: 'pass_rate', label: '行通过率（pass_rate，0-1）' }
   ]
+  if ((verifiersUi.value || []).length > 0) {
+    opts.push({ value: 'verification_pass_rate', label: '校验通过率（verification_pass_rate，0-1）' })
+  }
+  const hasTrajectory = (trajectoryUi.value.expected || []).some(e => (e.tool || '').trim())
+    || (trajectoryUi.value.forbidden || []).some(e => (e.tool || '').trim())
+  if (form.value.evaluation_type === 'agent' && hasTrajectory) {
+    opts.push({ value: 'trajectory_match_rate', label: '轨迹匹配率（trajectory_match_rate，0-1）' })
+  }
   for (const metric of (form.value.evaluation_metrics || [])) {
     const name = metric && metric.name
     if (name) opts.push({ value: `dimension:${name}`, label: `维度均分：${name}` })
@@ -1542,6 +1811,223 @@ const collectGateConfig = () => {
 // 门禁 verdict 展示口径（执行历史列表与结果页横幅共用语义）
 const gateVerdictLabel = (verdict) => ({ passed: '通过', failed: '未通过', error: '错误' }[verdict] || verdict)
 const gateVerdictTagType = (verdict) => ({ passed: 'success', failed: 'danger', error: 'warning' }[verdict] || 'info')
+
+// ---------- M2 终态校验器（表单态：verifiers 落库形状为 [{type, name, on_fail, config}]，null=未配置） ----------
+const VERIFIER_TYPES = [
+  { value: 'script', label: 'script（脚本）' },
+  { value: 'db_assert', label: 'db_assert（数据库）' },
+  { value: 'file_assert', label: 'file_assert（文件）' },
+  { value: 'http_assert', label: 'http_assert（回调）' }
+]
+// db_assert 期望断言的默认 JSON 模板（模板表达式内联字符串转义易错，收敛为常量）
+const DB_ASSERT_EXPECTED_DEFAULT = '{"scalar": 1}'
+const verifiersUi = ref([])
+
+// 各类型的默认 config（切换类型时重置）
+const _verifierDefaultConfig = (type) => {
+  if (type === 'script') return { script_id: '', timeout_seconds: null, network: false }
+  if (type === 'db_assert') return { assertions: [{ name: '', sql: '', expectedJson: DB_ASSERT_EXPECTED_DEFAULT }] }
+  if (type === 'file_assert') return { assertions: [{ path: '', mode: 'exists', pattern: '', jsonpath: '', expected: '', negate: false }] }
+  return { url: '', method: 'GET', expect_status: 200, allow_private: false, body_regex: '', jsonpath: '', expected: '' }
+}
+
+const addVerifier = () => {
+  verifiersUi.value.push({ type: 'file_assert', name: '', on_fail: 'continue', config: _verifierDefaultConfig('file_assert') })
+}
+
+const onVerifierTypeChange = (verifier) => {
+  verifier.config = _verifierDefaultConfig(verifier.type)
+}
+
+// 打开弹窗时从任务 verifiers 同步到表单态（db_assert 的 expected JSON 编辑态拆为字符串）
+const applyVerifiers = (verifiers) => {
+  const list = Array.isArray(verifiers) ? verifiers : []
+  verifiersUi.value = list
+    .filter(v => v && VERIFIER_TYPES.some(t => t.value === v.type))
+    .map(v => {
+      const config = { ...(v.config || {}) }
+      if (v.type === 'db_assert') {
+        config.assertions = (Array.isArray(config.assertions) ? config.assertions : []).map(a => ({
+          name: a?.name || '',
+          sql: a?.sql || '',
+          expectedJson: a?.expected != null ? JSON.stringify(a.expected) : '{"scalar": 1}'
+        }))
+      }
+      return { type: v.type, name: v.name || '', on_fail: v.on_fail === 'abort' ? 'abort' : 'continue', config }
+    })
+}
+
+// 提交前收集：过滤无效行（缺脚本/断言/URL）；db_assert expectedJson 解析回对象；
+// 有效行全空 = 未配置（落 null，清空校验器）
+const _collectVerifierList = (list) => {
+  const collected = []
+  for (const verifier of (list || [])) {
+    if (!VERIFIER_TYPES.some(t => t.value === verifier.type)) continue
+    const config = verifier.config || {}
+    if (verifier.type === 'script') {
+      if (!config.script_id) continue
+      const scriptConfig = { script_id: config.script_id }
+      if (config.timeout_seconds) scriptConfig.timeout_seconds = config.timeout_seconds
+      if (config.network) scriptConfig.network = true
+      collected.push({ type: verifier.type, name: (verifier.name || '').trim(), on_fail: verifier.on_fail, config: scriptConfig })
+      continue
+    }
+    if (verifier.type === 'db_assert') {
+      const assertions = (config.assertions || [])
+        .filter(a => a && (a.sql || '').trim())
+        .map(a => {
+          let expected
+          try { expected = JSON.parse(a.expectedJson || '{}') } catch (e) { expected = { scalar: null } }
+          return { name: (a.name || '').trim(), sql: a.sql, expected }
+        })
+      if (assertions.length === 0) continue
+      collected.push({ type: verifier.type, name: (verifier.name || '').trim(), on_fail: verifier.on_fail, config: { assertions } })
+      continue
+    }
+    if (verifier.type === 'file_assert') {
+      const assertions = (config.assertions || [])
+        .filter(a => a && (a.path || '').trim())
+        .map(a => ({
+          name: (a.name || '').trim(), path: a.path.trim(), mode: a.mode || 'exists',
+          pattern: (a.pattern || '').trim(), jsonpath: (a.jsonpath || '').trim(),
+          expected: a.expected === '' || a.expected == null ? null : a.expected,
+          negate: !!a.negate
+        }))
+      if (assertions.length === 0) continue
+      collected.push({ type: verifier.type, name: (verifier.name || '').trim(), on_fail: verifier.on_fail, config: { assertions } })
+      continue
+    }
+    if (verifier.type === 'http_assert') {
+      const url = (config.url || '').trim()
+      if (!url) continue
+      const httpConfig = {
+        url, method: config.method || 'GET',
+        expect_status: config.expect_status ?? 200,
+        allow_private: !!config.allow_private
+      }
+      if ((config.body_regex || '').trim()) httpConfig.body_regex = config.body_regex.trim()
+      if ((config.jsonpath || '').trim()) {
+        httpConfig.jsonpath = config.jsonpath.trim()
+        if ((config.expected || '') !== '') httpConfig.expected = config.expected
+      }
+      collected.push({ type: verifier.type, name: (verifier.name || '').trim(), on_fail: verifier.on_fail, config: httpConfig })
+      continue
+    }
+    collected.push({ type: verifier.type, name: (verifier.name || '').trim(), on_fail: verifier.on_fail, config })
+  }
+  return collected
+}
+
+const collectVerifiers = () => {
+  const collected = _collectVerifierList(verifiersUi.value)
+  return collected.length > 0 ? collected : null
+}
+
+// 校验器试跑（复用脚本试跑通道语义：超管口径，POST /evaluation/tasks/verifiers/debug）
+const verifierDebugVisible = ref(false)
+const verifierDebugIndex = ref(-1)
+const verifierDebugRunning = ref(false)
+const verifierDebugSample = ref('')
+const verifierDebugResult = ref(null)
+
+const openVerifierDebug = (index) => {
+  const verifier = verifiersUi.value[index]
+  if (!verifier) return
+  const payload = collectSingleVerifier(verifier)
+  if (!payload) {
+    ElMessage.warning('请先补全校验器必填项（脚本/断言/URL）再试跑')
+    return
+  }
+  verifierDebugIndex.value = index
+  verifierDebugSample.value = ''
+  verifierDebugResult.value = null
+  verifierDebugVisible.value = true
+}
+
+// 收集单个校验器（与 collectVerifiers 同构，供试跑）
+const collectSingleVerifier = (verifier) => {
+  const collected = _collectVerifierList([verifier])
+  return collected.length > 0 ? collected[0] : null
+}
+
+const runVerifierDebug = async () => {
+  const verifier = verifiersUi.value[verifierDebugIndex.value]
+  if (!verifier) return
+  const payload = collectSingleVerifier(verifier)
+  if (!payload) {
+    ElMessage.warning('请先补全校验器必填项再试跑')
+    return
+  }
+  verifierDebugRunning.value = true
+  try {
+    const res = await taskApi.debugVerifier({
+      verifier: payload,
+      sample: { model_output: verifierDebugSample.value }
+    })
+    verifierDebugResult.value = res
+  } catch (e) {
+    ElMessage.error(e.message || '试跑失败')
+  } finally {
+    verifierDebugRunning.value = false
+  }
+}
+
+// 校验器状态展示口径（pass/fail/error，与后端 verifier_runner 一致）
+const verifierStatusTag = (status) => {
+  const map = {
+    pass: { type: 'success', label: '通过' },
+    fail: { type: 'danger', label: '未通过' },
+    error: { type: 'warning', label: '错误' }
+  }
+  return map[status] || { type: 'info', label: status || '-' }
+}
+
+// ---------- M2 轨迹断言（agent 类型表单态：trajectory_config 落库形状为
+// {mode, expected[], forbidden[]}，null=未配置） ----------
+const TRAJECTORY_MODES = ['strict', 'unordered', 'subset', 'superset']
+const trajectoryUi = ref({ mode: 'subset', expected: [], forbidden: [] })
+
+// 编辑态字符串 ↔ 落库数组：args_contains 编辑框为逗号分隔字符串
+const _splitArgsStr = (str) => String(str || '').split(/[,，]/).map(s => s.trim()).filter(Boolean)
+const _joinArgsList = (list) => Array.isArray(list) ? list.join(', ') : ''
+
+// 打开弹窗时从任务 trajectory_config 同步表单态
+const applyTrajectoryConfig = (config) => {
+  const cfg = config && typeof config === 'object' ? config : null
+  trajectoryUi.value = {
+    mode: TRAJECTORY_MODES.includes(cfg?.mode) ? cfg.mode : 'subset',
+    expected: (Array.isArray(cfg?.expected) ? cfg.expected : [])
+      .map(e => ({
+        tool: e?.tool || '',
+        argsContainsStr: _joinArgsList(e?.args_contains),
+        min_calls: Number.isInteger(e?.min_calls) && e.min_calls >= 1 ? e.min_calls : 1
+      })),
+    forbidden: (Array.isArray(cfg?.forbidden) ? cfg.forbidden : [])
+      .map(e => ({ tool: e?.tool || '', argsContainsStr: _joinArgsList(e?.args_contains) }))
+  }
+}
+
+// 提交前收集：过滤空 tool 行；期望/禁用全空 = 未配置（落 null）
+const collectTrajectoryConfig = () => {
+  const expected = trajectoryUi.value.expected
+    .filter(e => (e.tool || '').trim())
+    .map(e => {
+      const entry = { tool: e.tool.trim(), min_calls: e.min_calls || 1 }
+      const args = _splitArgsStr(e.argsContainsStr)
+      if (args.length > 0) entry.args_contains = args
+      return entry
+    })
+  const forbidden = trajectoryUi.value.forbidden
+    .filter(e => (e.tool || '').trim())
+    .map(e => {
+      const entry = { tool: e.tool.trim() }
+      const args = _splitArgsStr(e.argsContainsStr)
+      if (args.length > 0) entry.args_contains = args
+      return entry
+    })
+  if (expected.length === 0 && forbidden.length === 0) return null
+  return { mode: TRAJECTORY_MODES.includes(trajectoryUi.value.mode) ? trajectoryUi.value.mode : 'subset', expected, forbidden }
+}
 
 // 是否选择了已有模板（用于动态切换按钮文字）
 const isExistingTemplate = computed(() => {
@@ -2408,6 +2894,11 @@ const openDialog = async (row = null) => {
       model_output_field: taskDetail.model_output_field || '',
       // 裁判引擎（存量旧任务无值时保持 graph 引擎不变，避免编辑保存后静默切换执行方式）
       judge_engine: taskDetail.judge_engine || 'graph',
+      // 行级多 Trial（M2 QE2-3，judge 类型；存量任务无值=1 不开启）
+      trials: taskDetail.trials || 1,
+      // 裁判治理（M2 QE2-4；存量任务无值=默认消毒开启/金丝雀关闭）
+      judge_guard_disabled: !!taskDetail.judge_guard_disabled,
+      judge_canary: !!taskDetail.judge_canary,
       evaluation_scene: taskDetail.evaluation_scene || '',
       scene_desc: taskDetail.scene_desc || '',
       max_score: taskDetail.max_score || 10,
@@ -2483,6 +2974,10 @@ const openDialog = async (row = null) => {
     delete form.value.pre_scripts
     // M1 门禁配置回填表单态
     applyGateConfig(taskDetail.gate_config)
+    // M2 终态校验器回填表单态
+    applyVerifiers(taskDetail.verifiers)
+    // M2 轨迹断言回填表单态（agent 类型）
+    applyTrajectoryConfig(taskDetail.trajectory_config)
     // 脚本统一落库前的历史引用归一化：script_output 行的 builtin:<name> 改写为脚本记录 id（保存即固化）
     for (const target of (form.value.evaluation_targets || [])) {
       if (target?.source === 'script_output' && target.source_config?.script_id) {
@@ -2512,6 +3007,11 @@ const openDialog = async (row = null) => {
       model_output_field: '',
       judge_engine: 'claude_agent',
       judge_count: 6,
+      // M2 QE2-3：行级多 Trial 默认不开启
+      trials: 1,
+      // M2 QE2-4：裁判治理默认（消毒开启/金丝雀关闭）
+      judge_guard_disabled: false,
+      judge_canary: false,
       description: '',
       template_id: '',
       evaluation_scene: '',
@@ -2551,6 +3051,10 @@ const openDialog = async (row = null) => {
     legacyConfigDetected.value = false
     // M1 门禁配置默认关闭
     applyGateConfig(null)
+    // M2 终态校验器默认为空
+    applyVerifiers(null)
+    // M2 轨迹断言默认为空
+    applyTrajectoryConfig(null)
   }
   dialogVisible.value = true
 
@@ -3867,6 +4371,23 @@ const submitForm = async () => {
     }
     // M1 门禁配置：表单态收集为落库形状（null=未启用）
     submitData.gate_config = collectGateConfig()
+    // M2 终态校验器：表单态收集为落库形状（null=未配置）
+    submitData.verifiers = collectVerifiers()
+    // M2 轨迹断言：仅 agent 类型收集（非 agent 显式置 null——切类型时清空，
+    // 服务端对非 agent 的非空配置按 400 拒绝）
+    submitData.trajectory_config = submitData.evaluation_type === 'agent'
+      ? collectTrajectoryConfig()
+      : null
+    // M2 QE2-3 行级多 Trial：仅 judge 类型提交（非 judge 显式置 null——
+    // 服务端对非 judge 的 trials>1 按 400 拒绝）
+    submitData.trials = submitData.evaluation_type === 'judge'
+      ? (Number(form.value.trials) > 1 ? Number(form.value.trials) : null)
+      : null
+    // M2 QE2-4 裁判治理：仅 judge/agent 提交（非 judge/agent 显式发 false——
+    // 服务端 _validate_judge_governance 对其他类型按 400 拒绝）
+    const governanceApplies = submitData.evaluation_type === 'judge' || submitData.evaluation_type === 'agent'
+    submitData.judge_guard_disabled = governanceApplies ? !!form.value.judge_guard_disabled : false
+    submitData.judge_canary = governanceApplies ? !!form.value.judge_canary : false
     // 对话评测：使用裁判配置，保留 judge_variable_config
     if (submitData.evaluation_type === 'dialogue') {
       submitData.template_id = ''
@@ -4688,6 +5209,56 @@ const removeDependency = (metric, index) => {
 
 .gate-add-btn {
   margin: 8px 0;
+}
+
+/* M2 终态校验器配置区 */
+.verifier-config-block {
+  width: 100%;
+}
+.verifier-card {
+  margin-bottom: 8px;
+}
+.verifier-card-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.verifier-header-spacer {
+  flex: 1;
+}
+.verifier-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 6px;
+  flex-wrap: wrap;
+}
+.verifier-label {
+  color: #606266;
+  font-size: 13px;
+}
+.verifier-evidence-preview {
+  max-height: 260px;
+  overflow: auto;
+  background: #f5f7fa;
+  padding: 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  margin: 0;
+}
+
+/* M2 轨迹断言配置区（agent 类型） */
+.trajectory-config-block {
+  width: 100%;
+  padding: 8px 0;
+}
+.trajectory-sub-title {
+  color: #303133;
+  font-size: 13px;
+  font-weight: 600;
+  margin: 10px 0 6px;
 }
 
 /* 请求链变量树形选择样式 */

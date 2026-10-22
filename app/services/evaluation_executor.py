@@ -81,7 +81,7 @@ class EvaluationExecutor:
             # 标注的 _orig_idx 数据项原始序号，作为行级落库键）
             future_to_payload = {
                 executor.submit(
-                    self._evaluate_single,
+                    self._evaluate_single_with_trials,
                     payload,
                     task,
                 ): (pos, payload)
@@ -191,6 +191,92 @@ class EvaluationExecutor:
             raise
         except Exception as e:
             logger.warning(f"[RowPersist] 行级结果落库失败（不影响评测主流程）idx={data_index}: {e}")
+
+    def _evaluate_single_with_trials(
+        self,
+        payload: Dict[str, Any],
+        task,
+    ) -> Dict[str, Any]:
+        """行级多 trial 评测入口（M2 QE2-3，pass^k）
+
+        trials=1（未配置/非 judge 类型）直接走单 trial 评测，零额外开销；
+        trials>1 时同一数据行重复「模型调用 → 前处理 → 校验器 → 裁判」
+        k 次合并为一行：语义对齐 τ-bench pass^k（app/services/pass_k.py）。
+        payload 逐 trial 拷贝（_evaluate_single 会写 payload["model_output"]
+        等键，每次 trial 独立工作区语义）；收到停止信号跑完当前 trial 即止，
+        pass^k 按实际跑到的 trial 数计算（不虚报）。
+        """
+        from app.services.pass_k import row_trials
+
+        trials = row_trials(task)
+        if trials <= 1:
+            return self._evaluate_single(payload, task)
+
+        trial_results = []
+        for trial_no in range(1, trials + 1):
+            trial = self._evaluate_single(dict(payload), task)
+            trial["_trial"] = trial_no
+            trial_results.append(trial)
+            if self.stop_event.is_set():
+                break
+        return self._merge_trial_results(trial_results)
+
+    @staticmethod
+    def _trial_passed(trial: Dict[str, Any]) -> bool:
+        """单 trial 通过判定（M2 QE2-3）
+
+        优先确定性口径：trial 配置了终态校验器（verification_result 存在）
+        时以校验 status==pass 为准（M2 验收的「校验器 + pass^k 全链路」）；
+        未配置校验器时退化为「trial 产出有效裁判分」（模型调用成功且
+        裁判未全失败）。trial 中途失败/停止均不计通过。
+        """
+        if not trial.get("success") or trial.get("average_score") is None:
+            return False
+        verification = trial.get("verification_result")
+        if isinstance(verification, dict):
+            return verification.get("status") == "pass"
+        return True
+
+    @staticmethod
+    def _merge_trial_results(trial_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """k 次 trial 结果合并为单行（M2 QE2-3）
+
+        - 证据主体（model_output/裁判明细/校验证据）取首个成功 trial
+          （全失败取首个），完整 trial 明细单列 trials_detail；
+        - 行分 average_score = k 次 trial 有效裁判分的均值（多次采样口径；
+          维度分/反馈等其余证据字段保持主体 trial 的）；pass@1/pass^k/
+          分数标准差/标准误由 pass_k 统一计算（与其他类型同口径）。
+        """
+        from app.services.pass_k import score_stats, trial_pass_stats
+
+        primary = next(
+            (t for t in trial_results if t.get("success")), trial_results[0]
+        )
+        merged = {k: v for k, v in primary.items() if k != "_trial"}
+
+        passes = [EvaluationExecutor._trial_passed(t) for t in trial_results]
+        scores = [
+            float(t["average_score"])
+            for t in trial_results
+            if isinstance(t.get("average_score"), (int, float))
+        ]
+        merged["trials_count"] = len(trial_results)
+        merged["trials_detail"] = [
+            {
+                "trial": t.get("_trial"),
+                "success": bool(t.get("success")),
+                "score": t.get("average_score"),
+                "error": t.get("error"),
+            }
+            for t in trial_results
+        ]
+        merged["trial_scores"] = [t.get("average_score") for t in trial_results]
+        merged["trial_passes"] = passes
+        merged.update(trial_pass_stats(passes))
+        merged.update(score_stats(scores))
+        if scores:
+            merged["average_score"] = round(sum(scores) / len(scores), 4)
+        return merged
 
     @staticmethod
     def _aggregate_judge_scores(result: Dict[str, Any], judge_scores: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -442,6 +528,64 @@ class EvaluationExecutor:
                 "script_files": {},
             }
 
+    @staticmethod
+    def _run_verifiers(task, payload: Dict[str, Any], model_output: Any) -> Optional[Dict[str, Any]]:
+        """执行任务配置的终态校验器管线（M2 QE2-1，步骤1.6）
+
+        Returns:
+            {status: pass|fail|error, results, passed, failed, errored, total,
+             aborted, error}；任务未配置校验器返回 None（result 不写
+            verification_result 键，兼容旧结果结构）。管线自身异常收敛为
+            error 状态整体条目（不阻断评测主流程，与 pre_scripts 同策略）。
+        """
+        from app.services.verifier_runner import STATUS_ERROR, run_verifiers
+
+        try:
+            return run_verifiers(task, payload=payload, model_output=model_output)
+        except Exception as e:  # noqa: BLE001 - 校验管线异常不阻断评测主流程
+            logger.exception("[Verifiers] 终态校验器管线执行异常")
+            return {
+                "status": STATUS_ERROR,
+                "results": [],
+                "passed": 0,
+                "failed": 0,
+                "errored": 0,
+                "total": 0,
+                "aborted": False,
+                "error": f"终态校验器管线异常: {e}",
+            }
+
+    @staticmethod
+    def _run_trajectory_match(task, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """执行任务配置的轨迹匹配（M2 QE2-2，步骤1.7，agent 类型）
+
+        Returns:
+            匹配结果 dict（含 status/timeline，行级落 trajectory_match 列）；
+            任务未配置 trajectory_config 返回 None（result 不写该键，兼容旧
+            结果结构）。管线自身异常收敛为 status=error 整体结果（确定性证据
+            缺失可见，不阻断评测主流程）。
+        """
+        from app.services.trajectory_matcher import STATUS_ERROR, run_trajectory_match
+
+        try:
+            return run_trajectory_match(task, payload=payload)
+        except Exception as e:  # noqa: BLE001 - 匹配管线异常不阻断评测主流程
+            logger.exception("[Trajectory] 轨迹匹配管线执行异常")
+            return {
+                "mode": None,
+                "status": STATUS_ERROR,
+                "matched": [],
+                "missing": [],
+                "unexpected": [],
+                "forbidden_hits": [],
+                "matched_count": 0,
+                "total_expected": 0,
+                "total_calls": 0,
+                "total_forbidden": 0,
+                "timeline": [],
+                "error": f"轨迹匹配管线异常: {e}",
+            }
+
     def _evaluate_single(
         self,
         payload: Dict[str, Any],
@@ -476,11 +620,28 @@ class EvaluationExecutor:
             "success": False,
         }
 
+        # M2 QE2-4 裁判治理：按任务配置设置本线程的裁判输入消毒开关
+        # （prompt 组装在 worker 线程内即时读取；显式关闭的任务可审计——
+        # 开关状态随 judge_config_snapshot 落执行记录）
+        from app.services.prompt_guard import set_prompt_guard_enabled
+
+        set_prompt_guard_enabled(not bool(getattr(task, "judge_guard_disabled", False)))
+
+        # M2 QE2-4 金丝雀探针行：合成「模型输出」直送裁判（见 judge_canary.py）。
+        # 探针行跳过被测模型/前处理/校验器/轨迹与空值短路——探的是裁判本身
+        is_canary = bool(payload.get("_judge_canary"))
+
         try:
             # 平铺 payload 中的输入变量到结果中
             input_variables = {k: v for k, v in payload.items()
                                if k not in ("_dataset_item", "idx") and not k.startswith("_")}
             result.update(input_variables)
+            if is_canary:
+                # 探针行标记（聚合整行剥离，不进均分；结果页单独展示）
+                result["judge_canary"] = {
+                    "kind": payload.get("_canary_kind", "empty"),
+                    "content": payload.get("_canary_content", ""),
+                }
             # ========== 步骤1: 请求被评测模型 ==========
 
             # 使用 ModelCallerSync（同步版本，与模型配置测试连通性使用相同的调用器）
@@ -531,7 +692,15 @@ class EvaluationExecutor:
             session_markdown = None
             # 超长会话的临时文件路径（步骤1.5 前处理脚本与步骤3 CC 裁判共用，避免重复写盘）
             session_file = None
-            if getattr(task, "evaluation_type", "") == "agent":
+            if is_canary:
+                # M2 QE2-4 金丝雀探针：空/乱码内容即「模型输出」，不调用被测
+                # 模型（探针是给裁判的对抗样本，不消耗外部资源）
+                call_result = {
+                    "success": True,
+                    "content": payload.get("_canary_content", ""),
+                    "chain_results": [],
+                }
+            elif getattr(task, "evaluation_type", "") == "agent":
                 # 长会话 Agent 评测：上传的会话文件即模型输出，不执行被测模型请求链
                 session_markdown = self._render_session_from_payload(payload)
                 if not session_markdown:
@@ -578,7 +747,7 @@ class EvaluationExecutor:
             from app.services.pre_judge_runner import derive_script_steps
 
             derived_steps = derive_script_steps(getattr(task, "evaluation_targets", None) or [])
-            if derived_steps or getattr(task, "pre_scripts", None):
+            if not is_canary and (derived_steps or getattr(task, "pre_scripts", None)):
                 # model_output 文本写入 payload（payload 每条独立，见 _generate_payloads），
                 # 由 pre_judge_runner 透传至脚本 stdin.model_output（设计文档 §三 标准输入契约）
                 payload["model_output"] = model_output
@@ -606,6 +775,31 @@ class EvaluationExecutor:
                     return result
                 script_outputs = pre_result["script_outputs"]
                 script_files = pre_result["script_files"]
+
+            # ========== 步骤1.6: 终态校验器（M2 QE2-1，确定性终态校验优先） ==========
+            # 模型调用/被测 agent 执行之后、裁判之前运行（前处理脚本之后——校验器
+            # 面向同一工作区，可断言脚本 stage 的执行包副本与产物）；输出
+            # result.verification_result（行级落库+聚合 verification_pass_rate），
+            # 独立于裁判计分（确定性证据，不算入裁判均分）。on_fail=abort 的校验器
+            # 失败 → 该条数据标记执行失败，不再进入裁判（与 pre_scripts abort 同口径）。
+            verification_result = None if is_canary else self._run_verifiers(task, payload, model_output)
+            if verification_result is not None:
+                result["verification_result"] = verification_result
+                if verification_result.get("aborted"):
+                    result["success"] = False
+                    result["row_status"] = "verification_failed"
+                    result["error"] = verification_result.get("error") or "终态校验器失败（on_fail=abort）"
+                    return result
+
+            # ========== 步骤1.7: 轨迹匹配（M2 QE2-2，agent 类型确定性轨迹断言） ==========
+            # 对会话（session_messages）的工具调用序列做四模式匹配，输出
+            # result.trajectory_match（行级落库+聚合 trajectory_match_rate）；
+            # 独立于裁判维度计分（确定性证据，不算入裁判均分），不拦截评测流程
+            # （截断 trace 虚高场景由匹配结果与门禁 metric 拦截，不是行失败）。
+            if getattr(task, "evaluation_type", "") == "agent" and not is_canary:
+                trajectory_match = self._run_trajectory_match(task, payload)
+                if trajectory_match is not None:
+                    result["trajectory_match"] = trajectory_match
 
             # ========== 步骤2: 组装裁判Prompt ==========
             # 从模型调用结果中提取 chain_results（需在空值校验前提取，因为评测目标可能来自 chain_result）
@@ -677,7 +871,10 @@ class EvaluationExecutor:
                 result["failed_judge_count"] = 0
                 return result
 
-            if not content_to_validate or not str(content_to_validate).strip():
+            # M2 QE2-4：金丝雀探针行不做空值短路——空内容探针必须进裁判
+            # （空值短路 0 分测不出「裁判被空内容欺骗」，对抗探针要让裁判
+            # 看到空内容本身）
+            if not is_canary and (not content_to_validate or not str(content_to_validate).strip()):
                 logger.info(f"[空值校验] idx={payload.get('idx', 0)} 待评测内容为空，跳过裁判评测")
                 result["success"] = True
                 result["average_score"] = 0

@@ -136,6 +136,98 @@
           </el-table>
         </div>
 
+        <!-- M2 QE2-4 裁判治理面板：本次裁决所用裁判配置快照 + 金丝雀自检结果
+             （judge_config_snapshot 存在或聚合含 judge_governance.canary 时显示） -->
+        <div
+          v-if="result.judge_config_snapshot || result.result?.judge_governance?.canary"
+          class="judge-governance-panel"
+        >
+          <div class="judge-governance-head">
+            <span class="judge-governance-title">裁判治理</span>
+            <el-tag
+              v-if="result.result?.judge_governance?.canary?.risk"
+              type="danger"
+              size="small"
+              effect="dark"
+            >
+              裁判可被欺骗风险
+            </el-tag>
+            <span v-if="result.result?.judge_governance?.canary" style="color: #909399; font-size: 12px;">
+              金丝雀探针 {{ result.result.judge_governance.canary.high_score_count }}/{{ result.result.judge_governance.canary.rows }} 行高分
+            </span>
+          </div>
+
+          <!-- 本次裁决所用裁判配置（版本可追溯） -->
+          <div v-if="result.judge_config_snapshot" class="judge-governance-section">
+            <div class="judge-governance-section-title">本次裁决所用裁判配置</div>
+            <el-descriptions :column="2" size="small" border>
+              <el-descriptions-item label="裁判引擎">
+                {{ judgeEngineLabel(result.judge_config_snapshot.engine) }}
+              </el-descriptions-item>
+              <el-descriptions-item label="裁判模型">
+                {{ judgeModelSummary(result.judge_config_snapshot.judge_model) }}
+              </el-descriptions-item>
+              <el-descriptions-item label="输入消毒">
+                <el-tag
+                  :type="result.judge_config_snapshot.guard?.injection_guard_disabled ? 'warning' : 'success'"
+                  size="small"
+                >
+                  {{ result.judge_config_snapshot.guard?.injection_guard_disabled ? '已显式关闭（审计留痕）' : '开启（<eval_data> 定界）' }}
+                </el-tag>
+              </el-descriptions-item>
+              <el-descriptions-item label="金丝雀自检">
+                {{ result.judge_config_snapshot.canary?.enabled ? '开启' : '关闭' }}
+              </el-descriptions-item>
+              <el-descriptions-item label="满分" label-align="right">
+                {{ result.judge_config_snapshot.max_score ?? '-' }}
+              </el-descriptions-item>
+              <el-descriptions-item label="评分维度">
+                {{ (result.judge_config_snapshot.evaluation_metrics || []).map(m => m.name || m).join('、') || '-' }}
+              </el-descriptions-item>
+              <el-descriptions-item label="评分标准" :span="2">
+                <span class="judge-governance-text">{{ result.judge_config_snapshot.score_details || '-' }}</span>
+              </el-descriptions-item>
+              <el-descriptions-item label="裁判 Prompt 模板" :span="2">
+                <span class="judge-governance-text">
+                  {{ result.judge_config_snapshot.prompt_template || '（未自定义，使用系统默认模板）' }}
+                </span>
+              </el-descriptions-item>
+            </el-descriptions>
+          </div>
+
+          <!-- 金丝雀自检结果：空/乱码探针行的裁判打分（不计入均分） -->
+          <div v-if="result.result?.judge_governance?.canary" class="judge-governance-section">
+            <div class="judge-governance-section-title">
+              金丝雀自检结果（探针行不计入均分；高分线 = 满分 × 0.7 = {{ result.result.judge_governance.canary.threshold ?? '-' }}）
+            </div>
+            <el-table :data="result.result.judge_governance.canary.items" size="small">
+              <el-table-column label="探针类型" width="110">
+                <template #default="{ row }">{{ canaryKindLabel(row.kind) }}</template>
+              </el-table-column>
+              <el-table-column label="探针内容" min-width="200">
+                <template #default="{ row }">
+                  <span class="judge-governance-text">{{ row.kind === 'empty' ? '（空内容）' : truncateText(row.content, 60) }}</span>
+                </template>
+              </el-table-column>
+              <el-table-column label="裁判打分" width="110">
+                <template #default="{ row }">{{ row.score ?? '-' }}</template>
+              </el-table-column>
+              <el-table-column label="判定" width="110">
+                <template #default="{ row }">
+                  <el-tag :type="row.high ? 'danger' : 'success'" size="small">
+                    {{ row.high ? '高分（可疑）' : '正常' }}
+                  </el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column label="说明" min-width="140">
+                <template #default="{ row }">
+                  {{ row.error ? `探针行失败：${row.error}` : (row.success ? '裁判按预期未给高分' : '探针行未完成评分') }}
+                </template>
+              </el-table-column>
+            </el-table>
+          </div>
+        </div>
+
         <!-- 详细结果 -->
         <div v-if="isResultRenderable(result)" class="result-detail">
           <el-divider />
@@ -171,6 +263,30 @@
               <div class="stat-card-small">
                 <div class="stat-label">平均分</div>
                 <div class="stat-value highlight">{{ result.result.average_score || '-' }}</div>
+              </div>
+            </el-col>
+          </el-row>
+
+          <!-- pass^k 统计卡（M2 QE2-3，judge 行级多 Trial）：聚合含 pass_k 块才显示 -->
+          <el-row :gutter="20" class="stats-row" style="margin-top: 0;" v-if="result.result.pass_k && result.evaluation_type !== 'consistency'">
+            <el-col :span="8">
+              <div class="stat-card-small">
+                <div class="stat-label">pass@1（单次通过率）</div>
+                <div class="stat-value highlight">{{ safePercent(result.result.pass_k.average_pass_at_1) }}%</div>
+              </div>
+            </el-col>
+            <el-col :span="8">
+              <div class="stat-card-small">
+                <div class="stat-label">pass^k（k 次全过比例）</div>
+                <div class="stat-value">{{ safePercent(result.result.pass_k.average_pass_pow_k) }}%</div>
+                <div class="stat-sub">全过 {{ result.result.pass_k.all_pass_rows }}/{{ result.result.pass_k.rows }} 行</div>
+              </div>
+            </el-col>
+            <el-col :span="8">
+              <div class="stat-card-small">
+                <div class="stat-label">多 Trial 行数</div>
+                <div class="stat-value">{{ result.result.pass_k.rows }}</div>
+                <div class="stat-sub">行级 pass@1/pass^k 见明细行徽标</div>
               </div>
             </el-col>
           </el-row>
@@ -486,6 +602,266 @@
             </el-card>
           </div>
 
+          <!-- 终态校验器证据（M2 QE2-1）：数据驱动展示，judge 与 agent 均生效；
+               任务未配置校验器或历史结果无 verification_result 字段时此区不渲染 -->
+          <div v-if="hasVerificationEntries" class="verification-section">
+            <el-divider />
+            <div class="pre-scripts-toolbar">
+              <h3>终态校验</h3>
+              <el-tag v-if="verificationSummaryTag" :type="verificationSummaryTag.type" size="small">
+                校验通过率 {{ verificationPassRateText }}（{{ verificationSummaryTag.detail }}）
+              </el-tag>
+              <el-select
+                v-if="verificationEntries.length > 1"
+                v-model="verificationSelectedIdx"
+                style="width: 220px"
+                placeholder="选择数据条目"
+              >
+                <el-option
+                  v-for="(entry, i) in verificationEntries"
+                  :key="i"
+                  :value="i"
+                  :label="`第 ${detailSeqNo(entry, i, seqNoFromIdx)} 条数据`"
+                />
+              </el-select>
+            </div>
+            <div class="pre-scripts-hint">
+              模型输出之后运行的确定性终态断言证据（script / db_assert / file_assert / http_assert），
+              独立于裁判评分；on_fail=abort 失败的行在失败明细中保留证据。
+            </div>
+
+            <el-card shadow="never" class="pre-script-card" style="margin-bottom: 8px;">
+              <template #header>
+                <div class="pre-script-card-header">
+                  <div class="pre-script-card-title">
+                    <span class="pre-script-name">整体判定</span>
+                    <el-tag :type="verificationStatusTag(currentVerification.status).type" size="small">
+                      {{ verificationStatusTag(currentVerification.status).label }}
+                    </el-tag>
+                    <el-tag v-if="currentVerification.aborted" type="warning" size="small">on_fail=abort 已中止</el-tag>
+                    <span class="pre-script-duration">
+                      {{ currentVerification.passed ?? 0 }}/{{ currentVerification.total ?? 0 }} 个校验器通过
+                    </span>
+                  </div>
+                </div>
+              </template>
+              <el-alert
+                v-if="currentVerification.error"
+                type="error"
+                :title="currentVerification.error"
+                :closable="false"
+                show-icon
+              />
+            </el-card>
+
+            <el-card
+              v-for="(vEntry, vIdx) in currentVerificationList"
+              :key="vEntry.name + vIdx"
+              shadow="never"
+              class="pre-script-card"
+            >
+              <template #header>
+                <div class="pre-script-card-header">
+                  <div class="pre-script-card-title">
+                    <span class="pre-script-name">{{ vEntry.name || vEntry.type }}</span>
+                    <el-tag size="small" effect="plain" type="info">{{ vEntry.type }}</el-tag>
+                    <el-tag :type="verificationStatusTag(vEntry.status).type" size="small">
+                      {{ verificationStatusTag(vEntry.status).label }}
+                    </el-tag>
+                    <span class="pre-script-duration">耗时 {{ vEntry.duration_ms ?? 0 }} ms</span>
+                  </div>
+                </div>
+              </template>
+              <el-alert
+                v-if="vEntry.error"
+                type="error"
+                :title="vEntry.error"
+                :closable="false"
+                show-icon
+                style="margin-bottom: 8px;"
+              />
+              <!-- file_assert / http_assert：断言清单表（checks 字段） -->
+              <el-table
+                v-if="verifierCheckRows(vEntry).length > 0"
+                :data="verifierCheckRows(vEntry)"
+                style="width: 100%"
+                stripe
+              >
+                <el-table-column label="断言" min-width="150" show-overflow-tooltip>
+                  <template #default="{ row }">
+                    <span>{{ row.name || row.checkName || '-' }}</span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="期望" min-width="140" show-overflow-tooltip>
+                  <template #default="{ row }">
+                    <span>{{ verifierValueText(row.expected) }}</span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="实际" min-width="140" show-overflow-tooltip>
+                  <template #default="{ row }">
+                    <span>{{ verifierValueText(row.actual) }}</span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="结果" width="90">
+                  <template #default="{ row }">
+                    <el-tag :type="verificationCheckTag(row).type" size="small">
+                      {{ verificationCheckTag(row).label }}
+                    </el-tag>
+                  </template>
+                </el-table-column>
+                <el-table-column label="说明" min-width="160" show-overflow-tooltip>
+                  <template #default="{ row }">
+                    <span>{{ row.error || '-' }}</span>
+                  </template>
+                </el-table-column>
+              </el-table>
+              <!-- 其余证据（script 摘要/db_assert 统计等）：键值对平铺 -->
+              <div v-if="verifierEvidenceChips(vEntry).length > 0" class="pre-script-chips">
+                <span v-for="chip in verifierEvidenceChips(vEntry)" :key="chip.key" class="pre-script-chip">
+                  <span class="pre-script-chip-label">{{ chip.label }}</span>
+                  <span class="pre-script-chip-value">{{ chip.value }}</span>
+                </span>
+              </div>
+              <div style="margin-top: 8px;">
+                <el-button
+                  link
+                  type="primary"
+                  size="small"
+                  @click="openDetail('校验证据 · ' + (vEntry.name || vEntry.type), JSON.stringify(vEntry.evidence || {}, null, 2))"
+                >
+                  查看完整证据
+                </el-button>
+              </div>
+            </el-card>
+          </div>
+
+          <!-- 轨迹匹配（M2 QE2-2）：序列时间线 + 匹配结果；agent 任务配置轨迹断言时
+               的确定性证据（独立于裁判评分）；历史/未配置的结果无该字段时此区不渲染 -->
+          <div v-if="hasTrajectoryEntries" class="trajectory-section">
+            <el-divider />
+            <div class="pre-scripts-toolbar">
+              <h3>轨迹匹配</h3>
+              <el-tag v-if="trajectorySummaryTag" :type="trajectorySummaryTag.type" size="small">
+                轨迹匹配率 {{ trajectoryMatchRateText }}（{{ trajectorySummaryTag.detail }}）
+              </el-tag>
+              <el-select
+                v-if="trajectoryEntries.length > 1"
+                v-model="trajectorySelectedIdx"
+                style="width: 220px"
+                placeholder="选择数据条目"
+              >
+                <el-option
+                  v-for="(entry, i) in trajectoryEntries"
+                  :key="i"
+                  :value="i"
+                  :label="`第 ${detailSeqNo(entry, i, seqNoFromIdx)} 条数据`"
+                />
+              </el-select>
+            </div>
+            <div class="pre-scripts-hint">
+              会话工具调用序列的确定性匹配结果（模式：{{ currentTrajectory.mode || '-' }}），
+              独立于裁判评分——截断 trace 虚高等问题在此以硬证据暴露。
+            </div>
+
+            <el-card shadow="never" class="pre-script-card" style="margin-bottom: 8px;">
+              <template #header>
+                <div class="pre-script-card-header">
+                  <div class="pre-script-card-title">
+                    <span class="pre-script-name">整体判定</span>
+                    <el-tag :type="verifierStatusTag(currentTrajectory.status).type" size="small">
+                      {{ verifierStatusTag(currentTrajectory.status).label }}
+                    </el-tag>
+                    <span class="pre-script-duration">
+                      期望 {{ currentTrajectory.matched_count ?? 0 }}/{{ currentTrajectory.total_expected ?? 0 }} 项满足 ·
+                      实际调用 {{ currentTrajectory.total_calls ?? 0 }} 次
+                    </span>
+                  </div>
+                </div>
+              </template>
+              <el-alert
+                v-if="currentTrajectory.error"
+                type="error"
+                :title="currentTrajectory.error"
+                :closable="false"
+                show-icon
+              />
+              <div v-if="!currentTrajectory.error" class="pre-script-chips">
+                <span class="pre-script-chip">
+                  <span class="pre-script-chip-label">满足</span>
+                  <span class="pre-script-chip-value">{{ currentTrajectory.matched?.length ?? 0 }}</span>
+                </span>
+                <span class="pre-script-chip">
+                  <span class="pre-script-chip-label">缺失</span>
+                  <span class="pre-script-chip-value">{{ currentTrajectory.missing?.length ?? 0 }}</span>
+                </span>
+                <span class="pre-script-chip">
+                  <span class="pre-script-chip-label">未期望</span>
+                  <span class="pre-script-chip-value">{{ currentTrajectory.unexpected?.length ?? 0 }}</span>
+                </span>
+                <span class="pre-script-chip">
+                  <span class="pre-script-chip-label">禁用命中</span>
+                  <span class="pre-script-chip-value">{{ currentTrajectory.forbidden_hits?.length ?? 0 }}</span>
+                </span>
+              </div>
+            </el-card>
+
+            <!-- 匹配结果清单：缺失/禁用命中优先展示（失败证据），未期望仅记录 -->
+            <el-row :gutter="12">
+              <el-col :span="12">
+                <el-card shadow="never" class="pre-script-card">
+                  <template #header>缺失的期望调用（missing）</template>
+                  <el-empty v-if="!(currentTrajectory.missing || []).length" description="无缺失" :image-size="50" />
+                  <div v-for="(m, i) in currentTrajectory.missing" :key="i" class="trajectory-entry trajectory-entry-missing">
+                    <el-tag type="danger" size="small">{{ m.tool }}</el-tag>
+                    <span v-if="m.min_calls > 1">至少 {{ m.min_calls }} 次</span>
+                    <span>实际 {{ m.matched_count ?? 0 }} 次</span>
+                    <span v-if="m.args_contains?.length" class="trajectory-entry-args">参数须含：{{ m.args_contains.join(' / ') }}</span>
+                  </div>
+                </el-card>
+              </el-col>
+              <el-col :span="12">
+                <el-card shadow="never" class="pre-script-card">
+                  <template #header>禁用调用命中（forbidden_hits）</template>
+                  <el-empty v-if="!(currentTrajectory.forbidden_hits || []).length" description="无命中" :image-size="50" />
+                  <div v-for="(f, i) in currentTrajectory.forbidden_hits" :key="i" class="trajectory-entry trajectory-entry-missing">
+                    <el-tag type="danger" size="small">#{{ f.index }} {{ f.tool }}</el-tag>
+                    <span v-if="f.args_contains?.length" class="trajectory-entry-args">参数含：{{ f.args_contains.join(' / ') }}</span>
+                  </div>
+                  <template v-if="(currentTrajectory.unexpected || []).length > 0">
+                    <el-divider style="margin: 10px 0;" />
+                    <div class="gate-config-tip" style="margin-bottom: 6px;">未期望调用（unexpected，本模式不判失败）：</div>
+                    <div v-for="(u, i) in currentTrajectory.unexpected.slice(0, 20)" :key="i" class="trajectory-entry">
+                      <el-tag type="info" size="small">#{{ u.index }} {{ u.tool }}</el-tag>
+                    </div>
+                  </template>
+                </el-card>
+              </el-col>
+            </el-row>
+
+            <!-- 序列时间线：covered=绿 / unexpected=灰 / forbidden=红 -->
+            <el-card shadow="never" class="pre-script-card" style="margin-top: 8px;">
+              <template #header>
+                工具调用序列（{{ currentTrajectory.total_calls ?? 0 }} 次；
+                时间线最多展示 {{ (currentTrajectory.timeline || []).length }} 条）
+              </template>
+              <el-empty v-if="!(currentTrajectory.timeline || []).length" description="会话无工具调用" :image-size="50" />
+              <el-timeline v-else style="padding-left: 4px;">
+                <el-timeline-item
+                  v-for="item in currentTrajectory.timeline"
+                  :key="item.index"
+                  :type="trajectoryTimelineType(item.kind)"
+                  :hollow="item.kind === 'unexpected'"
+                >
+                  <div class="trajectory-timeline-item">
+                    <span class="trajectory-call-index">#{{ item.index }}</span>
+                    <el-tag :type="trajectoryTimelineType(item.kind)" size="small" effect="plain">{{ item.tool }}</el-tag>
+                    <span class="trajectory-call-args">{{ item.args_snippet }}</span>
+                  </div>
+                </el-timeline-item>
+              </el-timeline>
+            </el-card>
+          </div>
+
           <!-- 结果观察（evaluation/result 扩展点）：observations 字段存在时只读展示；
                历史任务无该字段时此区不渲染 -->
           <div v-if="observationItems.length > 0" class="observations-section">
@@ -533,6 +909,35 @@
                 <el-card>
                   <template #header>结构一致性</template>
                   <div class="metric-value">{{ safePercent(result.result.average_structure_consistency) }}%</div>
+                </el-card>
+              </el-col>
+            </el-row>
+
+            <!-- pass^k 徽标卡（M2 QE2-3，语义对齐 τ-bench）：聚合含 pass_k 块才显示 -->
+            <el-row :gutter="20" style="margin-top: 20px;" v-if="result.result.pass_k">
+              <el-col :span="12">
+                <el-card>
+                  <template #header>
+                    pass@1
+                    <el-tag size="small" type="info" style="margin-left: 8px;">单次重复调用成功率均值</el-tag>
+                  </template>
+                  <div class="metric-value">
+                    {{ safePercent(result.result.pass_k.average_pass_at_1) }}%
+                  </div>
+                </el-card>
+              </el-col>
+              <el-col :span="12">
+                <el-card>
+                  <template #header>
+                    pass^k
+                    <el-tag size="small" type="info" style="margin-left: 8px;">k 次重复全部成功的行比例</el-tag>
+                  </template>
+                  <div class="metric-value">
+                    {{ safePercent(result.result.pass_k.average_pass_pow_k) }}%
+                    <el-tag :type="result.result.pass_k.average_pass_pow_k >= 0.9 ? 'success' : (result.result.pass_k.average_pass_pow_k >= 0.5 ? 'warning' : 'danger')" size="small" style="margin-left: 8px;">
+                      全过 {{ result.result.pass_k.all_pass_rows }}/{{ result.result.pass_k.rows }} 行
+                    </el-tag>
+                  </div>
                 </el-card>
               </el-col>
             </el-row>
@@ -604,6 +1009,24 @@
               <el-table-column label="调用统计" width="120">
                 <template #default="{ row }">
                   <span>{{ row.metrics?.successful_calls ?? '-' }}/{{ row.metrics?.total_calls ?? '-' }}</span>
+                </template>
+              </el-table-column>
+              <!-- pass^k 行级徽标（M2 QE2-3）：旧结果无该键显示 '-' -->
+              <el-table-column label="pass@1 / pass^k" width="150">
+                <template #default="{ row }">
+                  <template v-if="row.metrics?.pass_at_1 != null">
+                    <el-tag :type="getConsistencyType(row.metrics?.pass_at_1)" size="small">
+                      {{ safePercent(row.metrics?.pass_at_1) }}%
+                    </el-tag>
+                    <el-tag
+                      :type="row.metrics?.pass_pow_k >= 1 ? 'success' : 'danger'"
+                      size="small"
+                      style="margin-left: 4px;"
+                    >
+                      {{ row.metrics?.pass_pow_k >= 1 ? '全过' : '未全过' }}
+                    </el-tag>
+                  </template>
+                  <span v-else>-</span>
                 </template>
               </el-table-column>
               <el-table-column label="重复结果" width="100">
@@ -2103,6 +2526,18 @@
                   </el-tag>
                 </template>
               </el-table-column>
+              <!-- 多 Trial 行徽标（M2 QE2-3）：trials_count 存在才显示，评分列为 k 次均值 -->
+              <el-table-column label="多 Trial" width="140" v-if="resultItems.some(r => r.trials_count > 1)">
+                <template #default="{ row }">
+                  <template v-if="row.trials_count > 1">
+                    <el-tag size="small" :type="row.pass_pow_k >= 1 ? 'success' : 'danger'">
+                      pass^{{ row.trials_count }} {{ row.pass_pow_k >= 1 ? '全过' : '未全过' }}
+                    </el-tag>
+                    <div class="trials-sub">{{ safePercent(row.pass_at_1) }}% · ±{{ row.score_sem ?? 0 }}</div>
+                  </template>
+                  <span v-else>-</span>
+                </template>
+              </el-table-column>
               <el-table-column prop="judge_count" label="裁判数" width="80" />
               <el-table-column prop="feedback" label="反馈" min-width="200">
                 <template #default="{ row }">
@@ -3132,6 +3567,22 @@ const safePercent = (val) => {
   return (Number(val) * 100).toFixed(1)
 }
 
+// M2 QE2-4 裁判治理面板展示口径
+const judgeEngineLabel = (engine) => ({
+  claude_agent: 'Claude Code Agent',
+  deepseek_agent: 'DeepSeek Agent',
+  graph: '传统裁判图',
+}[engine] || engine || '-')
+// 裁判模型摘要（掩码凭据快照：provider/model_type + 掩码 key 指纹，无明文）
+const judgeModelSummary = (m) => {
+  if (!m) return '-'
+  if (m.config_missing) return `配置缺失（${m.source || '-'}）`
+  const parts = [m.provider, m.model_type].filter(Boolean)
+  if (m.api_key_masked) parts.push(m.api_key_masked)
+  return parts.join(' / ') || m.source || '-'
+}
+const canaryKindLabel = (kind) => ({ empty: '空样本', garbage: '乱码样本' }[kind] || kind || '-')
+
 // 安全获取 result.items，防止字段不存在时崩溃；
 // failed_items（模型调用失败/前处理脚本失败/裁判失败等未进入评分的数据行）合并进明细，
 // 合并后按 idx 升序稳定排序（同 idx / 缺失 idx 保持合并前相对顺序），保证主表序号与图表 x 轴连续
@@ -3640,6 +4091,169 @@ const formatDurationMs = (ms) => {
   if (num < 1000) return `${Math.round(num)} ms`
   return `${(num / 1000).toFixed(2)} s`
 }
+
+// ---------------- 终态校验器证据（M2 QE2-1 verification_result） ----------------
+// 数据来源：result.items[i].verification_result（judge 与 agent 通用，见
+// result_aggregator._format_items）；on_fail=abort 失败条目在 failed_items 内
+// 保留（_format_failed_items）。任务未配置校验器/历史结果无该字段时本区不渲染。
+
+const verificationSelectedIdx = ref(0)
+
+// 拥有校验结果的数据条目列表（含 abort 失败条目）
+const verificationEntries = computed(() => {
+  if (!result.value?.result) return []
+  const entries = []
+  const collect = (list) => {
+    if (Array.isArray(list)) {
+      list.forEach(item => {
+        if (item?.verification_result && typeof item.verification_result === 'object') {
+          entries.push(item)
+        }
+      })
+    }
+  }
+  collect(result.value.result.items)
+  collect(result.value.result.failed_items)
+  return entries
+})
+
+const hasVerificationEntries = computed(() => verificationEntries.value.length > 0)
+
+// 当前选中条目的整体校验结果（越界钳制，切换任务后不错位）
+const currentVerification = computed(() => {
+  const entries = verificationEntries.value
+  if (entries.length === 0) return {}
+  const idx = Math.min(Math.max(verificationSelectedIdx.value, 0), entries.length - 1)
+  return entries[idx].verification_result || {}
+})
+
+const currentVerificationList = computed(() => currentVerification.value.results || [])
+
+// 任务级校验通过率（聚合写入 result.verification；仅配置校验器的任务存在）
+const verificationSummaryTag = computed(() => {
+  const stats = result.value?.result?.verification
+  if (!stats || typeof stats !== 'object') return null
+  const rate = Number(stats.pass_rate ?? 0)
+  const detail = `${stats.passed ?? 0}/${stats.total ?? 0} 行通过`
+  if (rate >= 1) return { type: 'success', detail }
+  if (rate > 0) return { type: 'warning', detail }
+  return { type: 'danger', detail }
+})
+
+const verificationPassRateText = computed(() => {
+  const stats = result.value?.result?.verification
+  if (!stats) return '-'
+  return `${Math.round(Number(stats.pass_rate ?? 0) * 100)}%`
+})
+
+// 校验器状态 tag（与后端 verifier_runner 的 pass/fail/error 一致）
+const verificationStatusTag = (status) => {
+  const map = {
+    pass: { type: 'success', label: '通过' },
+    fail: { type: 'danger', label: '未通过' },
+    error: { type: 'warning', label: '错误' }
+  }
+  return map[status] || { type: 'info', label: status || '-' }
+}
+
+// 断言行状态 tag（file_assert/http_assert 的 checks[].passed）
+const verificationCheckTag = (check) => {
+  return check?.passed
+    ? { type: 'success', label: '通过' }
+    : { type: 'danger', label: '未通过' }
+}
+
+// 断言清单行（file_assert checks / http_assert checks 归一：http 的 name 键补 checkName）
+const verifierCheckRows = (vEntry) => {
+  const checks = vEntry?.evidence?.checks
+  if (!Array.isArray(checks)) return []
+  return checks.map(check => ({
+    ...check,
+    checkName: check.name,
+    name: check.name === 'status' || check.name === 'body_regex' || check.name === 'jsonpath'
+      ? ({ status: '状态码', body_regex: '响应体正则', jsonpath: '响应 JSONPath' }[check.name] || check.name)
+      : check.name
+  }))
+}
+
+// 证据键值 chips（script 摘要 / db_assert 统计等浅层字段）
+const verifierEvidenceChips = (vEntry) => {
+  const evidence = vEntry?.evidence
+  if (!evidence || typeof evidence !== 'object') return []
+  const chips = []
+  if (evidence.summary) chips.push({ key: 'summary', label: '摘要', value: evidence.summary })
+  const output = evidence.output
+  if (output && typeof output === 'object') {
+    for (const key of ['total', 'passed', 'failed', 'consistency_rate']) {
+      if (output[key] != null) chips.push({ key, label: key, value: String(output[key]) })
+    }
+  }
+  if (evidence.status_code != null) chips.push({ key: 'status_code', label: '状态码', value: String(evidence.status_code) })
+  if (evidence.finish_reason) chips.push({ key: 'finish_reason', label: '结束原因', value: evidence.finish_reason })
+  return chips
+}
+
+const verifierValueText = (value) => {
+  if (value == null) return '-'
+  if (typeof value === 'object') return JSON.stringify(value)
+  return String(value)
+}
+
+// ---------------- 轨迹匹配证据（M2 QE2-2 trajectory_match） ----------------
+// 数据来源：result.items[i].trajectory_match（agent 类型，见 result_aggregator
+// ._format_items）。任务未配置轨迹断言/历史结果无该字段时本区不渲染。
+
+const trajectorySelectedIdx = ref(0)
+
+// 拥有轨迹匹配结果的数据条目列表
+const trajectoryEntries = computed(() => {
+  if (!result.value?.result) return []
+  const entries = []
+  const collect = (list) => {
+    if (Array.isArray(list)) {
+      list.forEach(item => {
+        if (item?.trajectory_match && typeof item.trajectory_match === 'object') {
+          entries.push(item)
+        }
+      })
+    }
+  }
+  collect(result.value.result.items)
+  collect(result.value.result.failed_items)
+  return entries
+})
+
+const hasTrajectoryEntries = computed(() => trajectoryEntries.value.length > 0)
+
+// 当前选中条目的匹配结果（越界钳制，切换任务后不错位）
+const currentTrajectory = computed(() => {
+  const entries = trajectoryEntries.value
+  if (entries.length === 0) return {}
+  const idx = Math.min(Math.max(trajectorySelectedIdx.value, 0), entries.length - 1)
+  return entries[idx].trajectory_match || {}
+})
+
+// 任务级轨迹匹配率（聚合写入 result.trajectory；仅配置轨迹断言的任务存在）
+const trajectorySummaryTag = computed(() => {
+  const stats = result.value?.result?.trajectory
+  if (!stats || typeof stats !== 'object') return null
+  const rate = Number(stats.pass_rate ?? 0)
+  const detail = `${stats.passed ?? 0}/${stats.total ?? 0} 行通过`
+  if (rate >= 1) return { type: 'success', detail }
+  if (rate > 0) return { type: 'warning', detail }
+  return { type: 'danger', detail }
+})
+
+const trajectoryMatchRateText = computed(() => {
+  const stats = result.value?.result?.trajectory
+  if (!stats) return '-'
+  return `${Math.round(Number(stats.pass_rate ?? 0) * 100)}%`
+})
+
+// 时间线节点配色：covered=绿 / unexpected=灰（hollow）/ forbidden=红
+const trajectoryTimelineType = (kind) => (
+  { covered: 'success', unexpected: 'info', forbidden: 'danger' }[kind] || 'info'
+)
 
 // per_case 比对结论：一致绿 / 不一致红 / 缺失灰（兼容只有 match 布尔、无 match_state 的结构）
 const getMatchStateOfRow = (row) => {
@@ -4224,11 +4838,15 @@ const loadResultByVersion = async (executionNumber) => {
       error_message: detail.error_message,
       // M1 门禁判定：单版端点随结果返回（null=该版未启用门禁，横幅不显示）
       gate_result: detail.gate_result || null,
+      // M2 QE2-4 裁判治理快照：单版端点随结果返回（null=该版未走裁判链路）
+      judge_config_snapshot: detail.judge_config_snapshot || null,
     }
 
     resultItems.value = safeGetItems(result.value.result)
-    // 重置脚本产物的数据条目选择，避免跨任务/版本残留旧选中项
+    // 重置脚本产物/终态校验的数据条目选择，避免跨任务/版本残留旧选中项
     preScriptSelectedIdx.value = 0
+    verificationSelectedIdx.value = 0
+    trajectorySelectedIdx.value = 0
     await nextTick()
     if (isResultRenderable(result.value)) {
       renderCharts()
@@ -4245,8 +4863,10 @@ const loadResult = async () => {
     const res = await resultApi.get(selectedTaskId.value)
     result.value = res
     resultItems.value = safeGetItems(res.result)
-    // 重置脚本产物的数据条目选择，避免跨任务残留旧选中项
+    // 重置脚本产物/终态校验的数据条目选择，避免跨任务残留旧选中项
     preScriptSelectedIdx.value = 0
+    verificationSelectedIdx.value = 0
+    trajectorySelectedIdx.value = 0
     await nextTick()
     if (isResultRenderable(result.value)) {
       renderCharts()
@@ -4776,6 +5396,45 @@ const renderLatencyHistogram = (res) => {
   background: var(--el-color-success-light-9);
 }
 
+/* M2 QE2-4 裁判治理面板 */
+.judge-governance-panel {
+  margin-bottom: 16px;
+  padding: 14px 16px;
+  border-radius: 8px;
+  border: 1px solid var(--el-border-color-light);
+  background: var(--el-fill-color-extra-light);
+}
+
+.judge-governance-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+}
+
+.judge-governance-title {
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.judge-governance-section {
+  margin-top: 10px;
+}
+
+.judge-governance-section-title {
+  font-size: 13px;
+  color: var(--el-text-color-secondary);
+  margin-bottom: 8px;
+}
+
+.judge-governance-text {
+  font-size: 12px;
+  color: var(--el-text-color-regular);
+  word-break: break-all;
+  white-space: pre-wrap;
+}
+
 .gate-banner.gate-failed {
   border-color: var(--el-color-danger-light-7);
   border-left-color: var(--el-color-danger);
@@ -4878,6 +5537,20 @@ const renderLatencyHistogram = (res) => {
   font-size: 24px;
   font-weight: 600;
   color: #1F2937;
+}
+
+/* pass^k 卡副文案（M2 QE2-3）：主数值下的口径说明行 */
+.stat-sub {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #9CA3AF;
+}
+
+/* 多 Trial 行徽标副文案（M2 QE2-3）：pass@1 与标准误 */
+.trials-sub {
+  margin-top: 4px;
+  font-size: 11px;
+  color: #9CA3AF;
 }
 
 .stat-value.success {
@@ -5194,6 +5867,41 @@ const renderLatencyHistogram = (res) => {
 
 .pre-script-card {
   margin-bottom: 16px;
+}
+
+/* M2 轨迹匹配证据区 */
+.trajectory-entry {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 3px 0;
+  font-size: 13px;
+  color: #606266;
+}
+.trajectory-entry-missing {
+  color: #303133;
+}
+.trajectory-entry-args {
+  color: #909399;
+  font-size: 12px;
+}
+.trajectory-timeline-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.trajectory-call-index {
+  color: #909399;
+  font-size: 12px;
+  min-width: 34px;
+}
+.trajectory-call-args {
+  color: #606266;
+  font-size: 12px;
+  font-family: monospace;
+  word-break: break-all;
 }
 
 .pre-script-card-header {

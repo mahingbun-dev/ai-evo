@@ -221,6 +221,11 @@ class Settings(BaseSettings):
     # 由部署者自行承担内网目标面
     WEBHOOK_ALLOW_PRIVATE_TARGETS: bool = False
 
+    # M2 http_assert 校验器内网目标放行的管理员总闸（默认关）：任务级
+    # allow_private 只是任务侧意向，真正生效需本开关置 true（SSRF 控制面
+    # 与 webhook 同口径——放行内网目标的决定权在部署管理员而非任务创建者）
+    HTTP_ASSERT_ALLOW_PRIVATE_TARGETS: bool = False
+
     @property
     def langfuse_config(self) -> Optional[Dict[str, str]]:
         """获取 LangFuse 配置字典，如果未启用则返回 None"""

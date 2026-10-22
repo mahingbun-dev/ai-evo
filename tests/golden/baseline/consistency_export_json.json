@@ -20,7 +20,13 @@
             "structure_consistency": 0.85,
             "unique_result_count": 2,
             "total_calls": 3,
-            "successful_calls": 3
+            "successful_calls": 3,
+            "pass_at_1": null,
+            "pass_pow_k": null,
+            "trials": null,
+            "pass_count": null,
+            "score_std": null,
+            "score_sem": null
           },
           "judge_assessment": {
             "综合评分": 8.2,
@@ -72,7 +78,13 @@
             "structure_consistency": 0.5,
             "unique_result_count": 3,
             "total_calls": 3,
-            "successful_calls": 3
+            "successful_calls": 3,
+            "pass_at_1": null,
+            "pass_pow_k": null,
+            "trials": null,
+            "pass_count": null,
+            "score_std": null,
+            "score_sem": null
           },
           "judge_assessment": {},
           "dimension_scores": {},
@@ -108,7 +120,13 @@
             "structure_consistency": 0,
             "unique_result_count": 0,
             "total_calls": 0,
-            "successful_calls": 0
+            "successful_calls": 0,
+            "pass_at_1": null,
+            "pass_pow_k": null,
+            "trials": null,
+            "pass_count": null,
+            "score_std": null,
+            "score_sem": null
           },
           "judge_assessment": {},
           "dimension_scores": {},

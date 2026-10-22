@@ -139,11 +139,49 @@ class EvaluationTask(Base):
 
     # 门禁配置（M1 QE1-2，评测即门禁）：{enabled, mode: all|any, thresholds:
     # [{metric, op, value}]}，metric 取 total_score/pass_rate/dimension:<维度名>
-    # （verification_* 随 M2 扩展）。空=未启用门禁（存量任务行为不变）
+    # （verification_pass_rate 随 M2 校验器接线）。空=未启用门禁（存量任务行为不变）
     gate_config = Column(
         JSON, nullable=True,
         comment="门禁配置（M1）：{enabled, mode: all|any, thresholds:[{metric,op,value}]},空=未启用",
     )
+
+    # 终态校验器配置（M2 QE2-1，确定性终态校验优先）：[{type: script|db_assert|
+    # file_assert|http_assert, name, on_fail: continue|abort, config: {...}}]。
+    # 评测流水线在模型调用/被测 agent 执行之后运行（步骤1.6），输出
+    # verification_result；聚合出 verification_pass_rate（接入门禁 metric）。
+    # 空=未配置校验器（存量任务行为不变）。见 app/services/verifier_runner.py
+    verifiers = Column(
+        JSON, nullable=True,
+        comment="终态校验器配置（M2）：[{type: script|db_assert|file_assert|http_assert, name, on_fail, config}],空=未配置",
+    )
+
+    # 轨迹断言配置（M2 QE2-2，agent 类型）：{mode: strict|unordered|subset|
+    # superset, expected: [{tool, args_contains?, min_calls?}], forbidden:
+    # [{tool, args_contains?}]}。会话（session_messages）的工具调用序列做
+    # 确定性匹配，输出 trajectory_match（独立于裁判维度计分）；聚合出
+    # trajectory_match_rate（接入门禁 metric）。空=未配置（行为不变）。
+    # 见 app/services/trajectory_matcher.py
+    trajectory_config = Column(
+        JSON, nullable=True,
+        comment="轨迹断言配置（M2，agent）：{mode, expected[], forbidden[]},空=未配置",
+    )
+
+    # 行级多 trial 次数（M2 QE2-3，judge 类型）：2-5，>1 时同一数据行
+    # 重复跑「模型调用+裁判+校验」k 次合并为一行，行级输出 pass@1/pass^k
+    # 与分数标准差/标准误（语义对齐 τ-bench pass^k，见 app/services/pass_k.py）。
+    # success_rate/consistency/latency 的多次重复走各自 repeat_count 通道。
+    # 空/1=不开启（存量任务行为不变）。
+    trials = Column(Integer, nullable=True, comment="行级多 trial 次数（M2，judge）：2-5，空/1=不开启")
+
+    # 裁判输入消毒关闭声明（M2 QE2-4，judge/agent）：prompt_guard 默认开启
+    # （待评数据 <eval_data> 定界 + 免责指令）；置 true 为显式关闭（审计可见：
+    # 每次执行的开关状态随 judge_config_snapshot 落执行记录）。
+    judge_guard_disabled = Column(Boolean, nullable=True, default=False, comment="裁判输入消毒显式关闭（M2）：true=关闭定界+免责指令，默认false=开启")
+
+    # 裁判金丝雀自检开关（M2 QE2-4，judge/agent）：true 时混入约 2%（至少
+    # 1 行）空/乱码合成行直送裁判，裁判给高分（≥满分70%）则结果页标记
+    # 「裁判可被欺骗风险」徽标；canary 行不计入均分（见 app/services/judge_canary.py）。
+    judge_canary = Column(Boolean, nullable=True, default=False, comment="裁判金丝雀自检（M2）：true=混入空/乱码探针行，默认false=关闭")
 
 
 class TaskExecutionLog(Base):
@@ -194,7 +232,15 @@ class TaskExecutionRecord(Base):
     # TaskExecutionRecordService 统一落 error verdict；空=该次执行未启用门禁
     gate_result = Column(
         JSON, nullable=True,
-        comment="门禁判定（M1）：{verdict: passed|failed|error, checks:[...], evaluated_at},空=未启用门禁",
+        comment="门禁判定（M1）：{verdict: passed|failed|error, checks:[...], evaluated_at},空=未启用",
+    )
+
+    # 裁判治理快照（M2 QE2-4）：本次裁决所用裁判配置——引擎/裁判模型摘要
+    # （掩码凭据）/prompt 模板/维度定义/输入消毒与金丝雀开关状态。空=该次
+    # 执行未落快照（存量记录）。见 config_snapshot.build_judge_config_snapshot
+    judge_config_snapshot = Column(
+        JSON, nullable=True,
+        comment="裁判治理快照（M2）：{engine, judge_model, prompt_template, metrics, guard, canary}",
     )
 
 
@@ -230,6 +276,20 @@ class EvaluationResult(Base):
     judge_results = Column(JSON, nullable=True, comment="裁判明细（judge_scores）")
     aggregate = Column(JSON, nullable=True, comment="行聚合分")
     row_result = Column(JSON, nullable=True, comment="全量行结果原文（聚合/续跑重建事实源）")
+    # 终态校验器结果投影（M2 QE2-1）：{status: pass|fail|error, results: [逐校验器
+    # 条目], passed/failed/errored/total, aborted}。事实源仍是 row_result
+    # （verification_result 键同构），本列供行级查询投影
+    verification_result = Column(
+        JSON, nullable=True,
+        comment="终态校验器结果（M2）：{status: pass|fail|error, results:[...], passed, total}",
+    )
+    # 轨迹匹配结果投影（M2 QE2-2）：{mode, status: pass|fail|error, matched,
+    # missing[], unexpected[], forbidden_hits[], timeline}。事实源仍是
+    # row_result（trajectory_match 键同构），本列供行级查询投影
+    trajectory_match = Column(
+        JSON, nullable=True,
+        comment="轨迹匹配结果（M2）：{mode, status, matched, missing, unexpected, forbidden_hits, timeline}",
+    )
     error = Column(Text, nullable=True, comment="行执行错误信息")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now())

@@ -22,6 +22,10 @@ pdfplumber==0.11.9
 beautifulsoup4==4.14.3
 jsonpath-ng==1.7.0
 jsonpath==0.82.2
+# M2 QE2-3 A/B 显著性统计（ab_statistics：Wilcoxon/配对 t/McNemar/二项精确）
+# 直依赖 scipy，钉与 requirements.lock / prod-constraints 一致的精确版本
+# （此前经 ragas→scikit-network 传递引入，lock 已含 arm64 wheel）
+scipy==1.18.0
 
 # ============ Configuration ============
 pydantic==2.12.5

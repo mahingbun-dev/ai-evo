@@ -1,6 +1,6 @@
 # AgentEvo — 私有化部署的 Agent 质量工程平台
 
-私有化部署的 Agent 质量工程平台，定位「评测即门禁」——模型 / Agent 的变更先过评测、再进发布。当前已可用：模型配置、数据集管理、评测前处理脚本、8 种评测类型、结果聚合与统计分析、A/B 对比测试；门禁闭环（阈值门禁、API Key、CI CLI、Webhook）随下一里程碑（M1）落地。FastAPI + Vue 3 + Celery，一个 Docker Compose 栈即可部署。
+私有化部署的 Agent 质量工程平台，定位「评测即门禁」——模型 / Agent 的变更先过评测、再进发布。当前已可用：模型配置、数据集管理、评测前处理脚本、8 种评测类型、终态校验器（脚本 / 数据库 / 文件 / 回调断言，确定性校验优先，M2 起）、轨迹匹配（agent 会话工具序列断言：严格 / 乱序 / 子序列 / 禁止多余四模式 + 期望 / 禁用调用，聚合出轨迹匹配率门禁指标，M2 起）、pass^k 统计（裁判类任务行级多 Trial 2-5 + 一致性/成功率重复次数，τ-bench 口径的 pass@1 / pass^k / 分数标准误，M2 起）、A/B 显著性检验（多轮同输入配对：Wilcoxon 符号秩 + 配对 t + Cliff's delta + McNemar 精确检验，M2 起）、结果聚合与统计分析、A/B 对比测试；门禁闭环已随 M1 落地：任务级阈值门禁（结果页判定横幅 + 执行历史门禁列）、按 scope 授权的 API Key、Webhook 通知、开发者设置控制台、CI 命令行 `aievo-cli`（退出码 0=通过 / 1=门禁失败 / 2=错误，GitHub/GitLab/Jenkins 模板见 `ci-templates/`）。FastAPI + Vue 3 + Celery，一个 Docker Compose 栈即可部署。
 
 ![首页](docs/assets/00-home.png)
 

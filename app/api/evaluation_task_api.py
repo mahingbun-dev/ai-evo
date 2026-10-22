@@ -92,6 +92,21 @@ class CreateTaskRequest(BaseModel):
     # M1 QE1-6 门禁配置：{mode: all|any, thresholds: [{metric, op, value}]}；
     # None/空 = 未启用门禁（编辑表单「门禁配置」折叠区提交）
     gate_config: Optional[Dict[str, Any]] = Field(None, description="门禁配置（空=未启用）")
+    # M2 QE2-1 终态校验器配置：[{type: script|db_assert|file_assert|http_assert,
+    # name, on_fail: continue|abort, config: {...}}]；None/空 = 未配置
+    verifiers: Optional[List[Dict[str, Any]]] = Field(None, description="终态校验器配置列表（空=未配置）")
+    # M2 QE2-2 轨迹断言配置（agent 类型）：{mode: strict|unordered|subset|superset,
+    # expected: [{tool, args_contains?, min_calls?}], forbidden: [{tool}]}
+    trajectory_config: Optional[Dict[str, Any]] = Field(None, description="轨迹断言配置（agent 类型，空=未配置）")
+    # M2 QE2-3 行级多 trial 次数（judge 类型）：2-5，>1 时同一数据行重复
+    # 「模型调用+裁判+校验」k 次合并为一行（pass@1/pass^k）；None/1=不开启
+    trials: Optional[int] = Field(None, description="行级多 trial 次数（judge 类型，2-5，空/1=不开启）")
+    # M2 QE2-4 裁判治理：输入消毒显式关闭（默认 false=开启 <eval_data> 定界
+    # + 免责指令；true 需显式声明，随 judge_config_snapshot 审计留痕）
+    judge_guard_disabled: Optional[bool] = Field(False, description="裁判输入消毒显式关闭（M2，默认false=开启）")
+    # M2 QE2-4 裁判治理：金丝雀自检（true 时混入约 2% 空/乱码探针行，
+    # 裁判高分→结果页风险徽标；探针行不计入均分）
+    judge_canary: Optional[bool] = Field(False, description="裁判金丝雀自检（M2，默认false=关闭）")
 
 
 class UpdateTaskRequest(BaseModel):
@@ -146,6 +161,15 @@ class UpdateTaskRequest(BaseModel):
     pre_scripts: Optional[List[Dict[str, Any]]] = None
     # M1 QE1-6 门禁配置（局部更新语义：携带即覆盖，None=关闭门禁）
     gate_config: Optional[Dict[str, Any]] = None
+    # M2 QE2-1 终态校验器配置（局部更新语义：携带即覆盖，None/空=清空校验器）
+    verifiers: Optional[List[Dict[str, Any]]] = None
+    # M2 QE2-2 轨迹断言配置（局部更新语义：携带即覆盖，None/空=清空轨迹断言）
+    trajectory_config: Optional[Dict[str, Any]] = None
+    # M2 QE2-3 行级多 trial 次数（局部更新语义：携带即覆盖，None/1=关闭多 trial）
+    trials: Optional[int] = Field(None, description="行级多 trial 次数（judge 类型，2-5，None/1=关闭）")
+    # M2 QE2-4 裁判治理（局部更新语义：携带即覆盖）
+    judge_guard_disabled: Optional[bool] = Field(None, description="裁判输入消毒显式关闭（true=关闭定界+免责指令）")
+    judge_canary: Optional[bool] = Field(None, description="裁判金丝雀自检开关（true=混入空/乱码探针行）")
 
 
 # ==================== Response Models ====================
@@ -272,6 +296,15 @@ class TaskConfigResponse(BaseModel):
     pre_scripts: Optional[List[Dict[str, Any]]] = None
     # M1 QE1-6 门禁配置（编辑回显用，from_attributes 自动带出）
     gate_config: Optional[Dict[str, Any]] = None
+    # M2 QE2-1 终态校验器配置（编辑回显用，from_attributes 自动带出）
+    verifiers: Optional[List[Dict[str, Any]]] = None
+    # M2 QE2-2 轨迹断言配置（编辑回显用，from_attributes 自动带出）
+    trajectory_config: Optional[Dict[str, Any]] = None
+    # M2 QE2-3 行级多 trial 次数（编辑回显用，from_attributes 自动带出）
+    trials: Optional[int] = None
+    # M2 QE2-4 裁判治理（编辑回显用，from_attributes 自动带出）
+    judge_guard_disabled: Optional[bool] = False
+    judge_canary: Optional[bool] = False
     # 不包含执行结果字段：result, total_cost, completed_at, progress, total_questions, completed_questions
     created_at: datetime
 
@@ -387,6 +420,9 @@ class ExecutionRecordResponse(BaseModel):
     # M1 QE1-2 门禁判定：{verdict: passed|failed|error, checks, evaluated_at}；
     # 空 = 该次执行未启用门禁（含全部存量执行记录）
     gate_result: Optional[Dict[str, Any]] = None
+    # M2 QE2-4 裁判治理快照：本次裁决所用裁判引擎/模型摘要/prompt 模板/
+    # 维度定义/输入消毒与金丝雀开关状态；空 = 该次执行未走裁判链路
+    judge_config_snapshot: Optional[Dict[str, Any]] = None
 
     @field_serializer('started_at')
     def serialize_started_at(self, value: datetime) -> str:
@@ -424,6 +460,15 @@ class MigrateLegacyAllResponse(BaseModel):
     migrated: int = Field(..., description="发生迁移的条数")
     skipped: int = Field(..., description="跳过（无需迁移）的条数")
     errors: List[Dict[str, Any]] = Field(default_factory=list, description="失败明细 [{id, error}]")
+
+
+class VerifierDebugPayload(BaseModel):
+    """校验器试跑请求（M2 QE1-6 同口径：与写操作一致仅超管可用）"""
+    verifier: Dict[str, Any] = Field(..., description="单个校验器配置（{type, name, on_fail, config}）")
+    sample: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="试跑样例输入：{model_output?, session_summary?}（script 类型进脚本 stdin）",
+    )
 
 
 # ==================== Router ====================
@@ -486,6 +531,11 @@ def create_task(
         template_id=body.template_id,
         pre_scripts=body.pre_scripts,
         gate_config=body.gate_config,
+        verifiers=body.verifiers,
+        trajectory_config=body.trajectory_config,
+        trials=body.trials,
+        judge_guard_disabled=body.judge_guard_disabled,
+        judge_canary=body.judge_canary,
     )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -507,7 +557,7 @@ def create_task(
 
 @router.post("/plugin-eval/upload", summary="上传插件包/SKILL.md（插件评测手动来源）")
 async def upload_plugin_package(file: UploadFile = File(..., description="zip 插件包（≤20MB）或 SKILL.md（≤2MB）")):
-    """上传插件/skill 压缩包或 SKILL.md 文件，供插件评测「手动指定」来源使用。
+    """上传插件/skill 压缩包或 SKILL.md，供插件评测「手动指定」来源使用。
 
     - .zip：内存解包（路径穿越校验/大小限制/唯一顶层目录剥离）后落盘到
       uploads/plugin_eval/，返回解包目录绝对路径（直接填入 plugin_path）
@@ -525,6 +575,50 @@ async def upload_plugin_package(file: UploadFile = File(..., description="zip �
     if result.get("error"):
         raise HTTPException(status_code=400, detail=result["error"])
     return result
+
+
+@router.post("/verifiers/debug", summary="校验器试跑（单条样例，落盘产物返回路径）")
+def debug_verifier(payload: VerifierDebugPayload, request: Request):
+    """给单个校验器配置试跑一次（M2 QE2-1，Tasks 表单「试跑」按钮通道）。
+
+    - script 类型复用脚本试跑通道（pre_judge_runner.execute_script 同一沙箱/
+      子进程路径，stdin 带 kind=verifier 与样例 model_output）；
+    - 原生类型（db_assert/file_assert/http_assert）在 debug 工作区
+      （uploads/script_runs/debug/verifier_{ts}/）内执行，产物落盘语义一致。
+    - W1-4 同口径：试跑与写操作一致，仅超管可用（执行任意脚本/发起外呼）。
+    """
+    # 与 pre_judge_script_api._ensure_admin 同口径（deny by default）
+    user = getattr(request.state, "user", None)
+    if not isinstance(user, dict) or user.get("super_admin_flag") != 1:
+        raise HTTPException(status_code=403, detail="仅超级管理员可试跑校验器")
+
+    from app.services import verifier_runner
+
+    try:
+        verifier_runner.validate_verifier_shape([payload.verifier])
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    run_dir = verifier_runner.build_debug_workspace(
+        str(payload.verifier.get("name") or payload.verifier.get("type") or "verifier"))
+    sample = payload.sample if isinstance(payload.sample, dict) else {}
+    entry = verifier_runner.run_single_verifier(
+        payload.verifier,
+        task_id="debug",
+        data_id="debug",
+        run_dir=run_dir,
+        model_output=sample.get("model_output"),
+        data={
+            "session_summary": sample.get("session_summary"),
+            "session_stats": sample.get("session_stats") or {},
+        },
+        payload={},
+    )
+    return {
+        "verifier": payload.verifier,
+        "run_dir": str(run_dir),
+        "result": entry,
+    }
 
 
 @router.get("/models/{model_id}/variables", summary="获取模型的变量列表")
@@ -1085,6 +1179,8 @@ def get_result_history(
             "completed_at": task.completed_at.isoformat() if task.completed_at else None,
             # M1 QE1-6：兼容记录无执行记录行，无门禁判定
             "gate_result": None,
+            # M2 QE2-4：兼容记录无执行记录行，无裁判治理快照
+            "judge_config_snapshot": None,
         }
         return [compatibility_record]
 
@@ -1102,6 +1198,7 @@ def get_result_history(
             "started_at": r.started_at.isoformat() if r.started_at else None,
             "completed_at": r.completed_at.isoformat() if r.completed_at else None,
             "gate_result": r.gate_result,
+            "judge_config_snapshot": r.judge_config_snapshot,
         }
         for r in records
     ]
@@ -1176,6 +1273,7 @@ def get_result_history_version(
             "started_at": record.started_at.isoformat() if record.started_at else None,
             "completed_at": record.completed_at.isoformat() if record.completed_at else None,
             "gate_result": record.gate_result,
+            "judge_config_snapshot": record.judge_config_snapshot,
         }
 
     # 兼容旧任务：无执行记录但任务有结果时，按 history 的兼容口径从任务本体取
@@ -1195,6 +1293,7 @@ def get_result_history_version(
         "started_at": task.created_at.isoformat() if task.created_at else None,
         "completed_at": task.completed_at.isoformat() if task.completed_at else None,
         "gate_result": None,
+        "judge_config_snapshot": None,
     }
 
 

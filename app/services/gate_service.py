@@ -17,13 +17,19 @@ gate_config 结构（plans/2026-10-22-Agent质量工程平台开发方案.md §M
       ]
     }
 
-metric 解析（M1 支持集；verification_* 随 M2 扩展）：
+metric 解析（M1 支持集 + M2 校验器/轨迹指标）：
 - ``total_score``：任务均分（aggregates.average_score，0..max_score）；
 - ``pass_rate``：行通过率（aggregates.success_rate，0..1；别名 success_rate）；
 - ``dimension:<维度名>``：维度均分（aggregates.dimension_scores.<名>.average）；
-- 其余（含 M2 的 verification_pass_rate 在 M2 接线前）：**metric 不可用**
-  → verdict=error（配置引用了本轮拿不到的指标，与质量不达标区分——CI 按
-  error 退出码 2 处理，不被误读成测试失败）。
+- ``verification_pass_rate``（M2 QE2-1 接线）：终态校验器行通过率
+  （aggregates.verification_pass_rate，0..1；任务配置校验器且行结果带
+  verification_result 时由聚合写入）。任务未配置校验器时聚合无该键
+  → metric 不可用 → error（配置引用了本轮拿不到的指标）；
+- ``trajectory_match_rate``（M2 QE2-2 接线）：agent 任务轨迹匹配行通过率
+  （aggregates.trajectory_match_rate，0..1；任务配置轨迹断言且行结果带
+  trajectory_match 时由聚合写入）。未配置时同上按不可用 → error；
+- 其余未知指标：**metric 不可用** → verdict=error（配置引用了本轮拿不到的
+  指标，与质量不达标区分——CI 按 error 退出码 2 处理，不被误读成测试失败）。
 
 失败/停止收尾：`build_error_gate_result(gate_config, reason)` 统一产
 error verdict，由 TaskExecutionRecordService 在 fail_record/stop_record
@@ -70,8 +76,16 @@ def _extract_metric(metric: str, aggregates: Dict[str, Any]) -> Optional[float]:
         dims = aggregates.get("dimension_scores") or {}
         dim = dims.get(dim_name)
         value = dim.get("average") if isinstance(dim, dict) else None
+    elif metric == "verification_pass_rate":
+        # M2 QE2-1：任务配置校验器时由聚合写入（任务级 pass_rate）；
+        # 未配置校验器/无校验行的聚合无该键 → None → metric 不可用（error）
+        value = aggregates.get("verification_pass_rate")
+    elif metric == "trajectory_match_rate":
+        # M2 QE2-2：agent 任务配置轨迹断言时由聚合写入；未配置/无匹配行同样
+        # metric 不可用 → error
+        value = aggregates.get("trajectory_match_rate")
     else:
-        # M2 verification_* 等尚未接线的指标：聚合里没有即不可用
+        # 其余未知指标：聚合里没有即不可用
         value = aggregates.get(metric)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None

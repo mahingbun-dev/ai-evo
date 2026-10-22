@@ -12,10 +12,11 @@ from typing import Optional, Dict, Any, List
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException, Query, Depends, Request
 from fastapi.websockets import WebSocketState
 from sqlalchemy.orm import Session
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.db.session import get_db, SessionLocal
 from app.services.ab_test_service import ABTestService
+from app.services.ab_statistics import compute_ab_significance
 from app.services.model_config_service import ModelConfigService
 from app.services.ws_auth import require_ws_user
 from app.services.access_control import AccessDeniedError, check_team_access, is_super_admin
@@ -25,6 +26,10 @@ from app.api.model_config_api import _serialize_vars, _serialize_response
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/ab-test", tags=["A/B测试"])
+
+# A/B 多轮上限：显著性配对检验（Wilcoxon/McNemar）的建议样本量量级，
+# 过多轮次纯耗时（每轮一次真实模型调用）
+AB_MAX_ROUNDS = 10
 
 
 # ==================== Pydantic 请求/响应模型 ====================
@@ -41,6 +46,16 @@ class SaveSessionRequest(BaseModel):
     duration_a: Optional[float] = None
     duration_b: Optional[float] = None
     name: Optional[str] = None
+    # M2 QE2-3：多轮显著性统计（{rounds, duration_paired, success_mcnemar}）；
+    # 单轮测试无配对结构，保存 NULL
+    significance: Optional[Dict[str, Any]] = None
+
+
+class SignificanceRequest(BaseModel):
+    """A/B 显著性计算请求（历史记录回放/外部配对数据复算）"""
+    rounds: List[Dict[str, Any]] = Field(
+        ..., description="逐轮同输入配对记录 [{duration_a, duration_b, success_a, success_b}]"
+    )
 
 
 # ==================== 工具函数 ====================
@@ -253,6 +268,30 @@ async def _run_model(
     }
 
 
+def _merge_round_results(side_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """多轮单侧结果合并为一份保存结果（M2 QE2-3）
+
+    success=任一轮成功；content=首个非空响应；request_details 全量拼接；
+    duration=各轮耗时合计；rounds=逐轮耗时/成败明细（显著性面板回放用）。
+    """
+    return {
+        "success": any(r.get("success") for r in side_results),
+        "content": next((r.get("content") for r in side_results if r.get("content")), ""),
+        "request_details": [
+            d for r in side_results for d in (r.get("request_details") or [])
+        ],
+        "duration": round(sum(r.get("duration") or 0 for r in side_results), 2),
+        "rounds": [
+            {
+                "round": i + 1,
+                "duration": r.get("duration"),
+                "success": bool(r.get("success")),
+            }
+            for i, r in enumerate(side_results)
+        ],
+    }
+
+
 # ==================== WebSocket 端点 ====================
 
 @router.websocket("/ws/run")
@@ -260,6 +299,8 @@ async def websocket_ab_test(websocket: WebSocket):
     """
     A/B 测试核心 WebSocket 端点。
     并行调用两个模型，通过 side 字段区分 A/B 消息，前端左右分列渲染。
+    M2 QE2-3：支持 rounds 多轮（1-10，同输入逐轮配对），≥2 轮时在 complete
+    消息附显著性统计（耗时配对 Wilcoxon/t/Cliff's delta + 成功比例 McNemar）。
 
     鉴权：accept 之前完成 SSO Cookie 验证，未认证一律 close(4401)。
     """
@@ -278,6 +319,11 @@ async def websocket_ab_test(websocket: WebSocket):
         model_a_id: str = data.get("model_a_id", "")
         model_b_id: str = data.get("model_b_id", "")
         runtime_vars: Dict = data.get("variables", {})
+        # 多轮配置：clamp 1..10（默认 1 = 旧行为，单轮不产生显著性统计）
+        try:
+            rounds = max(1, min(int(data.get("rounds", 1) or 1), AB_MAX_ROUNDS))
+        except (TypeError, ValueError):
+            rounds = 1
 
         if not model_a_id or not model_b_id:
             await websocket.send_json({"type": "error", "content": "model_a_id 和 model_b_id 不能为空"})
@@ -309,22 +355,61 @@ async def websocket_ab_test(websocket: WebSocket):
         # ws_lock 保证并发 send_json 串行化，避免 WebSocket 帧交织
         ws_lock = asyncio.Lock()
 
-        # 并行执行 A 和 B
-        results = await asyncio.gather(
-            _run_model(model_a_id, "A", websocket, processed_vars, db, ws_lock),
-            _run_model(model_b_id, "B", websocket, processed_vars, db, ws_lock),
-            return_exceptions=True,
-        )
+        # 逐轮并行执行 A 和 B（同输入配对）；单轮保持旧行为（无轮次消息）
+        results_a: List[Dict[str, Any]] = []
+        results_b: List[Dict[str, Any]] = []
+        rounds_records: List[Dict[str, Any]] = []
+        for round_no in range(1, rounds + 1):
+            if rounds > 1:
+                await websocket.send_json({
+                    "type": "round_start",
+                    "round": round_no,
+                    "content": f"第 {round_no}/{rounds} 轮",
+                })
 
-        result_a = results[0] if not isinstance(results[0], Exception) else {"success": False, "duration": 0}
-        result_b = results[1] if not isinstance(results[1], Exception) else {"success": False, "duration": 0}
+            round_results = await asyncio.gather(
+                _run_model(model_a_id, "A", websocket, processed_vars, db, ws_lock),
+                _run_model(model_b_id, "B", websocket, processed_vars, db, ws_lock),
+                return_exceptions=True,
+            )
+            round_a = round_results[0] if not isinstance(round_results[0], Exception) else {"success": False, "duration": 0}
+            round_b = round_results[1] if not isinstance(round_results[1], Exception) else {"success": False, "duration": 0}
+            results_a.append(round_a)
+            results_b.append(round_b)
+            record = {
+                "round": round_no,
+                "duration_a": round_a.get("duration"),
+                "success_a": bool(round_a.get("success")),
+                "duration_b": round_b.get("duration"),
+                "success_b": bool(round_b.get("success")),
+            }
+            rounds_records.append(record)
+            if rounds > 1:
+                await websocket.send_json({"type": "round_complete", **record})
 
-        await websocket.send_json({
+            # 客户端断开（停止）即不再发起新一轮模型调用
+            if websocket.client_state == WebSocketState.DISCONNECTED:
+                break
+
+        if rounds > 1:
+            result_a = _merge_round_results(results_a)
+            result_b = _merge_round_results(results_b)
+        else:
+            result_a, result_b = results_a[0], results_b[0]
+
+        # 显著性统计（M2 QE2-3）：≥2 轮同输入配对才有配对结构可检验
+        significance = compute_ab_significance(rounds_records) if rounds > 1 else None
+
+        complete_message = {
             "type": "complete",
             "content": "A/B 测试完成",
             "duration_a": result_a.get("duration", 0),
             "duration_b": result_b.get("duration", 0),
-        })
+        }
+        if rounds > 1:
+            complete_message["rounds"] = rounds_records
+            complete_message["significance"] = significance
+        await websocket.send_json(complete_message)
 
     except WebSocketDisconnect:
         logger.info("A/B Test WebSocket 断开连接")
@@ -380,8 +465,22 @@ async def save_session(request: Request, body: SaveSessionRequest, db: Session =
         duration_b=body.duration_b,
         name=body.name,
         created_by=(request.state.user or {}).get("user_code"),
+        significance=body.significance,
     )
     return _session_to_dict(session)
+
+
+@router.post("/significance", summary="计算 A/B 多轮显著性统计")
+async def compute_significance(body: SignificanceRequest):
+    """对逐轮同输入配对记录计算显著性（M2 QE2-3）
+
+    耗时走 Wilcoxon 符号秩 + 配对 t + Cliff's delta（95% CI），成败走
+    McNemar 精确检验；纯计算无外部调用。历史详情回放与外部复算共用。
+    """
+    stats = compute_ab_significance(body.rounds)
+    if stats is None:
+        raise HTTPException(status_code=400, detail="轮数不足：显著性检验至少需要 2 轮同输入配对记录")
+    return stats
 
 
 @router.get("/sessions", summary="获取 A/B 测试历史列表")
@@ -448,6 +547,8 @@ def _session_to_dict(session, include_results: bool = True) -> Dict[str, Any]:
         "status": session.status,
         "duration_a": session.duration_a,
         "duration_b": session.duration_b,
+        # M2 QE2-3：多轮显著性统计（单轮/旧记录为 None）
+        "significance": getattr(session, "significance", None),
         "created_at": session.created_at.isoformat() if session.created_at else None,
     }
     if include_results:

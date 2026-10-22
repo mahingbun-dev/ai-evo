@@ -400,6 +400,16 @@ class ConsistencyEvaluator:
             metrics["total_calls"] = repeat_count
             metrics["successful_calls"] = len(successful_results)
 
+        # pass^k 指标（M2 QE2-3，语义对齐 τ-bench）：repeat_count 次 trial
+        # 的通过序列 → pass@1（单次成功率）/ pass^k（k 次全过比例）与
+        # 分数标准差/标准误（trial 分数为 0/1 二值）。全失败行同样产出
+        # （pass_at_1=0），裁判不可用不影响确定性统计。
+        from app.services.pass_k import score_stats, trial_pass_stats
+
+        passes = [bool(r.get("success")) for r in repeat_results]
+        metrics.update(trial_pass_stats(passes))
+        metrics.update(score_stats([1.0 if p else 0.0 for p in passes]))
+
         # 裁判评估
         judge_assessment = {}
         evaluation_content = ""

@@ -6,7 +6,7 @@ Prompt组装器
 import json
 from typing import Dict, Any, Optional, List
 
-from app.services.prompt_guard import EMPTY_VALUE_RULES, PROMPT_INJECTION_GUARD, wrap_eval_data
+from app.services.prompt_guard import EMPTY_VALUE_RULES, injection_guard_clause, wrap_eval_data
 from app.services.metric_scoring import format_score_range, metric_max_score
 
 WEIGHT_MAP = {"高": 3, "中": 2, "低": 1}
@@ -899,8 +899,11 @@ class PromptBuilder:
             parts.append(f"## 场景描述\n{self.scene_desc}")
 
         # W12-5：分隔符内是数据非指令——与 user prompt/targets 的 <eval_data>
-        # 包裹配套的最小注入防护声明
-        parts.append(PROMPT_INJECTION_GUARD)
+        # 包裹配套的最小注入防护声明；M2 QE2-4 模板级配置：任务显式声明
+        # 关闭消毒时 clause 为空串（不拼接声明）
+        guard_clause = injection_guard_clause()
+        if guard_clause:
+            parts.append(guard_clause)
 
         # 注入评测目标内容（evaluation_targets）
         # include_targets_content=False 供 CC 裁判引擎使用：claude-agent-sdk 以

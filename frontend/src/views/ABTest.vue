@@ -98,7 +98,69 @@
           {{ isRunning ? '测试中...' : '开始 A/B 测试' }}
         </el-button>
         <el-button v-if="isRunning" :icon="VideoPause" @click="stopTest" size="large">停止</el-button>
+        <!-- 多轮配置（M2 QE2-3）：≥2 轮时同输入逐轮配对，跑完输出显著性统计 -->
+        <div class="rounds-config" v-if="!isRunning">
+          <span class="rounds-label">轮数</span>
+          <el-input-number v-model="rounds" :min="1" :max="10" size="large" style="width: 110px;" />
+          <span class="rounds-tip" v-if="rounds > 1">同输入跑 {{ rounds }} 轮，完成后给出显著性结论（Wilcoxon / McNemar）</span>
+        </div>
         <span v-if="!modelAId || !modelBId" class="hint-text">请先选择模型 A 和模型 B</span>
+      </div>
+    </el-card>
+
+    <!-- 显著性面板（M2 QE2-3）：多轮跑完/历史详情有统计才显示 -->
+    <el-card v-if="significance" class="significance-card" shadow="never">
+      <template #header>
+        <div class="significance-header">
+          <span>显著性统计</span>
+          <el-tag size="small" type="info">配对样本 n={{ significance.rounds }} 轮（同输入）</el-tag>
+        </div>
+      </template>
+      <el-alert
+        v-if="significance.duration_paired?.conclusion"
+        :type="significance.duration_paired.significant ? 'success' : 'info'"
+        :closable="false"
+        class="significance-alert"
+        :title="`耗时：${significance.duration_paired.conclusion}`"
+      />
+      <el-alert
+        v-if="significance.success_mcnemar?.conclusion"
+        :type="significance.success_mcnemar.significant ? 'success' : 'info'"
+        :closable="false"
+        class="significance-alert"
+        :title="`成功率：${significance.success_mcnemar.conclusion}`"
+      />
+      <el-descriptions :column="3" size="small" border style="margin-top: 12px;">
+        <el-descriptions-item label="Wilcoxon p（耗时）">
+          {{ significance.duration_paired?.wilcoxon_p ?? '-' }}
+        </el-descriptions-item>
+        <el-descriptions-item label="配对 t p（耗时）">
+          {{ significance.duration_paired?.paired_t_p ?? '-' }}
+        </el-descriptions-item>
+        <el-descriptions-item label="均值差 95% CI（B-A，秒）">
+          <span v-if="significance.duration_paired?.diff_ci95">
+            [{{ significance.duration_paired.diff_ci95[0] }}, {{ significance.duration_paired.diff_ci95[1] }}]
+          </span>
+          <span v-else>-</span>
+        </el-descriptions-item>
+        <el-descriptions-item label="Cliff's δ（耗时）">
+          {{ significance.duration_paired?.cliffs_delta ?? '-' }}
+          <el-tag v-if="significance.duration_paired?.delta_magnitude" size="small" style="margin-left: 4px;">
+            {{ significance.duration_paired.delta_magnitude }}效应
+          </el-tag>
+        </el-descriptions-item>
+        <el-descriptions-item label="McNemar p（成功）">
+          {{ significance.success_mcnemar?.p_value ?? '-' }}
+        </el-descriptions-item>
+        <el-descriptions-item label="不一致对（A过B败 / A败B过）">
+          {{ significance.success_mcnemar?.b_a_pass_b_fail ?? '-' }} / {{ significance.success_mcnemar?.c_a_fail_b_pass ?? '-' }}
+        </el-descriptions-item>
+      </el-descriptions>
+      <div class="significance-note">
+        <template v-if="significance.duration_paired?.adequate === false || significance.success_mcnemar?.adequate === false">
+          样本量提示：当前轮数偏少，结论仅供参考——连续配对建议 ≥30 轮、成败配对建议不一致对 ≥10 再下判定。
+        </template>
+        <template v-else>口径：耗时为主检验 Wilcoxon 符号秩（配对 t 需差值近似正态）；成败为 McNemar 精确检验；p&lt;0.05 视为显著。</template>
       </div>
     </el-card>
 
@@ -237,6 +299,21 @@
     <!-- 历史详情弹窗 -->
     <el-dialog v-model="historyDetailVisible" title="A/B 测试详情" width="1100px" top="4vh">
       <div v-if="historyDetail">
+        <!-- 历史显著性结论（M2 QE2-3）：多轮记录保存的统计快照 -->
+        <el-alert
+          v-if="historyDetail.significance?.duration_paired?.conclusion"
+          :type="historyDetail.significance.duration_paired.significant ? 'success' : 'info'"
+          :closable="false"
+          style="margin-bottom: 12px;"
+          :title="`耗时：${historyDetail.significance.duration_paired.conclusion}`"
+        />
+        <el-alert
+          v-if="historyDetail.significance?.success_mcnemar?.conclusion"
+          :type="historyDetail.significance.success_mcnemar.significant ? 'success' : 'info'"
+          :closable="false"
+          style="margin-bottom: 12px;"
+          :title="`成功率：${historyDetail.significance.success_mcnemar.conclusion}`"
+        />
         <el-row :gutter="16">
           <el-col :span="12">
             <el-card shadow="never" class="result-card result-card-a">
@@ -352,6 +429,11 @@ const isRunning = ref(false)
 const testStarted = ref(false)
 const testDone = ref(false)
 
+// 多轮配置（M2 QE2-3）：1=单轮（旧行为），2-10 轮同输入配对出显著性
+const rounds = ref(1)
+// 显著性统计（WS complete 消息返回 / 历史记录回放）：单轮为 null 不显示面板
+const significance = ref(null)
+
 const logsA = ref([])
 const logsB = ref([])
 const loadingA = ref(false)
@@ -379,6 +461,7 @@ const startABTest = () => {
   successB.value = false
   resultA.value = null
   resultB.value = null
+  significance.value = null
   testStarted.value = true
   testDone.value = false
   isRunning.value = true
@@ -392,7 +475,8 @@ const startABTest = () => {
     ws.send(JSON.stringify({
       model_a_id: modelAId.value,
       model_b_id: modelBId.value,
-      variables: currentVariables.value
+      variables: currentVariables.value,
+      rounds: rounds.value
     }))
   }
 
@@ -404,6 +488,7 @@ const startABTest = () => {
       if (side === 'A') {
         if (data.type !== 'stream_chunk') logsA.value.push(data)
         if (data.type === 'side_complete') {
+          // 多轮：逐轮覆盖展示最近一轮耗时/成败（历史明细看逐轮记录）
           loadingA.value = false
           durationA.value = data.duration
           successA.value = data.success
@@ -415,14 +500,28 @@ const startABTest = () => {
           durationB.value = data.duration
           successB.value = data.success
         }
+      } else if (data.type === 'round_start') {
+        logsA.value.push({ type: 'info', content: `—— ${data.content} ——` })
+        logsB.value.push({ type: 'info', content: `—— ${data.content} ——` })
       }
 
       if (data.type === 'complete') {
         isRunning.value = false
         testDone.value = true
+        durationA.value = data.duration_a
+        durationB.value = data.duration_b
+        // M2 QE2-3：多轮显著性统计（单轮 complete 消息不携带该键）
+        if (data.significance) {
+          significance.value = data.significance
+        }
         // 整理保存数据
         resultA.value = buildResultFromLogs(logsA.value, durationA.value, successA.value)
         resultB.value = buildResultFromLogs(logsB.value, durationB.value, successB.value)
+        // 多轮：逐轮耗时/成败明细并入两侧保存结果（历史回放显著性复算用）
+        if (data.rounds) {
+          resultA.value.rounds = data.rounds.map(r => ({ round: r.round, duration: r.duration_a, success: r.success_a }))
+          resultB.value.rounds = data.rounds.map(r => ({ round: r.round, duration: r.duration_b, success: r.success_b }))
+        }
       }
 
       if (data.type === 'error' && !side) {
@@ -500,6 +599,8 @@ const confirmSave = async () => {
       duration_a: durationA.value,
       duration_b: durationB.value,
       name: saveName.value || null,
+      // M2 QE2-3：多轮显著性统计一并留档（单轮为 null）
+      significance: significance.value,
     })
     saveNameVisible.value = false
     ElMessage.success('记录已保存')
@@ -685,6 +786,45 @@ onMounted(() => {
   margin-top: 20px;
   padding-top: 16px;
   border-top: 1px solid var(--border-color);
+}
+
+/* 多轮配置（M2 QE2-3）：轮数次与提示 */
+.rounds-config {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.rounds-label {
+  font-size: 14px;
+  color: var(--text-secondary);
+}
+
+.rounds-tip {
+  font-size: 12px;
+  color: #909399;
+}
+
+/* 显著性面板（M2 QE2-3） */
+.significance-card {
+  margin-bottom: 16px;
+}
+
+.significance-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-weight: 600;
+}
+
+.significance-alert {
+  margin-bottom: 8px;
+}
+
+.significance-note {
+  margin-top: 10px;
+  font-size: 12px;
+  color: #909399;
 }
 
 .hint-text {

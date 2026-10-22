@@ -38,7 +38,13 @@ RESUME_SKIP_STATUSES = ("completed", "judge_failed")
 _ROW_OUTPUT_KEYS = frozenset({
     "idx", "success", "error", "judge_scores", "average_score", "feedback",
     "dimension_scores", "model_output", "model_raw_response", "input_data",
-    "pre_script_results", "row_status",
+    "pre_script_results", "row_status", "verification_result", "trajectory_match",
+    # 行级多 trial 统计（M2 QE2-3，judge trials>1）：输出侧字段
+    "trials_count", "trials_detail", "trial_scores", "trial_passes",
+    "pass_at_1", "pass_pow_k", "pass_count", "trials",
+    "score_mean", "score_std", "score_sem",
+    # 金丝雀探针行标记（M2 QE2-4）：输出侧字段（聚合整行剥离）
+    "judge_canary",
 })
 
 # 行级表不可用（迁移未执行/DB 异常）时每进程只告警一次，避免大任务日志刷屏
@@ -126,6 +132,8 @@ def upsert_row_result(
         "judge_results": result.get("judge_scores"),
         "aggregate": _aggregate_projection(result),
         "row_result": result,
+        "verification_result": result.get("verification_result"),
+        "trajectory_match": result.get("trajectory_match"),
         "error": result.get("error"),
     }
     stmt = pg_insert(EvaluationResult).values(**row_values)
@@ -246,6 +254,8 @@ def load_execution_results(
                 "model_output": row.model_output,
                 "model_raw_response": row.model_raw_response,
                 "judge_scores": row.judge_results,
+                "verification_result": row.verification_result,
+                "trajectory_match": row.trajectory_match,
                 "error": row.error,
             }
             aggregate = row.aggregate or {}

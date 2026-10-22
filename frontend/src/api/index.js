@@ -292,7 +292,9 @@ export const taskApi = {
   // 批量迁移全部旧版任务配置（幂等；返回 {total, migrated, skipped, errors}）
   migrateAllLegacy: () => request.post('/evaluation/tasks/migrate-legacy-all'),
   // 门禁状态轻量查询（M1：{verdict, gate_enabled, gate_result, ...}，可带 execution_number 查指定版本）
-  gate: (id, params) => request.get(`/evaluation/tasks/${id}/gate`, { params })
+  gate: (id, params) => request.get(`/evaluation/tasks/${id}/gate`, { params }),
+  // 校验器试跑（M2 QE2-1：单条样例试跑，script 类型复用脚本试跑通道；仅超管）
+  debugVerifier: (data) => request.post('/evaluation/tasks/verifiers/debug', data)
 }
 
 // 评测结果API
@@ -330,7 +332,9 @@ export const abTestApi = {
   listSessions: (params) => request.get('/ab-test/sessions', { params }),
   getSession: (id) => request.get(`/ab-test/sessions/${id}`),
   saveSession: (data) => request.post('/ab-test/sessions', data),
-  deleteSession: (id) => request.delete(`/ab-test/sessions/${id}`)
+  deleteSession: (id) => request.delete(`/ab-test/sessions/${id}`),
+  // M2 QE2-3：多轮配对记录的显著性复算（历史详情回放共用）
+  computeSignificance: (rounds) => request.post('/ab-test/significance', { rounds })
 }
 
 // API Key 管理（M1 开发者设置）：明文 token 仅创建响应返回一次
