@@ -202,7 +202,7 @@ class TestMigrationUpgrade:
         before = _all_tables_columns(pre_w9_db)
         assert "team_code" not in before["hub_files"], "基线应无 team_code 列"
 
-        _alembic(pre_w9_db, "upgrade", W9_HEAD)
+        _alembic(pre_w9_db, "upgrade", "head")
 
         # alembic 版本推进到 W9 head
         assert _fetchall(pre_w9_db, "SELECT version_num FROM alembic_version")[0][0] == _repo_head()
