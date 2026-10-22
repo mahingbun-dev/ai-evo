@@ -101,8 +101,11 @@ def make_post(chunks, full_sha, full_size, filename, session_id=SESSION_ID, reco
         if method == "notifications/initialized":
             return FakeResp("")
         if method == "tools/call":
-            assert msg["params"]["name"] == "file-store__file_download"
-            args = msg["params"]["arguments"]
+            # 中台收口后：tools/call → call_tool → 插件工具
+            assert msg["params"]["name"] == hub_file_service.HUB_CALL_TOOL
+            inner = msg["params"]["arguments"]
+            assert inner["name"] == "file-store__file_download"
+            args = inner["arguments"]
             assert args.get("offset") == state["offset"], \
                 f"offset 不连续: {args.get('offset')} != {state['offset']}"
             assert args.get("max_bytes") <= HUB_DOWNLOAD_CHUNK
@@ -578,6 +581,27 @@ class TestHubMcpClient:
         cli.close()
         mock_requests.delete.assert_not_called()
 
+    @patch("app.services.hub_file_service.requests")
+    def test_call_plugin_tool_wraps_with_call_tool(self, mock_requests):
+        """插件工具经 call_tool 元工具转发：tools/call → call_tool → {name, arguments}"""
+        mock_requests.post.return_value = FakeResp(text=rpc_result(1, {"ok": True}))
+        with HubMcpClient(ENDPOINT) as cli:
+            cli.call_plugin_tool("file-store__file_query", {"page": 2})
+        sent = json.loads(mock_requests.post.call_args.kwargs["data"])
+        assert sent["method"] == "tools/call"
+        assert sent["params"] == {
+            "name": "call_tool",
+            "arguments": {"name": "file-store__file_query", "arguments": {"page": 2}},
+        }
+
+    @patch("app.services.hub_file_service.requests")
+    def test_call_plugin_tool_defaults_empty_arguments(self, mock_requests):
+        mock_requests.post.return_value = FakeResp(text=rpc_result(1, {"ok": True}))
+        with HubMcpClient(ENDPOINT) as cli:
+            cli.call_plugin_tool("file-store__file_query")
+        sent = json.loads(mock_requests.post.call_args.kwargs["data"])
+        assert sent["params"]["arguments"]["arguments"] == {}
+
 
 # ---------------------------------------------------------------------------
 # 工具结果 payload 提取
@@ -629,6 +653,21 @@ class TestExtractToolPayload:
         with pytest.raises(HubFileError) as exc:
             _extract_tool_payload(result)
         assert "登录态已过期" in str(exc.value)
+
+    def test_use_call_tool_moved_hint(self):
+        """中台收口提示（decision=use_call_tool / status=moved）转成可读中文错误"""
+        card = {
+            "decision": "use_call_tool",
+            "hint": '请改用 call_tool: {"name":"file-store__file_query","arguments":{...}}',
+            "message": "插件工具不再直接出现在 tools/list 中，已收口到 call_tool",
+            "name": "file-store__file_query",
+            "status": "moved",
+        }
+        result = {"content": [{"type": "text", "text": json.dumps(card, ensure_ascii=False)}]}
+        with pytest.raises(HubFileError) as exc:
+            _extract_tool_payload(result)
+        assert "call_tool" in str(exc.value)
+        assert "已收口插件工具" in str(exc.value)
 
     def test_unparseable_raises(self):
         with pytest.raises(HubFileError) as exc:
@@ -800,7 +839,7 @@ class TestDownloadToFile:
             if msg.get("method") == "initialize":
                 return FakeResp(rpc_result(msg.get("id"), {}), headers={"mcp-session-id": SESSION_ID})
             if msg.get("method") == "tools/call":
-                captured.append(msg["params"]["arguments"])
+                captured.append(msg["params"]["arguments"]["arguments"])
                 return FakeResp(rpc_result(msg["id"], {"structuredContent": {"ok": True, "payload": {
                     "ok": True, "data_base64": "", "bytes_read": 0, "eof": True,
                     "sha256": hashlib.sha256(b"").hexdigest(), "size": 0, "filename": "empty.jsonl"}}}))
@@ -828,55 +867,6 @@ class TestDownloadToFile:
         svc = HubFileService(endpoint=ENDPOINT, cache_root=cache_root)
         with pytest.raises(HubFileError):
             svc.download_to_file("  ")
-
-
-# ---------------------------------------------------------------------------
-# query_files（file_query 透传）
-# ---------------------------------------------------------------------------
-
-def make_query_post(expected_args, result_payload, record=None):
-    def _post(url, data=None, headers=None, timeout=None, **kwargs):
-        msg = json.loads(data)
-        if record is not None:
-            record.append((msg.get("method"), msg))
-        if msg.get("method") == "initialize":
-            return FakeResp(rpc_result(msg.get("id"), {}), headers={"mcp-session-id": SESSION_ID})
-        if msg.get("method") == "notifications/initialized":
-            return FakeResp("")
-        if msg.get("method") == "tools/call":
-            assert msg["params"]["name"] == hub_file_service.QUERY_TOOL
-            assert msg["params"]["arguments"] == expected_args
-            return FakeResp(rpc_result(msg["id"], {"structuredContent": {"ok": True, "payload": result_payload}}))
-        raise AssertionError("未预期的 MCP 方法")
-
-    return _post
-
-
-class TestQueryFiles:
-    @patch("app.services.hub_file_service.requests")
-    def test_query_args_passthrough(self, mock_requests, cache_root):
-        """查询条件原样透传 file_query，结果透传返回"""
-        record = []
-        expected_args = {"name_like": "session", "uploader": "zhang",
-                         "uploaded_after": "2026-01-01T00:00:00Z", "page": 2, "page_size": 50}
-        payload = {"ok": True, "total": 1, "files": [{"file_id": "f1", "name": "session-x.jsonl"}]}
-        mock_requests.post.side_effect = make_query_post(expected_args, payload, record=record)
-        mock_requests.delete.return_value = FakeResp("")
-
-        svc = make_service(cache_root)
-        result = svc.query_files(
-            name_like="session", uploaded_after="2026-01-01T00:00:00Z",
-            uploader="zhang", page=2, page_size=50)
-        assert result == payload
-        assert [r[0] for r in record] == ["initialize", "notifications/initialized", "tools/call"]
-
-    @patch("app.services.hub_file_service.requests")
-    def test_query_none_fields_omitted(self, mock_requests, cache_root):
-        """未提供的过滤条件不出现在 arguments 中"""
-        mock_requests.post.side_effect = make_query_post({"name_like": "a"}, {"ok": True})
-        svc = make_service(cache_root)
-        result = svc.query_files(name_like="a")
-        assert result == {"ok": True}
 
 
 # ---------------------------------------------------------------------------
@@ -1096,8 +1086,11 @@ def make_query_post(expected_args, result_payload, record=None):
         if msg.get("method") == "notifications/initialized":
             return FakeResp("")
         if msg.get("method") == "tools/call":
-            assert msg["params"]["name"] == hub_file_service.QUERY_TOOL
-            assert msg["params"]["arguments"] == expected_args
+            # 中台收口后：tools/call → call_tool → 插件工具
+            assert msg["params"]["name"] == hub_file_service.HUB_CALL_TOOL
+            inner = msg["params"]["arguments"]
+            assert inner["name"] == hub_file_service.QUERY_TOOL
+            assert inner["arguments"] == expected_args
             return FakeResp(rpc_result(msg["id"], {"structuredContent": {"ok": True, "payload": result_payload}}))
         raise AssertionError("未预期的 MCP 方法")
 

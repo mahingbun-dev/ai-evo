@@ -47,6 +47,9 @@ class JudgeAgentState(TypedDict):
     final_score: float
     final_feedback: str
     final_dimension_scores: Dict[str, float]
+    # 分维度评分理由（aggregate_scores 从 dimension_results 组装，仅收录成功
+    # 评分的维度；缺失 reasoning 时置空字符串），由 format_output 写入输出顶层
+    final_dimension_feedbacks: Dict[str, str]
     # W2-1 失败显式标记：任一维度解析失败时该裁判整体标记失败，
     # 由 format_output 写入 raw_output，行级聚合据此剔除该裁判
     final_judge_failed: bool
@@ -108,6 +111,7 @@ def build_state_input(
         "final_score": 0.0,
         "final_feedback": "",
         "final_dimension_scores": {},
+        "final_dimension_feedbacks": {},
         "final_judge_failed": False,
         "final_fail_reason": "",
         "raw_output": "",

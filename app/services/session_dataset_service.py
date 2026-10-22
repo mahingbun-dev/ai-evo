@@ -11,24 +11,31 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# 会话数据集的标准字段元数据（写入 DatasetFieldMetadata）
-# 注意 label 必须与字段语义一致：user_input 是评测输入（首条用户消息摘要），
-# session_summary 是展示用的会话摘要——前端表格列头与编辑表单 label 均来自这里
-SESSION_FIELD_METADATA = [
-    {"name": "user_input", "label": "用户输入（评测输入）", "type": "string", "is_media": False, "is_required": False, "position": 0},
-    {"name": "source", "label": "会话来源", "type": "string", "is_media": False, "is_required": False, "position": 1},
-    {"name": "session_summary", "label": "会话摘要", "type": "string", "is_media": False, "is_required": False, "position": 2},
-    {"name": "session_stats", "label": "会话统计（JSON）", "type": "json", "is_media": False, "is_required": False, "position": 3},
-    {"name": "session_messages", "label": "会话内容（JSON，勿手改）", "type": "json", "is_media": False, "is_required": False, "position": 4},
-]
+# 会话数据行的字段契约自描述（build_session_data 随行内容一起落库）：
+# 「字段名 → 中文含义」对照表，导入侧 derive_fields_from_row 直接取作字段 label
+# （前端表格列头与编辑表单 label 均来自字段元数据）。
+# 维护规则：build_session_data 的行内容新增/改名任何字段，必须同步更新本表——
+# 字段契约与产出代码同源，平台不再维护行 schema 清单。
+SESSION_FIELD_DESCRIPTIONS = {
+    "user_input": "用户输入（评测输入=用户首条消息摘要）",
+    "source": "会话来源",
+    "session_summary": "会话摘要（首条用户输入，≤120 字）",
+    "session_stats": "会话统计（轮数/消息数/工具调用数/时长秒）",
+    "session_messages": "会话内容（SessionRecord 整包 JSON，勿手改）",
+    "session_id": "会话 ID",
+    "session_metadata": "会话元信息（工作目录/客户端版本/git 分支）",
+    "field_descriptions": "字段说明（本行各字段中文含义对照表）",
+}
 
 # anc-hub 导入页签（from-hub）附加的字段元数据：每条会话数据自动回填原始 jsonl 的
 # file_id，且 session_file_id 字段类型标记为 hub_file——评测执行时
 # resolve_hub_file_fields 复用持久解包区镜像到任务目录并替换字段值
 # （阶段B：缺持久区时该数据项标记失败；设计文档五/决策 #1）
+# 这两个是平台注入字段（由导入链路写入、type=hub_file 是平台语义），不由产出方声明；
+# position 只表相对次序，写库前由 reindex_field_positions 统一重排
 SESSION_HUB_FILE_METADATA = [
-    {"name": "session_file_id", "label": "会话原始文件 ID（anc-hub）", "type": "hub_file", "is_media": False, "is_required": False, "position": 5},
-    {"name": "session_file_name", "label": "会话原始文件名", "type": "string", "is_media": False, "is_required": False, "position": 6},
+    {"name": "session_file_id", "label": "会话原始文件 ID（anc-hub）", "type": "hub_file", "is_media": False, "is_required": False, "position": 0},
+    {"name": "session_file_name", "label": "会话原始文件名", "type": "string", "is_media": False, "is_required": False, "position": 1},
 ]
 
 # hub 通道字段名（type=hub_file）：from-hub 导入时每条会话数据行对其持一次
@@ -55,19 +62,25 @@ def save_upload_to_temp(content: bytes, filename: str) -> str:
 
 
 def build_session_data(record: Dict[str, Any]) -> Dict[str, Any]:
-    """SessionRecord → EvaluationDataV2.data 扁平结构"""
+    """SessionRecord → EvaluationDataV2.data 扁平结构
+
+    键顺序即前端列头顺序：字段元数据由 derive_fields_from_row 按行内键顺序推导
+    position，故 user_input（评测输入）排在最前。field_descriptions 是本行的
+    字段契约自描述，导入侧直接取作字段 label（见 SESSION_FIELD_DESCRIPTIONS）。
+    """
     from app.services.session_file_parser import summarize_first_user_message
 
     summary = summarize_first_user_message(record, limit=120)
     return {
-        "session_id": record.get("session_id", ""),
+        "user_input": summarize_first_user_message(record, limit=80),
         "source": record.get("source", ""),
         "session_summary": summary,
         "session_stats": record.get("stats", {}),
-        "session_metadata": record.get("metadata", {}),
         # 完整 SessionRecord（含 messages），评测时由 render_session_markdown 渲染
         "session_messages": record,
-        "user_input": summarize_first_user_message(record, limit=80),
+        "session_id": record.get("session_id", ""),
+        "session_metadata": record.get("metadata", {}),
+        "field_descriptions": dict(SESSION_FIELD_DESCRIPTIONS),
     }
 
 
@@ -129,20 +142,15 @@ def preview_session_files(entries: List[Tuple[str, str]]) -> Dict[str, Any]:
 
 
 def _merge_field_metadata(existing: List[Dict[str, Any]], base: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """以 base 为准合并已有字段元数据，保留 existing 中 base 未覆盖的字段
+    """以 base 为准合并已有字段元数据（委托 dataset_field_service 的统一实现）
 
     追加导入时 save_field_metadata 是全删重建——若不合并，向已有数据集追加普通
     会话会丢掉此前 hub 导入回填的 session_file_id(hub_file) 元数据，导致已导入
-    数据的 hub_file 通道失效。
+    数据的 hub_file 通道失效。保留本模块函数名以兼容既有调用点与测试。
     """
-    known = {m.get("name") for m in base}
-    merged = list(base)
-    for f in existing or []:
-        name = f.get("name")
-        if name and name not in known:
-            merged.append(f)
-            known.add(name)
-    return merged
+    from app.services.dataset_field_service import merge_field_metadata
+
+    return merge_field_metadata(existing, base)
 
 
 def import_sessions(
@@ -177,7 +185,11 @@ def import_sessions(
     """
     from app.services.session_file_parser import detect_and_parse
     from app.services.dataset_service import DatasetService, DatasetDataService
-    from app.services.dataset_field_service import DatasetFieldService
+    from app.services.dataset_field_service import (
+        DatasetFieldService,
+        derive_fields_from_row,
+        reindex_field_positions,
+    )
     from app.models.dataset_models import EvaluationDataV2, EvaluationDataset
     from sqlalchemy import func
 
@@ -216,9 +228,13 @@ def import_sessions(
     data_service = DatasetDataService(db)
     count = 0
     hub_file_refs: List[str] = []
+    # 首条数据行：字段元数据的推导样本（同一批会话的行结构一致）
+    first_data: Optional[Dict[str, Any]] = None
     try:
         for entry_key, file_name, record in all_records:
             data = build_session_data(record)
+            if first_data is None:
+                first_data = data
             if file_extra and entry_key in file_extra:
                 extra = file_extra[entry_key]
                 data.update(extra)
@@ -248,16 +264,22 @@ def import_sessions(
                 db.rollback()
         raise
 
-    # 字段元数据（新建/追加均幂等保存）：SESSION 标准字段 + hub 导入回填字段
-    # （file_extra 非空即 anc-hub 导入，session_file_id 标记为 hub_file 通道），
+    # 字段元数据（新建/追加均幂等保存）：平台注入字段前置（file_extra 非空即
+    # anc-hub 导入，session_file_id 标记为 hub_file 通道，type 语义无法从行内值
+    # 推导）+ 产出方字段从首条数据行推导（label 取行内 field_descriptions 自描述），
     # 并保留数据集已有、本次未覆盖的字段元数据（追加模式防覆盖退化）
     try:
-        base_meta = list(SESSION_FIELD_METADATA)
-        if file_extra:
-            base_meta.extend(SESSION_HUB_FILE_METADATA)
+        hub_meta = [dict(m) for m in SESSION_HUB_FILE_METADATA] if file_extra else []
+        base_meta = hub_meta + derive_fields_from_row(
+            first_data or {},
+            exclude=tuple(m["name"] for m in SESSION_HUB_FILE_METADATA),
+            start_position=len(hub_meta),
+        )
         field_service = DatasetFieldService(db)
-        merged_meta = _merge_field_metadata(
-            field_service.get_field_metadata(dataset.id), base_meta
+        merged_meta = reindex_field_positions(
+            _merge_field_metadata(
+                field_service.get_field_metadata(dataset.id), base_meta
+            )
         )
         field_service.save_field_metadata(dataset.id, merged_meta)
     except Exception as e:

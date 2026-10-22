@@ -6,7 +6,8 @@ Prompt组装器
 import json
 from typing import Dict, Any, Optional, List
 
-from app.services.prompt_guard import PROMPT_INJECTION_GUARD, wrap_eval_data
+from app.services.prompt_guard import EMPTY_VALUE_RULES, PROMPT_INJECTION_GUARD, wrap_eval_data
+from app.services.metric_scoring import format_score_range, metric_max_score
 
 WEIGHT_MAP = {"高": 3, "中": 2, "低": 1}
 
@@ -676,6 +677,14 @@ class PromptBuilder:
                     chain_results=chain_results,
                 )
 
+                if value is None or value == "":
+                    # 空值显式化：不再丢弃变量——裁判必须看到「该变量存在且值为空」
+                    # 才能做「双方均空→一致」的判定，而不是凭空断言「字段缺失」
+                    logger.info(f"变量 {var_key} 获取值为空，以（值为空）显式渲染")
+                    user_vars.append({"name": name, "value": "（值为空）"})
+                    continue
+
+                # 其它 falsy 值（0/False 等非空语义）维持原跳过行为
                 if not value:
                     logger.warning(f"变量 {var_key} 获取值为空，跳过")
                     continue
@@ -711,8 +720,15 @@ class PromptBuilder:
                     chain_results=chain_results,
                 )
 
+                if value is None or value == "":
+                    # 空值显式化：与列表格式口径一致（原 TODO 行为，不再丢弃）
+                    logger.info(f"变量 {var_name} 获取值为空，以（值为空）显式渲染")
+                    user_vars.append({"name": name, "value": "（值为空）"})
+                    continue
+
+                # 其它 falsy 值（0/False 等非空语义）维持原跳过行为
                 if not value:
-                    logger.warning(f"变量 {var_name} 获取值为空，跳过") # TODO: 需要处理这种情况
+                    logger.warning(f"变量 {var_name} 获取值为空，跳过")  # TODO: 需要处理这种情况
                     continue
 
                 # 步骤2: 如果超过阈值，进行上下文压缩
@@ -887,7 +903,14 @@ class PromptBuilder:
         parts.append(PROMPT_INJECTION_GUARD)
 
         # 注入评测目标内容（evaluation_targets）
-        if self.evaluation_targets:
+        # include_targets_content=False 供 CC 裁判引擎使用：claude-agent-sdk 以
+        # --system-prompt argv 传 system_prompt，待评数据超 Linux 单参数 131072B
+        # 上限会 execve 失败（E2BIG），数据改由 evaluation_executor 分流进
+        # user prompt（stdin 传输）或落盘文件（裁判 Read 工具阅读）
+        include_targets_content = kwargs.get("include_targets_content", True)
+        if self.evaluation_targets and not include_targets_content:
+            logger.info("[_build_system_prompt] include_targets_content=False，targets 内容改由调用方分流，跳过注入")
+        elif self.evaluation_targets:
             targets_content = self._inject_evaluation_targets(
                 payload=payload,
                 model_output=model_output,
@@ -899,6 +922,10 @@ class PromptBuilder:
             logger.info(f"[_build_system_prompt] evaluation_targets 为空，跳过注入")
 
         parts.append("\n\n##规范\n请严格根据评测维度要求对待评测目标内容进行评测，并按维度顺序逐步分析并评分。")
+
+        # 空值判定规则：约束裁判区分「字段存在但值为空」与「字段缺失」，
+        # 避免把空字符串/null 误判为缺失并说「无法比较」随意扣分
+        parts.append(f"\n{EMPTY_VALUE_RULES}")
 
         # 添加评测维度（有序步骤形式：维度顺序即评分步骤，契约 v3 §四）
         if self.evaluation_metrics:
@@ -916,7 +943,9 @@ class PromptBuilder:
                     weight_label = str(weight)
 
                 if metric_name:
-                    parts.append(f"\n### 第{i}步 {metric_name} (权重: {weight_label})")
+                    # 维度最高分：每个维度按自己的量程评分（缺省回退任务满分）
+                    dim_max_label = format_score_range(metric_max_score(metric, self.max_score))
+                    parts.append(f"\n### 第{i}步 {metric_name} (权重: {weight_label}, 最高分: {dim_max_label})")
                     if metric_desc:
                         parts.append(metric_desc)
 
@@ -926,12 +955,13 @@ class PromptBuilder:
 
         # 添加输出格式要求
         if self.evaluation_metrics:
-            # 有评测维度时，要求返回各维度独立评分
+            # 有评测维度时，要求返回各维度独立评分（每个维度按自己的最高分量程）
             dim_example_lines = []
             for metric in self.evaluation_metrics:
                 metric_name = metric.get("name", "")
                 if metric_name:
-                    dim_example_lines.append(f'    "{metric_name}": <该维度得分(0-{self.max_score})>')
+                    dim_max_label = format_score_range(metric_max_score(metric, self.max_score))
+                    dim_example_lines.append(f'    "{metric_name}": <该维度得分(0-{dim_max_label})>')
             dim_block = ",\n".join(dim_example_lines)
             output_format = (
                 f"\n## 输出格式要求\n"
@@ -963,7 +993,7 @@ class PromptBuilder:
                 f"- 只输出 ```json 代码块，不要输出 ``` 包裹的其他内容\n"
                 f"- 确保JSON格式正确，可以被 json.loads 解析\n"
                 f"- score 必须是 0-{self.max_score} 之间的数字\n"
-                f"- dimension_scores 中的每个维度分数必须是 0-{self.max_score} 之间的数字\n"
+                f"- dimension_scores 中的每个维度分数必须介于 0 到该维度自己的最高分之间（各维度最高分见评测维度列表标注），不得超过该维度的最高分\n"
                 f"- 综合评分将由系统按权重自动计算，无需你手动计算\n"
                 f"- 请确保每个维度的评分准确，权重越高(数值越大)的维度对综合评分影响更大"
             )
@@ -1065,9 +1095,10 @@ class PromptBuilder:
                 )
 
                 if value or value == "":
+                    # 空字符串显式渲染（值为空），与 build_user_prompt_from_judge_vars 口径一致
                     user_vars.append({
                         "name": name,
-                        "value": value,
+                        "value": value if value != "" else "（值为空）",
                     })
 
         elif isinstance(judge_vars, dict):
@@ -1087,10 +1118,11 @@ class PromptBuilder:
                     chain_results=chain_results,
                 )
 
-                if value:
+                if value or value == "":
+                    # 空字符串显式渲染（值为空），与列表格式口径一致
                     user_vars.append({
                         "name": name,
-                        "value": value,
+                        "value": value if value != "" else "（值为空）",
                     })
 
         # 构建 user prompt，格式：【name】value

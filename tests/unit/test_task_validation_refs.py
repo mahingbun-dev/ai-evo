@@ -129,7 +129,7 @@ class TestTargetsRequired:
         service, db, patchers = _service_with_db()
         try:
             service.create_task(
-                name="t", evaluation_type="judge",
+                name="t", evaluation_type="judge", model_provider="m1",
                 evaluation_targets=[_model_target()],
             )
             assert db.add.called
@@ -177,7 +177,7 @@ class TestReferenceMarkValidation:
         service, db, patchers = _service_with_db()
         try:
             service.create_task(
-                name="t", evaluation_type="judge",
+                name="t", evaluation_type="judge", model_provider="m1",
                 evaluation_targets=[_model_target()],
                 score_details="按 id：{{ref:target:t_model|模型输出}}；按显示名：{{ref:target:whatever|模型输出}}",
                 evaluation_metrics=[_metric(desc="维度内 {{ref:target:t_model|模型输出}}")],
@@ -210,7 +210,7 @@ class TestReferenceMarkValidation:
         service, db, patchers = _service_with_db()
         try:
             service.create_task(
-                name="t", evaluation_type="judge",
+                name="t", evaluation_type="judge", model_provider="m1",
                 evaluation_targets=[_model_target()],
                 judge_variable_config=[{"key": "allure_rate", "name": "一致率",
                                         "source": "script_output", "source_config": {}}],
@@ -224,7 +224,7 @@ class TestReferenceMarkValidation:
         service2, db2, patchers2 = _service_with_db()
         try:
             service2.create_task(
-                name="t2", evaluation_type="judge",
+                name="t2", evaluation_type="judge", model_provider="m1",
                 evaluation_targets=[_model_target()],
                 judge_variable_config={"user_input": {"name": "用户输入", "source": "dataset_field"}},
                 score_details="dict 配置按 key：{{ref:var:user_input|用户输入}}；按名称：{{ref:var:zzz|用户输入}}",
@@ -265,7 +265,7 @@ class TestReferenceMarkValidation:
         service, db, patchers = _service_with_db()
         try:
             service.create_task(
-                name="t", evaluation_type="judge",
+                name="t", evaluation_type="judge", model_provider="m1",
                 evaluation_targets=[_model_target()],
                 evaluation_metrics=[
                     _metric(description="对照 {{ref:target:t_model|模型输出}} 评分"),
@@ -281,6 +281,9 @@ class TestReferenceMarkValidation:
         service, db, patchers = _service_with_db()
         task = SimpleNamespace(
             id="task_1", evaluation_type="judge", dataset_id=None,
+            # 存量任务显式带被评测模型，聚焦 @ 标记合并校验（新的模型输出校验见
+            # test_judge_dataset_output.py）
+            model_provider="m1",
             evaluation_targets=[_model_target()],
             consistency_config=None,
             score_details="存量标准引用 {{ref:target:t_model|模型输出}}",

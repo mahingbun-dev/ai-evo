@@ -33,7 +33,7 @@ DEFAULT_TIMEOUT_SECONDS = 30.0
 
 
 class AievoHubPlugin(hubkit.Plugin):
-    """把 ai-evo 的 18 个核心操作暴露为 anc-hub MCP 工具。"""
+    """把 ai-evo 的 23 个核心操作暴露为 anc-hub MCP 工具。"""
 
     def __init__(self) -> None:
         self._base = os.environ.get("AIEVO_API_BASE", DEFAULT_API_BASE).rstrip("/")
@@ -117,9 +117,11 @@ class AievoHubPlugin(hubkit.Plugin):
 
         method, path, query, body = built
 
+        # 慢操作（文档导出的生成+分块上传）按 route 声明放宽超时，其余用插件级缺省
+        timeout = float(route.get("timeout_seconds") or self._timeout)
         try:
             resp = self._client.request(
-                method, path, mas_token, params=query, json_body=body
+                method, path, mas_token, params=query, json_body=body, timeout=timeout
             )
         except AievoApiError as e:
             return hubkit.with_payload_json(
@@ -183,12 +185,26 @@ class AievoHubPlugin(hubkit.Plugin):
 # ── 请求拼装 ──────────────────────────────────────────────────────
 
 
+def _normalize_value(value: Any) -> Any:
+    """整值 float 归一为 int：hub 信封（protobuf Struct）只有 double 数字位，
+    调用方传的整数经中台往返后一律变 ``3.0``——直接进 URL/查询串会得到
+    ``/history/3.0``、``skip=0.0``（依赖后端 pydantic 宽松模式才不 422），
+    这里在拼装层归一，非整值 float 原样保留。"""
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, list):
+        return [_normalize_value(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _normalize_value(v) for k, v in value.items()}
+    return value
+
+
 def _build_request(route: Dict[str, Any], payload: Dict[str, Any]):
     """按 route 把 payload 拼成 (method, path, query, body)；参数缺失返回错误卡。"""
     method = route["method"]
     path = route["path"]
 
-    params = dict(payload)
+    params = {k: _normalize_value(v) for k, v in payload.items()}
     params.pop("op", None)
 
     for key in route.get("path_params", []):

@@ -83,6 +83,30 @@ class TestBuildFinalPrompt:
         assert "0 到 5" in prompt
         assert "质量" in prompt
 
+    def test_with_session_file_contract_contains_dimension_feedbacks(self):
+        """输出契约含 dimension_feedbacks：模板分支（有 session_file）"""
+        task = type("Task", (), {
+            "id": "task_x",
+            "evaluation_metrics": [{"name": "任务完成度"}],
+            "max_score": 10,
+        })()
+        agent = ClaudeCodeJudgeAgent(task)
+        prompt = agent._build_final_prompt("用户提示", "/tmp/session.md")
+        assert '"dimension_feedbacks"' in prompt
+        assert "该维度评分理由" in prompt
+
+    def test_without_session_file_contract_contains_dimension_feedbacks(self):
+        """输出契约含 dimension_feedbacks：内联分支（无 session_file）"""
+        task = type("Task", (), {
+            "id": "task_x",
+            "evaluation_metrics": [{"name": "质量"}],
+            "max_score": 5,
+        })()
+        agent = ClaudeCodeJudgeAgent(task)
+        prompt = agent._build_final_prompt("用户提示", None)
+        assert '"dimension_feedbacks"' in prompt
+        assert "该维度评分理由" in prompt
+
 
 class TestSessionFiles:
     def test_write_and_cleanup(self, tmp_path, monkeypatch):

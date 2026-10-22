@@ -112,7 +112,9 @@ def zip_post(zip_bytes: bytes, filename: str):
         if method == "notifications/initialized":
             return FakeResp("")
         if method == "tools/call":
-            args = msg["params"]["arguments"]
+            # 中台收口后：tools/call → call_tool → 插件工具
+            assert msg["params"]["name"] == "call_tool"
+            args = msg["params"]["arguments"]["arguments"]
             offset = args.get("offset", 0)
             chunk = zip_bytes[offset:offset + args.get("max_bytes", 1 << 20)]
             pl = {
@@ -144,7 +146,7 @@ def mcp_router(payloads: dict, default: bytes = None):
         if method == "notifications/initialized":
             return FakeResp("")
         if method == "tools/call":
-            fid = msg["params"]["arguments"]["file_id"]
+            fid = msg["params"]["arguments"]["arguments"]["file_id"]
             payload = payloads.get(fid, fallback)
             return zip_post(payload, f"{fid}.zip")(url, data, headers, timeout)
         raise AssertionError(f"未预期的 MCP 方法: {method}")
@@ -308,7 +310,7 @@ def flaky_mcp_router(payloads: dict, fail_first: dict = None, default: bytes = N
         if method == "notifications/initialized":
             return FakeResp("")
         if method == "tools/call":
-            fid = msg["params"]["arguments"]["file_id"]
+            fid = msg["params"]["arguments"]["arguments"]["file_id"]
             if state.get(fid, 0) > 0:
                 state[fid] -= 1
                 raise HubFileError(f"文件 {fid} 下载失败: 服务器返回空响应（已重试一次）")

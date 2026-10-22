@@ -32,6 +32,137 @@ def merge_field_metadata(existing: List[Dict[str, Any]], base: List[Dict[str, An
     return merged
 
 
+# 数据行自描述字段说明的约定键：产出方（清洗脚本 / 平台内置解析器）随行内容落一份
+# 「字段名 → 中文含义」对照表（可含嵌套键，嵌套键以 "." 分隔），字段元数据的 label
+# 直接取用——字段契约与产出代码同源，平台不再维护任何行 schema 清单。
+ROW_FIELD_DESCRIPTIONS_KEY = "field_descriptions"
+
+# 字段元数据的合法类型（dataset_api 的字段类型枚举口径）
+FIELD_TYPES = ("string", "number", "boolean", "json", HUB_FIELD_TYPE)
+
+
+def infer_field_type(value: Any) -> str:
+    """按行内值推断字段类型（dict/list→json，bool→boolean，数值→number，其余→string）
+
+    bool 必须先于数值判断（Python 中 bool 是 int 子类）。
+    无法从值推断的语义（hub_file 通道、is_media 绑定）只能由产出方显式声明。
+    """
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (dict, list)):
+        return "json"
+    if isinstance(value, (int, float)):
+        return "number"
+    return "string"
+
+
+def _row_field_labels(row: Dict[str, Any]) -> Dict[str, str]:
+    """取行内自描述对照表的顶层字段 label（嵌套键 "a.b" 不是字段，跳过）"""
+    descriptions = row.get(ROW_FIELD_DESCRIPTIONS_KEY)
+    if not isinstance(descriptions, dict):
+        return {}
+    return {
+        str(key): str(value).strip()
+        for key, value in descriptions.items()
+        if isinstance(key, str) and "." not in key
+        and isinstance(value, str) and value.strip()
+    }
+
+
+def derive_fields_from_row(
+    row: Dict[str, Any],
+    declared: Optional[List[Dict[str, Any]]] = None,
+    exclude: Tuple[str, ...] = (),
+    start_position: int = 0,
+) -> List[Dict[str, Any]]:
+    """从数据行推导字段元数据（产出方声明优先，行内容兜底）
+
+    平台不维护行 schema 清单——字段契约由产出方自描述：
+
+    - ``declared`` 非空（清洗脚本 stdout 的 ``row_fields``）时优先采用：
+      ``type=hub_file``、``is_media`` 等平台语义无法从值推断，只能由产出方
+      声明；声明项缺 label/type 时按行内容兜底补全；
+    - 未声明时从行顶层键推导：label 取行内 ``field_descriptions`` 的中文对照，
+      缺失回落字段名；type 按值推断（:func:`infer_field_type`）；
+    - ``is_required`` 一律 False——``save_field_metadata`` 的缺省值是 True，
+      不显式置 False 会让导入行被必填校验拦掉；
+    - ``exclude``：平台注入字段（如 hub_file_id）由调用方前置声明，推导时跳过；
+    - 只取行顶层键：``field_descriptions`` 的嵌套键（``session_stats.turns``）
+      是字段内部结构说明，不是独立字段。
+
+    Args:
+        row: 数据行内容（EvaluationDataV2.data）
+        declared: 产出方显式声明的字段契约（[{name, label?, type?, is_media?}]）
+        exclude: 推导时跳过的字段名
+        start_position: 起始 position（平台注入字段已占位时接续编号）
+
+    Returns:
+        字段元数据列表（save_field_metadata 的入参形态）
+    """
+    if not isinstance(row, dict):
+        return []
+
+    labels = _row_field_labels(row)
+    excluded = set(exclude or ())
+    fields: List[Dict[str, Any]] = []
+    seen: set = set()
+    position = int(start_position or 0)
+
+    for item in declared or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name or name in excluded or name in seen:
+            continue
+        seen.add(name)
+        declared_type = str(item.get("type") or "").strip()
+        fields.append({
+            "name": name,
+            "label": str(item.get("label") or "").strip() or labels.get(name) or name,
+            "type": declared_type if declared_type in FIELD_TYPES else infer_field_type(row.get(name)),
+            "is_media": bool(item.get("is_media", False)),
+            "is_media_field": item.get("is_media_field"),
+            "is_required": False,
+            "position": position,
+        })
+        position += 1
+
+    for name, value in row.items():
+        key = str(name)
+        if not key or key in excluded or key in seen:
+            continue
+        seen.add(key)
+        fields.append({
+            "name": key,
+            "label": labels.get(key) or key,
+            "type": infer_field_type(value),
+            "is_media": False,
+            "is_media_field": None,
+            "is_required": False,
+            "position": position,
+        })
+        position += 1
+
+    return fields
+
+
+def reindex_field_positions(fields: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """按列表顺序重排 position（0..n-1），就地修改并返回该列表
+
+    平台注入字段与推导字段的 position 来自不同来源（常量 / 行内键序），合并后
+    统一重排——position 重复会让 get_field_metadata 的 order_by(position)
+    排序不稳定，前端列顺序随之抖动。
+
+    入参非列表（None 等）时返回空列表：返回值必须与类型注解一致，否则下游
+    save_field_metadata 迭代会直接抛错。
+    """
+    items = fields if isinstance(fields, list) else []
+    for index, field in enumerate(items):
+        if isinstance(field, dict):
+            field["position"] = index
+    return items
+
+
 class DatasetFieldService:
     """数据集字段服务"""
 

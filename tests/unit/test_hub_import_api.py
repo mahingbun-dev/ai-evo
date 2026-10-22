@@ -410,6 +410,9 @@ class TestFromHubReuseChain:
             if msg.get("method") == "notifications/initialized":
                 return FakeMcpResp("")
             if msg.get("method") == "tools/call":
+                # 中台收口后：tools/call → call_tool → 插件工具
+                assert msg["params"]["name"] == "call_tool"
+                assert msg["params"]["arguments"]["name"] == "file-store__file_download"
                 pl = {"ok": True, "data_base64": base64.b64encode(part).decode(),
                       "bytes_read": len(part), "eof": True, "sha256": full_sha,
                       "size": len(part), "filename": "session-run.jsonl"}
@@ -650,6 +653,8 @@ class TestFromHubZipCompat:
             if msg.get("method") == "notifications/initialized":
                 return FakeMcpResp("")
             if msg.get("method") == "tools/call":
+                assert msg["params"]["name"] == "call_tool"
+                assert msg["params"]["arguments"]["name"] == "file-store__file_download"
                 pl = {"ok": True, "data_base64": base64.b64encode(zip_bytes).decode(),
                       "bytes_read": len(zip_bytes), "eof": True, "sha256": full_sha,
                       "size": len(zip_bytes), "filename": zip_name}

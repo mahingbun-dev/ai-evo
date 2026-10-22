@@ -63,6 +63,7 @@
             "准确性": 8.5,
             "完整性": 8.0
           },
+          "dimension_feedbacks": null,
           "evaluation_target_name": "裁判1",
           "langfuse_trace_id": "trace-judge1-row0",
           "langfuse_trace_url": "http://langfuse.local/trace/judge1-row0",
@@ -77,6 +78,7 @@
             "准确性": 9.0,
             "完整性": 9.5
           },
+          "dimension_feedbacks": null,
           "evaluation_target_name": "裁判2",
           "langfuse_trace_id": null,
           "langfuse_trace_url": null,
@@ -132,6 +134,7 @@
             "准确性": 7.0,
             "完整性": 6.0
           },
+          "dimension_feedbacks": null,
           "evaluation_target_name": "裁判1",
           "langfuse_trace_id": "trace-judge1-row1",
           "langfuse_trace_url": "http://langfuse.local/trace/judge1-row1",
@@ -184,6 +187,7 @@
           "score": null,
           "feedback": null,
           "dimension_scores": null,
+          "dimension_feedbacks": null,
           "evaluation_target_name": "裁判1",
           "langfuse_trace_id": null,
           "langfuse_trace_url": null,
@@ -195,6 +199,7 @@
           "score": null,
           "feedback": null,
           "dimension_scores": null,
+          "dimension_feedbacks": null,
           "evaluation_target_name": "裁判2",
           "langfuse_trace_id": null,
           "langfuse_trace_url": null,
@@ -213,7 +218,10 @@
     {
       "idx": 3,
       "success": false,
-      "error": "模型调用超时"
+      "error": "模型调用超时",
+      "model_output": "",
+      "row_status": "failed",
+      "user_input": "请写一个堆排序"
     }
   ],
   "completed_at": "2026-01-01T12:00:00"

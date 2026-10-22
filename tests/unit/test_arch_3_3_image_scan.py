@@ -262,6 +262,7 @@ class TestScanGateInBuildThread:
         monkeypatch.setattr(bs, "checkout_ref", lambda branch, sha: "full-sha-abc")
         monkeypatch.setattr(bs, "check_offline_snapshot", lambda: (True, "v1"))
         monkeypatch.setattr(bs, "ensure_claude_bin", lambda lf: None)
+        monkeypatch.setattr(bs, "ensure_git_bin", lambda lf: None)
         monkeypatch.setattr(bs, "prune_releases", lambda: None)
         monkeypatch.setattr(bs, "scan_image", scan_impl)
 

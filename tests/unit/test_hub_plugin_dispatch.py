@@ -34,7 +34,7 @@ class FakeClient:
         self.exc = exc
         self.calls = []
 
-    def request(self, method, path, mas_token, params=None, json_body=None):
+    def request(self, method, path, mas_token, params=None, json_body=None, timeout=None):
         self.calls.append(
             {
                 "method": method,

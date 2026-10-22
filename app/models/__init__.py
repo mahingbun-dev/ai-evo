@@ -16,6 +16,7 @@ from app.models.user_models import User
 from app.models.team_models import Team
 from app.models.audit_models import OperationLog
 from app.models.stats_models import TaskExecutionStats, WeeklyCoverageConfig, WeeklyPlanTask
+from app.models.plugin_marketplace_models import PluginMarketplace
 
 __all__ = [
     # 原有模型
@@ -62,4 +63,6 @@ __all__ = [
     "TaskExecutionStats",
     "WeeklyCoverageConfig",
     "WeeklyPlanTask",
+    # 插件市场（插件评测评测对象来源）
+    "PluginMarketplace",
 ]

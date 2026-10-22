@@ -29,7 +29,7 @@ CHUNK="${CHUNK:-100m}"
 
 : "${GITLAB_UPLOAD_TOKEN:?需要设置 GITLAB_UPLOAD_TOKEN（需 write_package_registry 权限）}"
 # Deploy Token 只认 Basic 鉴权，用 PRIVATE-TOKEN 头会 401（实测）
-GITLAB_UPLOAD_USER="${GITLAB_UPLOAD_USER:-gitlab+deploy-token-173}"
+GITLAB_UPLOAD_USER="${GITLAB_UPLOAD_USER:-gitlab+deploy-token-1}"
 AUTH=(-u "${GITLAB_UPLOAD_USER}:${GITLAB_UPLOAD_TOKEN}")
 
 log_info() { echo -e "\033[0;32m[INFO]\033[0m $1"; }

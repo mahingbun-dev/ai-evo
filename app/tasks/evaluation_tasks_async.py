@@ -6,6 +6,7 @@
 """
 import asyncio
 import logging
+import os
 import threading
 from typing import Dict, Any, List, Optional, Protocol
 
@@ -167,6 +168,11 @@ def run_evaluation_async(task_id: str, stop_event: Optional[StopEventProtocol] =
         # 使行级落库键与 hub 拆分/续跑过滤后的列表序号解耦、多次执行间稳定
         for _orig_pos, _payload in enumerate(payloads):
             _payload["_orig_idx"] = _orig_pos
+            # 恢复 payload 行序号契约：执行器 _evaluate_single 等下游以
+            # payload.get("idx", 0) 取行号（VariableInjector 从不写入 idx，
+            # 缺失时全部回退 0，结果页详细结果序号因此全为 1）；
+            # "idx" 为保留键——裁判 prompt 变量与结果平铺均显式排除该键
+            _payload["idx"] = _orig_pos
 
         # ========== 步骤5: 并发执行评测 ==========
         # 执行前检查是否已被停止（可能在排队期间被停止）
@@ -586,6 +592,9 @@ def _execute_evaluation(task, payloads: List[Dict], db, task_id: str, stop_event
     # W17：binary_classification 已迁移注册表（见上方类型适配器分发），
     # 专用路径保留供适配器委托与直调使用
 
+    # W17：plugin（插件评测）已迁移注册表（见上方类型适配器分发），
+    # 专用路径保留供适配器委托与直调使用
+
     executor = EvaluationExecutor(
         max_workers=min(task.judge_count or 4, 4),
         task_id=task_id,
@@ -997,6 +1006,319 @@ def _execute_binary_classification_evaluation(task, payloads: List[Dict], task_i
             }
             results.append(failed_item)
             _persist_row(task_id, execution_number, payload.get("_orig_idx", idx), failed_item)
+
+    results.sort(key=lambda x: x.get("idx", 0))
+    return results
+
+
+def _execute_plugin_evaluation(task, payloads: List[Dict], task_id: str, db, stop_event: Optional[StopEventProtocol] = None, execution_number: Optional[int] = None) -> List[Dict]:
+    """执行插件评测：每行一个评测对象（插件目录 / skill 目录 / 内联 SKILL.md / 市场插件）。
+
+    - quick 深度：仅静态层，零模型调用；
+    - standard 深度：静态 + judge 层（judge 经 Claude Code 承载，见 plugin_evaluator；
+      未配置 Claude Code 时 judge 层降级 unmeasured）。
+    行级来源：payload 平铺变量 / 数据集行原始字段的 plugin_path、skill_content；
+    无数据集行时回退任务级 plugin_config：marketplace 来源解析市场插件路径，
+    manual 来源取 plugin_path/skill_content，均单行评测。
+
+    execution_number 为 None（直调/测试链路）时跳过行级落库。
+    """
+    import logging
+    from app.services.plugin_evaluator import PluginEvaluator
+
+    logger = logging.getLogger(__name__)
+
+    plugin_config = getattr(task, 'plugin_config', None) or {}
+    depth = plugin_config.get("depth", "quick")
+
+    # trace 口径：数据集行提供会话 trace，被测插件由线程里的技能调用识别
+    # （评的是历史那次执行，不是当前插件代码），走独立分支
+    if str(plugin_config.get("source") or "") == "trace":
+        return _execute_plugin_trace_evaluation(
+            task, payloads, task_id, db, stop_event, execution_number
+        )
+
+    # market 引擎要按同一个市场加载评测动作（plugin-eval 与被测插件同源，一起懒加载）
+    _market_id = plugin_config.get("market_id")
+    evaluator = PluginEvaluator(
+        depth=depth, market_id=int(_market_id) if isinstance(_market_id, int) else None
+    )
+
+    rows = list(payloads)
+    market_info: Optional[Dict[str, Any]] = None
+    if not rows:
+        market_id = plugin_config.get("market_id")
+        market_plugin = str(plugin_config.get("market_plugin") or "").strip()
+        if market_id is not None and market_plugin:
+            # 无数据集行：任务级市场来源解析为单行（市场缺失/未同步按失败行处理）。
+            # 判断依据是 market_id+market_plugin 字段本身（与 source 标记解耦，
+            # 兼容未写 source 的存量任务）
+            try:
+                from app.services.plugin_marketplace_service import prepare_market_plugin_for_eval
+
+                # 懒加载：评测开始前把市场更新到远端最新（节流 + 失败降级），
+                # 并把被评测插件的 commit 作为版本锚点带进结果
+                market_info = prepare_market_plugin_for_eval(
+                    int(plugin_config["market_id"]), str(plugin_config["market_plugin"])
+                )
+                rows = [{
+                    "idx": 0,
+                    "_orig_idx": 0,
+                    "plugin_path": market_info["path"],
+                    "skill_content": "",
+                }]
+                if market_info.get("stale"):
+                    logger.warning(
+                        f"[插件评测] 市场同步失败，本次用本地副本评测: {market_info.get('refresh_error')}"
+                    )
+            except Exception as e:
+                logger.warning(f"[插件评测] 市场插件路径解析失败: {e}")
+                failed_row = {
+                    "idx": 0,
+                    "success": False,
+                    "target_type": "",
+                    "target_name": "",
+                    "plugin_eval": None,
+                    "average_score": None,
+                    "badge": "",
+                    "dimension_scores": {},
+                    "anti_patterns": [],
+                    "error": f"市场插件路径解析失败: {e}",
+                }
+                # W3-2：失败行同样即时落库（P0-E 行级 write-through）
+                _persist_row(task_id, execution_number, 0, failed_row)
+                return [failed_row]
+        elif (
+            str(plugin_config.get("plugin_path") or "").strip()
+            or str(plugin_config.get("skill_content") or "").strip()
+        ):
+            # 无数据集行：任务级评测对象兜底为单行
+            rows = [{
+                "idx": 0,
+                "_orig_idx": 0,
+                "plugin_path": plugin_config.get("plugin_path") or "",
+                "skill_content": plugin_config.get("skill_content") or "",
+            }]
+
+    results = []
+    total = len(rows)
+
+    for idx, payload in enumerate(rows):
+        if stop_event and stop_event.is_set():
+            logger.info(f"插件评测任务 {task_id} 收到停止信号，已完成 {len(results)}/{total} 行")
+            break
+
+        # 平铺 payload 中的输入变量（行标识除外）
+        input_variables = {k: v for k, v in payload.items()
+                           if k not in ("_dataset_item", "idx") and not k.startswith("_")}
+
+        try:
+            # 行级评测对象来源：payload 平铺变量优先，其次数据集行原始字段；
+            # {value, type} 形态的运行时变量先解包（口径同二分分类评测）
+            dataset_data = (payload.get("_dataset_item") or {}).get("data") or {}
+
+            def _row_field(name: str) -> str:
+                value = payload.get(name)
+                if value is None and name in dataset_data:
+                    value = dataset_data.get(name)
+                if isinstance(value, dict) and "value" in value:
+                    value = value.get("value")
+                return "" if value is None else str(value)
+
+            plugin_path = _row_field("plugin_path").strip()
+            skill_content = _row_field("skill_content")
+
+            row = evaluator.evaluate(plugin_path=plugin_path, skill_content=skill_content)
+            row["idx"] = payload.get("_orig_idx", payload.get("idx", idx))
+            row.update(input_variables)
+            if market_info:
+                # 版本锚点：该行评测对象来自哪个市场的哪个 commit
+                row["market_info"] = market_info
+            results.append(row)
+
+            # W3-2：行级 write-through（每行终态即时幂等落库，P0-E）
+            _persist_row(task_id, execution_number, payload.get("_orig_idx", row["idx"]), row)
+
+            # 更新进度
+            _update_progress(len(results), total, task_id)
+
+        except SoftTimeLimitExceeded:
+            # W3-4：软超时不得按行失败吞掉（P0-E），上抛触发收尾
+            raise
+        except Exception as e:
+            logger.exception(f"插件评测执行失败 (idx={idx})")
+            failed_item = {
+                "idx": payload.get("_orig_idx", payload.get("idx", idx)),
+                "success": False,
+                "plugin_eval": None,
+                "average_score": None,
+                "badge": "",
+                "dimension_scores": {},
+                "anti_patterns": [],
+                "error": str(e),
+            }
+            failed_item.update(input_variables)
+            results.append(failed_item)
+            _persist_row(task_id, execution_number, payload.get("_orig_idx", failed_item["idx"]), failed_item)
+
+    # 按原始顺序排序结果
+    results.sort(key=lambda x: x.get("idx", 0))
+    return results
+
+
+def _execute_plugin_trace_evaluation(task, payloads: List[Dict], task_id: str, db, stop_event: Optional[StopEventProtocol] = None, execution_number: Optional[int] = None) -> List[Dict]:
+    """会话 trace 口径的插件评测：每行一个 hub 执行包（内含原始会话线程）
+
+    被测插件由线程里的技能调用识别（市场历史规则覆盖哪些插件，就只能评哪些）。
+    一行一份合并报告：设计质量综合分（静态层 + 逐 skill 的 rubric 评审，标准深度）
+    与真实数据分（历史线程的执行 + 生成两阶段）同时产出，两套分数相互独立。
+    行不可评（无原始会话文件 / 无对应规则 / 市场未收录 / 未识别到调用）
+    按「未测」落库且不计失败——数据本身不含该插件的运行现场不是平台错误；只有评测动作
+    执行失败才记失败行。
+
+    执行包目录来自行内 hub_file 字段（`_process_media_files` 已把 file_id 镜像为任务内
+    目录），缺持久解包区的行在更早的批次拆分阶段已标失败，不会到这里。
+
+    execution_number 为 None（直调/测试链路）时跳过行级落库。
+    """
+    import logging
+    from app.services.hub_file_service import get_hub_file_fields
+    from app.services.plugin_evaluator import PluginEvaluator
+
+    logger = logging.getLogger(__name__)
+
+    plugin_config = getattr(task, 'plugin_config', None) or {}
+    market_id = plugin_config.get("market_id")
+    evaluator = PluginEvaluator(
+        depth="quick",
+        market_id=int(market_id) if isinstance(market_id, int) else None,
+        trace_judgement=plugin_config.get("trace_judgement"),
+        trace_concurrency=plugin_config.get("trace_concurrency"),
+    )
+
+    # 数据集的 hub_file 类型字段名（执行包通道）：行值即任务内镜像目录
+    try:
+        hub_fields = get_hub_file_fields(db, getattr(task, "dataset_id", None))
+    except Exception as e:  # 库不可用不阻断——按「无执行包」处理，行标未测
+        logger.warning(f"[插件Trace评测] 读取数据集 hub_file 字段失败: {e}")
+        hub_fields = []
+
+    results: List[Dict] = []
+    total = len(payloads)
+    # 设计质量线：只与插件有关，同一插件（版本/路径/判定方式一致）任务内只评一次，
+    # 其余行复用快照、只跑历史线（--history-only），避免 N 行重复静态层与 judge
+    design_cache: Dict[tuple, Dict] = {}
+
+    # 进度与心跳：历史评测单行可能跑近一小时，行内必须有可见进度，
+    # 且必须在评测动作执行期间持续刷新执行心跳（收尸 reaper 阈值 15 分钟，
+    # 一次部署重启就会把还在跑的任务误判为 failed）
+    task_service = None
+    log_service = None
+    try:  # db 不可用（直调/测试链路）时退化为「无日志无心跳」，不影响评测本身
+        task_service = EvaluationTaskService(db)
+        log_service = TaskExecutionLogService(db)
+    except Exception as e:
+        logger.warning(f"[插件Trace评测] 任务日志/心跳服务不可用（忽略）: {e}")
+
+    def _add_log(level: str, message: str) -> None:
+        if log_service is None:
+            return
+        try:
+            log_service.add_log(task_id, level, message)
+        except Exception as e:  # 日志不可用不阻断评测
+            logger.warning(f"[插件Trace评测] 写任务日志失败（忽略）: {e}")
+
+    for idx, payload in enumerate(payloads):
+        if stop_event and stop_event.is_set():
+            logger.info(f"插件 trace 评测任务 {task_id} 收到停止信号，已完成 {len(results)}/{total} 行")
+            break
+
+        input_variables = {k: v for k, v in payload.items()
+                           if k not in ("_dataset_item", "idx") and not k.startswith("_")}
+        row_no = idx + 1
+        try:
+            dataset_data = (payload.get("_dataset_item") or {}).get("data") or {}
+
+            def _row_field(name: str) -> str:
+                value = payload.get(name)
+                if value is None and name in dataset_data:
+                    value = dataset_data.get(name)
+                if isinstance(value, dict) and "value" in value:
+                    value = value.get("value")
+                return "" if value is None else str(value)
+
+            package_dir = ""
+            for field in hub_fields:
+                candidate = _row_field(field).strip()
+                if candidate:
+                    package_dir = candidate
+                    break
+
+            _add_log(
+                "info",
+                f"[{row_no}/{total}] 开始评测：{os.path.basename(package_dir.rstrip('/')) or '（无执行包）'}"
+                f"（会话线程逐个关键步骤抽取与判定，单行可能数十分钟）",
+            )
+
+            def _on_tick(elapsed: int) -> None:
+                # 心跳必须刷新（部署重启不误判）；日志按分钟节流避免刷屏
+                if task_service is not None:
+                    task_service.touch_heartbeat(task_id, execution_number)
+                if elapsed % 600 < 60:
+                    _add_log("info", f"[{row_no}/{total}] 评测动作执行中（已 {max(1, elapsed // 60)} 分钟）")
+
+            row = evaluator.evaluate_trace(
+                package_dir, on_tick=_on_tick, design_cache=design_cache
+            )
+            row["idx"] = payload.get("_orig_idx", payload.get("idx", idx))
+            row.update(input_variables)
+            results.append(row)
+
+            real_data = row.get("real_data") or {}
+            counts = real_data.get("counts") or {}
+            real_score = real_data.get("score")
+            if real_score is None:
+                _add_log(
+                    "warning",
+                    f"[{row_no}/{total}] 完成（真实数据未测）：{(row.get('trace') or {}).get('unavailable_reason') or '内容不足以判定'}",
+                )
+            else:
+                _add_log(
+                    "info",
+                    f"[{row_no}/{total}] 完成：被测插件 {row.get('target_name') or '-'}，"
+                    f"设计质量分 {row.get('average_score')}"
+                    f"{'（复用首次评测）' if row.get('design_reused') else '（本任务首次评测）'}，"
+                    f"真实数据分 {real_score}，"
+                    f"判定通过/失败/证据不足 "
+                    f"{counts.get('passed', 0)}/{counts.get('failed', 0)}/{counts.get('insufficient', 0)}",
+                )
+
+            # W3-2：行级 write-through（每行终态即时幂等落库，P0-E）
+            _persist_row(task_id, execution_number, payload.get("_orig_idx", row["idx"]), row)
+            _update_progress(len(results), total, task_id, execution_number)
+
+        except SoftTimeLimitExceeded:
+            # W3-4：软超时不得按行失败吞掉（P0-E），上抛触发收尾
+            raise
+        except Exception as e:
+            logger.exception(f"插件 trace 评测执行失败 (idx={idx})")
+            _add_log("error", f"[{row_no}/{total}] 执行失败：{e}")
+            failed_item = {
+                "idx": payload.get("_orig_idx", payload.get("idx", idx)),
+                "success": False,
+                "evaluation_mode": "trace",
+                "plugin_eval": {"mode": "trace"},
+                "average_score": None,
+                "badge": "",
+                "dimension_scores": {},
+                "anti_patterns": [],
+                "real_data": None,
+                "trace": {"mode": "trace"},
+                "error": str(e),
+            }
+            failed_item.update(input_variables)
+            results.append(failed_item)
+            _persist_row(task_id, execution_number, payload.get("_orig_idx", failed_item["idx"]), failed_item)
 
     results.sort(key=lambda x: x.get("idx", 0))
     return results

@@ -816,3 +816,90 @@ class TestStrictCopySemantics:
         assert (root / "script_written_here.txt").is_file()          # 写在副本上
         assert not (pkg_root / "script_written_here.txt").exists()   # 源镜像无污染
         assert (pkg_root / "sub" / "a.json").is_file()
+
+
+_ROW_FIELDS_SRC = '''
+def run(stdin):
+    """产出行字段契约（stdout.row_fields）：含合法项、重名项、非法项与非白名单键"""
+    return {
+        "status": "ok",
+        "output": {"schema_version": "v1", "thread_events": None},
+        "files": {},
+        "summary": "row_fields 契约",
+        "row_fields": [
+            {"name": "schema_version", "type": "string"},
+            {"name": "thread_events", "type": "json", "label": "会话事件时间线"},
+            {"name": "schema_version", "type": "json"},
+            {"label": "缺 name"},
+            "not-a-dict",
+            {"name": "extra", "type": "string", "position": 3, "unknown": "x"},
+        ],
+        "finish_reason": "completed",
+        "error": None,
+    }
+'''
+
+
+class TestRowFieldsContract:
+    """脚本自描述的行字段契约（stdout.row_fields）：归一化与透传
+
+    平台不再持有行 schema 清单——字段元数据由产出方声明（本契约）优先、
+    行内容推导（dataset_field_service.derive_fields_from_row）兜底。
+    """
+
+    def test_normalize_keeps_whitelist_keys_only(self):
+        """只保留 name/label/type/is_media/is_media_field 五键，其余剔除"""
+        raw = [{"name": "a", "label": "甲", "type": "json", "is_media": True,
+                "is_media_field": "image", "position": 3, "unknown": "x"}]
+        assert pre_judge_runner._normalize_row_fields(raw) == [
+            {"name": "a", "label": "甲", "type": "json",
+             "is_media": True, "is_media_field": "image"}]
+
+    def test_normalize_drops_invalid_and_duplicate_items(self):
+        """非 dict / 缺 name / 空白 name / 重名 一律丢弃，保留首次出现"""
+        raw = ["not-a-dict", None, 42, {"label": "缺 name"}, {"name": "   "},
+               {"name": "a"}, {"name": "a", "type": "json"}]
+        assert pre_judge_runner._normalize_row_fields(raw) == [{"name": "a"}]
+
+    def test_normalize_non_list_returns_empty(self):
+        for bad in (None, "not-a-list", {"name": "a"}, 42):
+            assert pre_judge_runner._normalize_row_fields(bad) == []
+
+    def test_normalize_stdout_carries_row_fields(self):
+        result = pre_judge_runner._normalize_stdout(
+            "pjs_x", "x",
+            {"status": "ok", "row_fields": [{"name": "a", "type": "json"}]},
+            started_at=0.0)
+        assert result["row_fields"] == [{"name": "a", "type": "json"}]
+
+    def test_normalize_stdout_defaults_row_fields_to_empty(self):
+        """脚本未声明时为空列表：导入侧改从行内容推导，不报错"""
+        result = pre_judge_runner._normalize_stdout(
+            "pjs_x", "x", {"status": "ok"}, started_at=0.0)
+        assert result["row_fields"] == []
+
+    def test_result_template_has_row_fields(self):
+        """_result 默认条目含 row_fields：超时/类型不支持等提前返回路径契约一致"""
+        result = pre_judge_runner._result("pjs_x", "x", "fail",
+                                          finish_reason="error", started_at=0.0)
+        assert result["row_fields"] == []
+
+    def test_output_keys_include_row_fields(self):
+        """row_fields 必须在输出白名单里，否则归一化结果会被裁掉"""
+        assert "row_fields" in pre_judge_runner._OUTPUT_KEYS
+
+    def test_execute_script_returns_row_fields_end_to_end(self, script_env, run_base):
+        """端到端：真实子进程脚本声明的 row_fields 经归一化后出现在执行结果里"""
+        _write_script_pkg(script_env["upload_base"], "pjs_row_fields", _ROW_FIELDS_SRC)
+        result = pre_judge_runner.execute_script(
+            {"script_id": "pjs_row_fields", "name": "fake_row_fields",
+             "exec_type": "script", "entrypoint": "main.py", "timeout_seconds": 30},
+            {"fields": {}, "params": {}, "upstream": {},
+             "_run_dir": str(run_base / "t")},
+        )
+        assert result["status"] == "ok", result.get("error")
+        assert result["row_fields"] == [
+            {"name": "schema_version", "type": "string"},
+            {"name": "thread_events", "type": "json", "label": "会话事件时间线"},
+            {"name": "extra", "type": "string"},
+        ]

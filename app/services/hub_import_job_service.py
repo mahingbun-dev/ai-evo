@@ -16,7 +16,9 @@ import logging
 import uuid
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+from app.services.dataset_field_service import HUB_FIELD_TYPE
 
 logger = logging.getLogger(__name__)
 
@@ -31,12 +33,25 @@ def beijing_now():
 # 数据行 data 中承载 file_id 的字段名（字段元数据类型为 hub_file，复用 HUB_FIELD_TYPE 常量语义）
 HUB_FILE_ID_FIELD = "hub_file_id"
 
-# 执行包导入数据集的字段元数据（写入 DatasetFieldMetadata，复用 dataset_field_service）
-# - hub_file_id：值为 anc-hub file_id，评测执行时 resolve_hub_file_fields 镜像到任务目录
-# - hub_summary：导入时提取的 attempt 执行包摘要（无 manifest 为空 dict）
+# 平台注入字段（hub_file 通道）：由导入链路自身写入数据行，与产出方无关。
+# type=hub_file 是平台语义——评测执行时 resolve_hub_file_fields 据此把字段值
+# （anc-hub file_id）解析为任务目录内的实体文件；这种语义无法从行内值推导，
+# 故只能由平台显式声明。
+_HUB_FILE_ID_METADATA = {
+    "name": HUB_FILE_ID_FIELD, "label": "执行包 file_id（anc-hub）", "type": HUB_FIELD_TYPE,
+    "is_media": False, "is_media_field": None, "is_required": False, "position": 0,
+}
+
+
+def _platform_injected_fields() -> List[Dict[str, Any]]:
+    """平台注入字段的副本（新 dict，避免调用方就地修改污染模块常量）"""
+    return [dict(_HUB_FILE_ID_METADATA)]
+
+
+# 原样导入（不挂清洗脚本）的字段元数据：该路径的数据行完全由平台组装
+# （hub_file_id + hub_summary），两个字段都是平台自产，故由平台声明。
 HUB_IMPORT_FIELD_METADATA = [
-    {"name": HUB_FILE_ID_FIELD, "label": "执行包 file_id（anc-hub）", "type": "hub_file",
-     "is_media": False, "is_media_field": None, "is_required": False, "position": 0},
+    dict(_HUB_FILE_ID_METADATA),
     {"name": "hub_summary", "label": "执行包摘要（JSON）", "type": "json",
      "is_media": False, "is_media_field": None, "is_required": False, "position": 1},
 ]
@@ -82,46 +97,6 @@ def release_job_lock(job_id: str) -> bool:
         return False
 
 
-# 清洗导入（job.script_id 非空）的数据行字段元数据：清洗脚本产出的行内容字段
-# + hub_file 引用。字段名与脚本包 hub_exec_clean 的行内容 schema
-# （hub_exec_cleaned_v1）一致——ai-evo 会话固定字段（与 session_dataset_service
-# 的 SESSION_FIELD_METADATA 同名同义）+ 三层清洗结构。
-CLEANSED_FIELD_METADATA = [
-    {"name": HUB_FILE_ID_FIELD, "label": "执行包 file_id（anc-hub 源文件回链）", "type": "hub_file",
-     "is_media": False, "is_media_field": None, "is_required": False, "position": 0},
-    {"name": "schema_version", "label": "清洗 schema 版本（hub_exec_cleaned_v1）", "type": "string",
-     "is_media": False, "is_media_field": None, "is_required": False, "position": 1},
-    {"name": "session_id", "label": "会话 ID（claude-thread 解析）", "type": "string",
-     "is_media": False, "is_media_field": None, "is_required": False, "position": 2},
-    {"name": "source", "label": "会话来源（当前固定 claude_code）", "type": "string",
-     "is_media": False, "is_media_field": None, "is_required": False, "position": 3},
-    {"name": "user_input", "label": "用户输入（评测输入=用户首条消息摘要）", "type": "string",
-     "is_media": False, "is_media_field": None, "is_required": False, "position": 4},
-    {"name": "session_summary", "label": "会话摘要（首条用户输入，≤120 字）", "type": "string",
-     "is_media": False, "is_media_field": None, "is_required": False, "position": 5},
-    {"name": "session_stats", "label": "会话统计（轮数/消息数/工具调用数/时长秒）", "type": "json",
-     "is_media": False, "is_media_field": None, "is_required": False, "position": 6},
-    {"name": "session_metadata", "label": "会话元信息（工作目录/客户端版本/git 分支）", "type": "json",
-     "is_media": False, "is_media_field": None, "is_required": False, "position": 7},
-    {"name": "session_messages", "label": "会话内容（SessionRecord 整包 JSON，勿手改）", "type": "json",
-     "is_media": False, "is_media_field": None, "is_required": False, "position": 8},
-    {"name": "exec_meta", "label": "执行包元信息（执行 ID/模式/状态/起止/环境仓库上下文）", "type": "json",
-     "is_media": False, "is_media_field": None, "is_required": False, "position": 9},
-    {"name": "thread_events", "label": "会话事件时间线（用户消息/澄清问答/用例调度/脚本编辑）", "type": "json",
-     "is_media": False, "is_media_field": None, "is_required": False, "position": 10},
-    {"name": "metrics_registry", "label": "指标适用性注册表（逐指标 name/applicable/reason/口径）", "type": "json",
-     "is_media": False, "is_media_field": None, "is_required": False, "position": 11},
-    {"name": "cases_evidence", "label": "逐用例对齐证据（定义/allure 摘要/三指标对齐记录/会话旁证）", "type": "json",
-     "is_media": False, "is_media_field": None, "is_required": False, "position": 12},
-    {"name": "review_material", "label": "用例执行对照材料（裁判主输入，markdown 逐用例对照）", "type": "string",
-     "is_media": False, "is_media_field": None, "is_required": False, "position": 13},
-    {"name": "clean_summary", "label": "清洗统计（分母/通过/需复核/失败清单与状态分布）", "type": "json",
-     "is_media": False, "is_media_field": None, "is_required": False, "position": 14},
-    {"name": "field_descriptions", "label": "字段说明（本行各字段含嵌套键的中文含义对照表）", "type": "json",
-     "is_media": False, "is_media_field": None, "is_required": False, "position": 15},
-]
-
-
 def _publish_job_progress(job) -> None:
     """发布导入进度到 Redis Pub/Sub（频道与评测进度同前缀 task_status:{id}，best-effort）"""
     try:
@@ -164,35 +139,74 @@ def _new_job_id() -> str:
 
 
 def _merge_field_metadata(existing: List[Dict[str, Any]], base: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """以 base 为准合并已有字段元数据，保留 existing 中 base 未覆盖的字段
+    """以 base 为准合并已有字段元数据（委托 dataset_field_service 的统一实现）
 
-    与 session_dataset_service._merge_field_metadata 同语义：save_field_metadata
-    是全删重建——若不合并，向已有数据集追加导入会丢掉此前注册的其它字段元数据。
+    保留本模块函数名以兼容既有调用点与测试。
     """
-    known = {m.get("name") for m in base}
-    merged = list(base)
-    for f in existing or []:
-        name = f.get("name")
-        if name and name not in known:
-            merged.append(f)
-            known.add(name)
-    return merged
+    from app.services.dataset_field_service import merge_field_metadata
+
+    return merge_field_metadata(existing, base)
 
 
-def _register_field_metadata(db, dataset_id: str, script_id: Optional[str] = None) -> None:
-    """注册导入字段元数据（幂等，保留数据集已有字段；失败不阻断导入）
-
-    挂载清洗脚本时注册 CLEANSED_FIELD_METADATA（清洗行字段），否则注册
-    HUB_IMPORT_FIELD_METADATA（原样导入字段）。
-    """
-    from app.services.dataset_field_service import DatasetFieldService
-
-    base_meta = CLEANSED_FIELD_METADATA if script_id else HUB_IMPORT_FIELD_METADATA
-    try:
-        field_service = DatasetFieldService(db)
-        merged = _merge_field_metadata(
-            field_service.get_field_metadata(dataset_id), base_meta
+def _field_signature(fields: List[Dict[str, Any]]) -> List[tuple]:
+    """字段元数据的可比签名（顺序敏感）：用于判断字段集是否发生变化"""
+    return [
+        (
+            str(f.get("name")),
+            str(f.get("label") or f.get("name")),
+            str(f.get("type") or "string"),
+            bool(f.get("is_media")),
+            f.get("is_media_field"),
         )
+        for f in fields or []
+    ]
+
+
+def _register_field_metadata(
+    db,
+    dataset_id: str,
+    row: Optional[Dict[str, Any]] = None,
+    row_fields: Optional[List[Dict[str, Any]]] = None,
+) -> None:
+    """注册导入字段元数据（幂等，字段集未变化时跳过写库；失败不阻断导入）
+
+    字段来源分两类：
+    - 平台注入字段（hub_file_id，type=hub_file）——由导入链路自身写入数据行，
+      语义无法从行内值推导，固定前置；
+    - 产出方字段——脚本声明（row_fields，见 pre_judge_runner 的 stdout 契约）
+      优先，数据行内容（row）兜底推导，label 取行内 field_descriptions 对照表。
+      平台不持有任何行 schema 清单：清洗脚本改了行结构，字段元数据自动跟随。
+
+    row 与 row_fields 均为空 = 原样导入（无清洗脚本），该路径数据行由平台自己
+    组装（hub_file_id + hub_summary），回落 HUB_IMPORT_FIELD_METADATA。
+
+    多包导入时逐包调用即为累积注册：merge_field_metadata 保留已有字段，
+    故 v1/v2 混合批次的字段并集会被完整登记。
+    """
+    from app.services.dataset_field_service import (
+        DatasetFieldService,
+        derive_fields_from_row,
+        reindex_field_positions,
+    )
+
+    try:
+        injected = _platform_injected_fields()
+        if row is None and not row_fields:
+            base_meta = [dict(m) for m in HUB_IMPORT_FIELD_METADATA]
+        else:
+            base_meta = injected + derive_fields_from_row(
+                row or {},
+                declared=row_fields,
+                exclude=(HUB_FILE_ID_FIELD,),
+                start_position=len(injected),
+            )
+        field_service = DatasetFieldService(db)
+        existing = field_service.get_field_metadata(dataset_id)
+        merged = reindex_field_positions(_merge_field_metadata(existing, base_meta))
+        # save_field_metadata 是全删重建：字段集没变就不必重写（逐包调用时多数
+        # 包命中此分支），避免无谓的 id 抖动与写放大
+        if _field_signature(existing) == _field_signature(merged):
+            return
         field_service.save_field_metadata(dataset_id, merged)
     except Exception as e:  # noqa: BLE001 - 元数据注册失败只记日志，不阻断数据行导入
         logger.warning(f"[hub_import] 保存执行包字段元数据失败: dataset_id={dataset_id} 错误: {e}")
@@ -225,14 +239,20 @@ def validate_clean_script(db, script_id: str) -> str:
     return row.id
 
 
-def _run_clean_script(unpack_dir: str, file_index: list, file_id: str, script_def: dict) -> dict:
-    """对单个执行包运行清洗脚本，返回数据集行内容 dict
+def _run_clean_script(
+    unpack_dir: str, file_index: list, file_id: str, script_def: dict
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """对单个执行包运行清洗脚本，返回 (数据集行内容, 脚本声明的行字段契约)
 
     工作区隔离复用评测脚本基建：build_run_dir("hub_import", file_id) 建工作区，
     copy_into_workspace 拷包副本（严格拷贝语义，不触碰持久解包区），stdin.inputs
     用 files 模式（文件对象数组由 file_index 还原；索引缺失时脚本会扫根兜底）。
     脚本产出的行内容从 stdout.files 登记的产物文件读取（避免超过 stdout 上限），
     兜底取 output。失败抛异常，由调用方记入 fail_detail。
+
+    第二项是脚本自描述的行字段契约（stdout.row_fields，已由
+    pre_judge_runner._normalize_row_fields 归一化）：脚本不声明时为空列表，
+    导入侧改从行内容推导字段元数据，平台不持有行 schema 清单。
 
     Raises:
         RuntimeError: 脚本执行失败 / 产物不可读（中文消息）
@@ -277,6 +297,7 @@ def _run_clean_script(unpack_dir: str, file_index: list, file_id: str, script_de
         raise RuntimeError(f"清洗脚本执行失败: {error}")
 
     # 行内容从产物文件读取（stdout 只携带摘要）；兜底 output
+    row_fields = result.get("row_fields") or []
     for name, path in (result.get("files") or {}).items():
         if name.endswith(".json") and Path(path).is_file():
             try:
@@ -284,10 +305,10 @@ def _run_clean_script(unpack_dir: str, file_index: list, file_id: str, script_de
             except (OSError, _json.JSONDecodeError) as e:
                 raise RuntimeError(f"清洗产物不可读: {name}（{e}）")
             if isinstance(row, dict):
-                return row
+                return row, row_fields
     output = result.get("output")
     if isinstance(output, dict) and output:
-        return output
+        return output, row_fields
     raise RuntimeError("清洗脚本未产出可用的行内容（产物文件与 output 均为空）")
 
 
@@ -457,8 +478,14 @@ def process_hub_import_job(
         if script_def is None:
             raise ValueError(f"清洗脚本不可用（不存在或已删除）: {job.script_id}")
 
-    # 注册字段元数据（幂等；数据集已有字段不会被覆盖删除）
-    _register_field_metadata(db, job.dataset_id, job.script_id)
+    # 字段元数据注册时机分两种：
+    # - 无清洗脚本：数据行由平台组装（hub_file_id + hub_summary）、字段固定，
+    #   循环前注册一次即可；
+    # - 挂清洗脚本：字段来自脚本声明 + 行内容推导，跑完才知道，改为逐包在数据行
+    #   落库后累积注册（merge 保留已有字段，故混合批次能登记出字段并集；
+    #   字段集未变化时 _register_field_metadata 内部跳过写库）
+    if script_def is None:
+        _register_field_metadata(db, job.dataset_id)
 
     succeeded = list(job.succeeded_file_ids or [])
     fail_detail = dict(job.fail_detail or {})
@@ -476,8 +503,9 @@ def process_hub_import_job(
             # 先持引用再写数据行：数据行写失败时在 except 分支补偿释放
             acquire_ref(db, fid)
             acquired = True
+            row_fields: List[Dict[str, Any]] = []
             if script_def is not None:
-                row = _run_clean_script(
+                row, row_fields = _run_clean_script(
                     info.get("unpack_dir") or "",
                     info.get("file_index") or [],
                     fid,
@@ -490,6 +518,9 @@ def process_hub_import_job(
                     "hub_summary": info.get("summary") or {},
                 }
             data_service.add_data_v2(job.dataset_id, data)
+            if script_def is not None:
+                # 数据行落库后再注册字段：字段契约以真实落库的行为准（含平台注入字段）
+                _register_field_metadata(db, job.dataset_id, data, row_fields)
             succeeded.append(fid)
             fail_detail.pop(fid, None)
         except Exception as e:  # noqa: BLE001 - 单包失败记明细，继续处理其余包

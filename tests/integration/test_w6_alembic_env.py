@@ -3,8 +3,11 @@
 核心断言：设 DATABASE_URL 指向测试库跑 alembic upgrade，**打到 env 指向的库
 而非 ini**（旧实现 env.py 只读 ini 硬编码共享库 URL，迁移打错库风险）。
 
-迁移链上 5a64da264cdd 与 14f63ba90774 的重复 ALTER 缺陷已在后续
-链路修复，空库 `alembic upgrade head` 现可全链成功（有独立用例覆盖）。
+历史缺陷已修复（2026-10-15，check-migrations 门禁实测揪出后修复）：
+5a64da264cdd 与 14f63ba90774 曾重复对 evaluation_tasks 加 evaluation_targets
+列导致空库 upgrade head 必然 DuplicateColumn（14f63ba90774 已改幂等），
+且 ab_test_sessions 表补建了缺失的迁移（a7c3e91b5d24）。原 strict xfail 的
+test_upgrade_head_on_fresh_db 随修复转正。
 
 环境：共享 PG 实例（shared_dsn fixture，不可达即 skip）；临时库 w67t_ 前缀
 自建自清，绝不触碰共享库既有对象。
@@ -94,9 +97,7 @@ def test_no_env_falls_back_to_ini_placeholder_cannot_connect(pg_admin):
 
 
 def test_upgrade_head_on_fresh_db(pg_admin):
-    """空库 upgrade head 全链成功（5a64da264cdd/14f63ba90774 重复 ALTER 缺陷
-    已在后续迁移链修复，原 strict xfail 标记按其约定移除）。"""
-    """全新空库 upgrade head 应成功（当前因既有重复列缺陷失败）。"""
+    """全新空库 upgrade head 应成功（2026-10-15 修复重复列与缺表后转正）。"""
     dbname = f"w67t_it_head_{uuid.uuid4().hex[:8]}"
     pg_admin.create_db(dbname)
     try:

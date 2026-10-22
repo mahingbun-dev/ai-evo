@@ -14,6 +14,7 @@ from app.services.model_caller import ModelCaller
 from app.services.instruction_builder import InstructionBuilder
 from app.services.judge_variable_resolver import JudgeVariableResolver, EvaluationTarget
 from app.services.judge_validation_service import JudgeValidationService
+from app.services.metric_scoring import normalize_dimension_score
 
 WEIGHT_MAP = {"高": 3, "中": 2, "低": 1}
 
@@ -373,6 +374,10 @@ class JudgeEvaluationEngine:
         """
         按权重加权平均计算综合评分
 
+        维度分先按各自最高分（evaluation_metrics[].max_score）归一化到任务
+        满分标度再加权：最高分 5 的维度打 5 与最高分 10 的维度打 10 等价；
+        维度未配置最高分时回退任务满分=恒等变换，存量任务口径不变。
+
         Args:
             evaluation_metrics: 评测维度配置列表，每个元素需含 name 和 weight
             dimension_scores: 各维度评分字典 {"维度名": {"score": 数字}, ...}
@@ -408,8 +413,10 @@ class JudgeEvaluationEngine:
                 except (ValueError, TypeError):
                     score = 0
 
+            # 按维度最高分归一化到任务满分标度（缺省回退任务满分=恒等）
+            normalized = normalize_dimension_score(score, metric, max_score)
             total_weight += weight
-            weighted_sum += score * weight
+            weighted_sum += normalized * weight
 
         if total_weight == 0:
             return 0.0

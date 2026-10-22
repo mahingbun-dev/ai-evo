@@ -85,7 +85,7 @@ def test_runtime_conformance_green():
 
 
 def test_registers_with_mockhub():
-    """L3 替身：mockhub 收到注册，manifest 自洽（ai-evo@1.1.0）。"""
+    """L3 替身：mockhub 收到注册，manifest 自洽（ai-evo@1.2.0）。"""
     hub = mockhub.Hub()
     try:
         with _served_plugin(hub.addr, "aievo-register"):
@@ -93,7 +93,7 @@ def test_registers_with_mockhub():
             reg = hub.last_registration
             assert reg is not None
             assert reg.manifest.name == "ai-evo"
-            assert reg.manifest.version == "1.1.0"
+            assert reg.manifest.version == "1.3.0"
             assert reg.instance_id == "aievo-register"
     finally:
         hub.close()

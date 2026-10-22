@@ -4,7 +4,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from app.services.access_control import ensure_super_admin
 from sqlalchemy.orm import Session
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 from pydantic import BaseModel, Field, field_serializer, field_validator, ConfigDict
 from datetime import datetime
 from app.db.session import get_db
@@ -18,7 +18,7 @@ import uuid
 class EvaluationMetricModel(BaseModel):
     id: str = Field(default_factory=lambda: f"metric_{uuid.uuid4().hex[:6]}")
     name: str = Field(..., description="维度名称")
-    weight: str = Field("中", description="权重：high/medium/low")
+    weight: Union[str, float] = Field("中", description="权重：high/medium/low 或数值（如 0.6）")
     max_score: int = Field(10, description="最大分值")
     description: Optional[str] = Field(None, description="维度描述")
     score_criteria: Optional[Dict[str, Any]] = Field(default_factory=dict, description="评分标准")

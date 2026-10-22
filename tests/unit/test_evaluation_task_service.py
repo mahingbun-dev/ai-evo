@@ -197,3 +197,113 @@ class TestEvaluationTaskServicePublish:
         """测试 _publish_status_update 方法存在"""
         assert hasattr(service, '_publish_status_update')
         assert callable(service._publish_status_update)
+
+
+class TestTaskExecutionRecordGetDimensionTrend:
+    """get_dimension_trend：跨执行维度趋势查询（sqlite 内存库）
+
+    覆盖四条行为：只返回 completed、execution_number 倒序、limit 生效、
+    仅投影标量趋势字段（items 等大字段不透出）+ result 非 dict 兜底。
+    """
+
+    @staticmethod
+    def _make_db():
+        # 函数内延迟导入（仓库先例：test_evaluation_pre_scripts_flow._make_db），
+        # 避免收集期把 app.db.session 缓存进 sys.modules
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy.pool import StaticPool
+
+        from app.db.session import Base
+        import app.models  # noqa: F401 - 注册全部模型
+
+        engine = create_engine(
+            "sqlite:///:memory:",
+            poolclass=StaticPool,
+            connect_args={"check_same_thread": False},
+        )
+        Base.metadata.create_all(engine)
+        return sessionmaker(bind=engine)()
+
+    @staticmethod
+    def _rec(n, status, result):
+        from app.models.task_models import TaskExecutionRecord
+
+        return TaskExecutionRecord(
+            id=f"exec-trend-{n}", task_id="t-trend", execution_number=n,
+            status=status, result=result,
+        )
+
+    def test_completed_only_desc_and_projection(self):
+        """只返回 completed、倒序、每条仅含趋势字段，items 大字段不透出"""
+        db = self._make_db()
+        db.add_all([
+            self._rec(1, "completed", {
+                "average_score": 6.5,
+                "dimension_scores": {"准确性": {"average": 6.5, "weight": 2}},
+            }),
+            self._rec(2, "failed", {"error": "boom"}),
+            self._rec(3, "completed", {
+                "average_score": 8.1,
+                "items": [{"idx": 0}],  # 大字段：应被投影剔除
+                "dimension_scores": {
+                    "准确性": {"average": 8.1, "weight": 2},
+                    "完整性": {"average": 8.0, "weight": 1},
+                },
+            }),
+            self._rec(4, "stopped", {
+                "average_score": 5.0,
+                "dimension_scores": {"准确性": {"average": 5.0, "weight": 2}},
+            }),
+        ])
+        db.commit()
+
+        from app.services.evaluation_task_service import TaskExecutionRecordService
+
+        trend = TaskExecutionRecordService(db).get_dimension_trend("t-trend", limit=50)
+
+        assert len(trend) == 2, "failed/stopped 版本不参与趋势"
+        assert [t["execution_number"] for t in trend] == [3, 1], "按 execution_number 倒序"
+        assert trend[0]["average_score"] == 8.1
+        assert set(trend[0]["dimension_scores"]) == {"准确性", "完整性"}
+        assert "items" not in trend[0], "items 大字段不应透出"
+        assert all(
+            set(t) == {"execution_number", "status", "completed_at", "average_score", "dimension_scores"}
+            for t in trend
+        )
+
+    def test_limit(self):
+        """limit 生效：最多返回 N 条（仍倒序取最近的 N 条）"""
+        db = self._make_db()
+        db.add_all([self._rec(i, "completed", {"average_score": float(i)}) for i in (1, 2, 3)])
+        db.commit()
+
+        from app.services.evaluation_task_service import TaskExecutionRecordService
+
+        trend = TaskExecutionRecordService(db).get_dimension_trend("t-trend", limit=2)
+        assert [t["execution_number"] for t in trend] == [3, 2]
+
+    def test_no_records_returns_empty(self):
+        """无执行记录返回空列表（端点层据此走任务本体兼容分支）"""
+        db = self._make_db()
+
+        from app.services.evaluation_task_service import TaskExecutionRecordService
+
+        assert TaskExecutionRecordService(db).get_dimension_trend("t-none") == []
+
+    def test_non_dict_result_tolerated(self):
+        """result 非 dict（NULL/异常数据）兜底：average_score=None、dimension_scores={}"""
+        db = self._make_db()
+        db.add(self._rec(1, "completed", None))
+        db.commit()
+
+        from app.services.evaluation_task_service import TaskExecutionRecordService
+
+        trend = TaskExecutionRecordService(db).get_dimension_trend("t-trend")
+        assert trend == [{
+            "execution_number": 1,
+            "status": "completed",
+            "completed_at": None,
+            "average_score": None,
+            "dimension_scores": {},
+        }]

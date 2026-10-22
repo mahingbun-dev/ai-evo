@@ -15,3 +15,4 @@ import './claudeCodeMcpSwitch.test.mjs';
 import './modelsPreScriptAdmin.test.mjs';
 import './refMarks.test.mjs';
 import './resultsPreScript.test.mjs';
+import './resultsUx.test.mjs';

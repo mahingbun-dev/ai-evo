@@ -8,6 +8,7 @@ import logging
 import threading
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import OperationalError, IntegrityError
 from sqlalchemy import func
@@ -69,6 +70,12 @@ def _heartbeat_throttled(task_id: str) -> bool:
         return False
 
 
+from app.services.plugin_eval_market_runner import (
+    MAX_CONCURRENCY as _MAX_CONCURRENCY,
+    TRACE_MODES as _TRACE_JUDGEMENTS,
+)
+
+
 class EvaluationTaskService:
     """评测任务服务"""
 
@@ -121,6 +128,7 @@ class EvaluationTaskService:
         rag_config: Optional[Dict] = None,
         latency_config: Optional[Dict] = None,
         binary_metrics_config: Optional[Dict] = None,
+        plugin_config: Optional[Dict] = None,
         multi_judge_config: Optional[Dict] = None,
         parallel_config: Optional[Dict] = None,
         evaluation_scene: Optional[str] = None,
@@ -143,13 +151,27 @@ class EvaluationTaskService:
         validation_enabled: Optional[bool] = True,
         template_id: Optional[str] = None,
         pre_scripts: Optional[List[Dict]] = None,
+        model_output_source: Optional[str] = None,
+        model_output_field: Optional[str] = None,
     ) -> EvaluationTask:
         """创建评测任务"""
         # 验证评测类型
         # W12-2：latency 白名单激活（执行/聚合/导出链早已就绪，此前仅因白名单缺席被拒）
-        valid_evaluation_types = ["judge", "consistency", "success_rate", "rag", "binary_classification", "agent", "latency"]
+        valid_evaluation_types = ["judge", "consistency", "success_rate", "rag", "binary_classification", "agent", "latency", "plugin"]
         if evaluation_type not in valid_evaluation_types:
             raise ValueError(f"不支持的评测类型: {evaluation_type}，可选值: {valid_evaluation_types}")
+
+        # 插件评测配置校验：深度白名单 + 评测对象来源（数据集 / 任务级路径或内联 SKILL.md 至少其一）
+        if evaluation_type == "plugin":
+            self._validate_plugin_config(plugin_config, dataset_id)
+            if str((plugin_config or {}).get("source") or "") == "trace":
+                # trace 口径的评测对象来自数据集行，不需要任务级 plugin_path/skill_content
+                pass
+            elif not dataset_id and not self._plugin_config_has_source(plugin_config):
+                raise ValueError(
+                    "插件评测需要指定评测对象：请选择包含 plugin_path/skill_content 字段的数据集，"
+                    "或在插件评测配置中填写插件路径 / 内联 SKILL.md 内容"
+                )
 
         # 验证裁判引擎
         if judge_engine and judge_engine not in ("claude_agent", "graph"):
@@ -189,6 +211,18 @@ class EvaluationTaskService:
             judge_variable_config,
             evaluation_targets,
         )
+        # 模型输出来源校验（judge 可跳过被评测模型调用）：来源白名单 +
+        # dataset_field 字段存在性 + model_call 必须有被评测模型
+        # 归一化后再校验与入库，避免 " dataset_field " 之类带空白的值校验通过、
+        # 执行器却按字面量走 model_call 分支
+        model_output_source = self._normalize_model_output_source(model_output_source)
+        self._validate_model_output_config(
+            evaluation_type=evaluation_type,
+            dataset_id=dataset_id,
+            model_provider=model_provider,
+            model_output_source=model_output_source,
+            model_output_field=model_output_field,
+        )
 
         # W4（P0-C）配置快照：创建时对被评测模型（model_provider）与裁判模型
         # （judge_model）各做一次深拷贝快照，写入 task.model_config /
@@ -212,6 +246,8 @@ class EvaluationTaskService:
             model_config=effective_model_config,
             model_provider=model_provider,
             model_endpoint=model_endpoint,
+            model_output_source=model_output_source,
+            model_output_field=model_output_field,
             dataset_id=dataset_id,
             judge_model=judge_model,
             judge_engine=judge_engine or "claude_agent",
@@ -221,6 +257,7 @@ class EvaluationTaskService:
             rag_config=rag_config,
             latency_config=latency_config,
             binary_metrics_config=binary_metrics_config,
+            plugin_config=plugin_config,
             multi_judge_config=multi_judge_config,
             judge_count=judge_count,
             # W4：创建时裁判配置快照（judge_model 为空时为 None，
@@ -268,6 +305,7 @@ class EvaluationTaskService:
     _TASK_LIST_DEFERRED_COLUMNS = (
         "result", "model_config", "consistency_config", "success_rate_config",
         "rag_config", "latency_config", "multi_judge_config", "parallel_config",
+        "plugin_config",
     )
 
     def get_tasks(
@@ -277,6 +315,7 @@ class EvaluationTaskService:
         skip: int = 0,
         limit: int = 100,
         team_code: Optional[str] = None,
+        name: Optional[str] = None,
     ) -> List[EvaluationTask]:
         """获取评测任务列表"""
         from sqlalchemy.orm import defer
@@ -287,6 +326,8 @@ class EvaluationTaskService:
             *[defer(getattr(EvaluationTask, col)) for col in self._TASK_LIST_DEFERRED_COLUMNS]
         )
 
+        if name:
+            query = query.filter(EvaluationTask.name.ilike(f"%{name.strip()}%"))
         if status:
             query = query.filter(EvaluationTask.status == status)
         if evaluation_type:
@@ -322,6 +363,45 @@ class EvaluationTaskService:
             kwargs.get("evaluation_metrics") if "evaluation_metrics" in kwargs else task.evaluation_metrics,
             kwargs.get("judge_variable_config") if "judge_variable_config" in kwargs else task.judge_variable_config,
             effective_targets,
+        )
+        # 插件评测配置：创建期一直在校验，编辑期此前漏掉——改来源（含新增的 trace 口径）
+        # 能绕过深度守卫与数据集要求，这里按合并后的最终态补校验
+        if effective_type == "plugin":
+            effective_plugin_config = (
+                kwargs.get("plugin_config") if "plugin_config" in kwargs else task.plugin_config
+            )
+            self._validate_plugin_config(
+                effective_plugin_config, kwargs.get("dataset_id") or task.dataset_id
+            )
+
+        # 模型输出来源校验：kwargs 与任务既有值合并成最终态（避免只改来源/字段
+        # 或只改数据集的局部更新绕过校验）；存量任务字段为空按 model_call 处理
+        effective_dataset_id = (
+            kwargs["dataset_id"] if "dataset_id" in kwargs else getattr(task, "dataset_id", None)
+        )
+        effective_provider = (
+            kwargs["model_provider"] if "model_provider" in kwargs else getattr(task, "model_provider", None)
+        )
+        # 来源值统一归一化（strip/lower）后回写 kwargs 参与最终态校验与落库
+        if "model_output_source" in kwargs:
+            kwargs["model_output_source"] = self._normalize_model_output_source(
+                kwargs["model_output_source"]
+            )
+        effective_output_source = (
+            kwargs["model_output_source"] if "model_output_source" in kwargs
+            else getattr(task, "model_output_source", None)
+        )
+        effective_output_source = self._normalize_model_output_source(effective_output_source)
+        effective_output_field = (
+            kwargs["model_output_field"] if "model_output_field" in kwargs
+            else getattr(task, "model_output_field", None)
+        )
+        self._validate_model_output_config(
+            evaluation_type=effective_type,
+            dataset_id=effective_dataset_id,
+            model_provider=effective_provider,
+            model_output_source=effective_output_source,
+            model_output_field=effective_output_field,
         )
 
         # 契约 v3 §五（保守语义）：pre_scripts 与 steps 仅在 payload 显式携带时置 None
@@ -386,6 +466,132 @@ class EvaluationTaskService:
                 "judge/agent 评测（或一致性评测启用裁判）必须配置待评测数据（evaluation_targets），"
                 "请先在「待评测数据」区添加评测目标行"
             )
+
+    # ---------- 插件评测配置校验 ----------
+
+    _PLUGIN_VALID_DEPTHS = ("quick", "standard")
+    # 评测对象来源：trace=数据集行里的会话 trace（历史/真实数据评测，被测插件从线程识别）
+    _PLUGIN_VALID_SOURCES = ("manual", "dataset", "marketplace", "trace")
+
+    def _validate_plugin_config(self, plugin_config: Optional[Dict], dataset_id: Optional[str] = None) -> None:
+        """插件评测 plugin_config 校验：深度白名单 + 来源字段类型，失败抛 ValueError（API 层转 400）"""
+        if plugin_config is None:
+            return
+        if not isinstance(plugin_config, dict):
+            raise ValueError("plugin_config 必须是对象")
+
+        depth = plugin_config.get("depth", "quick")
+        if depth not in self._PLUGIN_VALID_DEPTHS:
+            raise ValueError(
+                f"不支持的插件评测深度: {depth}，可选值: {', '.join(self._PLUGIN_VALID_DEPTHS)}"
+            )
+
+        for key in ("plugin_path", "skill_content", "market_plugin"):
+            value = plugin_config.get(key)
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"plugin_config.{key} 必须是字符串")
+
+        source = plugin_config.get("source")
+        if source is not None and source not in self._PLUGIN_VALID_SOURCES:
+            raise ValueError(f"不支持的插件评测来源: {source}")
+
+        market_id = plugin_config.get("market_id")
+        if market_id is not None:
+            if isinstance(market_id, bool) or not isinstance(market_id, int):
+                raise ValueError("plugin_config.market_id 必须是整数")
+            if source == "marketplace" and not str(plugin_config.get("market_plugin") or "").strip():
+                raise ValueError("marketplace 来源必须指定 market_plugin（市场内插件路径）")
+
+        if source == "trace":
+            # trace 口径的深度由服务端固定（合并口径：模型判定=standard 静态 + LLM 评审，
+            # 离线判定=quick 仅静态），与「综合分口径的深度」无关，
+            # 故深度守卫（插件级/ skill 级限制）在此不适用，也不接受任务级 depth 覆盖
+            judgement = plugin_config.get("trace_judgement")
+            if judgement is not None and judgement not in _TRACE_JUDGEMENTS:
+                raise ValueError(
+                    f"不支持的 trace 判定方式: {judgement}，可选值: {', '.join(_TRACE_JUDGEMENTS)}"
+                )
+            concurrency = plugin_config.get("trace_concurrency")
+            if concurrency is not None:
+                if isinstance(concurrency, bool) or not isinstance(concurrency, int):
+                    raise ValueError("plugin_config.trace_concurrency 必须是整数")
+                if not 1 <= concurrency <= _MAX_CONCURRENCY:
+                    raise ValueError(
+                        f"plugin_config.trace_concurrency 必须在 1~{_MAX_CONCURRENCY} 之间"
+                        f"（plugin-eval 的模型调用并发上限为 {_MAX_CONCURRENCY}）"
+                    )
+            self._validate_plugin_trace_config(plugin_config, dataset_id)
+            return
+
+        self._validate_plugin_depth_target(plugin_config, depth)
+
+    def _validate_plugin_trace_config(self, plugin_config: Dict, dataset_id: Optional[str]) -> None:
+        """trace 来源校验：必须选数据集，且数据集要有 anc-hub 文件通道字段
+
+        执行包目录来自行内 hub_file 字段（导入时物化、评测期镜像到任务目录）；没有该
+        字段的数据集拿不到原始会话文件，无法做历史评测，故创建期直接拒绝。
+        """
+        from app.services.hub_file_service import get_hub_file_fields
+
+        if not dataset_id:
+            raise ValueError(
+                "trace 来源需要选择数据集：数据集每行提供一个会话 trace"
+                "（请选择由「从 anc-hub 导入」建的会话/执行包数据集）"
+            )
+        if not get_hub_file_fields(self.db, str(dataset_id)):
+            raise ValueError(
+                "所选数据集不含 anc-hub 文件字段（hub_file），行里拿不到原始会话文件；"
+                "请用「从 anc-hub 导入」创建数据集（会话数据或执行包数据）"
+            )
+
+    def _validate_plugin_depth_target(self, plugin_config: Dict, depth: str) -> None:
+        """深度守卫：插件级目标只支持 quick（standard/蒙特卡洛仅 skill 级）
+
+        创建/更新任务时能判定目标类型就前置拒绝（报 400），判不出来（数据集行、市场
+        尚未同步）留给执行期按 quick 降级——执行期在行的 warnings 里写明原因。
+        """
+        if depth == "quick":
+            return
+
+        from app.services.plugin_eval.parser import detect_target
+
+        target_type = ""
+        market_id = plugin_config.get("market_id")
+        market_plugin = str(plugin_config.get("market_plugin") or "").strip()
+        if market_id is not None and market_plugin:
+            try:
+                from app.services.plugin_marketplace_service import list_marketplace_plugins
+
+                items = list_marketplace_plugins(self.db, int(market_id))
+            except Exception as e:  # 市场未同步/目录缺失：留给执行期判定
+                logger.warning(f"[插件评测] 深度守卫跳过市场目标类型判定: {e}")
+                return
+            matched = next((i for i in items if i["source"] == market_plugin), None)
+            target_type = (matched or {}).get("target_type", "")
+        elif str(plugin_config.get("plugin_path") or "").strip():
+            path = Path(str(plugin_config["plugin_path"]).strip()).expanduser()
+            if path.is_dir():
+                target_type = detect_target(path)
+
+        if target_type == "plugin":
+            raise ValueError(
+                "插件级评测对象只支持 quick 深度（仅静态层）；"
+                "standard（及蒙特卡洛）只支持 skill 级对象，请在市场中改选该插件下的 skill"
+            )
+
+    @staticmethod
+    def _plugin_config_has_source(plugin_config: Optional[Dict]) -> bool:
+        """plugin_config 是否带有任务级评测对象来源（插件路径/内联 SKILL.md/市场插件）"""
+        if not isinstance(plugin_config, dict):
+            return False
+        return bool(
+            (plugin_config.get("plugin_path") or "").strip()
+            or (plugin_config.get("skill_content") or "").strip()
+            or (
+                plugin_config.get("market_id") is not None
+                and str(plugin_config.get("market_plugin") or "").strip()
+            )
+        )
 
     def _validate_script_targets(
         self,
@@ -656,6 +862,126 @@ class EvaluationTaskService:
         except Exception as e:
             logger.warning(f"从数据项推断字段失败: {e}")
         return None
+
+    # ---------- 模型输出来源校验 ----------
+
+    # 允许的模型输出来源：model_call-调用被评测模型（默认，存量行为）/
+    # dataset_field-直接取数据集字段 / none-不使用模型输出
+    _MODEL_OUTPUT_SOURCES = ("model_call", "dataset_field", "none")
+    # 数据集字段元数据中的平台辅助列（is_media 标记 / hub_file 类型标记），
+    # 不是用户数据字段，不能作为模型输出来源
+    _DATASET_AUX_FIELD_SUFFIXES = ("_is_media", "_hub_file")
+
+    @staticmethod
+    def _normalize_model_output_source(value: Optional[str]) -> Optional[str]:
+        """归一化模型输出来源：空值按 model_call，字符串 strip+lower
+
+        校验与执行器分支必须用同一个口径，避免 " dataset_field " 校验通过、
+        执行期却按 model_call 去调模型（无端点时整行失败）。
+        """
+        if value is None:
+            return "model_call"
+        if not isinstance(value, str):
+            # API 层 Pydantic 已把类型错误挡成 422；服务层直调时保持 400 语义
+            raise ValueError(
+                f"不支持的模型输出来源: {value!r}，可选值: "
+                f"{', '.join(EvaluationTaskService._MODEL_OUTPUT_SOURCES)}"
+            )
+        normalized = value.strip().lower()
+        return normalized or "model_call"
+
+    def _get_dataset_data_field_names(self, dataset_id: str) -> set:
+        """枚举数据集的真实数据字段名（字段元数据口径）
+
+        - 优先 dataset_field_metadata（数据推断会把 is_media 等辅助键算进来）；
+        - 无元数据的存量数据集回退到首条数据（V2 data 键 + V1 question/ref_answer），
+          与任务表单字段接口的回退口径保持一致；
+        - 排除 *_is_media / *_hub_file 平台辅助列（hub 辅助列/媒体标记列）。
+        """
+        from app.services.dataset_field_service import DatasetFieldService
+
+        field_metas = DatasetFieldService(self.db).get_field_metadata(dataset_id) or []
+        names = set()
+        for meta in field_metas:
+            name = meta.get("name") if isinstance(meta, dict) else None
+            if not name:
+                continue
+            if name.endswith(self._DATASET_AUX_FIELD_SUFFIXES):
+                continue
+            names.add(name)
+
+        if not names:
+            # 存量数据集无字段元数据：按任务表单字段接口的回退口径枚举，
+            # 避免 UI 可选、创建却被拒
+            from app.services.dataset_service import DatasetDataService
+
+            data_service = DatasetDataService(self.db)
+            try:
+                items = data_service.get_data_list_v2(dataset_id, skip=0, limit=1)
+                if not items:
+                    items = data_service.get_data_list(dataset_id, skip=0, limit=1)
+                if items:
+                    first = items[0]
+                    data = first.get("data") if isinstance(first, dict) else getattr(first, "data", None)
+                    if isinstance(data, dict):
+                        names.update(str(k) for k in data.keys())
+                    for legacy in ("question", "ref_answer"):
+                        value = first.get(legacy) if isinstance(first, dict) else getattr(first, legacy, None)
+                        if value:
+                            names.add(legacy)
+            except Exception as e:
+                logger.warning(f"枚举数据集 {dataset_id} 数据字段失败: {e}")
+            names = {
+                n for n in names
+                if n and not n.endswith(self._DATASET_AUX_FIELD_SUFFIXES)
+            }
+        return names
+
+    def _validate_model_output_config(
+        self,
+        evaluation_type: Optional[str],
+        dataset_id: Optional[str],
+        model_provider: Optional[str],
+        model_output_source: Optional[str],
+        model_output_field: Optional[str],
+    ) -> None:
+        """校验模型输出来源配置（create/update 共用，失败抛 ValueError→API 400）
+
+        - 来源白名单；
+        - dataset_field：必须有 dataset_id 与字段名，且字段存在于字段元数据；
+        - judge + model_call：必须有被评测模型（model_provider），否则执行期
+          必然报「未配置端点」，创建/更新时直接拒绝并给出可选出路。
+        """
+        source = (model_output_source or "model_call").strip()
+        if source not in self._MODEL_OUTPUT_SOURCES:
+            raise ValueError(
+                f"不支持的模型输出来源: {model_output_source}，可选值: "
+                f"{', '.join(self._MODEL_OUTPUT_SOURCES)}"
+            )
+
+        if source == "dataset_field":
+            if not dataset_id:
+                raise ValueError(
+                    "模型输出来源选择「数据集字段」时必须先选择数据集（dataset_id）"
+                )
+            field_name = (model_output_field or "").strip()
+            if not field_name:
+                raise ValueError(
+                    "模型输出来源选择「数据集字段」时必须指定字段名（model_output_field）"
+                )
+            field_names = self._get_dataset_data_field_names(dataset_id)
+            if field_name not in field_names:
+                available = "、".join(sorted(field_names)) or "无"
+                raise ValueError(
+                    f"模型输出字段 {field_name!r} 不存在于数据集 {dataset_id} 的字段元数据中，"
+                    f"可选字段: {available}"
+                )
+
+        if evaluation_type == "judge" and source == "model_call" and not model_provider:
+            raise ValueError(
+                "judge 评测的模型输出来源为「调用模型」时必须选择被评测模型（model_provider）；"
+                "也可以把模型输出来源改为「数据集字段」或「不使用模型输出」"
+            )
 
     def delete_task(self, task_id: str) -> bool:
         """删除任务"""
@@ -1345,6 +1671,78 @@ class TaskExecutionRecordService:
         return self.db.query(TaskExecutionRecord).filter(
             TaskExecutionRecord.task_id == task_id,
         ).order_by(TaskExecutionRecord.execution_number.desc()).limit(limit).all()
+
+    def get_record_summaries(self, task_id: str, limit: int = 50) -> List[dict]:
+        """获取执行历史版本摘要（不含 result 大列），按执行次数倒序
+
+        结果展示页选任务时只需版本列表（序号/状态/时间），全量 result 仅
+        渲染选中的单版：摘要查询 SQL 只 SELECT 标量列，不触碰 result
+        JSONB，避免历史接口随执行次数线性放大载荷。
+        """
+        rows = (
+            self.db.query(
+                TaskExecutionRecord.execution_number,
+                TaskExecutionRecord.status,
+                TaskExecutionRecord.total_cost,
+                TaskExecutionRecord.error_message,
+                TaskExecutionRecord.started_at,
+                TaskExecutionRecord.completed_at,
+            )
+            .filter(TaskExecutionRecord.task_id == task_id)
+            .order_by(TaskExecutionRecord.execution_number.desc())
+            .limit(limit)
+            .all()
+        )
+        return [
+            {
+                "execution_number": r.execution_number,
+                "status": r.status,
+                "result": None,
+                "total_cost": r.total_cost,
+                "error_message": r.error_message,
+                "started_at": r.started_at.isoformat() if r.started_at else None,
+                "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+            }
+            for r in rows
+        ]
+
+    def get_dimension_trend(self, task_id: str, limit: int = 50) -> List[dict]:
+        """获取跨执行版本的维度评分趋势，按执行次数倒序
+
+        只返回 status=completed 的版本（失败/停止版本无完整结果，不参与趋势）。
+        每条仅提取 result JSONB 中的 dimension_scores（与单版
+        result.dimension_scores 同构：{维度: {average, weight, count}}）与
+        average_score 标量，其余大字段（items/failed_items 等）不透出，
+        避免趋势接口随执行次数与行数线性放大载荷。
+        """
+        rows = (
+            self.db.query(
+                TaskExecutionRecord.execution_number,
+                TaskExecutionRecord.status,
+                TaskExecutionRecord.completed_at,
+                TaskExecutionRecord.result,
+            )
+            .filter(
+                TaskExecutionRecord.task_id == task_id,
+                TaskExecutionRecord.status == "completed",
+            )
+            .order_by(TaskExecutionRecord.execution_number.desc())
+            .limit(limit)
+            .all()
+        )
+        trend = []
+        for r in rows:
+            # result JSONB 理论上恒为 dict（fail_record/stop_record 也写 dict），
+            # 兼容异常数据非 dict 时按空结果处理
+            result = r.result if isinstance(r.result, dict) else {}
+            trend.append({
+                "execution_number": r.execution_number,
+                "status": r.status,
+                "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+                "average_score": result.get("average_score"),
+                "dimension_scores": result.get("dimension_scores") or {},
+            })
+        return trend
 
     def get_record_by_number(self, task_id: str, execution_number: int) -> Optional[TaskExecutionRecord]:
         """按执行序号获取单条记录"""

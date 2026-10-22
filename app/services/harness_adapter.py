@@ -16,7 +16,9 @@ Harness 适配层：裁判引擎统一执行契约
   调度接线在 app/services/pre_judge_runner._execute_harness_agent
 
 统一返回结构（与 JudgeLangGraphAgent 裁判结果兼容，另加 finish_reason）：
-  {score, feedback, dimension_scores, finish_reason}
+  {score, feedback, dimension_scores, dimension_feedbacks?, finish_reason}
+  dimension_feedbacks 为可选字段：裁判未输出分维度理由或理由全部非法时不出现在
+  结果中（旧消费方无感知）；存在时为 {维度名: 评分理由} 的非空字符串映射。
   finish_reason 语义对齐 DSH RunResult：completed | max_turns | timeout | error
 """
 import logging
@@ -36,6 +38,12 @@ from app.services.claude_code_judge_agent import (
 )
 
 logger = logging.getLogger(__name__)
+
+# claude-agent-sdk 以 --system-prompt argv 传 system_prompt；Linux execve 单个
+# argv 字符串上限 131072B（MAX_ARG_STRLEN=32*PAGE_SIZE），超限即报
+# [Errno 7] Argument list too long、CLI 启动失败。取 100KB 保守阈值：超限时
+# system_prompt 降级并入首条消息（走 stdin 传输无上限），system_prompt 置 None
+SYSTEM_PROMPT_ARGV_LIMIT_BYTES = 100_000
 
 
 def run_sync_with_timeout(callable_: Callable[[], Any], timeout: float, thread_name: str = "harness-call") -> Any:
@@ -64,7 +72,8 @@ def run_sync_with_timeout(callable_: Callable[[], Any], timeout: float, thread_n
 
 
 def normalize_judge_result(parsed: Dict[str, Any], finish_reason: Optional[str] = None) -> Dict[str, Any]:
-    """归一化裁判输出：score 数值化、dimension_scores 过滤非法值、finish_reason 兜底"""
+    """归一化裁判输出：score 数值化、dimension_scores 过滤非法值、
+    dimension_feedbacks 仅保留键值均为非空字符串的条目、finish_reason 兜底"""
     score = parsed.get("score", 0)
     try:
         score = float(score)
@@ -79,12 +88,24 @@ def normalize_judge_result(parsed: Dict[str, Any], finish_reason: Optional[str] 
                 dim_scores[str(name)] = float(value)
             except (TypeError, ValueError):
                 continue
-    return {
+    # 分维度理由透传：键与值均为非空字符串（按 strip 后判空）才保留；
+    # 非 dict（裁判违反协议输出 list/str）按字段缺失处理，优雅丢弃而非抛错；
+    # 裁判未输出或条目全部非法时不输出该键，结果结构保持旧形态
+    raw_feedbacks = parsed.get("dimension_feedbacks")
+    dim_feedbacks: Dict[str, str] = {
+        name: value
+        for name, value in (raw_feedbacks.items() if isinstance(raw_feedbacks, dict) else ())
+        if isinstance(name, str) and name.strip() and isinstance(value, str) and value.strip()
+    }
+    result = {
         "score": score,
         "feedback": str(parsed.get("feedback", "")),
         "dimension_scores": dim_scores,
         "finish_reason": finish_reason or "completed",
     }
+    if dim_feedbacks:
+        result["dimension_feedbacks"] = dim_feedbacks
+    return result
 
 
 class HarnessAdapter(ABC):
@@ -130,7 +151,7 @@ class HarnessAdapter(ABC):
             timeout: 单次调用超时（秒）；缺省取 config.timeout_seconds 或 300
 
         Returns:
-            {score, feedback, dimension_scores, finish_reason}
+            {score, feedback, dimension_scores, dimension_feedbacks?, finish_reason}
         """
         timeout = float(timeout or self._default_timeout())
         file_refs = self._materialize_files(files)
@@ -234,6 +255,10 @@ class ClaudeCodeAdapter(HarnessAdapter):
 
             options_kwargs["mcp_servers"] = {MCP_SERVER_KEY: get_stdio_server_config()}
 
+        # argv 安全兜底：system_prompt 超限时降级并入首条消息
+        # （--system-prompt 走 argv 有单参数上限，首条消息走 stdin 无上限）
+        system_prompt, prompt = self._argv_safe_prompts(system_prompt, prompt)
+
         options = ClaudeAgentOptions(
             system_prompt=system_prompt,
             allowed_tools=JUDGE_ALLOWED_TOOLS,
@@ -251,6 +276,24 @@ class ClaudeCodeAdapter(HarnessAdapter):
         if not raw:
             raise RuntimeError("Claude Code 裁判无返回内容")
         return raw, "completed"
+
+    @staticmethod
+    def _argv_safe_prompts(system_prompt: str, prompt: str) -> Tuple[Optional[str], str]:
+        """system_prompt 超 argv 单参数上限时降级：并入首条消息，system_prompt 置 None
+
+        claude-agent-sdk 以 --system-prompt argv 传 system_prompt，Linux execve
+        单参数超 131072B 直接报 [Errno 7] Argument list too long（生产 Errno 7
+        裁判启动失败事故根因）；首条消息经 stdin 传输无此限制。返回的
+        system_prompt 可能为 None（SDK 不再传 --system-prompt flag）。
+        """
+        sp_bytes = len(system_prompt.encode("utf-8")) if system_prompt else 0
+        if sp_bytes > SYSTEM_PROMPT_ARGV_LIMIT_BYTES:
+            logger.warning(
+                f"[ClaudeCodeAdapter] system_prompt {sp_bytes}B "
+                f"超 argv 安全阈值 {SYSTEM_PROMPT_ARGV_LIMIT_BYTES}B，降级并入首条消息"
+            )
+            return None, f"{system_prompt}\n\n---\n{prompt}"
+        return system_prompt, prompt
 
 
 # ---------------- 沙箱被测 agent 执行（ARCH-3-2，设计 §2.3 D8 / §3 表 3-2 行） ----------------

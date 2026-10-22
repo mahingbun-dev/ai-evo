@@ -285,6 +285,8 @@ export const taskApi = {
   // 轮询专用轻端点（W14）：{status, progress, completed_questions, total} 四字段，
   // 供 useTaskPolling 高频拉取，替代每 8s 拉全量 detail
   getStatus: (id) => request.get(`/evaluation/tasks/${id}/status`),
+  // 上传插件包/SKILL.md（插件评测手动指定来源）：zip 返回解包目录绝对路径，md 返回文本内容
+  uploadPluginPackage: (formData) => request.post('/evaluation/tasks/plugin-eval/upload', formData, { headers: { 'Content-Type': 'multipart/form-data' } }),
   // 迁移单个旧版任务配置（steps 合并进 score_details、pre_scripts 转为 script_output 待评测数据行，幂等）
   migrateConfig: (id) => request.post(`/evaluation/tasks/${id}/migrate-config`),
   // 批量迁移全部旧版任务配置（幂等；返回 {total, migrated, skipped, errors}）
@@ -294,9 +296,24 @@ export const taskApi = {
 // 评测结果API
 export const resultApi = {
   get: (id) => request.get(`/evaluation/results/${id}`),
+  // history 传 include_result=false 走轻量版本列表（不带 result 大列）
   history: (id, params) => request.get(`/evaluation/results/${id}/history`, { params }),
+  // 按执行序号取单版完整结果
+  historyVersion: (id, executionNumber) => request.get(`/evaluation/results/${id}/history/${executionNumber}`),
+  // 多次执行维度分数趋势（后端按 execution_number 倒序返回、最近一次在前，仅 completed 版本，
+  // 前端使用前显式排序；limit 限制返回次数）
+  dimensionTrend: (id, limit = 50) => request.get('/evaluation/results/' + id + '/dimension-trend', { params: { limit } }),
   // 批量导出（Excel/CSV）：rawResponse 取完整响应以读 blob 与 content-type
   exportBatch: (data) => request.post('/evaluation/results/batch-export', data, { responseType: 'blob', rawResponse: true })
+}
+
+// 插件市场API（插件评测「插件市场」来源）
+export const pluginMarketplaceApi = {
+  list: () => request.get('/evaluation/plugin-marketplaces'),
+  create: (data) => request.post('/evaluation/plugin-marketplaces', data),
+  sync: (id) => request.post(`/evaluation/plugin-marketplaces/${id}/sync`),
+  remove: (id) => request.delete(`/evaluation/plugin-marketplaces/${id}`),
+  plugins: (id) => request.get(`/evaluation/plugin-marketplaces/${id}/plugins`)
 }
 
 // 批量操作API

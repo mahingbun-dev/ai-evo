@@ -12,7 +12,12 @@ import re
 import logging
 from typing import Dict, Any, List
 from app.services.model_caller import ModelCallerSync
-from app.services.prompt_guard import PROMPT_INJECTION_GUARD, wrap_eval_data
+from app.services.prompt_guard import EMPTY_VALUE_RULES, PROMPT_INJECTION_GUARD, wrap_eval_data
+from app.services.metric_scoring import (
+    format_score_range,
+    metric_max_score,
+    normalize_dimension_score,
+)
 from .judge_graph_state import JudgeAgentState
 
 logger = logging.getLogger(__name__)
@@ -62,14 +67,15 @@ def analyze_output_node(state: JudgeAgentState) -> dict:
     metrics = state["evaluation_metrics"]
     max_score = state["max_score"]
 
-    # 构建维度摘要
+    # 构建维度摘要（每个维度标注自己的最高分，低量程维度不再被任务满分误导）
     dim_summaries = []
     for m in metrics:
         name = m.get("name", "")
         desc = m.get("description", "")
         weight = m.get("weight", "中")
         if name:
-            dim_summaries.append(f"- {name} (权重: {weight}): {desc}")
+            dim_max_label = format_score_range(metric_max_score(m, max_score))
+            dim_summaries.append(f"- {name} (权重: {weight}, 最高分: {dim_max_label}): {desc}")
 
     # 构建变量摘要
     var_lines = []
@@ -90,7 +96,11 @@ def analyze_output_node(state: JudgeAgentState) -> dict:
     if var_lines:
         prompt_parts.append(f"\n[附加上下文]\n" + "\n\n".join(var_lines))
     if dim_summaries:
-        prompt_parts.append(f"\n[评测维度 (0-{max_score}分)]\n" + "\n".join(dim_summaries))
+        prompt_parts.append(f"\n[评测维度 (总分 0-{max_score} 分，各维度最高分见各项标注)]\n" + "\n".join(dim_summaries))
+
+    # 空值判定规则：约束分析阶段就区分「字段存在但值为空」与「字段缺失」，
+    # 避免分析结论带着「字段缺失」的误判污染后续维度评分
+    prompt_parts.append(f"\n{EMPTY_VALUE_RULES}")
 
     prompt_parts.append(
         "\n请分析上述内容的整体质量，并从每个评测维度的角度指出优点和不足。\n"
@@ -132,6 +142,8 @@ def create_score_dimension_node(metric: dict):
         scene_desc = state["scene_desc"]
         max_score = state["max_score"]
         score_details = state["score_details"]
+        # 本维度自己的最高分（缺省/非法回退任务满分，与 prompt_builder 口径一致）
+        dim_max = metric_max_score(metric, max_score)
 
         # 构建评分标准段落
         criteria_lines = []
@@ -140,14 +152,14 @@ def create_score_dimension_node(metric: dict):
             criteria_lines.append(f"[评分等级]")
             for level, info in dim_criteria.items():
                 min_s = info.get("min", 0)
-                max_s = info.get("max", max_score)
+                max_s = info.get("max", dim_max)
                 desc = info.get("desc", "")
                 criteria_lines.append(f"- {level} ({min_s}-{max_s}分): {desc}")
         elif score_details:
             # 回退全局评分标准
             criteria_lines.append(f"[评分标准]\n{score_details}")
         else:
-            criteria_lines.append(f"[评分标准]\n0-{max_score}分，越高越好。")
+            criteria_lines.append(f"[评分标准]\n0-{format_score_range(dim_max)}分，越高越好。")
 
         prompt_parts = [
             f"你是一个 AI 评分裁判。现在需要对**【{dim_name}】**维度进行独立评分。",
@@ -202,11 +214,14 @@ def create_score_dimension_node(metric: dict):
             prompt_parts.append("\n".join(dep_lines))
 
         prompt_parts.append(
-            f"\n请严格基于上述标准，对该维度进行评分 (0-{max_score}分)。\n"
+            f"\n请严格基于上述标准，对该维度进行评分 (0-{format_score_range(dim_max)}分，"
+            f"分数不得超过该维度最高分)。\n"
             f"输出 JSON 格式：\n"
             f'{{"score": <分数>, "reasoning": "<评分理由>"}}\n'
             f"只输出 JSON，不要其他内容。"
         )
+        # 空值判定规则：评分阶段是「空值误判为缺失」的高发点，独立提醒一次
+        prompt_parts.append(f"\n{EMPTY_VALUE_RULES}")
 
         prompt = "\n".join(prompt_parts)
         logger.info(f"[score_{dim_name}] prompt 长度: {len(prompt)} 字符")
@@ -233,8 +248,8 @@ def create_score_dimension_node(metric: dict):
             # 而是携带 judge_failed 标记由 aggregate_scores 冒泡为整裁判失败
             dim_failed = True
 
-        # 确保分数在有效范围
-        score = max(0.0, min(score, float(max_score)))
+        # 确保分数在有效范围（夹到本维度自己的最高分，而非任务满分）
+        score = max(0.0, min(score, float(dim_max)))
 
         dim_result = {
             "score": score,
@@ -260,12 +275,17 @@ WEIGHT_MAP = {
 }
 
 
-def _compute_weighted_scores(metrics, dim_results):
+def _compute_weighted_scores(metrics, dim_results, max_score):
     """计算各维度加权平均分数
+
+    维度分先按各自最高分归一化到任务满分标度再加权（最高分 5 的维度打 5
+    与最高分 10 的维度打 10 等价），维度未配置最高分时回退任务满分=恒等，
+    存量任务口径不变。反馈文案仍展示原始分。
 
     Args:
         metrics: 评测维度配置列表
         dim_results: 各维度评分结果
+        max_score: 任务满分（归一化目标标度）
 
     Returns:
         (total_weight, weighted_sum, feedback_parts) 元组
@@ -285,8 +305,9 @@ def _compute_weighted_scores(metrics, dim_results):
         score = dim_data.get("score", 0)
         reasoning = dim_data.get("reasoning", "")
 
+        normalized = normalize_dimension_score(score, metric, max_score)
         total_weight += weight
-        weighted_sum += score * weight
+        weighted_sum += normalized * weight
         feedback_parts.append(f"【{name}】{score}分 - {reasoning}")
 
     return total_weight, weighted_sum, feedback_parts
@@ -336,16 +357,18 @@ def aggregate_scores_node(state: JudgeAgentState) -> dict:
             "final_score": 0.0,
             "final_feedback": "没有有效的评分结果",
             "final_dimension_scores": {},
+            "final_dimension_feedbacks": {},
         }
 
     # ── 第一步：初始加权平均（使用原始分数） ──
-    total_weight, weighted_sum, feedback_parts = _compute_weighted_scores(metrics, dim_results)
+    total_weight, weighted_sum, feedback_parts = _compute_weighted_scores(metrics, dim_results, max_score)
 
     if total_weight == 0:
         return {
             "final_score": 0.0,
             "final_feedback": "权重之和为 0",
             "final_dimension_scores": {},
+            "final_dimension_feedbacks": {},
         }
 
     # ── 第二步：维度依赖覆盖逻辑 ──
@@ -375,7 +398,7 @@ def aggregate_scores_node(state: JudgeAgentState) -> dict:
 
     # ── 第三步：如果触发了覆盖，重新计算加权平均 ──
     if override_applied:
-        total_weight, weighted_sum, feedback_parts = _compute_weighted_scores(metrics, dim_results)
+        total_weight, weighted_sum, feedback_parts = _compute_weighted_scores(metrics, dim_results, max_score)
 
     final_score = weighted_sum / total_weight
     final_score = max(0.0, min(round(final_score, 2), float(max_score)))
@@ -396,6 +419,13 @@ def aggregate_scores_node(state: JudgeAgentState) -> dict:
             for name in (m["name"] for m in metrics)
             if name in dim_results
         },
+        # 分维度评分理由：仅收录成功评分的维度（judge_failed 维度不进理由表），
+        # reasoning 缺失时置空字符串
+        "final_dimension_feedbacks": {
+            name: dim_results.get(name, {}).get("reasoning") or ""
+            for name in (m["name"] for m in metrics)
+            if name in dim_results and not dim_results[name].get("judge_failed")
+        },
         "final_judge_failed": final_judge_failed,
         "final_fail_reason": "parse_failed" if final_judge_failed else "",
     }
@@ -412,6 +442,8 @@ def format_output_node(state: JudgeAgentState) -> dict:
         "score": state["final_score"],
         "feedback": state["final_feedback"],
         "dimension_scores": state["final_dimension_scores"],
+        # 分维度评分理由（新增字段；state 缺该键时兜底空 dict，旧消费方无感知）
+        "dimension_feedbacks": state.get("final_dimension_feedbacks") or {},
         "judge_details": {
             "analysis": state["analysis"],
             "dimension_details": state["dimension_results"],

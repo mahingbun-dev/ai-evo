@@ -12,10 +12,10 @@
 4. alembic downgrade c4e8f9a2b7d6：列清零、版本回退；
 5. 再次 upgrade head：干净重放。
 
-注：从零全链 alembic upgrade 因先存迁移链缺陷（5a64da264cdd 与
-14f63ba90774 重复添加 evaluation_targets 列，主仓同现）不可用，
-故用 create_all + stamp 构造基线，只验证 W9 迁移本身的正确性
-（与 test_migration_w3.py 同口径）。
+注：用 create_all + stamp 构造基线，只验证 W9 迁移本身的正确性
+（与 test_migration_w3.py 同口径）。原「从零全链 upgrade 因重复列缺陷
+不可用」的限制已随 2026-10-15 修复（14f63ba90774 幂等化 + ab_test_sessions
+补建迁移）解除，见 test_w6_alembic_env.py 的转正用例。
 """
 import secrets
 import time
@@ -29,8 +29,22 @@ from tests.integration.conftest import BASE_DSN
 
 WORKTREE_ROOT = Path(__file__).resolve().parents[2]
 
-W3_HEAD = "c4e8f9a2b7d6"      # W9 迁移的直接父
-W9_HEAD = "a1b2c3d4e5f6"
+W3_HEAD = "c4e8f9a2b7d6"      # W9 迁移的直接父（stamp 基点，链上位置固定）
+
+
+def _repo_head() -> str:
+    """当前仓库迁移链 head——动态取，合入新迁移无需改本文件
+
+    （原写死 a1b2c3d4e5f6，plugin-eval 合入 head 推进后本用例假红；
+    2026-10-15 改为动态。）
+    """
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    cfg = Config(str(WORKTREE_ROOT / "alembic.ini"))
+    heads = ScriptDirectory.from_config(cfg).get_heads()
+    assert len(heads) == 1, f"迁移链应单 head，实得 {heads}"
+    return heads[0]
 
 _parts = urlsplit(BASE_DSN)
 _ADMIN_DSN = urlunsplit(_parts._replace(path="/postgres"))
@@ -191,7 +205,7 @@ class TestMigrationUpgrade:
         _alembic(pre_w9_db, "upgrade", W9_HEAD)
 
         # alembic 版本推进到 W9 head
-        assert _fetchall(pre_w9_db, "SELECT version_num FROM alembic_version")[0][0] == W9_HEAD
+        assert _fetchall(pre_w9_db, "SELECT version_num FROM alembic_version")[0][0] == _repo_head()
 
         after = _all_tables_columns(pre_w9_db)
         # expand-only：差异恰好 = hub_files.team_code 一列
@@ -267,6 +281,6 @@ class TestMigrationDowngrade:
         assert "team_code" not in after_down["hub_files"]
 
         # 再次 upgrade：干净重放（回滚后可恢复）
-        _alembic(pre_w9_db, "upgrade", W9_HEAD)
-        assert _fetchall(pre_w9_db, "SELECT version_num FROM alembic_version")[0][0] == W9_HEAD
+        _alembic(pre_w9_db, "upgrade", "head")
+        assert _fetchall(pre_w9_db, "SELECT version_num FROM alembic_version")[0][0] == _repo_head()
         assert "team_code" in _all_tables_columns(pre_w9_db)["hub_files"]

@@ -12,9 +12,9 @@
 4. alembic downgrade f8e1d4c7a2b6（W4 head，W3 迁移的直接父）：表/列清零、版本回退；
 5. 再次 upgrade head：干净重放。
 
-注：从零全链 alembic upgrade 因先存迁移链缺陷（5a64da264cdd 与
-14f63ba90774 重复添加 evaluation_targets 列，主仓同现）不可用，
-故用 create_all + stamp 构造基线，只验证 W3 迁移本身的正确性。
+注：用 create_all + stamp 构造基线，只验证 W3 迁移本身的正确性。
+原「从零全链 upgrade 因重复列缺陷不可用」的限制已随 2026-10-15 修复解除，
+见 test_w6_alembic_env.py 的转正用例。
 """
 import secrets
 import time

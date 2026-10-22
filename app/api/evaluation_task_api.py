@@ -2,7 +2,7 @@
 评测任务API
 """
 import logging
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from sqlalchemy.orm import Session
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field, field_serializer, field_validator, computed_field, ConfigDict
@@ -19,10 +19,14 @@ logger = logging.getLogger(__name__)
 class CreateTaskRequest(BaseModel):
     name: str = Field(..., description="任务名称")
     description: Optional[str] = Field(None, description="任务描述")
-    evaluation_type: str = Field(..., description="评测类型：judge/consistency/success_rate/rag/binary_classification")
+    evaluation_type: str = Field(..., description="评测类型：judge/consistency/success_rate/rag/binary_classification/plugin")
     eval_model_config: Optional[Dict[str, Any]] = Field(None, description="模型配置")
     model_provider: Optional[str] = Field(None, description="模型提供商")
     model_endpoint: Optional[str] = Field(None, description="模型端点")
+    model_output_source: Optional[str] = Field(
+        None, description="模型输出来源：model_call-调用模型（默认）/dataset_field-数据集字段/none-不使用"
+    )
+    model_output_field: Optional[str] = Field(None, description="模型输出字段名（source=dataset_field 时生效）")
     dataset_id: Optional[str] = Field(None, description="数据集ID")
     judge_model: Optional[str] = Field(None, description="裁判模型")
     judge_engine: Optional[str] = Field("claude_agent", description="裁判引擎：claude_agent(Claude Code Agent)/graph(裁判图 HTTP 直调)")
@@ -32,6 +36,7 @@ class CreateTaskRequest(BaseModel):
     rag_config: Optional[Dict[str, Any]] = Field(None, description="RAG评测配置")
     latency_config: Optional[Dict[str, Any]] = Field(None, description="耗时评测配置")
     binary_metrics_config: Optional[Dict[str, Any]] = Field(None, description="二分分类评测配置")
+    plugin_config: Optional[Dict[str, Any]] = Field(None, description="插件评测配置（depth/plugin_path/skill_content）")
     multi_judge_config: Optional[Dict[str, Any]] = Field(None, description="多裁判配置")
     judge_count: Optional[int] = Field(6, description="裁判数量")
     parallel_config: Optional[Dict[str, Any]] = Field(None, description="并行执行配置")
@@ -70,6 +75,8 @@ class UpdateTaskRequest(BaseModel):
     eval_model_config: Optional[Dict[str, Any]] = None
     model_provider: Optional[str] = None
     model_endpoint: Optional[str] = None
+    model_output_source: Optional[str] = None
+    model_output_field: Optional[str] = None
     dataset_id: Optional[str] = None
     judge_model: Optional[str] = None
     judge_engine: Optional[str] = None
@@ -101,6 +108,8 @@ class UpdateTaskRequest(BaseModel):
     latency_config: Optional[Dict[str, Any]] = None
     # 二分分类评测配置
     binary_metrics_config: Optional[Dict[str, Any]] = None
+    # 插件评测配置
+    plugin_config: Optional[Dict[str, Any]] = None
     # 关联的评测模板ID
     template_id: Optional[str] = None
     # 评测目标配置（多评测目标）
@@ -124,6 +133,8 @@ class TaskResponse(BaseModel):
     dataset_id: Optional[str]
     model_provider: Optional[str] = None  # 被评测模型ID
     model_endpoint: Optional[str] = None
+    model_output_source: Optional[str] = None
+    model_output_field: Optional[str] = None
     judge_model: Optional[str]
     judge_engine: Optional[str] = None
     judge_prompt: Optional[str] = None
@@ -194,6 +205,8 @@ class TaskConfigResponse(BaseModel):
     dataset_id: Optional[str]
     model_provider: Optional[str] = None
     model_endpoint: Optional[str] = None
+    model_output_source: Optional[str] = None
+    model_output_field: Optional[str] = None
     judge_model: Optional[str]
     judge_engine: Optional[str] = None
     judge_prompt: Optional[str] = None
@@ -225,6 +238,7 @@ class TaskConfigResponse(BaseModel):
     multi_judge_config: Optional[Dict[str, Any]] = None
     parallel_config: Optional[Dict[str, Any]] = None
     binary_metrics_config: Optional[Dict[str, Any]] = None
+    plugin_config: Optional[Dict[str, Any]] = None
     template_id: Optional[str] = None
     # 评测前处理脚本编排
     pre_scripts: Optional[List[Dict[str, Any]]] = None
@@ -404,6 +418,8 @@ def create_task(
             model_config=body.eval_model_config,
             model_provider=body.model_provider,
             model_endpoint=body.model_endpoint,
+            model_output_source=body.model_output_source,
+            model_output_field=body.model_output_field,
             dataset_id=body.dataset_id,
             judge_model=body.judge_model,
             judge_engine=body.judge_engine,
@@ -413,6 +429,7 @@ def create_task(
         rag_config=body.rag_config,
         latency_config=body.latency_config,
         binary_metrics_config=body.binary_metrics_config,
+        plugin_config=body.plugin_config,
         multi_judge_config=body.multi_judge_config,
         parallel_config=body.parallel_config,
         evaluation_scene=body.evaluation_scene,
@@ -454,6 +471,28 @@ def create_task(
 # ==================== Variable Endpoints ====================
 # 注意：这些路由必须放在 /{task_id} 之前，否则会被 /{task_id} 匹配
 
+@router.post("/plugin-eval/upload", summary="上传插件包/SKILL.md（插件评测手动来源）")
+async def upload_plugin_package(file: UploadFile = File(..., description="zip 插件包（≤20MB）或 SKILL.md（≤2MB）")):
+    """上传插件/skill 压缩包或 SKILL.md 文件，供插件评测「手动指定」来源使用。
+
+    - .zip：内存解包（路径穿越校验/大小限制/唯一顶层目录剥离）后落盘到
+      uploads/plugin_eval/，返回解包目录绝对路径（直接填入 plugin_path）
+    - .md：返回文本内容（回填内联 SKILL.md）
+    """
+    content = await file.read()
+    from app.services.plugin_upload_service import MAX_UPLOAD_SIZE, save_plugin_upload
+
+    if len(content) > MAX_UPLOAD_SIZE:
+        raise HTTPException(status_code=400, detail=f"文件超限（>{MAX_UPLOAD_SIZE // (1024 * 1024)}MB）")
+    if not content:
+        raise HTTPException(status_code=400, detail="上传文件为空")
+
+    result = save_plugin_upload(file.filename or "", content)
+    if result.get("error"):
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
 @router.get("/models/{model_id}/variables", summary="获取模型的变量列表")
 def get_model_variables(
     model_id: str,
@@ -494,10 +533,18 @@ def get_dataset_fields(
     field_service = DatasetFieldService(db)
     field_metas = field_service.get_field_metadata(dataset_id)
 
+    # 平台辅助列（*_is_media / *_hub_file）不是可选数据字段：过滤后若没有
+    # 可用元数据，回退到数据推断，保持与任务创建时 model_output_field 校验一致
+    aux_suffixes = ("_is_media", "_hub_file")
+    usable_metas = [
+        f for f in (field_metas or [])
+        if f.get("name") and not str(f["name"]).endswith(aux_suffixes)
+    ]
+
     fields = []
-    if field_metas:
+    if usable_metas:
         # 使用字段元数据
-        for f in field_metas:
+        for f in usable_metas:
             fields.append({
                 "name": f["name"],
                 "label": f.get("label", f["name"]),
@@ -506,30 +553,48 @@ def get_dataset_fields(
                 "is_media_field": f.get("is_media_field")
             })
     else:
-        # 兼容旧逻辑：从数据推断字段
+        # 兼容旧逻辑：从数据推断字段（无字段元数据的存量数据集）
+        # V2 行按 data 键枚举，与创建/更新时 model_output_field 的校验口径一致；
+        # 无 V2 行时回退 V1 的 question/ref_answer。
         data_service = DatasetDataService(db)
-        items = data_service.get_data_list(dataset_id, skip=0, limit=1)
+        aux_suffixes = ("_is_media", "_hub_file")
+        v2_items = data_service.get_data_list_v2(dataset_id, skip=0, limit=1)
+        if v2_items:
+            first_data = getattr(v2_items[0], "data", None)
+            if isinstance(first_data, dict):
+                for name in first_data.keys():
+                    if not name or name.endswith(aux_suffixes):
+                        continue
+                    fields.append({
+                        "name": name,
+                        "label": name,
+                        "type": "string",
+                        "is_media": False,
+                        "is_media_field": f"{name}_is_media"
+                    })
+        else:
+            items = data_service.get_data_list(dataset_id, skip=0, limit=1)
 
-        if items:
-            first_item = items[0]
-            # 检查 question 字段（对应 user_input）
-            if first_item.question:
-                fields.append({
-                    "name": "question",
-                    "label": "user_input（用户输入）",
-                    "type": "string",
-                    "is_media": False,
-                    "is_media_field": "question_is_media"
-                })
-            # 检查 ref_answer 字段（对应 answer）
-            if first_item.ref_answer:
-                fields.append({
-                    "name": "ref_answer",
-                    "label": "answer（参考答案）",
-                    "type": "string",
-                    "is_media": False,
-                    "is_media_field": "ref_answer_is_media"
-                })
+            if items:
+                first_item = items[0]
+                # 检查 question 字段（对应 user_input）
+                if first_item.question:
+                    fields.append({
+                        "name": "question",
+                        "label": "user_input（用户输入）",
+                        "type": "string",
+                        "is_media": False,
+                        "is_media_field": "question_is_media"
+                    })
+                # 检查 ref_answer 字段（对应 answer）
+                if first_item.ref_answer:
+                    fields.append({
+                        "name": "ref_answer",
+                        "label": "answer（参考答案）",
+                        "type": "string",
+                        "is_media": False,
+                        "is_media_field": "ref_answer_is_media"
+                    })
 
     return {"dataset_id": dataset_id, "fields": fields}
 
@@ -539,6 +604,7 @@ def get_tasks(
     request: Request,
     status: Optional[str] = Query(None, description="状态过滤"),
     evaluation_type: Optional[str] = Query(None, description="评测类型过滤"),
+    name: Optional[str] = Query(None, max_length=200, description="任务名称模糊过滤（不区分大小写的子串匹配）"),
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=1000),
     db: Session = Depends(get_db),
@@ -556,7 +622,7 @@ def get_tasks(
     if super_admin_flag != 1:
         team_code = org_code if org_code else "DEFAULT"
 
-    tasks = service.get_tasks(status=status, evaluation_type=evaluation_type, skip=skip, limit=limit, team_code=team_code)
+    tasks = service.get_tasks(status=status, evaluation_type=evaluation_type, skip=skip, limit=limit, team_code=team_code, name=name)
     return tasks
 
 
@@ -862,24 +928,30 @@ def get_result_history(
     task_id: str,
     request: Request,
     limit: int = Query(50, ge=1, le=200),
+    include_result: bool = Query(True, description="false 时返回版本摘要（不含 result 大列），按版本取全量用 /history/{execution_number}"),
     db: Session = Depends(get_db),
 ):
-    """获取任务所有历史版本的评测结果列表（W9：对象级归属校验）"""
+    """获取任务所有历史版本的评测结果列表（W9：对象级归属校验）
+
+    include_result=false（轻量模式）：SQL 只查标量列、不触碰 result JSONB，
+    供结果展示页选任务时拉版本列表——全量 result 仅渲染选中的单版，
+    默认 true 保持旧契约兼容。
+    """
     task = ensure_task_access(db, request.state.user, task_id)
 
     from app.services.evaluation_task_service import TaskExecutionRecordService
     record_service = TaskExecutionRecordService(db)
-    records = record_service.get_records(task_id, limit=limit)
+    summaries = record_service.get_record_summaries(task_id, limit=limit)
 
     # 兼容处理：如果没有执行记录但任务有结果，从任务结果创建兼容记录
-    if not records and task.result:
+    if not summaries and task.result:
         # 检查任务结果是否已经是聚合格式（包含items等）
         result_data = task.result
         # 创建兼容记录
         compatibility_record = {
             "execution_number": task.execution_count or 1,
             "status": task.status,
-            "result": result_data,
+            "result": result_data if include_result else None,
             "total_cost": task.total_cost,
             "error_message": None,
             "started_at": task.created_at.isoformat() if task.created_at else None,
@@ -887,6 +959,10 @@ def get_result_history(
         }
         return [compatibility_record]
 
+    if not include_result:
+        return summaries
+
+    records = record_service.get_records(task_id, limit=limit)
     return [
         {
             "execution_number": r.execution_number,
@@ -899,3 +975,205 @@ def get_result_history(
         }
         for r in records
     ]
+
+
+@results_router.get("/{task_id}/dimension-trend", summary="获取跨执行版本的维度评分趋势")
+def get_dimension_trend(
+    task_id: str,
+    request: Request,
+    limit: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+):
+    """获取任务跨执行版本的维度评分趋势（W9：对象级归属校验）
+
+    每条仅含 {execution_number, status, completed_at, average_score,
+    dimension_scores}，dimension_scores 与单版 result.dimension_scores 同构
+    （{维度: {average, weight, count}}），按执行次数倒序；只统计 completed 版本。
+    """
+    task = ensure_task_access(db, request.state.user, task_id)
+
+    from app.services.evaluation_task_service import TaskExecutionRecordService
+    record_service = TaskExecutionRecordService(db)
+    trend = record_service.get_dimension_trend(task_id, limit=limit)
+
+    # 兼容旧任务：无执行记录但任务本体结果含 dimension_scores 时返回单条兼容条目
+    # （execution_number 用 task.execution_count or 1，口径与 get_result_history 的兼容分支一致）
+    if not trend and isinstance(task.result, dict) and task.result.get("dimension_scores"):
+        return [{
+            "execution_number": task.execution_count or 1,
+            "status": task.status,
+            "completed_at": task.completed_at.isoformat() if task.completed_at else None,
+            "average_score": task.result.get("average_score"),
+            "dimension_scores": task.result.get("dimension_scores") or {},
+        }]
+
+    return trend
+
+
+@results_router.get("/{task_id}/history/{execution_number}", summary="获取指定历史版本的完整结果")
+def get_result_history_version(
+    task_id: str,
+    execution_number: int,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """按执行序号取单版完整结果（W9：对象级归属校验）
+
+    配合 /history?include_result=false 使用：版本列表轻量化后，前端选中
+    某版本时再取该版全量 result，避免一次传输全部版本的大 JSON。
+    """
+    task = ensure_task_access(db, request.state.user, task_id)
+
+    from app.services.evaluation_task_service import TaskExecutionRecordService
+    record_service = TaskExecutionRecordService(db)
+    record = record_service.get_record_by_number(task_id, execution_number)
+
+    if record is not None:
+        return {
+            "execution_number": record.execution_number,
+            "status": record.status,
+            "result": record.result,
+            "total_cost": record.total_cost,
+            "error_message": record.error_message,
+            "started_at": record.started_at.isoformat() if record.started_at else None,
+            "completed_at": record.completed_at.isoformat() if record.completed_at else None,
+        }
+
+    # 兼容旧任务：无执行记录但任务有结果时，按 history 的兼容口径从任务本体取
+    if not task.result:
+        raise HTTPException(status_code=404, detail=f"执行版本不存在: 第 {execution_number} 次")
+
+    compat_number = task.execution_count or 1
+    if execution_number != compat_number:
+        raise HTTPException(status_code=404, detail=f"执行版本不存在: 第 {execution_number} 次")
+
+    return {
+        "execution_number": compat_number,
+        "status": task.status,
+        "result": task.result,
+        "total_cost": task.total_cost,
+        "error_message": None,
+        "started_at": task.created_at.isoformat() if task.created_at else None,
+        "completed_at": task.completed_at.isoformat() if task.completed_at else None,
+    }
+
+
+class ExecutionExportRequest(BaseModel):
+    format: str = Field("markdown", description="导出格式：markdown（全量报告）| json（无损）")
+
+
+@results_router.post("/{task_id}/history/{execution_number}/export", summary="导出指定执行版本的结果文档")
+def export_result_history_version(
+    task_id: str,
+    execution_number: int,
+    body: ExecutionExportRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """把单次执行结果渲染成文档并上传 anc-hub file-store，返回 file_id（W9：对象级归属校验）
+
+    插件 task_execution_export 工具的入口：markdown 为全量人读报告（failed/stopped
+    只出失败简报），json 为无损结构。同版本同格式幂等——exported_files 已登记的
+    file_id 直接复用（cached=true），不重复上传。上传以调用者平台登录态
+    （平台登录态 Cookie，名由 HUB_SSO_COOKIE_NAME 配置）执行，file-store 侧落调用者身份审计。
+    """
+    from types import SimpleNamespace
+
+    from app.services.hub_file_service import (
+        HubEndpointNotConfiguredError,
+        HubFileError,
+        HubFileService,
+        extract_bearer_token,
+    )
+    from app.services import result_report
+    from app.services.evaluation_task_service import TaskExecutionRecordService
+
+    if body.format not in ("markdown", "json"):
+        raise HTTPException(status_code=400, detail=f"不支持的导出格式: {body.format}（仅 markdown/json）")
+
+    task = ensure_task_access(db, request.state.user, task_id)
+    record_service = TaskExecutionRecordService(db)
+    record = record_service.get_record_by_number(task_id, execution_number)
+    is_db_record = record is not None
+
+    if not is_db_record:
+        # 兼容旧任务：无执行记录但任务有结果时，按 /history/{execution_number} 同口径回退任务本体
+        if not task.result:
+            raise HTTPException(status_code=404, detail=f"执行版本不存在: 第 {execution_number} 次")
+        compat_number = task.execution_count or 1
+        if execution_number != compat_number:
+            raise HTTPException(status_code=404, detail=f"执行版本不存在: 第 {execution_number} 次")
+        record = SimpleNamespace(
+            execution_number=compat_number,
+            status=task.status,
+            result=task.result,
+            total_cost=task.total_cost,
+            error_message=None,
+            started_at=task.created_at,
+            completed_at=task.completed_at,
+            config_snapshot=None,
+        )
+
+    # 幂等复用：该版本该格式已上传过则直接返回已登记 file_id（仅 DB 记录可登记）
+    exported = record.exported_files if is_db_record and isinstance(record.exported_files, dict) else {}
+    cached_entry = exported.get(body.format)
+    if isinstance(cached_entry, dict) and cached_entry.get("file_id"):
+        return {
+            "task_id": task_id,
+            "execution_number": execution_number,
+            "format": body.format,
+            "cached": True,
+            **{k: cached_entry[k] for k in ("file_id", "filename", "size", "sha256") if cached_entry.get(k)},
+        }
+
+    data = (result_report.build_markdown_export(record, task) if body.format == "markdown"
+            else result_report.build_json_export(record, task))
+    filename = result_report.export_filename(
+        task.name, execution_number, body.format,
+        completed_at=record.completed_at if isinstance(record.completed_at, datetime) else None,
+    )
+
+    bearer_token = extract_bearer_token(request.headers.get("cookie"))
+    if not bearer_token:
+        raise HTTPException(
+            status_code=401,
+            detail="请求缺少平台登录凭证（HUB_SSO_COOKIE_NAME 配置的 Cookie），无法以调用者身份上传 anc-hub file-store",
+        )
+
+    try:
+        uploaded = HubFileService(bearer_token=bearer_token, timeout=180).upload_bytes(filename, data)
+    except HubEndpointNotConfiguredError:
+        raise HTTPException(status_code=500, detail="ANC_HUB_MCP_ENDPOINT 未配置，无法上传导出文档")
+    except HubFileError as e:
+        raise HTTPException(status_code=502, detail=f"anc-hub file-store 上传失败: {e}")
+
+    if is_db_record:
+        # 上传成功后登记（upload 成功、登记失败时下次会重传一份，无害）
+        try:
+            record.exported_files = {
+                **(record.exported_files or {}),
+                body.format: {**uploaded, "uploaded_at": datetime.utcnow().isoformat()},
+            }
+            db.commit()
+        except Exception as e:
+            logger.warning(f"导出登记写入失败（file_id={uploaded.get('file_id')}）: {e}")
+            db.rollback()
+
+    try:
+        from app.services.audit_service import log_operation
+        client_host = request.client.host if request.client else ""
+        log_operation(
+            request.state.user, "EXPORT", "execution_record", record.id if is_db_record else task_id,
+            f"{task.name}#exec{execution_number}",
+            detail={"format": body.format, **uploaded}, ip_address=client_host,
+        )
+    except Exception as e:
+        logger.warning(f"审计日志记录失败: {e}")
+
+    return {
+        "task_id": task_id,
+        "execution_number": execution_number,
+        "format": body.format,
+        "cached": False,
+        **uploaded,
+    }

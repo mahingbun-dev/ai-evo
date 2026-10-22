@@ -43,6 +43,8 @@ GitLab push main
    build-service 容器（常驻，:8181）
          │
          ├─ git checkout 到隔离构建工作区 /apps/qa-code/ai-evo-build
+         ├─ 变更分类：相对「线上已部署 commit」（data/deployed_commit）diff，
+         │    变更全部落在 frontend/ 内 → frontend-only 模式（2026-10-16 起）
          ├─ 校验 .offline-snapshot.json 与锁文件哈希是否一致
          │    └─ 不一致 → 从 GitLab Packages 下载离线快照
          ├─ docker run ai-evo-builder（挂载 docker.sock）
@@ -54,6 +56,29 @@ GitLab push main
                      → docker compose up -d → 校验容器与接口
                      → 同步 frontend/dist 到 nginx 静态根（宿主机目录）
 ```
+
+### 前端-only 快速通道（2026-10-16 起）
+
+变更相对**线上已部署 commit** 全部落在 `frontend/` 内时，走快速通道：
+
+- **构建**：只跑 `pnpm install --offline && pnpm build`（跳过应用镜像构建、
+  跳过 claude/git bin 就位），release 记录 `mode=frontend`、tag 为 `frontend-<短sha>`；
+- **部署**：只把 dist 同步到 nginx 静态根（备份+原子切换，复用既有
+  `sync_frontend`），**容器零重启、数据库不动、api/worker 全程在线**，
+  整条流水线从十几分钟缩到三几分钟。
+
+判定在 build-service 端做（CI 零改动），基准是「线上已部署 commit」而不是
+MR diff——语义是「相对线上正在运行的版本改了什么」，能兜住「前序后端 MR
+部署失败后、紧跟的前端 MR 把后端变更漏掉不部署」的场景。「已部署 commit」
+记录在 `build-service/data/deployed_commit`，每次部署成功（含前端-only 与
+回滚）后写入；releases 记录在 build 成功时就写入、不能当基线用。
+
+- 无基线记录 / 基线 commit 不在仓库历史（如 force push）/ diff 失败 →
+  一律按全量处理。误判为 full 只是多做一次镜像构建，误判为 frontend 会
+  漏部署后端变更，所以判定偏保守。
+- Web 手动触发构建时传 `force_mode=full` 可强制全量（调试判定问题用）。
+- 回滚不受影响：显式指定 tag 的回滚一律走全量路径；前端应急回退也可
+  手工恢复 `frontend/dist.bak-<时间戳>`（保留最近 3 份）。
 
 **为什么 builder 容器要挂 `/var/run/docker.sock`**：镜像在 builder 容器里构建，但通过挂载的
 socket 直接 build 进宿主机 daemon，省掉了 `docker save` / 传输 / `docker load` 这一整条链路。
@@ -70,7 +95,7 @@ socket 直接 build 进宿主机 daemon，省掉了 `docker save` / 传输 / `do
 | `/apps/qa-code/ai-evo-build` | 隔离构建工作区，build-service 独占（git checkout / clean 都在这里） |
 | `/apps/qa-code/ai-evo-build-cache` | 跨构建复用的缓存目录 |
 | `/apps/qa-code/ai-evo/build-service/config.toml` | build-service 配置（含凭据，权限 600） |
-| `/apps/qa-code/ai-evo/build-service/data` | `releases/` 版本记录、`logs/` 任务日志 |
+| `/apps/qa-code/ai-evo/build-service/data` | `releases/` 版本记录、`logs/` 任务日志、`deployed_commit` 已部署基线 |
 
 > ⚠️ **前端有两个位置，别只更新一个**：nginx 直接托管宿主机上的
 > `/apps/qa-code/ai-evo/frontend/dist`，而镜像里也有一份 dist 由容器的 FastAPI 托管。
@@ -107,7 +132,7 @@ socket 直接 build 进宿主机 daemon，省掉了 `docker save` / 传输 / `do
 
 **Deploy Token（一个就够）**
 
-项目里已有名为 `ci/cd` 的 Deploy Token（`gitlab+deploy-token-173`），其 scope 是
+项目里已有名为 `ci/cd` 的 Deploy Token（`gitlab+deploy-token-1`），其 scope 是
 `read_repository` + `read_package_registry` + `write_package_registry`：
 
 - **上传离线快照**（开发机）用它 —— 因为含 `write_package_registry`；
@@ -116,7 +141,7 @@ socket 直接 build 进宿主机 daemon，省掉了 `docker save` / 传输 / `do
 该 token 的鉴权方式（已实测通过，上传返回 201、回读内容一致）：
 
 ```
-用户名：gitlab+deploy-token-173
+用户名：gitlab+deploy-token-1
 密码：  <token 值>
 ```
 
@@ -409,17 +434,63 @@ build-service 在**每次部署成功后**清理超期镜像，保留策略是�
 
 ### 数据库迁移
 
-**不随部署自动执行**——`DATABASE_URL` 指向多人共用的测试库，自动迁移一旦碰上破坏性变更
-会直接打断别人。需要迁移时手动执行：
+**部署自动执行**（2026-10-15 起）：build-service 在部署流程里 compose up 之后、verify 之前，
+在 api 容器内执行 `alembic upgrade head`（重试 3 次，失败终止部署）。此前是「不随部署自动
+执行」，结果 2026-10-14（W19 f1a9c5e3b7d2）与 2026-10-15（plugin_config b3c9d7e2f1a4）两次
+带新迁移的 MR 合入后，health/deep 的 migrations 探针比对 alembic_version 落后于代码 heads
+判 503，部署 verify 必红一次，都得手动补迁移再重跑 job——所以把升级放进部署流程。
+
+自动迁移只覆盖「拉齐到代码 head」这一步；**破坏性变更（drop/rename）仍需人工评估**：
+`DATABASE_URL` 指向多人共用的测试库，这类迁移不要写进常规 MR，先与使用方约窗口。
+
+配套的 CI 门禁分两档，按流水线来源切换：
+
+- **合并前**（MR / 非 main 分支 push）：`check-migrations` job（check 阶段、一次性 PG15
+  容器）跑 `tools/check_migrations.py` 完整检查——迁移链分叉/断链、空库全量升级跑不通两项
+  **阻断**；模型漂移（`alembic check`，改模型忘写迁移）当前为**告警不阻断**（仓库有漂移存量：
+  模型声明 JSON 而迁移建的是 JSONB、列注释、索引命名——json 列迁 jsonb 的 P1 遗留，
+  清理后把 `check_migrations.py` 的 `DRIFT_BLOCKING` 改 `True` 收紧为阻断）。
+- **合并后**（main、Web 手动触发）：`check-migrations-static` job 跑
+  `tools/check_migrations.py --static-only`——纯标准库解析 `alembic/versions/*.py`，只查
+  「恰好一个 head、`down_revision` 无断链、revision 不重复」，秒级、不起容器、不装依赖。
+  完整检查在合并前已通过，main 上重跑全量只会把分钟级等待串行压在 build 之前；合并后新增的
+  风险只有并发合并造成的链分叉，静态检查即可覆盖。迁移本身能否在空库跑通，由部署内的
+  `alembic upgrade head` 兜底（失败终止部署）。
+
+本地可同样执行完整检查：
+
+```bash
+docker run --rm -d --name mig-check -p 127.0.0.1:55432:5432 \
+  -e POSTGRES_PASSWORD=ci -e POSTGRES_DB=migcheck postgres:15-alpine
+.venv/bin/python tools/check_migrations.py \
+  --database-url postgresql+psycopg2://postgres:ci@127.0.0.1:55432/migcheck
+docker rm -f mig-check
+```
+
+需要绕过自动迁移手动执行时（如应急），命令不变：
 
 ```bash
 docker exec -it ai-evo-api alembic upgrade head
 ```
 
-命令保持不变，但 W6-2 起 `alembic` 的目标库**优先读容器内 `DATABASE_URL`**
-（`docker exec` 自动继承容器 env，即跟随部署目录 `.env`）；`alembic.ini` 内只保留
-占位符，不再硬编码任何库地址——「拿着 ini 里写死的共享 dev 库地址、在错误环境执行
-迁移」的风险就此消除。
+W6-2 起 `alembic` 的目标库**优先读容器内 `DATABASE_URL`**（`docker exec` 自动继承容器 env，
+即跟随部署目录 `.env`）；`alembic.ini` 内只保留占位符，不再硬编码任何库地址——「拿着 ini
+里写死的共享 dev 库地址、在错误环境执行迁移」的风险就此消除。
+
+### build-service 自身代码的更新
+
+build-service 的代码（`tools/build-service/build_service.py`）烤在 `ai-evo-build-service:latest`
+镜像里，随 ai-evo 仓库演进。2026-10-15 起容器以绑定挂载方式运行该文件：
+
+```
+-v /apps/qa-code/ai-evo-build/tools/build-service/build_service.py:/app/build_service.py:ro
+```
+
+构建工作区 `/apps/qa-code/ai-evo-build` 在每次构建时 checkout 到目标 commit，因此
+**改 build-service 代码的生效流程 = 合入 main → 流水线构建（工作区已同步）→
+`docker restart ai-evo-build-service`**，无需重新做镜像/导出/上传。重启前确认没有
+构建或部署任务在执行（`GET /api/v1/health` 正常、无 running 任务），重启后用
+`docker exec ai-evo-build-service grep -c "新函数名" /app/build_service.py` 确认新代码已加载。
 
 ### 备份与恢复
 
@@ -531,24 +602,56 @@ W6-3 已把明文口令从 `alembic.ini`、`alembic_local.ini`（已删除）、
 
 `worker` 服务设置了 `stop_grace_period: 900s`。部署触发 `docker compose up -d` 时：
 
-- Celery 收到 SIGTERM 后进入 warm shutdown，**跑完当前任务再退出**；
-- 排队中的任务保留在 Redis 队列里，由新 worker 接手；
-- 若当前任务超过 900s 仍未结束，会被强制杀掉。
+worker 不再参与 `docker compose up`（只重建 api/hub-plugin），由 build-service
+的 `swap_worker` 单独非阻塞换代：
 
-因此部署耗时可能较长（有长任务在执行时）。CI 的 deploy job 等待上限是 2400s。
+```
+compose up -d api [hub-plugin] → 迁移 → verify → 前端同步（旧 worker 全程未动）
+→ docker update --restart=no ai-evo-worker        # 防 warm shutdown 退出后被 restart policy 复活
+→ docker kill --signal=TERM ai-evo-worker         # 立即返回：celery 停止接新任务、跑完当前任务自行退出
+→ 短等 drain_wait_sec（默认 120s）
+    ├─ 退出 → docker compose up -d worker          # fast path，换代完成
+    └─ 未退出 → 部署立即成功结束，后台 watcher 接管：
+          按容器 ID 轮询旧容器退出 → compose up -d worker → 校验新容器 running
+          超过 drain_force_kill_sec（默认 7500s）→ docker rm -f 强杀 + 拉起 + 告警
+```
 
-对比旧流程：`scripts/do_deploy.sh` 会先 `DEL celery` 清空队列，正在执行和排队的任务全丢。
-该脚本已标注为仅应急使用。
+行为要点：
+
+- **流水线不再被长任务阻塞**：deploy job 等待上限 900s；旧 worker 收到 TERM 后
+  继续跑完当前任务（celery warm shutdown），跑完后由 watcher 拉起新 worker（秒级）。
+- **任务零丢失**：drain 期间新任务只在 Redis 队列排队（旧 worker 停止接单），
+  api 正常服务；新 worker 就绪后立即接手。worker 容量空窗 = 旧任务剩余时长 +
+  秒级拉起，可接受。
+- **强制回收**：watcher 超过 7500s（2h celery task_time_limit + 缓冲）会
+  `docker rm -f` 旧容器并告警；正常情况下长任务到点被 celery 自杀、worker
+  自然退出，轮不到触发。
+- **兜底链**：watcher 挂掉（如 build-service 容器重启）→ cron 的
+  `ensure_worker.sh`（每 5 分钟）在旧容器退出后拉起新 worker；watcher 拉起
+  失败也发告警（webhook / `alerts.log`）。watcher 与 cron 并发 compose up
+  幂等，最坏一方报错、下一轮自愈。
+- watcher 日志在服务器 `build-service/data/logs/worker-drain-*.log`；
+  GitLab 部署日志里出现「worker 换代转后台」即代表走了后台路径，此时 job
+  已成功、worker 换代稍后自动完成，无需人工干预。
+
+`stop_grace_period: 7200s` **保持不变**：部署编排不再依赖它，它退化为手工
+`compose up/stop` 运维操作时的保护伞（手工重启仍等任务跑完再退出）。
+
+对比旧流程：整条 `compose up -d` 会被 warm shutdown 阻塞最长 7200s，期间
+部署流水线一直挂着。更早的 `scripts/do_deploy.sh` 会先 `DEL celery` 清空队列，
+正在执行和排队的任务全丢，仅应急使用。
 
 ### 与 worker 自愈脚本的关系
 
 部署机上 crontab 每 5 分钟跑一次 `scripts/ensure_worker.sh`，发现 `ai-evo-worker`
-不在运行就 `docker compose up -d worker` —— 这原本会与上面的优雅退出打架：
-worker 优雅退出期间容器处于 Stopping、不出现在 `docker ps` 里，自愈脚本会误判为
-「挂了」并插入一次 compose up，与外层部署的 compose 撞车。
+不在运行就 `docker compose up -d worker`。
 
-处理方式：build-service 在 `compose up` 到校验结束之间写
-`/apps/qa-code/ai-evo/.deploy-in-progress`，`ensure_worker.sh` 见到该标记就跳过。
+- 部署的 compose up（api/hub-plugin）到校验结束之间，build-service 写
+  `/apps/qa-code/ai-evo/.deploy-in-progress`，`ensure_worker.sh` 见到该标记就跳过；
+- worker drain 期间旧容器仍在 `docker ps` 里（warm shutdown 进行中），
+  自愈脚本判断「在运行」自然不会介入；
+- 旧容器退出后，自愈脚本与后台 watcher 都能拉起新 worker（compose 幂等，
+  并发触发无害）——脚本零改动，天然构成换代兜底。
 
 > ⚠️ **服务器上的 `scripts/` 目录不由 CI 同步**——build-service 只同步
 > `docker-compose.yml` 并维护 `.env`。改了 `scripts/` 下的文件，需要手工同步到
@@ -653,7 +756,7 @@ docker run --rm --network=none --platform linux/amd64 \
 | 构建卡在「离线安装前端依赖」，日志刷 `registry.npmjs.org ... error (23)` | pnpm 11 的**供应链复核**（`minimumReleaseAge` / `trustPolicy`）在 `install` 时会对锁文件每个条目向 registry 查询，**`--offline` 不阻止这一步**，断网即报 `ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION`。`build-in-container.sh` 已传 `--config.trustLockfile=true` 跳过复核（锁文件经 MR 评审、且快照生成时在开发机已复核过），**不要删这个参数**。注意用命令行开关而非写进 `pnpm-workspace.yaml`，避免削弱开发机上的默认保护。 |
 | 构建报「pnpm store 中未找到 @esbuild/linux-x64」 | 快照是在非 linux 环境下生成的。`prepare-offline.sh` 已在 linux 容器内执行该步骤，不要绕过它手工 `pnpm fetch`。 |
 | `docker compose up -d` 报 `invalid env file ... contains whitespaces` | `.env` 里有 `KEY = value`（等号前空格）等写法。docker 的 env_file 解析比 python-dotenv 严格，见第 4.4 节。 |
-| 上传快照报 401 | Deploy Token **只认 Basic 鉴权**，用 `PRIVATE-TOKEN` 头会返回 401（实测确认）。脚本已改用 Basic，用户名默认 `gitlab+deploy-token-173`，可用 `GITLAB_UPLOAD_USER` 覆盖。 |
+| 上传快照报 401 | Deploy Token **只认 Basic 鉴权**，用 `PRIVATE-TOKEN` 头会返回 401（实测确认）。脚本已改用 Basic，用户名默认 `gitlab+deploy-token-1`，可用 `GITLAB_UPLOAD_USER` 覆盖。 |
 | 快照解出来文件数翻倍、多出 `._xxx` 文件 | macOS 的 `bsdtar` 默认附带 AppleDouble 元数据。脚本已用 `COPYFILE_DISABLE=1` 关闭，不要绕过脚本手工 `tar` 打包。 |
 | 部署报「部署目录缺少 .env」/「缺少必需变量: DATABASE_URL」 | build-service 的前置护栏拦住了。按第 4.4 节把 `.env` 建好再部署——这是为了不在缺配置时覆盖 compose、把线上服务搞坏。 |
 | api 容器反复退出，日志报「AUTH_JWT_SECRET 未配置」（ARCH-0-2） | JWT 密钥缺失的应用层 fail-fast（build-service 护栏不查这一项）。按「JWT 密钥配置与轮换」一节：`openssl rand -hex 32` 生成后写入 `.env` 的 `AUTH_JWT_SECRET=`，`docker compose up -d` 重启。 |

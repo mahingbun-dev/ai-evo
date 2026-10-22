@@ -4,7 +4,7 @@ Claude Code Agent 裁判执行器
 以 claude-agent-sdk 驱动 Claude Code CLI 完成裁判评分：
 - 支持超长会话：会话内容渲染为 markdown 文件，agent 用 Read/Grep 工具自行阅读
 - 提示词参考现有裁判图结构（整体分析 → 逐维度评分 → 汇总），单次会话完成
-- 返回格式与 JudgeLangGraphAgent 兼容：[{score, feedback, dimension_scores, langfuse_trace_*}]
+- 返回格式与 JudgeLangGraphAgent 兼容：[{score, feedback, dimension_scores, dimension_feedbacks, langfuse_trace_*}]
 """
 import asyncio
 import json
@@ -15,6 +15,8 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
+
+from app.services.metric_scoring import format_score_range, metric_max_score
 
 logger = logging.getLogger(__name__)
 
@@ -30,8 +32,8 @@ OUTPUT_PROTOCOL_TEMPLATE = """
 
 ## 输出要求
 请先在心里完成整体分析与逐维度评分，然后最终回复【只包含一个 JSON 对象】，不要输出任何其他文字：
-{{"score": <总分，0 到 {max_score} 的数字>, "feedback": "<整体评价与依据，200字以内>", "dimension_scores": {{<维度名>: <该维度得分数字>, ...}}}}
-必须评分的维度：{dimension_names}
+{{"score": <总分，0 到 {max_score} 的数字>, "feedback": "<整体评价与依据，200字以内>", "dimension_scores": {{<维度名>: <该维度得分数字或字符串"F">, ...}}, "dimension_feedbacks": {{"<维度名>": "<该维度评分理由，100字以内>", ...}}}}
+参与评分的维度及各自最高分：{dimension_specs}。每个维度的得分不得超过该维度自己的最高分。各需求涉及的维度集合不同：该行涉及的维度必须评分；该行不涉及的维度（评测材料中该维度校验点数为 0）在 dimension_scores 中输出字符串 "F" 作为哨兵标识，并在 feedback 中标注「本行不涉及：<维度名>」——总评分按实际涉及校验点微平均计算，F 维度不参与（dimension_feedbacks 中无需输出 F 维度的条目）。
 """
 
 
@@ -187,15 +189,20 @@ class ClaudeCodeJudgeAgent:
     def _build_final_prompt(self, user_prompt: str, session_file: Optional[str]) -> str:
         """在 user prompt 基础上拼接会话文件说明与输出协议"""
         metrics = getattr(self.task, "evaluation_metrics", []) or []
-        dimension_names = [m.get("name", "") for m in metrics if m.get("name")]
         max_score = getattr(self.task, "max_score", 10) or 10
+        # 维度清单带各自最高分（缺省回退任务满分），裁判按维度自己的量程评分
+        dimension_specs = "、".join(
+            f"{m.get('name', '')}(最高分{format_score_range(metric_max_score(m, max_score))})"
+            for m in metrics
+            if m.get("name")
+        ) or "（按提示词中的维度）"
         parts = [user_prompt.rstrip()]
         if session_file:
             parts.append(
                 OUTPUT_PROTOCOL_TEMPLATE.format(
                     session_file=session_file,
                     max_score=max_score,
-                    dimension_names="、".join(dimension_names) or "（按提示词中的维度）",
+                    dimension_specs=dimension_specs,
                 )
             )
         else:
@@ -204,8 +211,9 @@ class ClaudeCodeJudgeAgent:
                 f"请先完成整体分析与逐维度评分，最终回复【只包含一个 JSON 对象】，不要输出其他文字：\n"
                 f'{{"score": <总分，0 到 {max_score} 的数字>, '
                 f'"feedback": "<整体评价，200字以内>", '
-                f'"dimension_scores": {{<维度名>: <得分数字>, ...}}}}\n'
-                f"必须评分的维度：{'、'.join(dimension_names) or '（按提示词中的维度）'}"
+                f'"dimension_scores": {{<维度名>: <得分数字>, ...}}, '
+                f'"dimension_feedbacks": {{"<维度名>": "<该维度评分理由，100字以内>", ...}}}}\n'
+                f"必须评分的维度及各自最高分：{dimension_specs}；每个维度的得分不得超过该维度自己的最高分"
             )
         return "\n".join(parts)
 

@@ -1,4 +1,4 @@
-"""工具清单：18 个 MCP 工具的单一事实源。
+"""工具清单：23 个 MCP 工具的单一事实源。
 
 每个工具的 route 声明 HTTP 方法、URL 模板、参数去向与 input schema，
 manifest 的 ToolDecl 与 handle 的分发共用这一张表，杜绝声明与实现漂移。
@@ -10,6 +10,9 @@ manifest 的 ToolDecl 与 handle 的分发共用这一张表，杜绝声明与�
 
 ``requires_approval`` 按「删除+修改需人工审批」的策略标记：agent 只能提交
 草稿，由人在中台侧确认后才执行。
+
+route 可选 ``timeout_seconds``：该工具对 ai-evo 的 HTTP 请求超时覆盖值
+（缺省用插件级 AIEVO_TIMEOUT），慢操作（如文档导出的生成+上传）单独放宽。
 """
 
 from __future__ import annotations
@@ -20,16 +23,24 @@ from typing import Any, Callable, Dict
 import hubkit
 from hubkit.proto.hubv1 import plugin_pb2
 
+from .result_pagination import (
+    DEFAULT_PAGE_SIZE as DETAIL_PAGE_SIZE,
+    MAX_PAGE_SIZE as DETAIL_MAX_PAGE_SIZE,
+    paginate_detail,
+)
 from .result_summary import (
     DEFAULT_MAX_FAILED_ITEMS as MAX_FAILED_ITEMS,
     summarize_result,
 )
 
 PLUGIN_NAME = "ai-evo"
-PLUGIN_VERSION = "1.1.0"
+# 中台规则：同版本号契约不可变（VERSION_CONFLICT 拒绝注册）——凡动工具/描述/schema/消息契约必须升此号
+PLUGIN_VERSION = "1.3.0"
 PLUGIN_DESCRIPTION = (
     "AI 评测平台（ai-evo）代理：数据集管理与导入（经 anc-hub file-store 的 file_id）、"
-    "评测任务的创建/修改/删除与执行、任务状态与评测结果查询。"
+    "评测任务的创建/修改/删除与执行、任务轻量状态轮询与执行历史、"
+    "单次执行明细分页查询与结果文档导出（markdown/json 上传 file-store 返回 file_id）、"
+    "评测结果摘要查询与任务日志。"
     "调用方需有平台登录态（经 anc-hub 登录后透传），所有操作以真实用户身份执行并落审计。"
 )
 
@@ -40,6 +51,20 @@ def _truncate_result(data: Any, ctx: Dict[str, Any]) -> Any:
     """task_get 的后处理：把任务里的 result 明细裁成摘要，避免大载荷撑爆回包。"""
     if isinstance(data, dict) and isinstance(data.get("result"), dict):
         data["result"] = summarize_result(data["result"])
+    return data
+
+
+def _strip_execution_records(data: Any, ctx: Dict[str, Any]) -> Any:
+    """task_executions 的后处理：执行历史列表剥掉 result/config_snapshot 大列。
+
+    该端点按 ORM 全字段序列化（含每版完整 result），列表场景只留标量元信息
+    （序号/状态/成本/错误/起止时间），全量明细走 task_execution_detail。
+    """
+    if isinstance(data, list):
+        for record in data:
+            if isinstance(record, dict):
+                record.pop("result", None)
+                record.pop("config_snapshot", None)
     return data
 
 
@@ -236,14 +261,15 @@ TOOL_ROUTES: Dict[str, _ROUTE_TYPE] = {
     "task_list": {
         "method": "GET",
         "path": "/api/v1/evaluation/tasks",
-        "query_params": ["status", "evaluation_type", "skip", "limit"],
+        "query_params": ["status", "evaluation_type", "name", "skip", "limit"],
         "body": False,
-        "desc": "列出评测任务（可按状态/评测类型过滤）",
+        "desc": "列出评测任务（可按状态/评测类型/名称模糊过滤）",
         "schema": {
             "type": "object",
             "properties": {
                 "status": {"type": "string", "description": "状态过滤：pending/running/completed/failed/stopped（可选）"},
                 "evaluation_type": {"type": "string", "description": "评测类型过滤：judge/consistency/success_rate/rag/binary_classification（可选）"},
+                "name": {"type": "string", "description": "任务名称模糊过滤（不区分大小写的子串匹配，可选）"},
                 "skip": {"type": "integer", "description": "跳过条数（默认 0）"},
                 "limit": {"type": "integer", "description": "返回条数上限（默认 100，最大 1000）"},
             },
@@ -402,6 +428,108 @@ TOOL_ROUTES: Dict[str, _ROUTE_TYPE] = {
             "type": "object",
             "properties": {
                 "task_id": {"type": "string", "description": "任务 ID"},
+            },
+            "required": ["task_id"],
+        },
+    },
+    "task_status": {
+        "method": "GET",
+        "path": "/api/v1/evaluation/tasks/{task_id}/status",
+        "path_params": ["task_id"],
+        "body": False,
+        "desc": (
+            "获取评测任务轻量状态（轮询专用）：仅 status/progress/completed_questions/total "
+            "四个字段，后端不碰大 JSON 列。评测执行中的显式状态查询用本工具——agent 需要轮询时"
+            "自行按自己的节奏重复调用，插件不做自动轮询；需要任务配置全量详情时再用 task_get"
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "description": "任务 ID"},
+            },
+            "required": ["task_id"],
+        },
+    },
+    "task_executions": {
+        "method": "GET",
+        "path": "/api/v1/evaluation/tasks/{task_id}/executions",
+        "path_params": ["task_id"],
+        "query_params": ["limit"],
+        "body": False,
+        "postprocess": _strip_execution_records,
+        "desc": (
+            "获取评测任务的执行历史列表（按执行次数倒序）：每次返回执行序号/状态/成本/"
+            "错误信息/起止时间，用于定位「第几次执行」。返回体已剥掉每版全量 result 与配置"
+            "快照大列；单版全量明细用 task_execution_detail，文档归档用 task_execution_export"
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "description": "任务 ID"},
+                "limit": {"type": "integer", "description": "返回条数上限（默认 50，最大 200）"},
+            },
+            "required": ["task_id"],
+        },
+    },
+    "task_execution_detail": {
+        "method": "GET",
+        "path": "/api/v1/evaluation/results/{task_id}/history/{execution_number}",
+        "path_params": ["task_id", "execution_number"],
+        "query_params": ["skip", "limit"],
+        "body": False,
+        "postprocess": paginate_detail,
+        "desc": (
+            f"获取指定执行版本的逐题明细（items 分页）：返回该版汇总指标（通过率/平均分/维度得分，"
+            f"不截断）与第 skip 条起的最多 limit 题明细（默认 {DETAIL_PAGE_SIZE} 题/页，上限 "
+            f"{DETAIL_MAX_PAGE_SIZE} 题，题目长文本不截断）。失败/停止版本返回错误摘要。"
+            "适合翻页定位问题题目；全量归档用 task_execution_export 导出文档"
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "description": "任务 ID"},
+                "execution_number": {"type": "integer", "description": "执行序号（第几次执行，从 1 起；用 task_executions 查可用版本）"},
+                "skip": {"type": "integer", "description": f"明细跳过条数（默认 0）"},
+                "limit": {"type": "integer", "description": f"明细返回条数上限（默认 {DETAIL_PAGE_SIZE}，最大 {DETAIL_MAX_PAGE_SIZE}）"},
+            },
+            "required": ["task_id", "execution_number"],
+        },
+    },
+    "task_execution_export": {
+        "method": "POST",
+        "path": "/api/v1/evaluation/results/{task_id}/history/{execution_number}/export",
+        "path_params": ["task_id", "execution_number"],
+        "body": True,
+        "timeout_seconds": 180,
+        "desc": (
+            "把指定执行版本的结果导出为文档并上传 anc-hub file-store，返回 file_id（用 "
+            "file-store 的 file_download 分块下载）。format=markdown 出全量人读报告（任务元信息/"
+            "配置摘要/汇总指标/逐题明细含裁判评语全文；失败版本只出失败简报）；format=json 出无损"
+            "结构。同版本同格式幂等：重复导出直接复用已上传的 file_id（响应 cached=true）"
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "description": "任务 ID"},
+                "execution_number": {"type": "integer", "description": "执行序号（第几次执行，从 1 起）"},
+                "format": {"type": "string", "description": "导出格式：markdown（全量报告，默认）/ json（无损）"},
+            },
+            "required": ["task_id", "execution_number"],
+        },
+    },
+    "task_logs": {
+        "method": "GET",
+        "path": "/api/v1/evaluation/tasks/{task_id}/logs",
+        "path_params": ["task_id"],
+        "query_params": ["level", "limit"],
+        "body": False,
+        "desc": "获取评测任务的执行日志（可按级别过滤），排查执行失败时直接看日志",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "description": "任务 ID"},
+                "level": {"type": "string", "description": "日志级别过滤（可选，如 error/warning/info）"},
+                "limit": {"type": "integer", "description": "返回条数上限（默认 100，最大 500）"},
             },
             "required": ["task_id"],
         },

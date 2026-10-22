@@ -540,11 +540,11 @@ class TestSystemPromptStepsContract:
         assert "步骤B" not in prompt
 
     def test_metrics_rendered_as_ordered_steps(self):
-        """评测维度段改为有序步骤形式：第N步 {name} (权重: x) + 维度定义"""
+        """评测维度段改为有序步骤形式：第N步 {name} (权重: x, 最高分: y) + 维度定义"""
         prompt = self._build_prompt()
-        assert "### 第1步 准确性 (权重: 高(3))" in prompt
+        assert "### 第1步 准确性 (权重: 高(3), 最高分: 10)" in prompt
         assert "内容准确度" in prompt
-        assert "### 第2步 完整性 (权重: 2)" in prompt
+        assert "### 第2步 完整性 (权重: 2, 最高分: 10)" in prompt
         assert "覆盖完整" in prompt
 
     def test_norm_section_emphasizes_sequential_scoring(self):
@@ -572,3 +572,50 @@ class TestSystemPromptStepsContract:
         prompt = self._build_prompt(metrics=[])
         assert "## 输出格式要求" in prompt
         assert "dimension_scores" not in prompt
+
+
+class TestSystemPromptTargetsInjection:
+    """include_targets_content 开关（CC 引擎 argv 单参数 128KB 修复）
+
+    claude-agent-sdk 以 --system-prompt argv 传 system_prompt，待评数据
+    超 Linux 单参数 131072B 上限会 execve 失败；CC 引擎调用方传
+    include_targets_content=False 跳过数据注入，数据改由 executor 分流。
+    """
+
+    @staticmethod
+    def _pb():
+        return PromptBuilder.from_config({
+            "scene_desc": "测试场景",
+            "evaluation_metrics": [{"name": "准确性", "weight": 1}],
+            "evaluation_targets": [
+                {"name": "输出", "source": "model_output", "display_name": "输出"}
+            ],
+        })
+
+    def _build(self, **overrides):
+        kwargs = {"payload": {}, "model_output": "待评内容ABC", "chain_results": []}
+        kwargs.update(overrides)
+        return self._pb()._build_system_prompt(**kwargs)
+
+    def test_default_includes_targets_content(self):
+        prompt = self._build()
+        assert "## 待评测目标内容" in prompt
+        assert "待评内容ABC" in prompt
+
+    def test_false_skips_targets_content(self):
+        prompt = self._build(include_targets_content=False)
+        assert "## 待评测目标内容" not in prompt
+        assert "待评内容ABC" not in prompt
+        # 评分指令部分完整保留
+        assert "测试场景" in prompt
+        assert "准确性" in prompt
+        assert "输出格式要求" in prompt
+
+    def test_false_without_targets_identical(self):
+        """无 targets 时开关不影响输出（graph 引擎零回归）"""
+        pb = PromptBuilder.from_config({"evaluation_metrics": [{"name": "准确性"}]})
+        default = pb._build_system_prompt(payload={}, model_output="x", chain_results=[])
+        skipped = pb._build_system_prompt(
+            payload={}, model_output="x", chain_results=[], include_targets_content=False
+        )
+        assert default == skipped

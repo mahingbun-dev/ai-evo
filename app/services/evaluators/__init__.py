@@ -21,6 +21,7 @@ from app.services.evaluators import success_rate as _success_rate  # noqa: F401,
 from app.services.evaluators import rag as _rag  # noqa: F401,E402
 from app.services.evaluators import binary_classification as _binary  # noqa: F401,E402
 from app.services.evaluators import latency as _latency  # noqa: F401,E402
+from app.services.evaluators import plugin as _plugin  # noqa: F401,E402
 
 __all__ = [
     "BaseEvaluator",
