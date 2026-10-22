@@ -53,12 +53,22 @@ keep_frontend_backups = 3
 # 且 docker 会拒绝删除正在被容器使用的镜像——回滚目标不会丢。
 # 设为 0 可关闭镜像清理。
 keep_releases = 5
+# worker 非阻塞优雅换代参数（见 build_service.py 的 swap_worker 与
+# docs/build-pipeline.md「部署时的任务中断行为」一节）：
+#   drain_wait_sec        流水线内等旧 worker 退出的短窗口（秒）。超时即转入
+#                         后台 watcher，流水线不再阻塞。空闲部署的 worker 收到
+#                         SIGTERM 后几秒内退出，2 分钟足够覆盖。
+#   drain_force_kill_sec  后台 watcher 强制回收上限（秒）。默认 7500 =
+#                         celery task_time_limit（2h）+ 缓冲；正常情况下长任务
+#                         到点会被 celery 强杀、worker 随之退出，轮不到触发。
+drain_wait_sec = 120
+drain_force_kill_sec = 7500
 
 [timeouts]
 # 构建超时（秒）：前端 pnpm build + docker build
 build_sec = 3600
-# 部署超时（秒）：注意 worker 的 stop_grace_period 是 900s，
-# 若部署时正好有长任务在执行，compose 会等它跑完，因此这里要留足
+# 部署超时（秒）：worker 已改为非阻塞换代（不再被 stop_grace_period 阻塞），
+# 该上限只需覆盖 api/hub-plugin 重建 + 数据库迁移 + verify
 deploy_sec = 1800
 
 # 构建后镜像漏洞扫描门禁（ARCH-3-3，设计 §3 Phase 3 表 3-3 行）
@@ -94,6 +104,8 @@ repo_url = "https://gitlab+deploy-token:<token>@gitlab.example.com/group/project
 project_id = "152361"
 # 离线快照包名（与 tools/upload-offline-snapshot.sh 的 SNAPSHOT_PACKAGE 一致）
 snapshot_package = "ai-evo-offline-snapshot"
+# 离线 git 运行时包名（与 tools/prepare-git-bin.sh 的 PKG 一致）
+git_package = "ai-evo-git-bin"
 # Deploy Token「ci/cd」的凭据：用户名形如 gitlab+deploy-token-<n>，密码是 token 值。
 # 该 token 的 scope 为 read_repository + read_package_registry + write_package_registry，
 # 下载离线快照只需要 read_package_registry。

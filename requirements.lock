@@ -8,7 +8,7 @@ aiohappyeyeballs==2.7.1
     # via
     #   -c /src/prod-constraints.txt
     #   aiohttp
-aiohttp==3.14.3
+aiohttp==3.14.4
     # via
     #   -c /src/prod-constraints.txt
     #   -r /src/requirements.txt
@@ -511,7 +511,7 @@ pdfplumber==0.11.9
     # via
     #   -c /src/prod-constraints.txt
     #   -r /src/requirements.txt
-pillow==12.3.0
+pillow==13.0.0
     # via
     #   -c /src/prod-constraints.txt
     #   -r /src/requirements.txt

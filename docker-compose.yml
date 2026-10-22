@@ -224,6 +224,10 @@ services:
     # W10-3：900s → 7200s，与 celery task_time_limit（单任务最长 2h）对齐——
     # 900s 窗口内跑不完的长任务会被 docker 强杀（SIGKILL），任务中断且消息
     # 未 ACK 会被重投。
+    # 2026-10-16 起 CI 部署编排不再依赖本参数（build-service 对 worker 发
+    # SIGTERM 后短等 2 分钟即返回，长任务由后台 watcher/cron 兜底换代，
+    # 见 docs/build-pipeline.md）；它退化为手工 compose up/stop 运维操作
+    # 时的保护伞：手工重启仍会等当前任务跑完再退出。
     stop_grace_period: 7200s
     volumes:
       - ${LOGS_VOLUME:-./logs}:/app/logs

@@ -947,6 +947,8 @@ class TestTaskServiceScriptTargetsValidation:
         try:
             task = service.create_task(
                 name="t", evaluation_type="judge", dataset_id="ds_1",
+                # judge + 模型调用来源必须有被评测模型（新的模型输出校验）
+                model_provider="m1",
                 evaluation_targets=[
                     {"id": "t_model", "name": "model_output", "source": "model_output",
                      "source_config": {}, "display_name": "模型输出", "required": True},
@@ -1084,6 +1086,9 @@ class TestTaskServiceScriptTargetsValidation:
         service, db, patchers = _service_with_db(script_rows=[])
         task = SimpleNamespace(
             id="task_1", evaluation_type="judge", dataset_id=None,
+            # 存量任务带被评测模型：聚焦 legacy 字段保守语义（新的模型输出校验见
+            # test_judge_dataset_output.py）
+            model_provider="m1",
             evaluation_targets=[{"id": "t_model", "display_name": "模型输出"}],
             consistency_config=None, score_details=None, evaluation_metrics=None,
             judge_variable_config=None,
@@ -1108,6 +1113,9 @@ class TestTaskServiceScriptTargetsValidation:
         legacy_steps = ["旧版步骤"]
         task = SimpleNamespace(
             id="task_1", evaluation_type="judge", dataset_id=None,
+            # 存量任务带被评测模型：聚焦 legacy 字段保守语义（新的模型输出校验见
+            # test_judge_dataset_output.py）
+            model_provider="m1",
             evaluation_targets=[{"id": "t_model", "display_name": "模型输出"}],
             consistency_config=None, score_details=None, evaluation_metrics=None,
             judge_variable_config=None,
@@ -1130,6 +1138,9 @@ class TestTaskServiceScriptTargetsValidation:
         service, db, patchers = _service_with_db(script_rows=[row])
         task = SimpleNamespace(
             id="task_1", evaluation_type="judge", dataset_id=None,
+            # 存量任务带被评测模型：聚焦 legacy 字段保守语义（新的模型输出校验见
+            # test_judge_dataset_output.py）
+            model_provider="m1",
             evaluation_targets=[{"id": "t_model", "display_name": "模型输出"}],
             consistency_config=None, score_details=None, evaluation_metrics=None,
             judge_variable_config=None,

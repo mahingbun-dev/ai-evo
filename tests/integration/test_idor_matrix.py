@@ -5,7 +5,7 @@
 
 覆盖端点族（与实现接入清单一一对应）：
 - evaluation_task_api：详情/config/更新/stop/logs/executions/results/history/
-  run（跨团队拒绝）/refresh-count
+  dimension-trend/run（跨团队拒绝）/refresh-count
 - batch_operations_api：batch-run/batch-delete/batch-stop 跨团队任务逐项失败
 - dataset_api：详情/更新/删除/fields/data/data-v2/export/文件上传/文件删除/
   临时上传/临时删除/确认导入 + 列表过滤
@@ -230,6 +230,10 @@ MATRIX = [
     ("task_stop", "POST", "/evaluation/tasks/{task_id}/stop", None, "ok"),
     ("task_result", "GET", "/evaluation/results/{task_id}", None, "ok"),
     ("task_result_history", "GET", "/evaluation/results/{task_id}/history", None, "ok"),
+    # 跨执行维度趋势端点：矩阵任务无执行记录且 result 为 NULL → 空列表 200
+    ("task_result_dimension_trend", "GET", "/evaluation/results/{task_id}/dimension-trend", None, "ok"),
+    # 单版全量结果端点：版本不存在时归属放行后 404，同属 non403 口径
+    ("task_result_history_version", "GET", "/evaluation/results/{task_id}/history/999", None, "non403"),
     ("task_run", "POST", "/evaluation/tasks/{task_id}/run", None, "non403"),
     # ---- 数据集族（dataset_api）----
     ("dataset_detail", "GET", "/evaluation/datasets/{dataset_id}", None, "ok"),

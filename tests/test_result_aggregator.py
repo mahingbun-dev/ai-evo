@@ -113,6 +113,49 @@ class TestFormatItemsJudgeDetails:
         assert "evaluation_target_name" in jd
         assert jd["dimension_scores"] == {"维度A": 8.0, "维度B": 7.5}
 
+    def test_judge_details_dimension_feedbacks(self):
+        """judge_details 投影携带 dimension_feedbacks（新裁判输出才有）"""
+        aggregator = ResultAggregator()
+        results = [
+            {
+                "idx": 0,
+                "model_output": "输出",
+                "average_score": 8.0,
+                "judge_scores": [
+                    {
+                        "score": 8.0,
+                        "feedback": "好",
+                        "dimension_scores": {"维度A": 8.0},
+                        "dimension_feedbacks": {"维度A": "内容准确"},
+                    }
+                ],
+                "feedback": "综合",
+                "dimension_scores": {},
+                "user_input": "",
+            }
+        ]
+        items = aggregator._format_items(results)
+        assert items[0]["judge_details"][0]["dimension_feedbacks"] == {"维度A": "内容准确"}
+
+    def test_judge_details_dimension_feedbacks_missing_compat(self):
+        """旧 judge_scores 无 dimension_feedbacks 时投影为 None，链路不报错"""
+        aggregator = ResultAggregator()
+        results = [
+            {
+                "idx": 0,
+                "model_output": "输出",
+                "average_score": 8.0,
+                "judge_scores": [
+                    {"score": 8.0, "feedback": "好", "dimension_scores": {"维度A": 8.0}}
+                ],
+                "feedback": "综合",
+                "dimension_scores": {},
+                "user_input": "",
+            }
+        ]
+        items = aggregator._format_items(results)
+        assert items[0]["judge_details"][0]["dimension_feedbacks"] is None
+
 
 class TestFormatItemsModelRawResponse:
     """测试 _format_items 方法的 model_raw_response 和 input_data 字段"""
@@ -156,6 +199,76 @@ class TestFormatItemsModelRawResponse:
 
         assert items[0]["model_raw_response"] == ""
         assert items[0]["input_data"] == ""
+
+
+class TestFormatFailedItems:
+    """测试 _format_failed_items 失败行上下文补齐"""
+
+    def test_failed_item_carries_context(self):
+        """失败行平铺输入变量并携带 model_output 与 row_status"""
+        aggregator = ResultAggregator()
+        results = [
+            {
+                "idx": 3,
+                "success": False,
+                "error": "脚本执行失败",
+                "model_output": "部分输出",
+                "row_status": "pre_script_failed",
+                "question": "什么是 FastAPI？",
+                "ref_answer": "一个现代 Web 框架",
+                "judge_scores": [{"score": None, "judge_failed": True}],
+                "judge_details": [{"judge_index": 0, "score": None}],
+            }
+        ]
+        items = aggregator._format_failed_items(results)
+        assert len(items) == 1
+        item = items[0]
+        assert item["success"] is False
+        assert item["error"] == "脚本执行失败"
+        assert item["model_output"] == "部分输出"
+        assert item["row_status"] == "pre_script_failed"
+        # 输入变量平铺（与 _format_items 同口径）
+        assert item["question"] == "什么是 FastAPI？"
+        assert item["ref_answer"] == "一个现代 Web 框架"
+        # 结构化键不平铺
+        assert "judge_scores" not in item
+        assert "judge_details" not in item
+
+    def test_failed_item_defaults_and_none_skip(self):
+        """缺省兜底：model_output 空串、row_status 默认 failed、None 值与下划线键不平铺"""
+        aggregator = ResultAggregator()
+        results = [
+            {
+                "idx": 0,
+                "success": False,
+                "error": "boom",
+                "model_output": None,
+                "internal_note": None,   # None 值 → 不平铺
+                "_secret": "x",          # 下划线开头 → 不平铺
+                "user_input": "输入",
+            }
+        ]
+        items = aggregator._format_failed_items(results)
+        item = items[0]
+        assert item["model_output"] == ""
+        assert item["row_status"] == "failed"
+        assert item["user_input"] == "输入"
+        assert "internal_note" not in item
+        assert "_secret" not in item
+
+    def test_failed_item_keeps_pre_script_results(self):
+        """on_fail=abort 失败行保留 pre_script_results（既有行为不回归）"""
+        aggregator = ResultAggregator()
+        results = [
+            {
+                "idx": 0,
+                "success": False,
+                "error": "abort",
+                "pre_script_results": [{"script": "s1", "success": False}],
+            }
+        ]
+        items = aggregator._format_failed_items(results)
+        assert items[0]["pre_script_results"] == [{"script": "s1", "success": False}]
 
 
 class TestExportBatchJudgeExpand:
@@ -265,6 +378,72 @@ class TestExportBatchJudgeExpand:
 
         assert len(df) == 2
         assert df["题目序号"].tolist() == [1, 2]
+
+
+class TestRowIndexSemantics:
+    """行序号取值口径（_row_index / _format_items / _format_failed_items）
+
+    背景：judge/agent 默认执行路径曾有 payload 缺 idx 的回归（执行器
+    payload.get("idx", 0) 兜底），历史脏数据全部行 idx=0 入库；行级表
+    重建行（load_execution_results）注入的 _orig_idx 是唯一可信行身份。
+    """
+
+    def setup_method(self):
+        self.aggregator = ResultAggregator()
+
+    def test_row_index_prefers_orig_idx_over_stale_idx(self):
+        """行级表重建行：row_result JSON 带历史脏 idx=0，但 _orig_idx 正确——以 _orig_idx 为准"""
+        from app.services.result_aggregator import _row_index
+
+        assert _row_index({"_orig_idx": 5, "idx": 0}, 99) == 5
+
+    def test_row_index_falls_back_to_idx(self):
+        """无行身份（旧内存直调）回退 result 自带 idx"""
+        from app.services.result_aggregator import _row_index
+
+        assert _row_index({"idx": 3}, 99) == 3
+
+    def test_row_index_falls_back_to_enumerate(self):
+        """idx 也缺失时回退枚举序号"""
+        from app.services.result_aggregator import _row_index
+
+        assert _row_index({}, 7) == 7
+
+    def test_row_index_guards_non_int_values(self):
+        """_orig_idx / idx 为非整数（脏值）时逐级回退，不抛错"""
+        from app.services.result_aggregator import _row_index
+
+        assert _row_index({"_orig_idx": "3", "idx": 2}, 9) == 2
+        assert _row_index({"_orig_idx": None, "idx": "x"}, 9) == 9
+        assert _row_index(None, 4) == 4
+
+    def test_format_items_uses_orig_idx_for_rebuilt_rows(self):
+        """_format_items：行级表重建行（idx=0 脏数据 + _orig_idx 正确）序号不再全为 0"""
+        results = [
+            {"_orig_idx": 0, "idx": 0, "success": True, "model_output": "o0"},
+            {"_orig_idx": 1, "idx": 0, "success": True, "model_output": "o1"},
+            {"_orig_idx": 2, "idx": 0, "success": True, "model_output": "o2"},
+        ]
+        items = self.aggregator._format_items(results)
+        assert [it["idx"] for it in items] == [0, 1, 2]
+
+    def test_format_items_without_row_identity_keeps_legacy_behavior(self):
+        """无 _orig_idx 的旧行回退 idx/枚举——既有单测与直调链路零行为变化"""
+        results = [
+            {"idx": 4, "success": True, "model_output": "o4"},
+            {"success": True, "model_output": "o5"},
+        ]
+        items = self.aggregator._format_items(results)
+        assert [it["idx"] for it in items] == [4, 1]
+
+    def test_format_failed_items_uses_orig_idx(self):
+        """_format_failed_items 与 _format_items 同口径"""
+        results = [
+            {"_orig_idx": 6, "idx": 0, "success": False, "error": "boom"},
+            {"_orig_idx": 3, "idx": 0, "success": False, "error": "bang"},
+        ]
+        items = self.aggregator._format_failed_items(results)
+        assert [it["idx"] for it in items] == [6, 3]
 
 
 if __name__ == "__main__":

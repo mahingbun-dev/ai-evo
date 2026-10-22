@@ -136,6 +136,8 @@ class TestCreateTaskAgentType:
         try:
             service.create_task(
                 name="普通裁判", evaluation_type="judge", dataset_id=None,
+                # judge + 模型调用来源必须有被评测模型（新的模型输出校验）
+                model_provider="m1",
                 evaluation_targets=_targets(),
             )
             assert db.add.called

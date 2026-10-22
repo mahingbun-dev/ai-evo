@@ -458,6 +458,56 @@ class TestPruneImages:
 
         assert "保留" in logf.getvalue()
 
+    def test_rmi_timeout_keeps_image_without_failing(self, tmp_path, monkeypatch):
+        """docker rmi 超时（部署机高负载）只跳过该镜像，不抛异常
+
+        实测 pipeline #513833：rmi 卡满 120s 抛 TimeoutExpired 冒泡到部署主流程，
+        把已经成功的部署判成 failed
+        """
+        import subprocess as sp
+
+        self._setup(tmp_path, monkeypatch)
+        monkeypatch.setattr(bs, "KEEP_RELEASES", 1)
+        monkeypatch.setattr(bs, "ENV_FILE", tmp_path / "absent.env")
+        removed = []
+
+        def fake_run(cmd, **kwargs):
+            if cmd[1] == "images":
+                out = ("sha_b\t2026-09-14 10:00:00\n"
+                       "sha_a\t2026-09-14 09:00:00\n"
+                       "sha_0\t2026-09-14 08:00:00\n")
+                return sp.CompletedProcess(cmd, 0, out, "")
+            if cmd[1] == "rmi":
+                if cmd[-1].endswith(":sha_a"):
+                    raise sp.TimeoutExpired(cmd, 120)
+                removed.append(cmd[-1])
+            return sp.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr(bs.subprocess, "run", fake_run)
+        logf = io.StringIO()
+        bs.prune_images(logf)  # 不应抛异常
+
+        assert "超时" in logf.getvalue()
+        # 超时的镜像被跳过，后面的镜像继续清理
+        assert removed == [f"{bs.IMAGE_NAME}:sha_0"]
+
+    def test_images_query_timeout_skips_prune(self, tmp_path, monkeypatch):
+        """docker images 本身超时时跳过本轮清理（清理是收尾动作，不阻断部署）"""
+        import subprocess as sp
+
+        self._setup(tmp_path, monkeypatch)
+        monkeypatch.setattr(bs, "KEEP_RELEASES", 1)
+        monkeypatch.setattr(bs, "ENV_FILE", tmp_path / "absent.env")
+
+        def fake_run(cmd, **kwargs):
+            raise sp.TimeoutExpired(cmd, 120)
+
+        monkeypatch.setattr(bs.subprocess, "run", fake_run)
+        logf = io.StringIO()
+        bs.prune_images(logf)  # 不应抛异常
+
+        assert "跳过本轮清理" in logf.getvalue()
+
 
 # ======================================================================
 # 构建工作区的 remote 名（曾导致「第二次构建必失败」）
@@ -747,8 +797,10 @@ class TestDeployMarker:
 
 class TestResolveDeployTag:
     def test_explicit_tag_wins(self):
-        tag, commit = bs._resolve_deploy_tag(bs.DeployReq(tag="abc12345"))
+        tag, commit, mode = bs._resolve_deploy_tag(bs.DeployReq(tag="abc12345"))
         assert tag == "abc12345"
+        # 显式 tag（回滚）一律走全量路径
+        assert mode == "full"
 
     def test_rejects_unknown_job(self):
         from fastapi import HTTPException
@@ -777,9 +829,20 @@ class TestResolveDeployTag:
         bs.set_job(job["job_id"], status="success",
                    result={"tag": "deadbee1", "commit": "full-sha"})
 
-        tag, commit = bs._resolve_deploy_tag(bs.DeployReq(job_id=job["job_id"]))
+        tag, commit, mode = bs._resolve_deploy_tag(bs.DeployReq(job_id=job["job_id"]))
         assert tag == "deadbee1"
         assert commit == "full-sha"
+        # 历史构建记录没有 mode 字段，缺省按全量处理
+        assert mode == "full"
+
+    def test_resolves_frontend_mode_from_build_job(self):
+        job = bs.new_job("build", {})
+        bs.set_job(job["job_id"], status="success",
+                   result={"tag": "frontend-deadbee1", "commit": "full-sha",
+                           "mode": "frontend"})
+
+        tag, commit, mode = bs._resolve_deploy_tag(bs.DeployReq(job_id=job["job_id"]))
+        assert mode == "frontend"
 
     def test_requires_job_or_tag(self):
         from fastapi import HTTPException
@@ -926,3 +989,92 @@ class TestVerifyDeployAlert:
 def test_health_url_defaults_to_deep_health():
     """W13：探活 URL 从恒 200 的 auth/status 切换为深健康检查"""
     assert bs.HEALTH_URL.endswith("/api/v1/health/deep")
+
+
+# ======================================================================
+# 部署内自动迁移（run_db_migrations，2026-10-15 事故门禁化）
+# ======================================================================
+
+def _mig_proc(code=0, out="", err=""):
+    import subprocess
+    return subprocess.CompletedProcess(args=[], returncode=code, stdout=out, stderr=err)
+
+
+class TestRunDbMigrations:
+    def test_success_single_compose_exec(self, monkeypatch):
+        """成功路径：恰好一次 compose exec api alembic upgrade head"""
+        calls = []
+
+        def fake_compose(*args, **kwargs):
+            calls.append(args)
+            assert kwargs.get("timeout") == bs.MIGRATE_TIMEOUT
+            return _mig_proc(out="Running upgrade a -> b\n")
+
+        monkeypatch.setattr(bs, "compose", fake_compose)
+        logf = io.StringIO()
+        bs.run_db_migrations(logf)
+
+        assert calls == [("exec", "-T", "api", "alembic", "upgrade", "head")]
+        assert "数据库迁移完成" in logf.getvalue()
+        assert "Running upgrade a -> b" in logf.getvalue()
+
+    def test_transient_failure_retries_then_succeeds(self, monkeypatch):
+        """exec 偶发失败（撞容器启动窗口）：重试后成功，不抛异常"""
+        results = [_mig_proc(code=1, err="container not running"), _mig_proc()]
+        calls = []
+
+        def fake_compose(*args, **kwargs):
+            calls.append(args)
+            return results[len(calls) - 1]
+
+        monkeypatch.setattr(bs, "compose", fake_compose)
+        monkeypatch.setattr(bs.time, "sleep", lambda s: None)
+        logf = io.StringIO()
+        bs.run_db_migrations(logf)
+
+        assert len(calls) == 2
+        assert "数据库迁移完成" in logf.getvalue()
+
+    def test_persistent_failure_raises_after_three_attempts(self, monkeypatch):
+        """持续失败：恰好重试 3 次后抛 RuntimeError（终止部署）"""
+        calls = []
+
+        def fake_compose(*args, **kwargs):
+            calls.append(args)
+            return _mig_proc(code=1, err="connection refused")
+
+        monkeypatch.setattr(bs, "compose", fake_compose)
+        monkeypatch.setattr(bs.time, "sleep", lambda s: None)
+
+        with pytest.raises(RuntimeError, match="连续 3 次失败"):
+            bs.run_db_migrations(io.StringIO())
+        assert len(calls) == 3
+
+    def test_timeout_counts_as_failure(self, monkeypatch):
+        """compose 超时也算失败：重试耗尽后抛 RuntimeError"""
+        import subprocess
+
+        def fake_compose(*args, **kwargs):
+            raise subprocess.TimeoutExpired(cmd="docker compose exec", timeout=1)
+
+        monkeypatch.setattr(bs, "compose", fake_compose)
+        monkeypatch.setattr(bs.time, "sleep", lambda s: None)
+
+        with pytest.raises(RuntimeError, match="迁移超时"):
+            bs.run_db_migrations(io.StringIO())
+
+
+class TestDeployThreadMigrationWiring:
+    def test_migrations_run_between_compose_up_and_verify(self):
+        """迁移步骤必须夹在 compose up 与 verify 之间——
+
+        verify 的 health/deep 探针依赖迁移已完成，顺序错了事故复现。
+        """
+        import inspect
+
+        src = inspect.getsource(bs.run_deploy_thread)
+        up_pos = src.index('compose("up"')
+        mig_pos = src.index("run_db_migrations(lf)")
+        verify_pos = src.index("verify_deploy_with_alert(lf")
+        assert up_pos < mig_pos < verify_pos, \
+            "数据库迁移必须在 compose up 之后、verify 之前执行"

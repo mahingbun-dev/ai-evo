@@ -8,7 +8,10 @@ ai-evo 构建服务（build-service）
 
 常驻容器运行在部署机上（默认 :8180），职责：
   1. build   ：在 ai-evo-builder 容器内离线构建前端 dist 与应用镜像
-  2. deploy  ：同步 docker-compose.yml，更新 .env 的 IMAGE_TAG，compose up -d 并校验
+     （变更相对线上已部署 commit 全部落在 frontend/ 内时只构建 dist）
+  2. deploy  ：同步 docker-compose.yml，更新 .env 的 IMAGE_TAG，compose up
+     （worker 除外，由 swap_worker 单独非阻塞换代）并校验；
+     前端-only 模式只同步 nginx 静态根，不动容器
   3. rollback：回退到某个历史镜像 tag（不重新构建）
   4. jobs    ：异步任务状态与日志查询（GitLab CI 轮询用）
 
@@ -20,6 +23,8 @@ ai-evo 构建服务（build-service）
 只负责调用本服务；真正的构建在一个预烘焙好工具链的容器里完成，依赖全部
 来自离线快照。CI 侧只做 curl + 轮询，与本服务的实现细节解耦。
 """
+# norm-exempt: attach-truncation —— 下方 [:N] 是部署日志/子进程错误消息限长，不是 allure 证据附件
+# norm-exempt: keyword-reuse —— 本模块是部署服务，不涉及用例 UI 操作与知识库关键字
 
 import base64
 import hashlib
@@ -99,9 +104,25 @@ HEALTH_URL = CFG.get("deploy", {}).get("health_url", "http://127.0.0.1:8100/api/
 FRONTEND_ROOT = CFG.get("deploy", {}).get("frontend_root", "")
 FRONTEND_BACKUPS = int(CFG.get("deploy", {}).get("keep_frontend_backups", 3))
 KEEP_RELEASES = int(CFG.get("deploy", {}).get("keep_releases", 5))
+# worker 优雅换代参数（swap_worker，见对应函数说明）：
+#   DRAIN_WAIT_SEC        流水线内等旧 worker 退出的短窗口，超时转入后台 watcher
+#   DRAIN_FORCE_KILL_SEC  watcher 强制回收上限（2h celery task_time_limit + 缓冲）
+DRAIN_WAIT_SEC = int(CFG.get("deploy", {}).get("drain_wait_sec", 120))
+DRAIN_FORCE_KILL_SEC = int(CFG.get("deploy", {}).get("drain_force_kill_sec", 7500))
+# worker 容器名（docker-compose.yml 的 container_name，与 ensure_worker.sh 同口径）
+WORKER_CONTAINER = "ai-evo-worker"
+# 「线上已部署 commit」记录：部署成功（含前端-only 与回滚）后写入，作为下次构建
+# 「前端-only 判定」的 diff 基线。不复用 releases 记录——release 记录在 build
+# 成功时就写入，若那次部署失败，基线会虚高、后续判定会漏掉未部署的后端变更。
+DEPLOYED_REF = DATA_DIR / "deployed_commit"
+# 前端-only 判定路径前缀：相对已部署基线的变更全部落在该前缀内时，
+# 跳过应用镜像构建与容器重建，仅同步前端静态资源
+FRONTEND_PREFIX = "frontend/"
 
 BUILD_TIMEOUT = int(CFG.get("timeouts", {}).get("build_sec", 3600))
 DEPLOY_TIMEOUT = int(CFG.get("timeouts", {}).get("deploy_sec", 1800))
+# 迁移步骤超时：常规增量迁移秒级，给 5 分钟余量覆盖大表 ALTER 等慢迁移
+MIGRATE_TIMEOUT = int(CFG.get("timeouts", {}).get("migrate_sec", 300))
 
 # 构建后镜像漏洞扫描门禁（ARCH-3-3，设计 §3 Phase 3 表 3-3 行：CI 加 trivy
 # 镜像扫描——本服务是企业 GitLab 线的等价构建钩子，GitLab runner 只 curl
@@ -128,6 +149,7 @@ GL_DT_USER = CFG.get("gitlab", {}).get("deploy_token_user", "")
 GL_DT_PASS = CFG.get("gitlab", {}).get("deploy_token_pass", "")
 GL_SNAPSHOT_PKG = CFG.get("gitlab", {}).get("snapshot_package", "ai-evo-offline-snapshot")
 GL_CLAUDE_PKG = CFG.get("gitlab", {}).get("claude_package", "ai-evo-claude-bin")
+GL_GIT_PKG = CFG.get("gitlab", {}).get("git_package", "ai-evo-git-bin")
 
 LOGS_DIR = DATA_DIR / "logs"
 RELEASES_DIR = DATA_DIR / "releases"
@@ -323,7 +345,8 @@ def checkout_ref(branch: str, sha: Optional[str]) -> str:
     git("clean", "-fdx",
         "--exclude=.wheels", "--exclude=.pnpm-store", "--exclude=.build-progress.json",
         "--exclude=.snapshot-version",
-        "--exclude=claude-local", "--exclude=.claude-bin-version")
+        "--exclude=claude-local", "--exclude=.claude-bin-version",
+        "--exclude=git-local", "--exclude=.git-bin-version")
     head = git("rev-parse", "HEAD")
     log.info("构建工作区已检出: %s", head)
     return head
@@ -491,6 +514,67 @@ def ensure_claude_bin(logf) -> None:
     logf.write(f"[claude] 就位完成（claude {spec.get('claude_version', '')}）\n")
 
 
+def ensure_git_bin(logf) -> None:
+    """确保工作区里有离线 git 运行时（插件市场 git 克隆的 COPY 输入）
+
+    与 ensure_claude_bin 同款机制：运行镜像基础 python:3.12-slim 不含 git，
+    构建机（部署机）无外网 apt 源。开发机跑 tools/prepare-git-bin.sh 生成
+    git-bin.tar.gz（git-local/ 树）上传 GitLab Packages，版本与 sha256 记录
+    在仓库 tools/git-bin.json；本函数在构建前把 git-local/ 就位（工作区标记
+    .git-bin-version 判断是否需要下载）。
+
+    升级 git：开发机重跑 tools/prepare-git-bin.sh → 上传 → 更新 git-bin.json
+    提交，服务器构建时自动下载新版本。
+    """
+    spec_file = BUILD_WS / "tools" / "git-bin.json"
+    if not spec_file.exists():
+        raise RuntimeError(f"缺少 {spec_file}（git 离线安装清单），无法构建应用镜像")
+    spec = json.loads(spec_file.read_text())
+    version = str(spec.get("version", "")).strip()
+    sha256_expected = str(spec.get("sha256", "")).strip()
+    if not version or not sha256_expected:
+        raise RuntimeError("tools/git-bin.json 缺少 version 或 sha256 字段")
+
+    stamp = BUILD_WS / ".git-bin-version"
+    bin_path = BUILD_WS / "git-local" / "bin" / "git"
+    if stamp.exists() and stamp.read_text().strip() == version and bin_path.exists():
+        logf.write(f"[git] 已就位（git {spec.get('git_version', version)}），跳过下载\n")
+        return
+
+    base = (f"{GL_HOST}/api/v4/projects/{GL_PROJECT}"
+            f"/packages/generic/{GL_GIT_PKG}/{version}")
+    auth = base64.b64encode(f"{GL_DT_USER}:{GL_DT_PASS}".encode()).decode()
+    headers = {"Authorization": f"Basic {auth}"}
+
+    work = Path("/tmp/git-bin-" + version)
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True)
+    tarball = work / "git-bin.tar.gz"
+
+    logf.write(f"[git] 下载 git-bin.tar.gz (version={version})\n")
+    req = urllib.request.Request(f"{base}/git-bin.tar.gz", headers=headers)
+    with urllib.request.urlopen(req, timeout=1800) as r, open(tarball, "wb") as f:
+        while True:
+            chunk = r.read(1 << 22)
+            if not chunk:
+                break
+            f.write(chunk)
+
+    digest = _sha256_file(tarball)
+    if digest != sha256_expected:
+        raise RuntimeError(f"git-bin 校验失败 sha256 {digest} != {sha256_expected}")
+    logf.write("[git] sha256 校验通过，解压中...\n")
+    with tarfile.open(tarball, "r:gz") as tar:
+        for m in tar:
+            tar.extract(m, BUILD_WS, filter="data")
+    shutil.rmtree(work, ignore_errors=True)
+
+    if not bin_path.exists():
+        raise RuntimeError("git-bin.tar.gz 解压后缺少 git-local/bin/git")
+    stamp.write_text(version + "\n", encoding="utf-8")
+    logf.write(f"[git] 就位完成（git {spec.get('git_version', '')}）\n")
+
+
 # ------------------------------------------------------------------
 # build
 # ------------------------------------------------------------------
@@ -566,10 +650,19 @@ def scan_image(image_ref: str, logf) -> None:
     logf.write(f"[scan] 扫描通过，无 {SCAN_SEVERITY} 级（有修复版本的）漏洞: {image_ref}\n")
 
 
-def run_build_thread(job_id: str, branch: str, sha: Optional[str]):
+def run_build_thread(job_id: str, branch: str, sha: Optional[str], force_mode: str = "auto"):
     try:
         set_job(job_id, status="running", stage="checkout", progress=2, message="拉取源码...")
         head = checkout_ref(branch, sha)
+
+        # 变更分类：相对线上已部署 commit 判定是否前端-only（force_mode=full 可绕过）
+        if force_mode == "full":
+            mode = "full"
+        else:
+            baseline = latest_deployed_commit()
+            mode = classify_change(baseline, head)
+        log.info("build %s: mode=%s（基线 %s）",
+                 job_id, mode, latest_deployed_commit()[:8] or "无")
 
         set_job(job_id, stage="snapshot", progress=5, message="校验离线快照...")
         ready, snap_version = check_offline_snapshot()
@@ -588,24 +681,32 @@ def run_build_thread(job_id: str, branch: str, sha: Optional[str]):
                 sync_offline_snapshot(snap_version, lf)
 
         with open(job_log_path(job_id), "a") as lf:
-            ensure_claude_bin(lf)
+            if mode == "full":
+                ensure_claude_bin(lf)
+                ensure_git_bin(lf)
+            else:
+                lf.write("[frontend-only] 跳过 claude/git bin 就位（仅应用镜像构建需要）\n")
 
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         board_file = BUILD_WS / ".build-progress.json"
         board_file.unlink(missing_ok=True)
 
-        set_job(job_id, stage="build", progress=8, message="在 builder 容器内构建...")
+        build_hint = "在 builder 容器内构建..." if mode == "full" else "在 builder 容器内构建前端..."
+        set_job(job_id, stage="build", progress=8, message=build_hint)
         with open(job_log_path(job_id), "a") as lf:
             lf.write(f"$ docker run {BUILDER_IMAGE} bash /workspace/tools/build-in-container.sh\n")
             lf.flush()
+            run_cmd = ["docker", "run", "--rm", "--name", f"ai-evo-build-{job_id}",
+                       "-v", f"{BUILD_WS}:/workspace",
+                       "-v", "/var/run/docker.sock:/var/run/docker.sock",
+                       "-v", f"{CACHE_DIR}:/cache",
+                       "-e", f"BUILD_SHA={head}",
+                       "-e", f"IMAGE_NAME={IMAGE_NAME}"]
+            if mode == "frontend":
+                run_cmd += ["-e", "BUILD_FRONTEND_ONLY=1"]
+            run_cmd += [BUILDER_IMAGE, "bash", "/workspace/tools/build-in-container.sh"]
             proc = subprocess.Popen(
-                ["docker", "run", "--rm", "--name", f"ai-evo-build-{job_id}",
-                 "-v", f"{BUILD_WS}:/workspace",
-                 "-v", "/var/run/docker.sock:/var/run/docker.sock",
-                 "-v", f"{CACHE_DIR}:/cache",
-                 "-e", f"BUILD_SHA={head}",
-                 "-e", f"IMAGE_NAME={IMAGE_NAME}",
-                 BUILDER_IMAGE, "bash", "/workspace/tools/build-in-container.sh"],
+                run_cmd,
                 stdout=lf, stderr=subprocess.STDOUT,
             )
             deadline = time.time() + BUILD_TIMEOUT
@@ -622,11 +723,18 @@ def run_build_thread(job_id: str, branch: str, sha: Optional[str]):
         if rc != 0:
             raise RuntimeError(f"构建脚本退出码 {rc}，详见日志")
 
-        image_file = BUILD_WS / ".build-image"
-        if not image_file.exists():
-            raise RuntimeError("构建结束但未找到 .build-image（镜像 tag）")
-        image = image_file.read_text().strip()
-        image_tag = image.split(":")[-1]
+        if mode == "frontend":
+            dist_index = BUILD_WS / "frontend" / "dist" / "index.html"
+            if not dist_index.exists():
+                raise RuntimeError("前端构建结束但未找到 dist/index.html")
+            image = ""
+            image_tag = f"frontend-{head[:8]}"
+        else:
+            image_file = BUILD_WS / ".build-image"
+            if not image_file.exists():
+                raise RuntimeError("构建结束但未找到 .build-image（镜像 tag）")
+            image = image_file.read_text().strip()
+            image_tag = image.split(":")[-1]
 
         # ARCH-3-3：漏洞门禁在写 release 记录**之前**——扫描不过的镜像
         # 不进可部署/可回滚列表（job 亦 failed，_resolve_deploy_tag 拒绝）
@@ -636,7 +744,8 @@ def run_build_thread(job_id: str, branch: str, sha: Optional[str]):
 
         record = {
             "image": image, "tag": image_tag, "commit": head,
-            "branch": branch, "built_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "branch": branch, "mode": mode,
+            "built_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
         (RELEASES_DIR / f"{image_tag}.json").write_text(json.dumps(record, indent=2))
         prune_releases()
@@ -644,7 +753,7 @@ def run_build_thread(job_id: str, branch: str, sha: Optional[str]):
         set_job(job_id, status="success", stage="done", progress=100,
                 finished_at=time.time(), message="构建完成",
                 result=record)
-        log.info("build %s 成功: %s", job_id, image)
+        log.info("build %s 成功: %s (mode=%s)", job_id, image or image_tag, mode)
     except Exception as e:
         log.exception("build %s 失败", job_id)
         set_job(job_id, status="failed", stage="error", finished_at=time.time(),
@@ -658,6 +767,58 @@ def prune_releases():
     records = sorted(RELEASES_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime)
     for old in records[:-KEEP_RELEASES]:
         old.unlink(missing_ok=True)
+
+
+def mark_deployed(commit: str) -> None:
+    """部署成功后记录「线上已部署 commit」（前端-only 判定的 diff 基线）
+
+    写失败不影响部署本身——最坏情况是下次构建退化为全量。
+    """
+    if not commit:
+        return
+    try:
+        tmp = DEPLOYED_REF.with_suffix(".tmp")
+        tmp.write_text(commit + "\n", encoding="utf-8")
+        tmp.replace(DEPLOYED_REF)
+    except OSError as e:
+        log.warning("写已部署 commit 记录失败（不影响部署）: %s", e)
+
+
+def latest_deployed_commit() -> str:
+    """读「线上已部署 commit」；文件缺失/损坏时返回空串（安全默认全量构建）"""
+    try:
+        return DEPLOYED_REF.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        # UnicodeDecodeError 是 ValueError 不是 OSError：基线文件被二进制
+        # 内容污染时若不捕获，后续每次构建都会永久失败而不是退化为全量
+        return ""
+
+
+def classify_change(baseline: str, head: str) -> str:
+    """判定本次变更是否前端-only，返回 "frontend" 或 "full"
+
+    判定基准是**线上已部署 commit**（而不是 MR 相对目标分支的 diff）：
+    语义是「相对线上正在运行的版本改了什么」，能兜住「前序后端 MR 部署
+    失败后、紧跟的前端 MR 把后端变更漏掉不部署」的场景。
+
+    任何不确定情况（无基线、diff 失败）一律按 full 处理——误判为 full
+    只是多做一次镜像构建，误判为 frontend 会漏部署后端变更。
+    """
+    if not baseline:
+        return "full"
+    r = subprocess.run(
+        ["git", "-C", str(BUILD_WS), "diff", "--name-only", baseline, head],
+        capture_output=True, text=True, timeout=120,
+    )
+    if r.returncode != 0:
+        log.info("diff %s..%s 失败（%s），按全量构建处理",
+                 baseline[:8], head[:8], r.stderr.strip()[:200])
+        return "full"
+    changed = [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+    if not changed:
+        # 与线上同一 commit 的重复构建：无变更，按前端-only 同步一次 dist 即可
+        return "frontend"
+    return "frontend" if all(p.startswith(FRONTEND_PREFIX) for p in changed) else "full"
 
 
 def current_image_tag() -> str:
@@ -684,10 +845,15 @@ def prune_images(logf) -> None:
     if KEEP_RELEASES <= 0:
         return
 
-    r = subprocess.run(
-        ["docker", "images", IMAGE_NAME, "--format", "{{.Tag}}\t{{.CreatedAt}}"],
-        capture_output=True, text=True, timeout=120,
-    )
+    try:
+        r = subprocess.run(
+            ["docker", "images", IMAGE_NAME, "--format", "{{.Tag}}\t{{.CreatedAt}}"],
+            capture_output=True, text=True, timeout=120,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        # 清理是收尾动作：docker daemon 繁忙时超时不应让已成功的部署被判失败
+        logf.write(f"[prune] docker images 超时/失败，跳过本轮清理: {e}\n")
+        return
     if r.returncode != 0:
         logf.write(f"[prune] docker images 失败: {r.stderr[:200]}\n")
         return
@@ -714,8 +880,18 @@ def prune_images(logf) -> None:
     for tag, _ in rows:
         if tag in protected or not tag:
             continue
-        rm = subprocess.run(["docker", "rmi", f"{IMAGE_NAME}:{tag}"],
-                            capture_output=True, text=True, timeout=120)
+        try:
+            rm = subprocess.run(["docker", "rmi", f"{IMAGE_NAME}:{tag}"],
+                                capture_output=True, text=True, timeout=120)
+        except subprocess.TimeoutExpired:
+            # 部署机高负载时 docker rmi 可能长时间不返回（实测 pipeline #513833
+            # 120s 超时直接判 deploy 失败，而部署本体早已成功）。清理失败只影响
+            # 磁盘占用，保留镜像继续下一个
+            logf.write(f"[prune] 删除 {IMAGE_NAME}:{tag} 超时（>120s），保留该镜像\n")
+            continue
+        except OSError as e:
+            logf.write(f"[prune] 删除 {IMAGE_NAME}:{tag} 失败，保留该镜像（{e}）\n")
+            continue
         if rm.returncode == 0:
             logf.write(f"[prune] 已删除旧镜像 {IMAGE_NAME}:{tag}\n")
         else:
@@ -787,6 +963,251 @@ def compose(*args: str, timeout: int = 600) -> subprocess.CompletedProcess:
         ["docker", "compose", "--project-directory", str(DEPLOY_DIR), *args],
         capture_output=True, text=True, timeout=timeout,
     )
+
+
+def run_db_migrations(logf) -> None:
+    """部署内自动数据库迁移：api 容器内 alembic upgrade head
+
+    health/deep 的 migrations 探针会比对 alembic_version 与代码 heads，
+    新增迁移后不升级必然 503（2026-10-14 W19 f1a9c5e3b7d2、2026-10-15
+    b3c9d7e2f1a4 两次同型事故，都要部署完手动补迁移再重跑 job）。因此把
+    升级放进部署流程，在 compose up 之后、verify 之前执行。失败重试 3 次
+    （exec 偶发撞上容器启动窗口；迁移本身幂等，重试安全），仍失败则终止
+    部署——不让 verify 阶段用 2 分钟探活重试慢速暴露同一个问题。
+    """
+    last_err = ""
+    for attempt in range(1, 4):
+        logf.write(f"[migrate] $ docker compose exec -T api alembic upgrade head（第 {attempt} 次）\n")
+        logf.flush()
+        try:
+            mig = compose("exec", "-T", "api", "alembic", "upgrade", "head",
+                          timeout=MIGRATE_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            last_err = f"迁移超时（>{MIGRATE_TIMEOUT}s）"
+            logf.write(f"[migrate] {last_err}\n")
+            logf.flush()
+            time.sleep(5)
+            continue
+        logf.write(mig.stdout or "")
+        if mig.stderr:
+            logf.write(mig.stderr)
+        logf.flush()
+        if mig.returncode == 0:
+            logf.write("[migrate] 数据库迁移完成\n")
+            return
+        last_err = (mig.stderr or mig.stdout or "").strip()[-500:]
+        logf.write(f"[migrate] 退出码 {mig.returncode}：{last_err}\n")
+        logf.flush()
+        time.sleep(5)
+    raise RuntimeError(f"alembic upgrade head 连续 3 次失败：{last_err}")
+
+
+# ------------------------------------------------------------------
+# worker 非阻塞优雅换代
+#
+# 旧编排 `docker compose up -d`（全家）重建 worker 时先 stop 旧容器，
+# celery warm shutdown 要等当前任务跑完（stop_grace_period 7200s），整个
+# compose up 与部署流水线被阻塞最长 2 小时。新编排把 worker 从 compose up
+# 里拆出来单独处理（swap_worker）：
+#   1. compose up 只重建除 worker 外的受管服务（秒级，旧 worker 不动）
+#   2. 对旧 worker 发 SIGTERM（docker kill --signal=TERM 立即返回）——
+#      celery warm shutdown：停止接新任务、跑完当前任务后自行退出
+#   3. 流水线内短等 DRAIN_WAIT_SEC，退出则立即拉起新 worker（fast path）
+#   4. 未退出（有长任务）转后台 watcher：旧容器退出后拉起新 worker，
+#      超过 DRAIN_FORCE_KILL_SEC 强杀+告警；流水线立即成功结束，
+#      排队任务由 Redis 暂存、新 worker 就绪后接手
+# cron 的 ensure_worker.sh（每 5 分钟）是第二层兜底：drain 期间旧容器仍在
+# docker ps 里它不会介入；旧容器退出后它同样能把新 worker 拉起来。
+# ------------------------------------------------------------------
+
+# watcher 内联脚本（build-service 容器内脱离部署线程运行）。
+# 用法: python3 -c <script> <old_container_id> <deploy_dir> <force_kill_sec>
+#                     <worker_name> <alerts_log> <drain_log>
+# 按容器 ID 盯旧容器而不是按名字：compose 换代会删旧起新、名字不变，
+# 若 cron 在 watcher 轮询间隙抢先换代，按名字盯会误判「仍在运行」而死循环。
+WORKER_WATCHER_SCRIPT = r'''
+import json, os, subprocess, sys, time, urllib.request
+
+old_id, deploy_dir, force_kill_sec, worker_name, alerts_log, drain_log = sys.argv[1:7]
+force_kill_sec = float(force_kill_sec)
+
+def w(msg):
+    print(time.strftime("%Y-%m-%d %H:%M:%S ") + msg, flush=True)
+
+def alert(level, title, details):
+    payload = {"level": level, "title": title, "details": details,
+               "source": "build-service-worker-watcher",
+               "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+    url = os.environ.get("ALERT_WEBHOOK_URL", "").strip()
+    delivered = False
+    if url:
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                headers={"Content-Type": "application/json"}, method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                delivered = 200 <= resp.status < 300
+        except Exception as e:  # noqa: BLE001 - 告警失败不影响换代流程
+            w(f"告警 webhook 发送失败: {e}")
+    try:
+        with open(alerts_log, "a", encoding="utf-8") as f:
+            record = dict(payload)
+            record["webhook_delivered"] = delivered
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as e:
+        w(f"告警落盘失败: {e}")
+
+def status_of(ident):
+    r = subprocess.run(["docker", "inspect", "--format", "{{.State.Status}}", ident],
+                       capture_output=True, text=True, timeout=30)
+    return r.stdout.strip() if r.returncode == 0 else "missing"
+
+w(f"watcher 启动：盯旧容器 {old_id[:12]}，强杀上限 {int(force_kill_sec)}s")
+deadline = time.time() + force_kill_sec
+while True:
+    st = status_of(old_id)
+    if st != "running":
+        w(f"旧容器已不在运行（status={st}）")
+        break
+    if time.time() > deadline:
+        w(f"超过 {int(force_kill_sec)}s 仍在运行（任务挂死？），强制回收")
+        subprocess.run(["docker", "rm", "-f", old_id],
+                       capture_output=True, text=True, timeout=60)
+        alert("warning", "worker 长任务超限被强制回收",
+              {"container": worker_name, "force_kill_sec": int(force_kill_sec),
+               "hint": "celery task_time_limit（2h）本应让长任务到点自行结束，请核查超长任务"})
+        break
+    time.sleep(10)
+
+up = subprocess.run(
+    ["docker", "compose", "--project-directory", deploy_dir, "up", "-d", worker_name],
+    capture_output=True, text=True, timeout=1800,
+)
+w((up.stdout or "") + (up.stderr or ""))
+ok = False
+for _ in range(12):
+    if status_of(worker_name) == "running":
+        ok = True
+        break
+    time.sleep(5)
+if ok:
+    w("新 worker 已运行，换代完成")
+else:
+    alert("error", "worker 换代后未运行",
+          {"container": worker_name,
+           "hint": "后台 watcher 拉起失败；cron 的 ensure_worker.sh 每 5 分钟会重试，请关注自愈日志"})
+w("watcher 退出")
+'''
+
+
+def _up_services() -> list[str]:
+    """compose up 的目标服务：除 worker 外的全部受管服务（config [deploy].services）
+
+    worker 由 swap_worker 单独编排——compose up 重建 worker 会先 stop 旧容器，
+    被 celery warm shutdown 阻塞最长 stop_grace_period（7200s），这正是要消除的。
+    """
+    return [s for s in DEPLOY_SERVICES if s != "worker"]
+
+
+def worker_container_state(container: str = WORKER_CONTAINER) -> tuple[str, str]:
+    """返回 (状态, 容器 ID)：状态为 docker inspect 的 State.Status，
+    容器不存在时 ("missing", "")。"""
+    r = subprocess.run(
+        ["docker", "inspect", "--format", "{{.State.Status}} {{.Id}}", container],
+        capture_output=True, text=True, timeout=30,
+    )
+    if r.returncode != 0:
+        return "missing", ""
+    parts = r.stdout.split()
+    if not parts:
+        return "unknown", ""
+    return parts[0], (parts[1] if len(parts) > 1 else "")
+
+
+def spawn_drain_watcher(old_container_id: str, logf) -> None:
+    """启动后台 watcher：旧 worker 退出后拉起新 worker（脱离部署线程存活）
+
+    build-service 容器重启会带走 watcher，此时由 cron 的 ensure_worker.sh
+    兜底（每 5 分钟检查 worker 不在运行就拉起），任务队列在 Redis 不丢。
+    watcher 启动失败同样只记日志、不阻断部署（cron 兜底）。
+    """
+    drain_log = LOGS_DIR / f"worker-drain-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:4]}.log"
+    cmd = ["python3", "-c", WORKER_WATCHER_SCRIPT,
+           old_container_id, str(DEPLOY_DIR), str(DRAIN_FORCE_KILL_SEC),
+           WORKER_CONTAINER, str(ALERT_LOG_PATH), str(drain_log)]
+    try:
+        lf = open(drain_log, "a", encoding="utf-8")
+    except OSError as e:
+        logf.write(f"[worker] watcher 日志文件打开失败（{e}），仍尝试启动 watcher\n")
+        lf = None
+    try:
+        subprocess.Popen(cmd, stdout=lf or subprocess.DEVNULL,
+                         stderr=subprocess.STDOUT, start_new_session=True)
+    except Exception as e:  # noqa: BLE001 - watcher 失败不阻断部署，cron 兜底
+        logf.write(f"[worker] watcher 启动失败（{e}），依赖 cron 自愈兜底\n")
+        return
+    finally:
+        if lf:
+            lf.close()
+    logf.write(f"[worker] worker 换代转后台：旧容器 {old_container_id[:12]} 退出后自动拉起新 worker"
+               f"（watcher 日志 {drain_log.name}，强杀上限 {DRAIN_FORCE_KILL_SEC}s）\n")
+
+
+def swap_worker(logf) -> str:
+    """把 worker 换到新镜像：非阻塞优雅换代，返回 "fast"|"deferred"|"noop"
+
+    旧 worker 在运行且需要换代时：
+      1. docker update --restart=no —— 不许 restart policy 在 warm shutdown
+         退出后把旧镜像容器复活抢任务；
+      2. docker kill --signal=TERM —— 立即返回；celery warm shutdown 停止
+         接新任务、跑完当前任务后自行退出（挂死由 watcher 超时强杀）；
+      3. 短等 DRAIN_WAIT_SEC，退出则 compose up worker（fast path）；
+      4. 未退出转后台 watcher（deferred）：流水线不阻塞，排队任务由
+         Redis 暂存，新 worker 就绪后接手。
+    两条 docker 命令失败都不阻断（记日志继续）：kill 失败最坏退化为旧容器
+    被 compose 后续动作处理，cron 亦可兜底。
+    """
+    state, cid = worker_container_state()
+    if state != "running":
+        logf.write(f"[worker] 容器状态 {state}，直接 compose up worker\n")
+        logf.flush()
+        up = compose("up", "-d", "worker", timeout=DEPLOY_TIMEOUT)
+        logf.write(up.stdout or "")
+        logf.write(up.stderr or "")
+        if up.returncode != 0:
+            raise RuntimeError(f"docker compose up -d worker 失败，退出码 {up.returncode}")
+        return "noop"
+
+    logf.write(f"[worker] 旧 worker 运行中（{cid[:12]}）：update --restart=no 后发 SIGTERM，"
+               "进入非阻塞 drain（celery warm shutdown 跑完当前任务自行退出）\n")
+    logf.flush()
+    for cmd in (["docker", "update", "--restart=no", WORKER_CONTAINER],
+                ["docker", "kill", "--signal=TERM", WORKER_CONTAINER]):
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            logf.write(f"[worker] $ {' '.join(cmd)} 失败: {r.stderr.strip()[:200]}\n")
+
+    deadline = time.time() + DRAIN_WAIT_SEC
+    while time.time() < deadline:
+        time.sleep(5)
+        state, _ = worker_container_state()
+        if state != "running":
+            break
+    if state == "running":
+        logf.write(f"[worker] {DRAIN_WAIT_SEC}s 内旧任务未跑完，转入后台 watcher（不阻塞部署）\n")
+        spawn_drain_watcher(cid, logf)
+        return "deferred"
+
+    logf.write("[worker] 旧 worker 已退出，拉起新 worker\n")
+    logf.flush()
+    up = compose("up", "-d", "worker", timeout=DEPLOY_TIMEOUT)
+    logf.write(up.stdout or "")
+    logf.write(up.stderr or "")
+    if up.returncode != 0:
+        raise RuntimeError(f"docker compose up -d worker 失败，退出码 {up.returncode}")
+    return "fast"
 
 
 # ------------------------------------------------------------------
@@ -1014,13 +1435,30 @@ def prune_frontend_backups(dest: Path, logf) -> None:
         logf.write(f"[frontend] 清理旧备份 {old.name}\n")
 
 
-def run_deploy_thread(job_id: str, tag: str, commit: str = ""):
+def run_deploy_thread(job_id: str, tag: str, commit: str = "", mode: str = "full"):
     try:
         set_job(job_id, status="running", stage="precheck", progress=5,
                 message="校验部署前置条件...")
 
         # 先校验再动任何文件：见 validate_env_file 的说明
         validate_env_file()
+
+        if mode == "frontend":
+            # 前端-only 部署：镜像与容器都没变，跳过 compose/迁移/verify，
+            # 只把构建出的 dist 同步到 nginx 静态根。nginx 托管的是宿主机
+            # 目录、每次请求都读磁盘，同步即生效，无需 reload。
+            set_job(job_id, stage="frontend", progress=50,
+                    message="前端-only 部署：同步静态资源...")
+            with open(job_log_path(job_id), "a") as lf:
+                lf.write("[deploy] 前端-only 部署：跳过镜像切换/容器重建/数据库迁移，仅同步前端\n")
+                sync_frontend(job_id, lf)
+            mark_deployed(commit)
+            set_job(job_id, status="success", stage="done", progress=100,
+                    finished_at=time.time(),
+                    message="前端-only 部署完成（容器未重启）",
+                    result={"tag": tag, "commit": commit, "mode": mode})
+            log.info("deploy %s 成功（frontend-only）: %s", job_id, commit[:8])
+            return
 
         set_job(job_id, stage="sync-config", progress=10,
                 message="同步 compose 配置...")
@@ -1046,22 +1484,33 @@ def run_deploy_thread(job_id: str, tag: str, commit: str = ""):
             update_env_image_tag(tag)
             lf.write(f"[deploy] IMAGE_TAG={tag}\n")
 
-            # 3. 拉起容器
-            #    这期间 worker 会优雅退出（容器 Stopping、不在 docker ps 里），
-            #    所以先写部署标记，让 cron 的 worker 自愈跳过，避免它插入一次
-            #    compose up 与本次部署撞车
+            # 3. 拉起容器（worker 除外——它由 swap_worker 单独非阻塞换代：
+            #    compose up 重建 worker 会被 celery warm shutdown 阻塞最长
+            #    stop_grace_period 7200s，这正是本次改造消除的部署阻塞）
+            #    这期间写部署标记，让 cron 的 worker 自愈跳过，避免它插入
+            #    一次 compose up 与本次部署撞车
             _write_deploy_marker(job_id)
             try:
-                set_job(job_id, stage="compose-up", progress=45, message="docker compose up -d ...")
-                lf.write("[deploy] $ docker compose up -d\n")
+                up_services = _up_services()
+                set_job(job_id, stage="compose-up", progress=45,
+                        message=f"docker compose up -d {' '.join(up_services)} ...")
+                lf.write(f"[deploy] $ docker compose up -d {' '.join(up_services)}"
+                         "（worker 由 swap_worker 单独编排）\n")
                 lf.flush()
-                up = compose("up", "-d", timeout=DEPLOY_TIMEOUT)
+                up = compose("up", "-d", *up_services, timeout=DEPLOY_TIMEOUT)
                 lf.write(up.stdout or "")
                 lf.write(up.stderr or "")
                 if up.returncode != 0:
                     raise RuntimeError(f"docker compose up -d 失败，退出码 {up.returncode}")
 
+                # 3.5 数据库迁移（verify 之前：health/deep 的 migrations 探针
+                #     比对 alembic_version 与代码 heads，不升级必 503）
+                set_job(job_id, stage="migrate", progress=60,
+                        message="数据库迁移 alembic upgrade head ...")
+                run_db_migrations(lf)
+
                 # 4. 校验（W13：verify 失败 → 告警 webhook / alerts.log）
+                #    此时旧 worker 仍未被触碰、处于 running，校验语义不变
                 set_job(job_id, stage="verify", progress=75, message="校验容器与接口...")
                 verify_deploy_with_alert(lf, job_id, tag, commit)
 
@@ -1073,14 +1522,25 @@ def run_deploy_thread(job_id: str, tag: str, commit: str = ""):
             finally:
                 _clear_deploy_marker()
 
-            # 6. 清理旧镜像（部署成功后再清，此时新镜像正在使用不会被误删）
+            # 6. worker 非阻塞优雅换代。放在 marker 清除之后：drain 期间旧
+            #    容器仍在 docker ps，cron 不会介入；旧容器退出后 cron 同样
+            #    是拉起新 worker 的兜底
+            set_job(job_id, stage="worker-swap", progress=92, message="worker 优雅换代...")
+            swap_mode = swap_worker(lf)
+
+            # 7. 清理旧镜像（部署成功后再清，此时新镜像正在使用不会被误删）
             set_job(job_id, stage="prune", progress=95, message="清理历史镜像...")
             prune_images(lf)
 
+        mark_deployed(commit)
+
+        done_msg = ("部署完成（worker 换代转后台：旧任务跑完后自动拉起新 worker）"
+                    if swap_mode == "deferred" else "部署完成")
         set_job(job_id, status="success", stage="done", progress=100,
-                finished_at=time.time(), message="部署完成",
-                result={"tag": tag, "commit": commit})
-        log.info("deploy %s 成功: %s", job_id, tag)
+                finished_at=time.time(), message=done_msg,
+                result={"tag": tag, "commit": commit, "mode": mode,
+                        "worker_swap": swap_mode})
+        log.info("deploy %s 成功: %s (worker_swap=%s)", job_id, tag, swap_mode)
     except Exception as e:
         log.exception("deploy %s 失败", job_id)
         set_job(job_id, status="failed", stage="error", finished_at=time.time(),
@@ -1095,6 +1555,10 @@ def run_deploy_thread(job_id: str, tag: str, commit: str = ""):
 class BuildReq(BaseModel):
     branch: str = "main"
     sha: Optional[str] = Field(default=None, description="构建的 commit SHA，缺省取分支最新")
+    force_mode: str = Field(
+        default="auto",
+        description='"auto" 按相对线上已部署 commit 的变更判定构建模式；"full" 强制全量构建（Web 手动触发调试用）',
+    )
 
 
 class DeployReq(BaseModel):
@@ -1119,36 +1583,50 @@ def start_build(req: BuildReq, x_build_token: Optional[str] = Header(default=Non
         job = new_job("build", req.model_dump())
         job_log_path(job["job_id"]).touch()
         threading.Thread(target=run_build_thread,
-                         args=(job["job_id"], req.branch, req.sha), daemon=True).start()
+                         args=(job["job_id"], req.branch, req.sha, req.force_mode),
+                         daemon=True).start()
         return job
     except Exception:
         BUSY_LOCK.release()
         raise
 
 
-def _resolve_deploy_tag(req: DeployReq) -> tuple[str, str]:
-    """确定要部署的镜像 tag；(tag, commit)"""
+def _resolve_deploy_tag(req: DeployReq) -> tuple[str, str, str]:
+    """确定要部署的镜像 tag；(tag, commit, mode)
+
+    mode="frontend" 表示该构建产物仅含前端 dist，部署只同步静态资源；
+    mode="full" 为常规全量部署（显式指定 tag 的回滚一律走全量路径）。
+    历史构建记录没有 mode 字段，缺省按 full 处理。
+    """
     if req.tag:
-        return req.tag, ""
+        commit = ""
+        rec_file = RELEASES_DIR / f"{req.tag}.json"
+        if rec_file.exists():
+            try:
+                commit = json.loads(rec_file.read_text()).get("commit", "")
+            except (OSError, json.JSONDecodeError):
+                commit = ""
+        return req.tag, commit, "full"
     if not req.job_id:
         raise HTTPException(400, "需要提供 job_id 或 tag")
     job = JOBS.get(req.job_id)
     if not job or job["status"] != "success" or job["kind"] != "build":
         raise HTTPException(400, f"构建任务 {req.job_id} 不存在或未成功")
-    return job["result"]["tag"], job["result"].get("commit", "")
+    return (job["result"]["tag"], job["result"].get("commit", ""),
+            job["result"].get("mode", "full"))
 
 
 @app.post("/api/v1/deploy")
 def start_deploy(req: DeployReq, x_build_token: Optional[str] = Header(default=None)):
     check_token(x_build_token)
-    tag, commit = _resolve_deploy_tag(req)
+    tag, commit, mode = _resolve_deploy_tag(req)
     if not BUSY_LOCK.acquire(blocking=False):
         raise HTTPException(409, "已有构建或部署任务在执行，请稍后重试")
     try:
-        job = new_job("deploy", {"tag": tag, "commit": commit})
+        job = new_job("deploy", {"tag": tag, "commit": commit, "mode": mode})
         job_log_path(job["job_id"]).touch()
         threading.Thread(target=run_deploy_thread,
-                         args=(job["job_id"], tag, commit), daemon=True).start()
+                         args=(job["job_id"], tag, commit, mode), daemon=True).start()
         return job
     except Exception:
         BUSY_LOCK.release()

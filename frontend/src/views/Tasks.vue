@@ -90,6 +90,7 @@
             <el-option label="响应耗时评测" value="latency" />
             <el-option label="二分分类评测" value="binary_classification" />
             <el-option label="Agent评测" value="agent" />
+            <el-option label="插件评测" value="plugin" />
             <!-- W12-2：safety/dialogue 后端尚未实现执行链（deepeval 接入列入 M3-W16），
                  前端禁用并标注「规划中」，防止创建后无法执行的任务 -->
             <el-option label="安全评测（规划中）" value="safety" disabled />
@@ -104,8 +105,39 @@
             <el-option v-for="ds in datasets" :key="ds.id" :label="ds.name" :value="ds.id" />
           </el-select>
         </el-form-item>
-        <!-- 长会话 Agent 评测不调用被测模型，隐藏被评测模型选择 -->
-        <el-form-item label="被评测模型" v-if="form.evaluation_type !== 'agent'">
+        <!-- 待评测内容来源：仅 AI 裁判员评测可配置；使用数据集字段/不使用模型输出时执行阶段不调用被测模型 -->
+        <el-form-item label="待评测内容来源" v-if="form.evaluation_type === 'judge'">
+          <div style="width: 100%;">
+            <el-radio-group v-model="form.model_output_source" @change="handleModelOutputSourceChange">
+              <el-radio label="model_call">调用被测模型</el-radio>
+              <el-radio label="dataset_field">使用数据集字段</el-radio>
+              <el-radio label="none">不使用模型输出（仅以待评测数据作为评分依据）</el-radio>
+            </el-radio-group>
+            <el-select
+              v-if="form.model_output_source === 'dataset_field'"
+              v-model="form.model_output_field"
+              placeholder="选择作为模型输出的数据集字段"
+              style="width: 100%; margin-top: 8px;"
+              clearable
+            >
+              <el-option v-for="opt in modelOutputFieldOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
+            </el-select>
+            <div style="color: #909399; font-size: 12px; margin-top: 4px;">
+              <template v-if="form.model_output_source === 'dataset_field'">
+                执行阶段不会调用被评测模型，所选字段值将作为模型输出（model_output）参与空值校验与裁判变量
+              </template>
+              <template v-else-if="form.model_output_source === 'none'">
+                执行阶段不会调用被评测模型，仅以待评测数据作为评分依据
+              </template>
+              <template v-else>
+                执行阶段会调用被评测模型，模型输出将作为待评测内容
+              </template>
+            </div>
+          </div>
+        </el-form-item>
+        <!-- 长会话 Agent 评测不调用被测模型，隐藏被评测模型选择；插件评测评的是插件本身，同样不需要；
+             AI 裁判员使用数据集字段/不使用模型输出时也不会调用被测模型 -->
+        <el-form-item label="被评测模型" v-if="form.evaluation_type !== 'agent' && form.evaluation_type !== 'plugin' && !(form.evaluation_type === 'judge' && form.model_output_source !== 'model_call')">
           <el-select v-model="form.model_provider" placeholder="请选择模型" style="width: 100%">
             <el-option v-for="m in models" :key="m.id" :label="m.name" :value="m.id" />
           </el-select>
@@ -388,6 +420,160 @@
             ref="safetyConfigRef"
             :initial-data="form.safety_config || {}"
             @update="handleSafetyConfigUpdate"
+          />
+        </template>
+
+        <!-- 插件评测配置 -->
+        <template v-if="form.evaluation_type === 'plugin'">
+          <el-divider content-position="left">插件评测配置</el-divider>
+          <el-form-item v-if="form.plugin_config.source !== 'trace'" label="评测深度">
+            <el-radio-group v-model="form.plugin_config.depth">
+              <el-radio label="quick">快速（仅静态检测）</el-radio>
+              <el-radio label="standard" :disabled="isPluginLevelTarget">标准（静态 + LLM 评审）</el-radio>
+            </el-radio-group>
+            <div style="color: #909399; font-size: 12px; margin-top: 4px;">
+              快速：结构化 lint（frontmatter / 触发短语 / 渐进披露 / 反模式等 7 项子分），零模型调用秒级完成；
+              标准：额外由 Claude Code 做 4 项锚定 rubric 评审（评测动作实时加载自插件市场的 plugin-eval），失败维度自动降级剔除。
+              <b>插件级对象只支持快速</b>（标准与蒙特卡洛仅支持 skill 级对象）。
+            </div>
+          </el-form-item>
+          <el-form-item label="评测对象来源">
+            <el-radio-group v-model="form.plugin_config.source">
+              <el-radio label="manual">手动指定</el-radio>
+              <el-radio label="marketplace">插件市场</el-radio>
+              <el-radio label="dataset">数据集批量</el-radio>
+              <el-radio label="trace">会话 Trace（数据集）</el-radio>
+            </el-radio-group>
+          </el-form-item>
+          <template v-if="form.plugin_config.source === 'marketplace'">
+            <el-form-item label="插件市场">
+              <div style="display: flex; gap: 8px; width: 100%;">
+                <el-select
+                  v-model="form.plugin_config.market_id"
+                  placeholder="请选择插件市场"
+                  style="flex: 1"
+                  :disabled="dialogBusy"
+                  @change="handleMarketChange"
+                >
+                  <el-option v-for="m in marketplaces" :key="m.id" :value="m.id" :label="m.name">
+                    <span>{{ m.name }}</span>
+                    <span style="float: right; color: #909399; font-size: 12px;">{{ m.sync_status === 'ok' ? '已同步' : m.sync_status === 'failed' ? '同步失败' : '未同步' }}</span>
+                  </el-option>
+                </el-select>
+                <el-button :disabled="dialogBusy" @click="marketDialogVisible = true">管理市场</el-button>
+                <el-button :loading="marketPluginsLoading" :disabled="!form.plugin_config.market_id || dialogBusy" @click="loadMarketPlugins(true)">刷新</el-button>
+              </div>
+            </el-form-item>
+            <el-form-item label="评测对象">
+              <el-select
+                v-model="form.plugin_config.market_plugin"
+                placeholder="请先选择市场，再选择插件或 skill"
+                style="width: 100%"
+                :loading="marketPluginsLoading"
+                :disabled="dialogBusy || !form.plugin_config.market_id"
+              >
+                <el-option
+                  v-for="p in marketPlugins"
+                  :key="p.source"
+                  :value="p.source"
+                  :label="`${p.name}（${p.target_type === 'plugin' ? '插件' : 'Skill'}${p.version ? ' v' + p.version : ''}）`"
+                >
+                  <span>{{ p.name }}</span>
+                  <span style="float: right; color: #909399; font-size: 12px;">{{ p.target_type === 'plugin' ? '插件' : 'Skill' }}</span>
+                </el-option>
+              </el-select>
+              <div style="color: #909399; font-size: 12px; margin-top: 4px;">
+                列表含插件与其内部 skill：插件级按整体静态评审（<b>仅支持快速深度</b>）；<b>Skill 级</b>按单个 skill 评审（标准深度时由 Claude Code 做 4 项 rubric 深度评审）
+              </div>
+            </el-form-item>
+          </template>
+          <template v-if="form.plugin_config.source === 'manual'">
+            <el-form-item label="上传插件包">
+              <el-upload
+                class="plugin-upload"
+                drag
+                accept=".zip,.md,.markdown"
+                :show-file-list="false"
+                :http-request="handlePluginUpload"
+                :disabled="dialogBusy || pluginUploading"
+              >
+                <div class="plugin-upload-inner">
+                  <el-icon class="plugin-upload-icon"><UploadFilled /></el-icon>
+                  <div class="plugin-upload-text">拖拽 .zip 插件包 或 SKILL.md 到此处，或 <em>点击选择</em></div>
+                  <div class="plugin-upload-hint">zip ≤ 20MB（服务端解包后按目录评测）；md ≤ 2MB（回填下方内联内容）</div>
+                </div>
+              </el-upload>
+            </el-form-item>
+            <el-form-item label="插件路径">
+              <el-input
+                v-model="form.plugin_config.plugin_path"
+                placeholder="本地插件或 skill 目录绝对路径，如 /path/to/my-plugin"
+                clearable
+              />
+              <div style="color: #909399; font-size: 12px; margin-top: 4px;">
+                目录含 .claude-plugin/plugin.json 按整个插件评（仅静态层）；含 SKILL.md 按单个 skill 评
+              </div>
+            </el-form-item>
+            <el-form-item label="内联 SKILL.md">
+              <el-input
+                v-model="form.plugin_config.skill_content"
+                type="textarea"
+                :rows="6"
+                placeholder="直接粘贴 SKILL.md 全文（与插件路径二选一，同时填写时优先使用插件路径）"
+              />
+            </el-form-item>
+          </template>
+          <el-form-item v-if="form.plugin_config.source === 'trace'" label="判定方式">
+            <el-radio-group v-model="form.plugin_config.trace_judgement">
+              <el-radio label="model">模型判定（标准深度）</el-radio>
+              <el-radio label="offline">离线（仅静态）</el-radio>
+            </el-radio-group>
+            <div style="color: #909399; font-size: 12px; margin-top: 4px;">
+              评测深度随判定方式固定，不需要选择（一份报告同时含设计质量综合分与真实数据分）。<br />
+              模型判定：逐关键步骤实例做抽取 + 逐检查项判定，并对插件内每个 skill 做 4 项 rubric 评审
+              ——实测一条 26MB 会话线程含 90+ 个关键步骤实例，<b>单行可能 1 小时以上</b>，
+              批量数据集请配合断点续跑分轮执行。<br />
+              离线：只跑确定性结构检查（检查数量统计、结论是否有证据等）与静态层，<b>全程零模型调用</b>，
+              单行分钟级；真实数据分与判定有效率照常产出，但语义类检查项未测、覆盖率更低。
+            </div>
+          </el-form-item>
+          <el-form-item
+            v-if="form.plugin_config.source === 'trace' && form.plugin_config.trace_judgement === 'model'"
+            label="判定并发"
+          >
+            <el-input-number
+              v-model="form.plugin_config.trace_concurrency"
+              :min="1"
+              :max="20"
+              :step="1"
+              :disabled="dialogBusy"
+            />
+            <div style="color: #909399; font-size: 12px; margin-top: 4px;">
+              同时进行的模型判定数（plugin-eval 上限 20）。留空沿用服务端默认
+              <code>PLUGIN_EVAL_CONCURRENCY</code>；调高可缩短单行耗时，但会成倍增加模型调用。
+            </div>
+          </el-form-item>
+          <el-alert
+            v-if="form.plugin_config.source === 'trace'"
+            type="info"
+            :closable="false"
+            title="会话 Trace 评测（合并口径）：一行一份报告，同时含设计质量综合分（静态 + LLM 评审）与真实数据分（历史线程的执行 + 生成两阶段）"
+          >
+            <div style="font-size: 12px; line-height: 1.7; margin-top: 4px;">
+              ① 数据集须由「从 anc-hub 导入」创建（行内含原始会话包，如 claude-thread.zip / .jsonl）；
+              截断的会话摘要无法做该评测。<br />
+              ② 被测插件由线程里的 <code>/anc-xxx:run</code> 调用自动识别，需市场 plugin-eval 已有该插件的
+              <code>rules/history/&lt;插件&gt;.yaml</code> 规则。<br />
+              ③ 两套分数相互独立：真实数据分不并入综合分/徽章/排名（plugin-eval 口径）。<br />
+              ④ 无原始会话 / 无对应规则 / 未识别到调用的行会标为「未测」并写明原因，不计失败。<br />
+              ⑤ 每条线程逐个关键步骤抽取与判定，单行耗时较长（分钟到十几分钟），任务可断点续跑。
+            </div>
+          </el-alert>
+          <el-alert
+            v-else
+            type="info"
+            :closable="false"
+            title="数据集批量评测：上方选择数据集，每行数据需包含 plugin_path 字段（本地目录路径）或 skill_content 字段（SKILL.md 全文），系统逐行评测"
           />
         </template>
 
@@ -703,7 +889,16 @@
                           </div>
                           <div class="metric-field metric-field-xs">
                             <label>权重</label>
-                            <el-select v-model="metric.weight" placeholder="权重" style="width: 100%">
+                            <el-select
+                              v-model="metric.weight"
+                              placeholder="权重"
+                              style="width: 100%"
+                              filterable
+                              allow-create
+                              default-first-option
+                              @change="(val) => { metric.weight = normalizeMetricWeight(val) }"
+                            >
+                              <el-option v-if="isCustomWeight(metric.weight)" :label="String(metric.weight)" :value="metric.weight" />
                               <el-option label="高" value="high" />
                               <el-option label="中" value="medium" />
                               <el-option label="低" value="low" />
@@ -740,6 +935,9 @@
                                 placeholder="等级描述（输入 @ 引用）"
                                 style="flex: 1;"
                               />
+                              <el-button type="danger" size="small" link :disabled="dialogBusy" @click="removeCriteriaLevel(metric, level)">
+                                <el-icon><Delete /></el-icon>
+                              </el-button>
                             </div>
                             <el-button size="small" type="primary" plain :disabled="dialogBusy" @click="addCriteriaLevel(metric)">
                               <el-icon><Plus /></el-icon> 添加等级
@@ -1007,18 +1205,68 @@
       :required="hubPickerRequired"
       @confirm="handleHubPatternConfirm"
     />
+
+    <!-- 插件市场管理弹窗（插件评测「插件市场」来源）：列表/新增/同步/删除 -->
+    <el-dialog v-model="marketDialogVisible" title="管理插件市场" width="860px" append-to-body>
+      <el-alert
+        type="info"
+        :closable="false"
+        show-icon
+        title="插件市场是一个 Claude Code marketplace git 仓库，添加后克隆到服务端，评测时从其中选择插件或 skill"
+        style="margin-bottom: 12px;"
+      />
+      <el-form :inline="true" @submit.prevent>
+        <el-form-item label="名称">
+          <el-input v-model="marketForm.name" placeholder="如 ANC 插件市场" style="width: 160px" />
+        </el-form-item>
+        <el-form-item label="Git 地址">
+          <el-input v-model="marketForm.git_url" placeholder="https://git.example.com/group/marketplace.git" style="width: 360px" />
+        </el-form-item>
+        <el-form-item label="分支">
+          <el-input v-model="marketForm.branch" placeholder="默认分支可留空" style="width: 130px" />
+        </el-form-item>
+        <el-form-item>
+          <el-button type="primary" :loading="marketCreating" @click="handleCreateMarketplace">添加并克隆</el-button>
+        </el-form-item>
+      </el-form>
+      <el-table :data="marketplaces" v-loading="marketListLoading" size="small" empty-text="暂无插件市场">
+        <el-table-column prop="name" label="名称" width="150" />
+        <el-table-column prop="git_url" label="Git 地址" show-overflow-tooltip />
+        <el-table-column label="状态" width="90">
+          <template #default="{ row }">
+            <el-tag :type="row.sync_status === 'ok' ? 'success' : row.sync_status === 'failed' ? 'danger' : 'info'" size="small">
+              {{ row.sync_status === 'ok' ? '已同步' : row.sync_status === 'failed' ? '失败' : '未同步' }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="最近同步" width="160">
+          <template #default="{ row }">{{ row.last_synced_at ? formatDateTime(row.last_synced_at) : '—' }}</template>
+        </el-table-column>
+        <el-table-column label="操作" width="140" fixed="right">
+          <template #default="{ row }">
+            <el-button link type="primary" size="small" :loading="marketSyncingId === row.id" @click="handleSyncMarketplace(row)">同步</el-button>
+            <el-button link type="danger" size="small" @click="handleDeleteMarketplace(row)">删除</el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+      <div v-if="marketSyncError" style="color: #f56c6c; font-size: 12px; margin-top: 8px;">{{ marketSyncError }}</div>
+      <template #footer>
+        <el-button @click="marketDialogVisible = false">关闭</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
+import { ref, reactive, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Plus, View, Delete, ArrowDown, Warning, Rank } from '@element-plus/icons-vue'
-import { taskApi, datasetApi, modelApi, batchApi, instructionApi, efficiencyApi, preJudgeScriptApi } from '@/api'
+import { Plus, View, Delete, ArrowDown, Warning, Rank, UploadFilled } from '@element-plus/icons-vue'
+import { taskApi, datasetApi, modelApi, batchApi, instructionApi, efficiencyApi, preJudgeScriptApi, pluginMarketplaceApi } from '@/api'
 import { getTemplate, previewPrompt } from '@/api/judgeConfig'
 import { useTaskPolling } from '@/composables/useTaskPolling'
 import { useTaskWebSocket } from '@/composables/useTaskWebSocket'
 import { formatTime } from '@/utils/time'
+import { isCustomWeight, normalizeMetricWeight } from '@/utils/weight'
 import HubFilePatternPicker from '@/components/HubFilePatternPicker.vue'
 import VariableInjector from '@/components/VariableInjector.vue'
 import AgentEvaluationConfig from '@/components/AgentEvaluationConfig.vue'
@@ -1078,6 +1326,9 @@ const form = ref({
   evaluation_type: 'judge',
   dataset_id: '',
   model_provider: '',
+  // 待评测内容来源（仅 AI 裁判员评测使用）：model_call-调用被测模型 / dataset_field-使用数据集字段 / none-不使用模型输出
+  model_output_source: 'model_call',
+  model_output_field: '',
   // 裁判引擎：claude_agent（Claude Code Agent 引擎）/ deepseek_agent（DeepSeek Agent 引擎）/ graph（传统裁判图引擎）
   judge_engine: 'claude_agent',
   judge_count: 6,
@@ -1133,6 +1384,8 @@ const form = ref({
   agent_config: {},
   // 安全评测配置
   safety_config: {},
+  // 插件评测配置（source 为表单态字段：manual-任务级路径/内联内容，dataset-数据集行字段）
+  plugin_config: { depth: 'quick', source: 'manual', plugin_path: '', skill_content: '', market_id: null, market_plugin: '', trace_judgement: 'model', trace_concurrency: null },
 })
 
 // 变量注入相关状态
@@ -1247,7 +1500,7 @@ const otherMetrics = computed(() => {
 })
 
 const getTypeName = (type) => {
-  const map = { judge: 'AI裁判员', consistency: '一致性', success_rate: '成功率', rag: 'RAG检索', latency: '响应耗时', binary_classification: '二分分类', agent: 'Agent评测', safety: '安全评测', dialogue: '对话评测' }
+  const map = { judge: 'AI裁判员', consistency: '一致性', success_rate: '成功率', rag: 'RAG检索', latency: '响应耗时', binary_classification: '二分分类', agent: 'Agent评测', plugin: '插件评测', safety: '安全评测', dialogue: '对话评测' }
   return map[type] || type
 }
 
@@ -1383,7 +1636,7 @@ watch(() => form.value?.model_provider, () => {
 })
 
 // 监听数据集选择变化
-watch(() => form.value.dataset_id, (newDatasetId, oldDatasetId) => {
+watch(() => form.value.dataset_id, async (newDatasetId, oldDatasetId) => {
   if (newDatasetId !== oldDatasetId) {
     // 只有当 oldDatasetId 有值时才清空（避免初始化时清空已有的配置）
     if (oldDatasetId) {
@@ -1400,7 +1653,14 @@ watch(() => form.value.dataset_id, (newDatasetId, oldDatasetId) => {
         }
       })
     }
-    fetchDatasetFields(newDatasetId)
+    await fetchDatasetFields(newDatasetId)
+    // 已选的模型输出字段若不在新数据集中，清空
+    if (form.value.model_output_field) {
+      const availableFields = modelOutputFieldOptions.value.map(opt => opt.value)
+      if (!availableFields.includes(form.value.model_output_field)) {
+        form.value.model_output_field = ''
+      }
+    }
   }
 })
 
@@ -2020,6 +2280,9 @@ const openDialog = async (row = null) => {
       ...taskDetail,
       // 确保新字段有默认值
       template_id: taskDetail.template_id || '',
+      // 待评测内容来源（存量任务无值时按调用被测模型处理）
+      model_output_source: taskDetail.model_output_source || 'model_call',
+      model_output_field: taskDetail.model_output_field || '',
       // 裁判引擎（存量旧任务无值时保持 graph 引擎不变，避免编辑保存后静默切换执行方式）
       judge_engine: taskDetail.judge_engine || 'graph',
       evaluation_scene: taskDetail.evaluation_scene || '',
@@ -2070,7 +2333,27 @@ const openDialog = async (row = null) => {
         session_context: taskDetail.agent_config?.session_context || taskDetail.scene_desc || ''
       },
       // 安全评测配置
-      safety_config: taskDetail.safety_config || {}
+      safety_config: taskDetail.safety_config || {},
+      // 插件评测配置（source 为表单态：显式 trace 优先，含市场来源即 marketplace，
+      // 含路径/内容即手动指定，否则数据集批量）
+      plugin_config: (function (pc) {
+        const base = { depth: 'quick', source: 'manual', plugin_path: '', skill_content: '', market_id: null, market_plugin: '', trace_judgement: 'model', trace_concurrency: null }
+        if (!pc || typeof pc !== 'object') return base
+        if (pc.source === 'trace') {
+          // trace 深度不可选，回显登记值 standard（旧记录可能是 quick）
+          return { ...base, depth: 'standard', source: 'trace', trace_judgement: pc.trace_judgement || 'model', trace_concurrency: pc.trace_concurrency ?? null }
+        }
+        const hasMarket = pc.market_id != null && !!(pc.market_plugin || '').trim()
+        const hasSource = (pc.plugin_path || '').trim() || (pc.skill_content || '').trim()
+        return {
+          depth: pc.depth || 'quick',
+          source: hasMarket ? 'marketplace' : (hasSource ? 'manual' : 'dataset'),
+          plugin_path: pc.plugin_path || '',
+          skill_content: pc.skill_content || '',
+          market_id: hasMarket ? pc.market_id : null,
+          market_plugin: hasMarket ? (pc.market_plugin || '') : ''
+        }
+      })(taskDetail.plugin_config)
     }
     // steps/pre_scripts 已废弃：不进入表单状态（展示归一化已分别并入 score_details / evaluation_targets）
     delete form.value.steps
@@ -2085,6 +2368,14 @@ const openDialog = async (row = null) => {
     if (!form.value.runtime_variables) {
       form.value.runtime_variables = {}
     }
+    // 插件评测编辑回显：拉市场列表；市场来源时进一步拉该市场的插件列表
+    if (form.value.evaluation_type === 'plugin') {
+      loadMarketplaces().then(() => {
+        if (form.value.plugin_config?.source === 'marketplace' && form.value.plugin_config.market_id) {
+          loadMarketPlugins()
+        }
+      })
+    }
   } else {
     isEdit.value = false
     form.value = {
@@ -2092,6 +2383,8 @@ const openDialog = async (row = null) => {
       evaluation_type: 'judge',
       dataset_id: '',
       model_provider: '',
+      model_output_source: 'model_call',
+      model_output_field: '',
       judge_engine: 'claude_agent',
       judge_count: 6,
       description: '',
@@ -2126,7 +2419,8 @@ const openDialog = async (row = null) => {
       binary_positive_value: 'true',
       binary_label_type: 'boolean',
       agent_config: {},
-      safety_config: {}
+      safety_config: {},
+      plugin_config: { depth: 'quick', source: 'manual', plugin_path: '', skill_content: '', market_id: null, market_plugin: '', trace_judgement: 'model', trace_concurrency: null }
     }
     // 新建任务无旧版结构
     legacyConfigDetected.value = false
@@ -2365,8 +2659,24 @@ const convertToDictConfig = (config) => {
   return result
 }
 
+// 待评测内容来源切换：离开「使用数据集字段」时清空已选字段
+const handleModelOutputSourceChange = (val) => {
+  if (val !== 'dataset_field') {
+    form.value.model_output_field = ''
+  }
+}
+
 // 评测类型切换时重置裁判变量配置为对应默认值
 const handleEvaluationTypeChange = (newType) => {
+  // 待评测内容来源仅 AI 裁判员评测使用：切到 judge 时默认调用被测模型，其它类型清空相关值
+  if (newType === 'judge') {
+    if (!form.value.model_output_source) {
+      form.value.model_output_source = 'model_call'
+    }
+  } else {
+    form.value.model_output_source = 'model_call'
+    form.value.model_output_field = ''
+  }
   if (newType === 'rag') {
     form.value.judge_variable_config = JSON.parse(JSON.stringify(DEFAULT_RAG_JUDGE_VARIABLE_CONFIG))
     // 初始化 RAG 配置
@@ -2419,6 +2729,17 @@ const handleEvaluationTypeChange = (newType) => {
     if (!form.value.judge_engine) {
       form.value.judge_engine = 'claude_agent'
     }
+  } else if (newType === 'plugin') {
+    // 插件评测：不使用裁判变量配置（standard 深度评审由 Claude Code 承载）
+    form.value.judge_variable_config = []
+    form.value.judge_count = 0
+    if (!form.value.plugin_config) {
+      form.value.plugin_config = { depth: 'quick', source: 'manual', plugin_path: '', skill_content: '', market_id: null, market_plugin: '', trace_judgement: 'model', trace_concurrency: null }
+    }
+    // 市场来源下拉数据（仅首次拉取）
+    if (!marketplaces.value.length) {
+      loadMarketplaces()
+    }
   } else if (newType === 'safety') {
     // 安全评测不使用裁判配置
     form.value.judge_variable_config = []
@@ -2447,6 +2768,174 @@ const handleAgentConfigUpdate = (data) => {
 // 安全评测配置更新处理
 const handleSafetyConfigUpdate = (data) => {
   form.value.safety_config = data
+}
+
+// 插件包/SKILL.md 上传（插件评测手动指定来源）：zip 回填解包路径，md 回填内联内容
+const pluginUploading = ref(false)
+const handlePluginUpload = async ({ file }) => {
+  const name = (file.name || '').toLowerCase()
+  if (!name.endsWith('.zip') && !name.endsWith('.md') && !name.endsWith('.markdown')) {
+    ElMessage.error('仅支持 .zip 插件包或 SKILL.md（.md）文件')
+    return
+  }
+  if (file.size > 20 * 1024 * 1024) {
+    ElMessage.error('文件超限（>20MB）')
+    return
+  }
+  pluginUploading.value = true
+  try {
+    const fd = new FormData()
+    fd.append('file', file)
+    const res = await taskApi.uploadPluginPackage(fd)
+    if (res.kind === 'plugin_dir') {
+      form.value.plugin_config.plugin_path = res.path
+      manualPluginTargetType.value = res.target_type || ''
+      ElMessage.success(`已解包并填入插件路径（${res.target_type === 'plugin' ? '识别为插件，按静态层评测' : '识别为 Skill'}，${res.file_count} 个文件）`)
+    } else if (res.kind === 'skill_md') {
+      form.value.plugin_config.skill_content = res.content
+      manualPluginTargetType.value = 'skill'
+      ElMessage.success(`已读取 ${res.name} 并填入内联 SKILL.md`)
+    } else {
+      ElMessage.error(res.error || '上传失败')
+    }
+  } catch (e) {
+    ElMessage.error(e.message || '上传失败')
+  } finally {
+    pluginUploading.value = false
+  }
+}
+
+// ---------------- 插件市场（插件评测「插件市场」来源） ----------------
+const marketplaces = ref([])
+const marketListLoading = ref(false)
+const marketCreating = ref(false)
+const marketSyncingId = ref(null)
+const marketSyncError = ref('')
+const marketDialogVisible = ref(false)
+const marketForm = reactive({ name: '', git_url: '', branch: '' })
+const marketPlugins = ref([])
+const marketPluginsLoading = ref(false)
+
+const loadMarketplaces = async () => {
+  marketListLoading.value = true
+  try {
+    marketplaces.value = await pluginMarketplaceApi.list()
+  } catch (e) {
+    console.warn('加载插件市场列表失败', e)
+  } finally {
+    marketListLoading.value = false
+  }
+}
+
+const loadMarketPlugins = async (force = false) => {
+  const marketId = form.value.plugin_config?.market_id
+  if (!marketId) {
+    marketPlugins.value = []
+    return
+  }
+  if (!force && marketPlugins.value.length) return
+  marketPluginsLoading.value = true
+  try {
+    marketPlugins.value = await pluginMarketplaceApi.plugins(marketId)
+  } catch (e) {
+    marketPlugins.value = []
+    ElMessage.error(e.message || '加载市场插件列表失败')
+  } finally {
+    marketPluginsLoading.value = false
+  }
+}
+
+const handleMarketChange = () => {
+  form.value.plugin_config.market_plugin = ''
+  marketPlugins.value = []
+  loadMarketPlugins(true)
+}
+
+// 深度守卫：插件级目标只支持快速（standard/蒙特卡洛仅支持 skill 级对象）。
+// 创建期由后端强校验，这里同步禁用选项并自动切回快速，避免用户提交后才报错。
+const manualPluginTargetType = ref('')   // 手动上传时后端识别出的对象类型
+
+const pluginTargetType = computed(() => {
+  const pc = form.value.plugin_config
+  if (pc.source === 'marketplace') {
+    const item = marketPlugins.value.find((p) => p.source === pc.market_plugin)
+    return item ? item.target_type : ''
+  }
+  if (pc.source === 'manual') {
+    if (pc.skill_content) return 'skill'
+    if (pc.plugin_path) return manualPluginTargetType.value
+  }
+  return ''
+})
+
+const isPluginLevelTarget = computed(() => pluginTargetType.value === 'plugin')
+
+watch(isPluginLevelTarget, (isPluginLevel) => {
+  if (isPluginLevel && form.value.plugin_config.depth !== 'quick') {
+    form.value.plugin_config.depth = 'quick'
+    ElMessage.info('插件级评测对象只支持快速深度（仅静态层），已切回快速')
+  }
+})
+
+const handleCreateMarketplace = async () => {
+  if (!marketForm.name.trim() || !marketForm.git_url.trim()) {
+    ElMessage.warning('请填写市场名称和 Git 地址')
+    return
+  }
+  marketCreating.value = true
+  marketSyncError.value = ''
+  try {
+    await pluginMarketplaceApi.create({ ...marketForm })
+    ElMessage.success('市场已添加并克隆成功')
+    marketForm.name = ''
+    marketForm.git_url = ''
+    marketForm.branch = ''
+    await loadMarketplaces()
+  } catch (e) {
+    marketSyncError.value = e.message || '添加失败'
+    ElMessage.error(e.message || '添加失败')
+  } finally {
+    marketCreating.value = false
+  }
+}
+
+const handleSyncMarketplace = async (row) => {
+  marketSyncingId.value = row.id
+  marketSyncError.value = ''
+  try {
+    await pluginMarketplaceApi.sync(row.id)
+    ElMessage.success(`市场「${row.name}」已同步`)
+    await loadMarketplaces()
+    if (form.value.plugin_config?.market_id === row.id) {
+      loadMarketPlugins(true)
+    }
+  } catch (e) {
+    marketSyncError.value = e.message || '同步失败'
+    ElMessage.error(e.message || '同步失败')
+    await loadMarketplaces()
+  } finally {
+    marketSyncingId.value = null
+  }
+}
+
+const handleDeleteMarketplace = async (row) => {
+  try {
+    await ElMessageBox.confirm(`确定删除市场「${row.name}」？将同时清理服务端克隆目录。`, '删除插件市场', { type: 'warning' })
+  } catch {
+    return
+  }
+  try {
+    await pluginMarketplaceApi.remove(row.id)
+    ElMessage.success('已删除')
+    if (form.value.plugin_config?.market_id === row.id) {
+      form.value.plugin_config.market_id = null
+      form.value.plugin_config.market_plugin = ''
+      marketPlugins.value = []
+    }
+    await loadMarketplaces()
+  } catch (e) {
+    ElMessage.error(e.message || '删除失败')
+  }
 }
 
 // 评测目标来源选项
@@ -2592,6 +3081,15 @@ const getDatasetFieldOptions = () => {
   }
   return []
 }
+
+// 模型输出字段选项：排除平台辅助列（*_is_media / *_hub_file），
+// 与后端 model_output_field 校验口径一致，避免 UI 可选、保存被拒
+const modelOutputFieldOptions = computed(() =>
+  getDatasetFieldOptions().filter(opt => {
+    const name = String(opt.value || '')
+    return name && !name.endsWith('_is_media') && !name.endsWith('_hub_file')
+  })
+)
 
 // 获取评测目标选中的请求链变量文本
 const getSelectedChainVarsTextForTarget = (target) => {
@@ -3062,6 +3560,33 @@ const submitForm = async () => {
         return
       }
     }
+    // 插件评测：按来源校验评测对象
+    if (form.value.evaluation_type === 'plugin') {
+      const pc = form.value.plugin_config || {}
+      if (pc.source === 'manual') {
+        if (!pc.plugin_path?.trim() && !pc.skill_content?.trim()) {
+          ElMessage.error('插件评测需要填写插件路径或内联 SKILL.md 内容（至少一项）')
+          return
+        }
+      } else if (pc.source === 'marketplace') {
+        if (!pc.market_id) {
+          ElMessage.error('插件评测（插件市场）需要选择插件市场')
+          return
+        }
+        if (!pc.market_plugin) {
+          ElMessage.error('插件评测（插件市场）需要选择要评测的插件或 skill')
+          return
+        }
+      } else if (pc.source === 'trace') {
+        if (!form.value.dataset_id) {
+          ElMessage.error('会话 Trace 评测需要选择数据集（每行提供一个会话 trace）')
+          return
+        }
+      } else if (!form.value.dataset_id) {
+        ElMessage.error('插件评测（数据集批量）需要选择包含 plugin_path/skill_content 字段的数据集')
+        return
+      }
+    }
     // 校验：所有引用到数据集字段的变量配置必须指定字段
     const datasetFieldVars = (form.value.judge_variable_config || []).filter(
       v => v.source === 'dataset_field' && (!v.source_config?.field || !v.source_config.field.toString().trim())
@@ -3077,8 +3602,27 @@ const submitForm = async () => {
       ElMessage.error(scriptTargetProblems[0])
       return
     }
+    // 校验：AI 裁判员选择「使用数据集字段」作为待评测内容来源时必须指定字段
+    if (
+      form.value.evaluation_type === 'judge' &&
+      form.value.model_output_source === 'dataset_field' &&
+      !(form.value.model_output_field || '').trim()
+    ) {
+      ElMessage.error('待评测内容来源为「使用数据集字段」时，请选择作为模型输出的数据集字段')
+      return
+    }
     // 复制表单数据并转换 judge_variable_config 为字典格式
     const submitData = JSON.parse(JSON.stringify(form.value))
+    // 待评测内容来源：仅 AI 裁判员评测使用；其它类型传 null，避免影响执行逻辑
+    if (submitData.evaluation_type === 'judge') {
+      submitData.model_output_source = submitData.model_output_source || 'model_call'
+      submitData.model_output_field = submitData.model_output_source === 'dataset_field'
+        ? (submitData.model_output_field || '')
+        : ''
+    } else {
+      submitData.model_output_source = null
+      submitData.model_output_field = null
+    }
     submitData.judge_variable_config = convertToDictConfig(submitData.judge_variable_config)
     // 待评测数据：脚本输出行 source_config 提交前清理（过滤空映射、参数值类型识别）
     submitData.evaluation_targets = cleanEvaluationTargetsForSubmit(submitData.evaluation_targets)
@@ -3161,6 +3705,38 @@ const submitForm = async () => {
       submitData.evaluation_metrics = []
       submitData.judge_prompt = ''
       submitData.template_id = ''
+    }
+    // 插件评测：按来源组装 plugin_config（source 为表单态不提交），清空未用配置
+    if (submitData.evaluation_type === 'plugin') {
+      const pc = submitData.plugin_config || {}
+      const source = pc.source || 'manual'
+      submitData.plugin_config = {
+        // trace 口径深度由服务端固定（模型判定=standard 静态 + LLM 评审，离线=quick 仅静态），
+        // 这里写的是「深度口径固定」的登记值，不是可选项
+        depth: source === 'trace' ? 'standard' : (pc.depth || 'quick'),
+        source,
+        plugin_path: source === 'manual' ? (pc.plugin_path || '').trim() : '',
+        skill_content: source === 'manual' ? (pc.skill_content || '') : '',
+        market_id: source === 'marketplace' ? pc.market_id : null,
+        market_plugin: source === 'marketplace' ? (pc.market_plugin || '').trim() : '',
+        trace_judgement: source === 'trace' ? (pc.trace_judgement || 'model') : null,
+        trace_concurrency: source === 'trace' && pc.trace_concurrency != null
+          ? Number(pc.trace_concurrency)
+          : null
+      }
+      submitData.judge_count = 0
+      submitData.judge_variable_config = {}
+      submitData.evaluation_scene = ''
+      submitData.scene_desc = ''
+      submitData.max_score = 10
+      submitData.score_details = ''
+      submitData.evaluation_metrics = []
+      submitData.judge_prompt = ''
+      submitData.template_id = ''
+    }
+    // 数据集空值统一归一化（FK 列空串会触发外键违规）
+    if (!submitData.dataset_id) {
+      submitData.dataset_id = null
     }
     // 对话评测：使用裁判配置，保留 judge_variable_config
     if (submitData.evaluation_type === 'dialogue') {
@@ -3297,6 +3873,14 @@ const formatHours = (ms) => {
   return (ms / 3600000).toFixed(2)
 }
 
+const formatDateTime = (value) => {
+  if (!value) return '—'
+  const d = new Date(value)
+  if (Number.isNaN(d.getTime())) return String(value)
+  const pad = (n) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
 const handleSelectionChange = (selection) => {
   selectedTasks.value = selection
 }
@@ -3371,8 +3955,16 @@ const addCriteriaLevel = (metric) => {
     return
   }
   // Existing levels: add custom one
-  const newLevel = `等级${levels.length + 1}`
-  metric.score_criteria[newLevel] = { min: 0, max: 0, desc: '' }
+  let levelSeq = levels.length + 1
+  while (Object.prototype.hasOwnProperty.call(metric.score_criteria, `等级${levelSeq}`)) {
+    levelSeq += 1
+  }
+  metric.score_criteria[`等级${levelSeq}`] = { min: 0, max: 0, desc: '' }
+}
+
+const removeCriteriaLevel = (metric, level) => {
+  if (!metric.score_criteria) return
+  delete metric.score_criteria[level]
 }
 
 const addDependency = (metric) => {
@@ -3705,7 +4297,7 @@ const removeDependency = (metric, index) => {
 }
 
 .metric-field-xs {
-  flex: 0 0 80px;
+  flex: 0 0 100px;
 }
 
 .metric-desc {
@@ -3973,5 +4565,41 @@ const removeDependency = (metric, index) => {
   align-items: center;
   flex-wrap: wrap;
   gap: 4px;
+}
+
+/* 插件评测：拖拽上传区 */
+.plugin-upload {
+  width: 100%;
+}
+
+.plugin-upload :deep(.el-upload-dragger) {
+  padding: 12px 16px;
+}
+
+.plugin-upload-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
+.plugin-upload-icon {
+  font-size: 32px;
+  color: #a8abb2;
+}
+
+.plugin-upload-text {
+  font-size: 13px;
+  color: #606266;
+}
+
+.plugin-upload-text em {
+  color: #409eff;
+  font-style: normal;
+}
+
+.plugin-upload-hint {
+  font-size: 12px;
+  color: #909399;
 }
 </style>

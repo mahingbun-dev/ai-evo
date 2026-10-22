@@ -45,12 +45,15 @@ class AievoClient:
         mas_token: str,
         params: Optional[Dict[str, Any]] = None,
         json_body: Optional[Dict[str, Any]] = None,
+        timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
         """执行一次请求，返回 ``{"status": int, "data": Any}``。
 
+        ``timeout`` 为单次请求的超时覆盖值（慢操作放宽用），缺省用客户端级超时。
         网络层故障（超时/连接失败）抛 :class:`AievoApiError`；ai-evo 返回什么
         HTTP 状态码都原样带回来（401/422/500 是业务结果，由调用方翻译）。
         """
+        effective_timeout = self._timeout if timeout is None else float(timeout)
         url = f"{self._base}{path}"
         try:
             resp = self._session.request(
@@ -59,12 +62,12 @@ class AievoClient:
                 headers=self._headers(mas_token),
                 params=params,
                 json=json_body,
-                timeout=self._timeout,
+                timeout=effective_timeout,
             )
         except requests.exceptions.Timeout as e:
             raise AievoApiError(
                 "timeout",
-                f"请求 ai-evo 超时（{self._timeout}s）：{url}",
+                f"请求 ai-evo 超时（{effective_timeout}s）：{url}",
             ) from e
         except requests.exceptions.ConnectionError as e:
             raise AievoApiError(

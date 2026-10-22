@@ -334,18 +334,25 @@
     </el-dialog>
 
     <!-- 数据查看/编辑对话框 -->
-    <el-dialog v-model="dataDialogVisible" title="预览数据" width="1000px">
+    <el-dialog v-model="dataDialogVisible" title="预览数据" width="1200px">
       <div style="margin-bottom: 16px">
         <el-button type="primary" :disabled="dataRowOpLoading" @click="openAddDataDialog">添加数据</el-button>
       </div>
-      <el-table :data="dataList" max-height="500">
+      <!-- scrollbar-always-on：字段列多时（实测 29 列 = 4310px）横向滚动条常显可拖，
+           否则 EP 默认只在 hover 数据区时冒出 6px 细条，用户看不到也拖不到 -->
+      <el-table :data="dataList" max-height="500" scrollbar-always-on>
         <el-table-column prop="index" label="序号" width="60" />
         <!-- 动态生成所有字段列（排除 _is_media 控制字段） -->
-        <el-table-column v-for="field in dataFormFields.filter(f => !f.name.endsWith('_is_media'))"
+        <el-table-column v-for="field in editableDataFields"
           :key="field.name"
           :prop="field.name"
           :label="field.label || field.name"
           show-overflow-tooltip min-width="150">
+          <!-- 字段描述最长 195 字符，表头换行会把表头顶到 362px、数据区只剩 138px；
+               这里单行省略，hover 用 title 看全文 -->
+          <template #header>
+            <span class="table-header-ellipsis" :title="field.label || field.name">{{ field.label || field.name }}</span>
+          </template>
           <template #default="{ row }">
             <!-- hub_file 字段：file_id 截断 + 文件图标 + 「文件」按钮（纯静态渲染，不发文件树请求） -->
             <div v-if="field.type === 'hub_file' && row[field.name]" class="hub-file-cell">
@@ -381,53 +388,81 @@
       </template>
     </el-dialog>
 
-    <!-- 添加/编辑数据对话框 -->
-    <el-dialog v-model="dataFormVisible" :title="isDataEdit ? '编辑数据' : '添加数据'" width="1000px" @close="handleDataFormClose">
-      <el-form :model="dataForm" label-width="100px">
-        <!-- 统一动态字段渲染：所有字段（包括user_input和answer）都通过dataForm[field.name]绑定 -->
-        <template v-for="field in dataFormFields.filter(f => !f.name.endsWith('_is_media'))" :key="field.name">
-          <el-form-item :label="field.label || field.name">
-            <el-input v-if="field.type === 'string' || !field.type || field.type === 'text'" v-model="dataForm[field.name]" type="textarea" :rows="3" :placeholder="`请输入${field.label || field.name}`" />
-            <!-- hub_file 字段：值为 anc-hub file_id，评测执行时平台自动下载落盘（设计文档五） -->
-            <el-input v-else-if="field.type === 'hub_file'" v-model="dataForm[field.name]" placeholder="填 anc-hub 文件 file_id，评测时自动下载" clearable />
-            <el-input-number v-else-if="field.type === 'number'" v-model="dataForm[field.name]" :min="0" style="width: 100%" />
-            <el-switch v-else-if="field.type === 'boolean' && field.name.endsWith('_is_media')" v-model="dataForm[field.name]" />
-            <!-- JSON 字段：只读美化展示（对象直接 v-model 会显示 [object Object]，且手改文本会把字符串写回破坏数据） -->
-            <el-input v-else-if="field.type === 'json'" :model-value="formatCellValue(dataForm[field.name])" type="textarea" :rows="8" readonly disabled />
-            <el-input v-else v-model="dataForm[field.name]" type="textarea" :rows="3" :placeholder="`请输入${field.label || field.name}`" />
-          </el-form-item>
-          <!-- is_media 开关 -->
-          <el-form-item v-if="field.is_media || dataForm[field.name + '_is_media'] !== undefined" :label="(field.label || field.name) + '关联附件'">
-            <el-switch v-model="dataForm[field.name + '_is_media']" active-text="是" inactive-text="否" />
-          </el-form-item>
-          <!-- 文件上传区域（当is_media为是时显示） -->
-          <el-form-item v-if="dataForm[field.name + '_is_media']" :label="(field.label || field.name) + '上传'">
-            <el-upload
-              :ref="el => { if(el) dataFormUploadRefs[field.name] = el }"
-              :auto-upload="false"
-              :limit="5"
-              :file-list="dataForm[field.name + '_files'] || []"
-              :on-change="(file, fileList) => handleDataFormFileChange(file, fileList, field.name)"
-              :on-remove="(file, fileList) => handleDataFormFileRemove(file, fileList, field.name)"
-              accept=".jpg,.jpeg,.png,.gif,.bmp,.webp,.mp3,.wav,.aac,.flac,.ogg,.m4a,.pdf,.doc,.docx,.txt,.md,.xlsx,.xls,.csv"
-              multiple
-            >
-              <el-button type="success" :disabled="fileRowOpLoading">
-                <el-icon><Upload /></el-icon>
-                选择文件
-              </el-button>
-            </el-upload>
-          </el-form-item>
-          <!-- 已上传文件列表（编辑时显示） -->
-          <el-form-item v-if="isDataEdit && dataForm[field.name + '_is_media'] && dataForm[field.name + '_editedFiles']?.length > 0" :label="(field.label || field.name) + '已上传'">
-            <div v-for="file in dataForm[field.name + '_editedFiles']" :key="file.id" style="display: flex; align-items: center; margin-bottom: 4px">
-              <el-icon><Document /></el-icon>
-              <span style="margin-left: 4px; flex: 1; overflow: hidden; text-overflow: ellipsis;">{{ file.file_name }}</span>
-              <el-button link type="danger" size="small" :loading="deletingFileId === file.id" :disabled="fileRowOpLoading" @click="deleteEditedDataFile(file, field.name)">删除</el-button>
-            </div>
-          </el-form-item>
-        </template>
-      </el-form>
+    <!-- 添加/编辑数据对话框：左字段列表 + 右单字段编辑区。
+         字段标签就是字段描述（实测平均 49 字符、最长 195 字符），并排表单标签会被
+         EP 固定 32px 行高截断后溢出重叠，故改为「字段名在左、描述与控件全宽在右」 -->
+    <el-dialog v-model="dataFormVisible" :title="isDataEdit ? '编辑数据' : '添加数据'" width="1200px" top="6vh" @close="handleDataFormClose">
+      <div class="data-form-layout">
+        <!-- 左栏：字段导航 -->
+        <aside class="data-form-nav">
+          <div v-if="editableDataFields.length === 0" class="data-form-nav-empty">暂无字段</div>
+          <button v-for="field in editableDataFields" :key="field.name" type="button"
+            class="data-form-nav-item"
+            :class="{ 'is-active': field.name === activeFieldName }"
+            :title="fieldNavTitle(field)"
+            @click="activeFieldName = field.name">
+            <span class="data-form-nav-name">{{ field.name }}</span>
+            <span v-if="field.is_required" class="data-form-nav-flag">必填</span>
+            <el-icon v-if="dataForm[field.name + '_is_media']" class="data-form-nav-media"><Upload /></el-icon>
+          </button>
+        </aside>
+
+        <!-- 右栏：当前字段的完整描述 + 编辑控件 -->
+        <section v-if="activeField" class="data-form-pane">
+          <div class="data-form-pane-head">
+            <span class="data-form-pane-name">{{ activeField.name }}</span>
+            <el-tag v-if="activeField.is_required" type="danger" size="small" effect="plain" disable-transitions>必填</el-tag>
+            <el-tag v-if="activeField.type" type="info" size="small" effect="plain" disable-transitions>{{ activeField.type }}</el-tag>
+          </div>
+          <p v-if="activeField.label && activeField.label !== activeField.name" class="data-form-pane-desc">{{ activeField.label }}</p>
+
+          <el-form :model="dataForm" label-position="top">
+            <!-- 统一动态字段渲染：值均绑定 dataForm[activeField.name] -->
+            <el-form-item>
+              <el-input v-if="activeField.type === 'string' || !activeField.type || activeField.type === 'text'" v-model="dataForm[activeField.name]" type="textarea" :rows="6" :placeholder="`请输入${activeField.label || activeField.name}`" />
+              <!-- hub_file 字段：值为 anc-hub file_id，评测执行时平台自动下载落盘（设计文档五） -->
+              <el-input v-else-if="activeField.type === 'hub_file'" v-model="dataForm[activeField.name]" placeholder="填 anc-hub 文件 file_id，评测时自动下载" clearable />
+              <el-input-number v-else-if="activeField.type === 'number'" v-model="dataForm[activeField.name]" :min="0" style="width: 100%" />
+              <el-switch v-else-if="activeField.type === 'boolean' && activeField.name.endsWith('_is_media')" v-model="dataForm[activeField.name]" />
+              <!-- JSON 字段：只读美化展示（对象直接 v-model 会显示 [object Object]，且手改文本会把字符串写回破坏数据） -->
+              <el-input v-else-if="activeField.type === 'json'" :model-value="formatCellValue(dataForm[activeField.name])" type="textarea" :rows="14" readonly disabled />
+              <el-input v-else v-model="dataForm[activeField.name]" type="textarea" :rows="6" :placeholder="`请输入${activeField.label || activeField.name}`" />
+            </el-form-item>
+            <!-- is_media 开关 -->
+            <el-form-item v-if="activeField.is_media || dataForm[activeField.name + '_is_media'] !== undefined" label="关联附件">
+              <el-switch v-model="dataForm[activeField.name + '_is_media']" active-text="是" inactive-text="否" />
+            </el-form-item>
+            <!-- 文件上传区域（当is_media为是时显示）：file-list 绑 pendingFiles，
+                 切字段再切回来时已选文件仍可见可删 -->
+            <el-form-item v-if="dataForm[activeField.name + '_is_media']" label="上传">
+              <el-upload
+                :ref="el => { if(el) dataFormUploadRefs[activeField.name] = el }"
+                :auto-upload="false"
+                :limit="5"
+                :file-list="pendingFiles[activeField.name] || []"
+                :on-change="(file, fileList) => handleDataFormFileChange(file, fileList, activeField.name)"
+                :on-remove="(file, fileList) => handleDataFormFileRemove(file, fileList, activeField.name)"
+                accept=".jpg,.jpeg,.png,.gif,.bmp,.webp,.mp3,.wav,.aac,.flac,.ogg,.m4a,.pdf,.doc,.docx,.txt,.md,.xlsx,.xls,.csv"
+                multiple
+              >
+                <el-button type="success" :disabled="fileRowOpLoading">
+                  <el-icon><Upload /></el-icon>
+                  选择文件
+                </el-button>
+              </el-upload>
+            </el-form-item>
+            <!-- 已上传文件列表（编辑时显示） -->
+            <el-form-item v-if="isDataEdit && dataForm[activeField.name + '_is_media'] && dataForm[activeField.name + '_editedFiles']?.length > 0" label="已上传">
+              <div v-for="file in dataForm[activeField.name + '_editedFiles']" :key="file.id" style="display: flex; align-items: center; margin-bottom: 4px">
+                <el-icon><Document /></el-icon>
+                <span style="margin-left: 4px; flex: 1; overflow: hidden; text-overflow: ellipsis;">{{ file.file_name }}</span>
+                <el-button link type="danger" size="small" :loading="deletingFileId === file.id" :disabled="fileRowOpLoading" @click="deleteEditedDataFile(file, activeField.name)">删除</el-button>
+              </div>
+            </el-form-item>
+          </el-form>
+        </section>
+        <section v-else class="data-form-pane data-form-pane-empty">请选择左侧字段</section>
+      </div>
       <template #footer>
         <el-button @click="dataFormVisible = false" :disabled="dataFormLoading || fileRowOpLoading">取消</el-button>
         <el-button type="primary" :loading="dataFormLoading" :disabled="fileRowOpLoading" @click="submitDataForm">确定</el-button>
@@ -691,6 +726,24 @@ const dataFormUploadRefs = ref({})
 
 // 数据表单动态字段元数据
 const dataFormFields = ref([])
+
+// 数据表单可编辑字段（排除 _is_media 控制字段）：预览表格列与编辑弹窗左栏共用
+const editableDataFields = computed(() => {
+  if (!Array.isArray(dataFormFields.value)) return []
+  return dataFormFields.value.filter(f => !f.name.endsWith('_is_media'))
+})
+
+// 编辑弹窗当前选中的字段（右栏显示哪个字段的编辑区）
+const activeFieldName = ref('')
+const activeField = computed(() =>
+  editableDataFields.value.find(f => f.name === activeFieldName.value) || editableDataFields.value[0] || null
+)
+
+// 左栏导航项的 hover 提示：字段名会被省略号截断，label 是字段描述，两者都给出便于辨认
+const fieldNavTitle = (field) => {
+  const label = field.label || ''
+  return label && label !== field.name ? `${field.name} —— ${label}` : field.name
+}
 
 const form = ref({
   name: '',
@@ -2005,6 +2058,11 @@ const deleteDataset = async (row) => {
   }
 }
 
+// 打开数据表单弹窗时默认选中第一个字段（右栏显示其编辑区）
+const resetActiveField = () => {
+  activeFieldName.value = editableDataFields.value[0]?.name || ''
+}
+
 // 添加数据相关方法
 const openAddDataDialog = async () => {
   isDataEdit.value = false
@@ -2025,6 +2083,7 @@ const openAddDataDialog = async () => {
     console.warn('getFields failed in openAddDataDialog, keeping existing fields:', e)
   }
 
+  resetActiveField()
   dataFormVisible.value = true
 }
 
@@ -2073,6 +2132,7 @@ const editData = async (row) => {
     console.warn('getFields failed in editData, keeping existing fields:', e)
   }
 
+  resetActiveField()
   dataFormVisible.value = true
 }
 
@@ -2429,5 +2489,120 @@ onMounted(() => {
 /* 错误行样式 */
 :deep(.el-table .error-row) {
   --el-table-tr-bg-color: #FEF2F2;
+}
+
+/* 预览弹窗表头：字段描述单行省略（换行会把表头撑到 362px、数据区只剩 138px） */
+.table-header-ellipsis {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 数据编辑弹窗：左字段列表 + 右单字段编辑区 */
+.data-form-layout {
+  display: flex;
+  gap: 16px;
+  height: 66vh;
+  min-height: 320px;
+}
+
+.data-form-nav {
+  flex: 0 0 240px;
+  width: 240px;
+  overflow-y: auto;
+  border-right: 1px solid #E5E7EB;
+  padding-right: 8px;
+}
+
+.data-form-nav-empty {
+  padding: 8px;
+  color: #909399;
+  font-size: 13px;
+}
+
+.data-form-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  margin-bottom: 2px;
+  padding: 8px 10px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: #4B5563;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.data-form-nav-item:hover {
+  background: #F3F4F6;
+}
+
+.data-form-nav-item.is-active {
+  background: var(--primary-light);
+  color: var(--primary-color);
+  font-weight: 500;
+}
+
+/* 字段名可很长：单行省略，hover 用 title 看全名 */
+.data-form-nav-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+}
+
+.data-form-nav-flag {
+  flex-shrink: 0;
+  color: #f56c6c;
+  font-size: 11px;
+}
+
+.data-form-nav-media {
+  flex-shrink: 0;
+  color: #e6a23c;
+}
+
+.data-form-pane {
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+}
+
+.data-form-pane-empty {
+  color: #909399;
+  font-size: 13px;
+}
+
+.data-form-pane-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.data-form-pane-name {
+  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+  font-size: 14px;
+  font-weight: 600;
+  color: #1F2937;
+  word-break: break-all;
+}
+
+/* 字段描述全文换行展示（最长 195 字符），不再截断溢出 */
+.data-form-pane-desc {
+  margin-bottom: 12px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: #F9FAFB;
+  color: #6B7280;
+  font-size: 12px;
+  line-height: 1.6;
+  word-break: break-word;
 }
 </style>

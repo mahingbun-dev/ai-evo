@@ -170,7 +170,7 @@ def _inject_builtin_db_dsn(script: Dict[str, Any], stdin: Dict[str, Any]) -> Dic
         return stdin
     return {**stdin, "db_dsn": dsn}
 
-_OUTPUT_KEYS = ("status", "output", "files", "summary", "finish_reason", "error")
+_OUTPUT_KEYS = ("status", "output", "files", "summary", "finish_reason", "error", "row_fields")
 
 __all__ = [
     "EXTENSION_POINT_PRE_JUDGE",
@@ -635,6 +635,30 @@ def execute_script(
     )
 
 
+def _normalize_row_fields(raw: Any) -> List[Dict[str, Any]]:
+    """归一化脚本声明的行字段契约（stdout.row_fields，可选增强）
+
+    只保留 [{name, label?, type?, is_media?, is_media_field?}] 形态的合法项，
+    非法项（非 dict / 缺 name / 重名）丢弃。脚本不声明时返回空列表——导入侧
+    改从行内容推导字段元数据（dataset_field_service.derive_fields_from_row），
+    平台不维护任何行 schema 清单。
+    """
+    if not isinstance(raw, list):
+        return []
+    allowed = ("name", "label", "type", "is_media", "is_media_field")
+    fields: List[Dict[str, Any]] = []
+    seen: set = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        fields.append({key: item[key] for key in allowed if key in item})
+    return fields
+
+
 def _execute_harness_agent(
     script: Dict[str, Any],
     stdin: Dict[str, Any],
@@ -699,6 +723,8 @@ def _normalize_stdout(
     result["files"] = stdout.get("files") or {}
     result["summary"] = stdout.get("summary") or ""
     result["error"] = stdout.get("error")
+    # 行字段契约（脚本自描述，供 hub 导入注册字段元数据；未声明为空列表）
+    result["row_fields"] = _normalize_row_fields(stdout.get("row_fields"))
     if raw_status not in ("ok", "skip", "fail"):
         result["status"] = "fail"
         result["error"] = f"非法 status 值: {raw_status}"
@@ -1213,6 +1239,7 @@ def _result(
         "output": None,
         "files": {},
         "summary": "",
+        "row_fields": [],
         "finish_reason": finish_reason,
         "error": None,
         "duration_ms": int((time.time() - started_at) * 1000) if started_at else 0,

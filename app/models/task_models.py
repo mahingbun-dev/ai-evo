@@ -23,6 +23,18 @@ class EvaluationTask(Base):
     model_provider = Column(String, nullable=True, comment="模型提供商")
     model_endpoint = Column(String, nullable=True, comment="模型端点（内部Agent用）")
 
+    # 模型输出来源（judge 评测：模型输出不一定来自被评测模型调用）
+    # model_call-调用被评测模型（默认，存量行为）/ dataset_field-直接取数据集字段 /
+    # none-不使用模型输出
+    model_output_source = Column(
+        String(32), nullable=True, server_default="model_call",
+        comment="模型输出来源：model_call/dataset_field/none（空值按 model_call 处理）",
+    )
+    model_output_field = Column(
+        String, nullable=True,
+        comment="模型输出字段名（model_output_source=dataset_field 时生效）",
+    )
+
     # 评测配置
     dataset_id = Column(String, ForeignKey("evaluation_datasets.id", ondelete="SET NULL"), nullable=True)
 
@@ -53,6 +65,9 @@ class EvaluationTask(Base):
 
     # 二分分类评测配置
     binary_metrics_config = Column(JSON, nullable=True, comment="二分分类评测配置")
+
+    # 插件评测配置（depth: quick/standard；plugin_path/skill_content 为任务级评测对象兜底来源）
+    plugin_config = Column(JSON, nullable=True, comment="插件评测配置")
 
     # 裁判数量配置
     judge_count = Column(Integer, default=6, comment="裁判数量")
@@ -162,6 +177,9 @@ class TaskExecutionRecord(Base):
     # config_snapshot 供 W4（配置快照归因锚点），heartbeat_at 供 W10（部署期收尸 reaper）
     config_snapshot = Column(JSON, nullable=True, comment="本次执行使用的模型/裁判配置快照（W4 写入，禁止落明文 api_key）")
     heartbeat_at = Column(DateTime(timezone=True), nullable=True, comment="执行心跳时间（W10 收尸 reaper 判断依据）")
+
+    # 导出登记（插件 task_execution_export 幂等复用）：{format: {file_id, filename, size, sha256, uploaded_at}}
+    exported_files = Column(JSON, nullable=True, comment="已上传 anc-hub file-store 的导出文档登记（按格式幂等复用 file_id）")
 
 
 class EvaluationResult(Base):

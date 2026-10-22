@@ -120,7 +120,16 @@
                     </div>
                     <div class="metric-field metric-field-xs">
                       <label>权重</label>
-                      <el-select v-model="metric.weight" placeholder="权重" style="width: 100%">
+                      <el-select
+                        v-model="metric.weight"
+                        placeholder="权重"
+                        style="width: 100%"
+                        filterable
+                        allow-create
+                        default-first-option
+                        @change="(val) => { metric.weight = normalizeMetricWeight(val) }"
+                      >
+                        <el-option v-if="isCustomWeight(metric.weight)" :label="String(metric.weight)" :value="metric.weight" />
                         <el-option label="高" value="high" />
                         <el-option label="中" value="medium" />
                         <el-option label="低" value="low" />
@@ -150,6 +159,9 @@
                         <span style="color: #909399;">~</span>
                         <el-input-number v-model="criteria.max" :min="0" :max="form.max_score" size="small" controls-position="right" style="width: 90px;" />
                         <el-input v-model="criteria.desc" placeholder="等级描述" size="small" style="flex: 1;" />
+                        <el-button type="danger" size="small" link :disabled="saving" @click="removeCriteriaLevel(metric, level)">
+                          <el-icon><Delete /></el-icon>
+                        </el-button>
                       </div>
                       <el-button size="small" type="primary" plain @click="addCriteriaLevel(metric)">
                         <el-icon><Plus /></el-icon> 添加等级
@@ -226,6 +238,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Delete, Rank } from '@element-plus/icons-vue'
 import { instructionApi } from '@/api'
 import { formatTime } from '@/utils/time'
+import { isCustomWeight, normalizeMetricWeight } from '@/utils/weight'
 import RefTextarea from '@/components/RefTextarea.vue'
 
 const templates = ref([])
@@ -385,6 +398,12 @@ const addCriteriaLevel = (metric) => {
   const usedLevels = Object.keys(metric.score_criteria)
   const nextLevel = levels.find(l => !usedLevels.includes(l)) || `Level${usedLevels.length + 1}`
   metric.score_criteria[nextLevel] = { min: 0, max: 0, desc: '' }
+}
+
+// 删除评分标准等级
+const removeCriteriaLevel = (metric, level) => {
+  if (!metric.score_criteria) return
+  delete metric.score_criteria[level]
 }
 
 // 添加维度依赖关系
@@ -728,7 +747,7 @@ onMounted(() => {
 }
 
 .metric-field-xs {
-  flex: 0 0 80px;
+  flex: 0 0 100px;
 }
 
 .metric-desc {

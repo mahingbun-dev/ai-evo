@@ -3,9 +3,12 @@
 覆盖：
 - validate_clean_script：不存在 / 停用 / 类型不支持 / 按 id 与按名称命中
 - create_import_job：script_id 校验通过落 job 行、校验失败不落库、不传兼容旧行为
-- _run_clean_script：files 模式 stdin 组装、产物文件读行、fail 状态、无产物
-- process_hub_import_job（挂清洗脚本）：逐包清洗落库 + CLEANSED_FIELD_METADATA
-  注册、脚本缺失整体失败、单包清洗失败记 fail_detail 并补偿释放引用
+- _run_clean_script：files 模式 stdin 组装、产物文件读行、fail 状态、无产物、
+  row_fields（脚本自描述的行字段契约）透传
+- process_hub_import_job（挂清洗脚本）：逐包清洗落库 + 字段元数据按「平台注入
+  字段 + 脚本声明/行内容推导」注册（平台不持有行 schema 清单）、混合批次累积
+  注册、字段集未变化时跳过写库、脚本缺失整体失败、单包清洗失败记 fail_detail
+  并补偿释放引用
 - API：script_id 透传、非法脚本 400
 
 mock 手法与 test_hub_import_job.py / test_hub_import_api.py 同构：
@@ -18,8 +21,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from app.services.hub_import_job_service import (
-    CLEANSED_FIELD_METADATA,
     HUB_FILE_ID_FIELD,
+    HUB_IMPORT_FIELD_METADATA,
     _run_clean_script,
     create_import_job,
     process_hub_import_job,
@@ -153,12 +156,15 @@ class TestRunCleanScript:
                 patch("app.services.pre_judge_runner.execute_script") as mock_exec:
             mock_exec.return_value = {"status": "ok",
                                       "files": {ROW_FILE_NAME: str(row_path)}}
-            result = _run_clean_script("/unpack/dir",
-                                       [{"path": "attempt-1/execution-manifest.json",
-                                         "size": 10, "type": "text"}],
-                                       "fid-x", self.SCRIPT_DEF)
+            row_out, row_fields = _run_clean_script(
+                "/unpack/dir",
+                [{"path": "attempt-1/execution-manifest.json",
+                  "size": 10, "type": "text"}],
+                "fid-x", self.SCRIPT_DEF)
 
-        assert result == row
+        assert row_out == row
+        # 脚本未声明 row_fields 时为空列表（导入侧改从行内容推导）
+        assert row_fields == []
         # 包拷贝进工作区（严格拷贝语义）
         assert mock_copy.call_args.args[:2] == ("/unpack/dir", tmp_path)
         # stdin files 模式：path=工作区内绝对路径、rel_path=索引 path
@@ -178,10 +184,45 @@ class TestRunCleanScript:
                       return_value=str(pkg_copy)), \
                 patch("app.services.pre_judge_runner.execute_script") as mock_exec:
             mock_exec.return_value = {"status": "ok", "output": {"schema_version": "v1"}}
-            result = _run_clean_script("/unpack/dir", [], "fid-y", self.SCRIPT_DEF)
+            row_out, row_fields = _run_clean_script("/unpack/dir", [], "fid-y", self.SCRIPT_DEF)
         # 索引为空时不带 files 键（脚本侧扫根兜底）
         assert "files" not in mock_exec.call_args.args[1]["inputs"]["hub_pkg"]
-        assert result == {"schema_version": "v1"}  # 兜底 output
+        assert row_out == {"schema_version": "v1"}  # 兜底 output
+        assert row_fields == []
+
+    def test_row_fields_passthrough(self, tmp_path):
+        """脚本自描述的行字段契约（stdout.row_fields）随兜底 output 一并返回
+
+        产物文件路径与 output 兜底两条取行路径都要带上 row_fields，否则声明
+        在产物模式下会被丢弃（hub_exec_clean 走的正是产物模式）。
+        """
+        row = {"schema_version": "v1", "thread_events": None}
+        row_path = tmp_path / ROW_FILE_NAME
+        row_path.write_text(json.dumps(row, ensure_ascii=False), encoding="utf-8")
+        declared = [{"name": "schema_version", "type": "string"},
+                    {"name": "thread_events", "type": "json"}]
+        with patch("app.services.pre_judge_runner.build_run_dir", return_value=tmp_path), \
+                patch("app.services.pre_judge_runner.copy_into_workspace",
+                      return_value=str(tmp_path)), \
+                patch("app.services.pre_judge_runner.execute_script") as mock_exec:
+            mock_exec.return_value = {"status": "ok",
+                                      "files": {ROW_FILE_NAME: str(row_path)},
+                                      "row_fields": declared}
+            row_out, row_fields = _run_clean_script("/unpack/dir", [], "fid-rf", self.SCRIPT_DEF)
+        assert row_out == row
+        assert row_fields == declared
+
+    def test_row_fields_missing_or_none_yields_empty(self, tmp_path):
+        """row_fields 缺失 / 为 None 时返回空列表（不抛异常、不污染行内容）"""
+        for absent in ({}, {"row_fields": None}):
+            with patch("app.services.pre_judge_runner.build_run_dir", return_value=tmp_path), \
+                    patch("app.services.pre_judge_runner.copy_into_workspace",
+                          return_value=str(tmp_path)), \
+                    patch("app.services.pre_judge_runner.execute_script") as mock_exec:
+                mock_exec.return_value = {"status": "ok",
+                                          "output": {"schema_version": "v1"}, **absent}
+                _, row_fields = _run_clean_script("/unpack/dir", [], "fid-n", self.SCRIPT_DEF)
+            assert row_fields == []
 
     def test_failed_status_raises(self, tmp_path):
         with patch("app.services.pre_judge_runner.build_run_dir", return_value=tmp_path), \
@@ -254,8 +295,41 @@ def make_job(file_ids, script_id=None, **kw):
 
 
 class TestProcessWithCleanScript:
-    CLEAN_ROW = {"schema_version": "hub_exec_cleaned_v1",
-                 "clean_summary": {"case_total": 18, "completion": {"completed": 18}}}
+    # 清洗脚本产出的行内容（v1 形态）：thread_events 故意置 None——复合字段缺数据时
+    # 靠平台按行内值推断会退化成 string，正是要由脚本声明 type 的场景
+    CLEAN_ROW = {
+        "schema_version": "hub_exec_cleaned_v1",
+        "thread_events": None,
+        "clean_summary": {"case_total": 18, "completion": {"completed": 18}},
+        "field_descriptions": {
+            "schema_version": "行内容 schema 版本",
+            "clean_summary": "清洗统计（分母/通过/需复核）",
+            # 嵌套键不是字段，不得被登记为字段元数据
+            "clean_summary.case_total": "用例总数",
+        },
+    }
+    # 脚本自描述的行字段契约：只声明 name/type，label 由行内 field_descriptions 提供
+    CLEAN_ROW_FIELDS = [
+        {"name": "schema_version", "type": "string"},
+        {"name": "thread_events", "type": "json"},
+        {"name": "clean_summary", "type": "json"},
+    ]
+    # v2 行（merge_dataset 并入准确度评测段后的形态）：字段并集应被累积登记
+    CLEAN_ROW_V2 = {
+        "schema_version": "hub_exec_cleaned_v2",
+        "thread_events": [],
+        "clean_summary": {"case_total": 7},
+        "complexity": "medium",
+        "accuracy_evaluation": {"coverage_matrix": {}},
+        "field_descriptions": {
+            "complexity": "需求复杂度（simple/medium/complex）",
+            "accuracy_evaluation": "准确度评测段（coverage_matrix 驱动）",
+        },
+    }
+    CLEAN_ROW_FIELDS_V2 = CLEAN_ROW_FIELDS + [
+        {"name": "complexity", "type": "string"},
+        {"name": "accuracy_evaluation", "type": "json"},
+    ]
 
     def _run(self, tmp_path, monkeypatch, jobs, clean_side_effect=None,
              script_def=None or {"script_id": "scr-1", "name": "hub_exec_clean",
@@ -264,11 +338,21 @@ class TestProcessWithCleanScript:
         rows = []
         meta = []
         released = []
+        # 有状态的字段元数据替身：get 读回上次 save 的内容——逐包累积注册与
+        # 「字段集未变化则跳过写库」都依赖真实读回，固定返回 [] 测不出来
+        store: dict = {}
 
         def fake_clean(unpack_dir, file_index, fid, sd):
             if clean_side_effect is not None:
                 return clean_side_effect(unpack_dir, file_index, fid, sd)
-            return dict(self.CLEAN_ROW)
+            return dict(self.CLEAN_ROW), list(self.CLEAN_ROW_FIELDS)
+
+        def fake_get(dataset_id):
+            return [dict(f) for f in store.get(dataset_id, [])]
+
+        def fake_save(dataset_id, fields):
+            store[dataset_id] = [dict(f) for f in fields]
+            meta.append((dataset_id, [dict(f) for f in fields]))
 
         with patch("app.services.hub_file_service.ensure_unpacked") as mock_eu, \
                 patch("app.services.hub_file_service.acquire_ref"), \
@@ -285,9 +369,8 @@ class TestProcessWithCleanScript:
                                     "file_index": [], "summary": {}}
             mock_ds.return_value.add_data_v2.side_effect = \
                 lambda dataset_id, data: rows.append((dataset_id, dict(data)))
-            mock_fs.return_value.get_field_metadata.return_value = []
-            mock_fs.return_value.save_field_metadata.side_effect = \
-                lambda dataset_id, fields: meta.append((dataset_id, [dict(f) for f in fields]))
+            mock_fs.return_value.get_field_metadata.side_effect = fake_get
+            mock_fs.return_value.save_field_metadata.side_effect = fake_save
             results = []
             for job in jobs:
                 db = FakeProcessDb(job)
@@ -303,14 +386,84 @@ class TestProcessWithCleanScript:
         assert rows[0][1][HUB_FILE_ID_FIELD] == "fid-1"
         assert rows[0][1]["clean_summary"]["case_total"] == 18
         assert rows[1][1]["schema_version"] == "hub_exec_cleaned_v1"
-        # 字段元数据注册为清洗字段集
+
         by_name = {f["name"]: f for f in meta[-1][1]}
+        # 平台注入字段：hub_file 通道语义无法从行内值推导，固定前置
         assert by_name[HUB_FILE_ID_FIELD]["type"] == "hub_file"
-        assert by_name["session_messages"]["type"] == "json"
-        assert by_name["review_material"]["type"] == "string"
-        assert {m["name"] for m in CLEANSED_FIELD_METADATA} <= set(by_name)
-        assert "hub_summary" not in by_name  # 原样导入字段不再注册
+        assert by_name[HUB_FILE_ID_FIELD]["position"] == 0
+        # 脚本声明的 type 生效：thread_events 值为 None，靠行内值推断会退化成 string
+        assert by_name["thread_events"]["type"] == "json"
+        assert by_name["clean_summary"]["type"] == "json"
+        # 未声明的字段由行内容兜底推导（field_descriptions 值是 dict → json）
+        assert by_name["field_descriptions"]["type"] == "json"
+        # label 取行内 field_descriptions 自描述——平台不持有中文清单
+        assert by_name["clean_summary"]["label"] == "清洗统计（分母/通过/需复核）"
+        assert by_name["schema_version"]["label"] == "行内容 schema 版本"
+        # 嵌套键不是字段
+        assert "clean_summary.case_total" not in by_name
+        # 原样导入字段不再注册（清洗路径的数据行没有 hub_summary）
+        assert "hub_summary" not in by_name
+        # 推导/声明字段一律非必填：save_field_metadata 的 is_required 默认 True，
+        # 不显式置 False 会让清洗数据集被当成「必填字段缺失」而拒绝后续导入
+        assert all(f["is_required"] is False for f in meta[-1][1])
+        # 两包行结构相同 → 第二包字段集未变化，跳过写库（只 save 一次）
+        assert len(meta) == 1
         assert released == []  # 全成功无补偿释放
+
+    def test_mixed_schema_versions_accumulate_fields(self, tmp_path, monkeypatch):
+        """混合批次（v1 + v2）逐包累积注册：字段并集被完整登记
+
+        这正是平台硬编码清单失效的场景——v2 新增的 complexity/accuracy_evaluation
+        不在任何平台常量里，只能由产出方声明 + 行内容推导得到。
+        """
+        job = make_job(["fid-v1", "fid-v2"], script_id="scr-1")
+
+        def fake_clean(unpack_dir, file_index, fid, sd):
+            if fid == "fid-v2":
+                return dict(self.CLEAN_ROW_V2), list(self.CLEAN_ROW_FIELDS_V2)
+            return dict(self.CLEAN_ROW), list(self.CLEAN_ROW_FIELDS)
+
+        [(result, _)], rows, meta, released = self._run(
+            tmp_path, monkeypatch, [job], clean_side_effect=fake_clean)
+        assert result["status"] == "completed" and result["success_count"] == 2
+        # 第一包（v1）写一次；第二包（v2）字段集变大 → 再写一次
+        assert len(meta) == 2
+        by_name = {f["name"]: f for f in meta[-1][1]}
+        assert {"complexity", "accuracy_evaluation"} <= set(by_name)
+        assert by_name["complexity"]["label"] == "需求复杂度（simple/medium/complex）"
+        assert by_name["accuracy_evaluation"]["type"] == "json"
+        # v1 的字段未被 v2 覆盖删除（merge 保留已有）
+        assert "schema_version" in by_name and "thread_events" in by_name
+        # position 重排后唯一且连续（重复 position 会让 order_by(position) 排序不稳）
+        positions = [f["position"] for f in meta[-1][1]]
+        assert positions == list(range(len(positions)))
+
+    def test_declared_label_wins_over_row_descriptions(self, tmp_path, monkeypatch):
+        """脚本显式声明的 label 优先于行内 field_descriptions（声明是更强的契约）"""
+        job = make_job(["fid-1"], script_id="scr-1")
+        declared = [{"name": "clean_summary", "label": "清洗统计（脚本声明）", "type": "json"}]
+
+        def fake_clean(unpack_dir, file_index, fid, sd):
+            return dict(self.CLEAN_ROW), declared
+
+        [(result, _)], rows, meta, released = self._run(
+            tmp_path, monkeypatch, [job], clean_side_effect=fake_clean)
+        by_name = {f["name"]: f for f in meta[-1][1]}
+        assert by_name["clean_summary"]["label"] == "清洗统计（脚本声明）"
+
+    def test_row_without_descriptions_falls_back_to_key_name(self, tmp_path, monkeypatch):
+        """行内无 field_descriptions 且脚本未声明时，label 回落字段名（不报错、不丢字段）"""
+        job = make_job(["fid-1"], script_id="scr-1")
+
+        def fake_clean(unpack_dir, file_index, fid, sd):
+            return {"complexity": "simple", "clean_summary": {"case_total": 1}}, []
+
+        [(result, _)], rows, meta, released = self._run(
+            tmp_path, monkeypatch, [job], clean_side_effect=fake_clean)
+        by_name = {f["name"]: f for f in meta[-1][1]}
+        assert by_name["complexity"]["label"] == "complexity"
+        assert by_name["complexity"]["type"] == "string"
+        assert by_name["clean_summary"]["type"] == "json"
 
     def test_script_load_failure_aborts(self, tmp_path, monkeypatch):
         job = make_job(["fid-1"], script_id="scr-gone")
@@ -324,7 +477,8 @@ class TestProcessWithCleanScript:
             tmp_path, monkeypatch, [job],
             clean_side_effect=lambda *a, **k: (
                 (_ for _ in ()).throw(RuntimeError("清洗脚本执行失败: no_cases_found"))
-                if a[2] == "fid-bad" else dict(self.CLEAN_ROW)))
+                if a[2] == "fid-bad"
+                else (dict(self.CLEAN_ROW), list(self.CLEAN_ROW_FIELDS))))
         assert result["status"] == "failed"
         assert result["success_count"] == 1 and result["fail_count"] == 1
         assert "清洗脚本执行失败" in result["fail_detail"]["fid-bad"]
@@ -333,6 +487,8 @@ class TestProcessWithCleanScript:
         assert db.rolls >= 1
         # 成功项进幂等键，retry 只重跑失败项
         assert job.succeeded_file_ids == ["fid-ok"]
+        # 失败包不注册字段元数据（只有成功落库的行才贡献字段契约）
+        assert len(meta) == 1
 
     def test_without_script_keeps_legacy_row(self, tmp_path, monkeypatch):
         job = make_job(["fid-1"], script_id=None)
@@ -343,6 +499,9 @@ class TestProcessWithCleanScript:
         by_name = {f["name"]: f for f in meta[-1][1]}
         assert "hub_summary" in by_name
         assert "review_material" not in by_name
+        assert {m["name"] for m in HUB_IMPORT_FIELD_METADATA} <= set(by_name)
+        # 无脚本时字段固定：循环前注册一次，不逐包重写
+        assert len(meta) == 1
 
 
 # ---------------------------------------------------------------------------

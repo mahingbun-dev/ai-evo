@@ -11,7 +11,7 @@ agent ──MCP──▶ anc-hub ──meta[hub.mas_token]──▶ ai-evo-hub-p
                                             ai-evo api(:8100, /api/v1)
 ```
 
-## 能力面（18 个 MCP 工具）
+## 能力面（23 个 MCP 工具）
 
 中台把 manifest 声明的工具聚合进 MCP 工具面，工具名带 `ai-evo__` 前缀。
 agent 从 `tools/list` 直接选用；也可走 `invoke_plugin` 通用入口（载荷里加 `op` 字段）。
@@ -23,9 +23,14 @@ agent 从 `tools/list` 直接选用；也可走 `invoke_plugin` 通用入口（�
 | 文件导入 | hub_files_query | 查询 anc-hub file-store 里的文件（找 file_id） |
 | 文件导入 | dataset_import_hub_files | 按 file_ids 建/追加数据集（异步 job） |
 | 文件导入 | hub_import_job_status | 查导入进度 |
-| 评测任务 | model_list / task_list / task_get | 选模型、列任务、查状态与配置 |
+| 评测任务 | model_list / task_list / task_get | 选模型、列任务（名称/状态/类型过滤）、查状态与配置 |
 | 评测任务 | task_create / task_update\* / task_delete\* | CRUD；update/delete 需人工审批 |
 | 评测任务 | task_run / task_stop | 触发执行（异步）/停止 |
+| 评测任务 | task_status | 轻量状态轮询（status/progress/完成数/总数，四字段） |
+| 执行历史 | task_executions | 执行历史列表（第几次执行/状态/成本/起止时间，剥大列） |
+| 执行历史 | task_execution_detail | 指定执行版本逐题明细分页（默认 10 题/页，长文本不截断） |
+| 执行历史 | task_execution_export | 导出 markdown 全量报告/json 无损文档上传 file-store 返 file_id（同版本幂等） |
+| 执行历史 | task_logs | 任务执行日志（按级别过滤） |
 | 评测任务 | task_results | 结果摘要（通过率/平均分/维度分/top失败样例）+ 前端链接 |
 
 \* 标记的工具 `requires_approval=true`：autonomous agent 只能提交草稿，由人在中台侧确认后执行。
@@ -54,9 +59,24 @@ agent 从 `tools/list` 直接选用；也可走 `invoke_plugin` 通用入口（�
 ### 长任务语义
 
 `task_run` 提交即返（celery 异步），评测耗时分钟到小时级。**插件不做轮询**——
-agent 需要状态就用 `task_get` 显式查询，需要监控就由 agent 自己安排轮询节奏。
-评测结果经 `task_results` 返回**摘要**（成功项明细整块省略、失败样例截断 top10），
-全量明细走前端结果页。
+agent 需要状态就用 `task_status`（轻量四字段，高频轮询首选）或 `task_get`
+（含任务配置全量）显式查询，需要监控就由 agent 自己安排轮询节奏。
+评测结果经 `task_results` 返回**摘要**（成功项明细整块省略、失败样例截断 top10）。
+
+### 执行历史与单次执行详情（v1.3.0+）
+
+每个任务可多次执行（后端按 `execution_number` 留档 `task_execution_records`）：
+
+1. `task_executions` 列执行历史（倒序，只带标量元信息，不带每版 result 大列）；
+2. `task_execution_detail` 按执行序号翻页看逐题明细——插件侧把全量 result 的
+   items/failed_items（judge/plugin）或 detail_results（rag）/records（latency）
+   合并排序后按 `skip/limit` 切页（默认 10 题/页、上限 50），当页长文本不截断，
+   汇总指标随页返回；failed/stopped 版本返回错误摘要；
+3. `task_execution_export` 把该版本渲染成文档上传 anc-hub file-store，返回
+   `file_id`——markdown 为全量人读报告（含逐题裁判评语全文；failed 版只出失败
+   简报），json 为无损结构。上传以调用者身份执行（Bearer 即 mas_token，落审计），
+   同版本同格式幂等复用已传 file_id（`task_execution_records.exported_files` 登记）。
+   agent 拿 file_id 后用 `file-store__file_download` 分块下载。
 
 ## 部署形态
 

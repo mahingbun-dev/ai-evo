@@ -15,8 +15,14 @@ from typing import List, Dict, Any, Optional
 from celery.exceptions import SoftTimeLimitExceeded
 
 from app.db.session import engine, SessionLocal
+from app.services.metric_scoring import has_custom_dimension_max
 
 logger = logging.getLogger(__name__)
+
+# CC 裁判 targets 内容并入 prompt 的字符阈值：与超长会话落盘阈值一致
+# （30000 字符 ≈ 90KB UTF-8，低于 harness_adapter 的 100KB argv 安全阈值
+# 与内核 131072B 单参数上限）；超过即落盘由裁判 Read 工具阅读
+CC_TARGETS_INLINE_LIMIT_CHARS = 30000
 
 
 class EvaluationExecutor:
@@ -233,6 +239,46 @@ class EvaluationExecutor:
         return result
 
     @staticmethod
+    def _renormalize_cc_judge_scores(judge_results, scoring_metrics, task_max_score):
+        """维度最高分归一化重算 CC 裁判自报总分（原地修改并返回）
+
+        CC 裁判自报总分不感知各维度量程（最高分 5 的维度打 5 会被当 5 分
+        微平均拉低总分），任务配置了非任务满分的维度最高分时，服务端按
+        「维度分/维度最高分×任务满分」加权重算每个裁判的总分（与图引擎聚合
+        口径一致）；未配置时原样返回，存量任务行为不变。裁判自报分保留在
+        judge_reported_score 供追溯；失败裁判与无维度分的裁判不重算。
+
+        重算只按该裁判实际评分的维度做微平均（验收 P1-1）：本行不涉及的
+        维度按 CC 协议输出 "F" 哨兵、normalize 阶段已从 dimension_scores
+        剔除，若仍按全量维度表计权会把不涉及维度当 0 分压低总分，违背
+        「F 维度不参与」的协议语义。
+        """
+        if not has_custom_dimension_max(scoring_metrics, task_max_score):
+            return judge_results
+        from app.services.judge_evaluation_engine import JudgeEvaluationEngine
+
+        for judge_result in judge_results or []:
+            if not isinstance(judge_result, dict):
+                continue
+            dim_scores = judge_result.get("dimension_scores")
+            if judge_result.get("judge_failed") or not dim_scores:
+                continue
+            # 只保留该裁判实际产出分数的维度配置（F 哨兵维度缺失 → 不计权）
+            involved_metrics = [
+                m for m in scoring_metrics
+                if isinstance(m, dict) and m.get("name") in dim_scores
+            ]
+            if not involved_metrics:
+                continue
+            reported_score = judge_result.get("score")
+            recomputed = JudgeEvaluationEngine.calculate_weighted_score(
+                involved_metrics, dim_scores, task_max_score or 10
+            )
+            judge_result["judge_reported_score"] = reported_score
+            judge_result["score"] = recomputed
+        return judge_results
+
+    @staticmethod
     def _judge_variable_keys(task) -> List[str]:
         """提取 judge_variable_config 的全部变量 key（dict / list 两种格式）
 
@@ -271,6 +317,86 @@ class EvaluationExecutor:
         except Exception as e:
             logger.warning(f"渲染会话 markdown 失败: {e}")
             return ""
+
+    @staticmethod
+    def _extract_dataset_field_output(payload: Dict[str, Any], field_name: Optional[str]) -> str:
+        """从数据集字段提取模型输出（model_output_source=dataset_field）
+
+        - 兼容数据项的两种形态：payload._dataset_item 为 dict（任务链路
+          _load_dataset 构造）或 ORM 对象（get_data_list_v2 直出）；
+        - 字段值可能是 dict/list 等非字符串，序列化为 JSON 文本（keep 中文）；
+        - 字段缺失/为 None 返回空串，交由既有空值校验走 empty_input 口径。
+        """
+        field = (field_name or "").strip()
+        if not field:
+            raise RuntimeError(
+                "模型输出来源为数据集字段但未配置字段名（model_output_field）"
+            )
+        dataset_item = payload.get("_dataset_item") or {}
+        if isinstance(dataset_item, dict):
+            data = dataset_item.get("data")
+        else:
+            data = getattr(dataset_item, "data", None)
+        if not isinstance(data, dict):
+            data = {}
+        value = data.get(field)
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        try:
+            return json.dumps(value, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return str(value)
+
+    @staticmethod
+    def _build_cc_targets_prompt(
+        resolved_targets: Dict[str, Dict[str, Any]],
+        task_id: str,
+        payload: Dict[str, Any],
+        session_file: Optional[str] = None,
+        session_markdown: Optional[str] = None,
+    ) -> str:
+        """CC 裁判待评内容分流：小内容并入 prompt，大内容落盘由裁判 Read 阅读
+
+        targets 内容原本经 PromptBuilder._build_system_prompt 注入 system_prompt，
+        由 claude-agent-sdk 以 --system-prompt argv 传给 CLI；Linux 单个 argv
+        字符串上限 131072B，超限 execve 直接报 [Errno 7] Argument list too long
+        （所有裁判启动失败）。CC 引擎 system_prompt 不再携带数据，改为：
+        ≤阈值的内容并入 user prompt（stdin 传输无上限），>阈值的写临时文件并把
+        绝对路径附进 prompt，裁判 agent 用 Read 工具分段阅读（与超长会话
+        session_file 同一机制）；与既有 session_file 内容相同时直接复用不重复落盘。
+        """
+        from app.services.claude_code_judge_agent import write_session_file
+        from app.services.prompt_guard import wrap_eval_data
+
+        if not resolved_targets:
+            return ""
+        dataset_item = payload.get("_dataset_item", {}) or {}
+        data_id = dataset_item.get("id", payload.get("idx", 0))
+        parts: List[str] = []
+        for target_info in resolved_targets.values():
+            name = target_info.get("name", "")
+            content = target_info.get("content", "")
+            if not content or target_info.get("is_empty", False):
+                continue
+            if session_file and content == session_markdown:
+                # 与超长会话落盘内容一致：复用同一文件，避免重复写盘与重复阅读
+                path = session_file
+            elif len(content) > CC_TARGETS_INLINE_LIMIT_CHARS:
+                path = write_session_file(task_id, data_id, content)
+            else:
+                path = None
+            if path:
+                parts.append(
+                    f"### {name}\n完整内容已保存到本地文件：{path}\n"
+                    f"请使用 Read 工具阅读该文件（文件较长时分段阅读，直到读完）。"
+                )
+            else:
+                parts.append(f"### {name}\n{wrap_eval_data(content)}")
+        if not parts:
+            return ""
+        return "\n---\n## 待评测目标内容\n\n" + "\n\n".join(parts)
 
     @staticmethod
     def _run_pre_scripts(task, payload: Dict[str, Any], steps=None) -> Dict[str, Any]:
@@ -390,6 +516,17 @@ class EvaluationExecutor:
                     else:
                         runtime_variables[key] = str(var_value)
 
+            # 模型输出来源：model_call-调用被评测模型（默认，含存量任务空值）/
+            # dataset_field-直接取数据集字段 / none-不使用模型输出。
+            # agent 的会话文件分支优先级最高（既有行为不变）。
+            # 与创建/更新校验同口径归一化（strip/lower），避免带空白值校验通过
+            # 却按字面量落到 model_call 分支。
+            raw_output_source = getattr(task, "model_output_source", None)
+            if isinstance(raw_output_source, str):
+                model_output_source = raw_output_source.strip().lower() or "model_call"
+            else:
+                model_output_source = raw_output_source or "model_call"
+
             # 调用模型（使用同步方法，与模型配置测试连通性一致）
             session_markdown = None
             # 超长会话的临时文件路径（步骤1.5 前处理脚本与步骤3 CC 裁判共用，避免重复写盘）
@@ -405,6 +542,16 @@ class EvaluationExecutor:
                 item_data = dataset_item.get("data", {}) if isinstance(dataset_item.get("data"), dict) else {}
                 result["session_summary"] = item_data.get("session_summary") or item_data.get("user_input", "")
                 result["session_source"] = item_data.get("source", "")
+            elif model_output_source == "dataset_field":
+                # 模型输出已在数据集字段中：直接取值，不调用被评测模型
+                # （知识库检索结果等场景无需也不应再次请求模型）
+                model_output = self._extract_dataset_field_output(
+                    payload, getattr(task, "model_output_field", None)
+                )
+                call_result = {"success": True, "content": model_output, "chain_results": []}
+            elif model_output_source == "none":
+                # 显式不使用模型输出：跳过模型调用，后续 targets/裁判变量照常解析
+                call_result = {"success": True, "content": "", "chain_results": []}
             else:
                 model_caller = ModelCallerSync()
                 call_result = model_caller.call(messages, model_config, runtime_variables)
@@ -600,6 +747,12 @@ class EvaluationExecutor:
             }
             overrides = resolve_task_ref_overrides(task, ref_ctx)
 
+            # 计分用维度口径：与 build_state_input 一致，@ 引用覆盖件优先于 task
+            # 同名字段（CC 引擎行级总分重算的守卫与公式都基于这份维度配置）
+            scoring_metrics = overrides.get("evaluation_metrics")
+            if scoring_metrics is None:
+                scoring_metrics = getattr(task, "evaluation_metrics", None) or []
+
             prompt_builder = PromptBuilder(task, overrides=overrides)
 
             # 使用新的 build_user_prompt_from_judge_vars 方法构建 user_prompt
@@ -643,6 +796,30 @@ class EvaluationExecutor:
                     data_id = (payload.get("_dataset_item", {}) or {}).get("id", payload.get("idx", 0))
                     session_file = write_session_file(str(task.id), data_id, session_markdown)
 
+                # CC 引擎 system_prompt 只保留评分指令：claude-agent-sdk 以
+                # --system-prompt argv 传 system_prompt，Linux 单参数上限
+                # 131072B，携待评数据超限即 execve E2BIG（全裁判启动失败）。
+                # targets 待评数据改由 _build_cc_targets_prompt 分流进
+                # user prompt / 落盘文件
+                system_prompt = prompt_builder._build_system_prompt(
+                    user_input=judge_payload.get("user_input", ""),
+                    ref_answer=judge_payload.get("ref_answer", ""),
+                    model_output=model_output,
+                    dataset_item=judge_payload.get("_dataset_item", {}),
+                    payload=judge_payload,
+                    chain_results=chain_results,
+                    include_targets_content=False,
+                )
+                targets_prompt = self._build_cc_targets_prompt(
+                    resolved_targets,
+                    str(task.id),
+                    payload,
+                    session_file=session_file,
+                    session_markdown=session_markdown,
+                )
+                if targets_prompt:
+                    user_prompt = f"{user_prompt}\n\n{targets_prompt}" if user_prompt else targets_prompt
+
                 cc_agent = ClaudeCodeJudgeAgent(
                     task=task,
                     langfuse_host=self.langfuse_host,
@@ -652,6 +829,9 @@ class EvaluationExecutor:
                     user_prompt=user_prompt,
                     session_file=session_file,
                     judge_count=task.judge_count or 1,
+                )
+                judge_results = self._renormalize_cc_judge_scores(
+                    judge_results, scoring_metrics, task.max_score
                 )
                 judge_scores = judge_results
                 result["judge_scores"] = judge_scores

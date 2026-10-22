@@ -274,6 +274,8 @@ class TestAggregateScoresNode:
         result = aggregate_scores_node(state)
         assert result["final_score"] == 0.0
         assert "没有有效的评分结果" in result["final_feedback"]
+        # 无有效评分分支：分维度理由置空
+        assert result["final_dimension_feedbacks"] == {}
 
     def test_aggregate_scores_basic(self):
         """Test aggregate with single metric"""
@@ -290,6 +292,8 @@ class TestAggregateScoresNode:
         result = aggregate_scores_node(state)
         assert result["final_score"] == 9.0
         assert "准确性" in result["final_feedback"]
+        # 正常聚合分支：从 dimension_results 组装分维度理由
+        assert result["final_dimension_feedbacks"] == {"准确性": "正确"}
 
     def test_aggregate_scores_weighted(self):
         """Test weighted aggregation with multiple metrics"""
@@ -328,6 +332,30 @@ class TestAggregateScoresNode:
         result = aggregate_scores_node(state)
         assert result["final_score"] == 0.0
         assert "权重之和为 0" in result["final_feedback"]
+        # 权重 0 分支：分维度理由置空
+        assert result["final_dimension_feedbacks"] == {}
+
+    def test_aggregate_scores_feedbacks_only_successful_dims(self):
+        """final_dimension_feedbacks 仅收录成功评分的维度；reasoning 缺失置空字符串"""
+        from app.services.judge_graph_nodes import aggregate_scores_node
+        state = {
+            "evaluation_metrics": [
+                {"name": "准确性", "weight": 1},
+                {"name": "完整性", "weight": 1},
+                {"name": "可读性", "weight": 1},
+            ],
+            "dimension_results": {
+                "准确性": {"score": 9.0, "reasoning": "内容准确"},
+                "完整性": {"score": 6.0},  # reasoning 缺失 → 空字符串
+                # judge_failed 维度（解析失败）→ 不收录进理由表
+                "可读性": {"score": 0.0, "reasoning": "评分解析失败", "judge_failed": True},
+            },
+            "max_score": 10,
+        }
+        result = aggregate_scores_node(state)
+        assert result["final_dimension_feedbacks"] == {"准确性": "内容准确", "完整性": ""}
+        # 失败维度仍冒泡整裁判失败标记（W2-1 既有口径不回归）
+        assert result["final_judge_failed"] is True
 
     def test_aggregate_dependency_override_eq(self):
         """Test dependency override: if source_dim eq 0, override dependent to 0"""
@@ -475,6 +503,7 @@ class TestFormatOutputNode:
             "final_score": 8.5,
             "final_feedback": "测试反馈",
             "final_dimension_scores": {"准确性": 9.0, "完整性": 8.0},
+            "final_dimension_feedbacks": {"准确性": "内容准确", "完整性": "覆盖完整"},
             "dimension_results": {"准确性": {"score": 9.0}, "完整性": {"score": 8.0}},
             "analysis": "分析内容",
         }
@@ -485,4 +514,22 @@ class TestFormatOutputNode:
         assert parsed["feedback"] == "测试反馈"
         assert "准确性" in parsed["dimension_scores"]
         assert parsed["dimension_scores"]["准确性"] == 9.0
+        # 顶层输出分维度理由字段
+        assert parsed["dimension_feedbacks"] == {"准确性": "内容准确", "完整性": "覆盖完整"}
+        # 既有 judge_details.dimension_details 保持不动
+        assert parsed["judge_details"]["dimension_details"] == state["dimension_results"]
         assert "judge_details" in parsed
+
+    def test_format_output_node_missing_feedbacks_key_compat(self):
+        """旧状态（无 final_dimension_feedbacks 键）不报错，顶层兜底空 dict"""
+        from app.services.judge_graph_nodes import format_output_node
+        state = {
+            "final_score": 8.5,
+            "final_feedback": "测试反馈",
+            "final_dimension_scores": {"准确性": 9.0},
+            "dimension_results": {"准确性": {"score": 9.0}},
+            "analysis": "分析内容",
+        }
+        result = format_output_node(state)
+        parsed = json.loads(result["raw_output"])
+        assert parsed["dimension_feedbacks"] == {}

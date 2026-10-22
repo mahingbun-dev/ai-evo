@@ -650,8 +650,8 @@ describe('D6 编辑弹窗 Tab 化与 model.py 声明联动', () => {
     assert.deepEqual(calls.api.saveFile[0][1].path, 'model.py')
     assert.deepEqual(api.scriptInputFieldRows.value,
       [{ name: 'src', value_type: 'local', description: '数据源' }])
-    // 输出声明已由纯文本改为树行 scriptOutputSchemaRows（叶子解析为 type/description，
-    // int 经 OUTPUT_TYPE_ALIASES 规范化为 integer）
+    // 输出说明已表单化（358fccc）：schema_sync 回写为行式树节点，
+    // 'int：命中数' 叶串按 OUTPUT_TYPE_ALIASES 解析为 type=integer
     assert.deepEqual(api.scriptOutputSchemaRows.value,
       [{ name: 'hits', type: 'integer', description: '命中数', collapsed: false, children: [] }])
     assert.equal(api.editingScript.value.input_fields.src.value_type, 'local')

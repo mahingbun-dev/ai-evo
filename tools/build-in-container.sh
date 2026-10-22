@@ -63,6 +63,15 @@ pnpm build
 [ -f /workspace/frontend/dist/index.html ] \
     || { echo "!!! 前端构建未产出 dist/index.html"; exit 1; }
 
+# BUILD_FRONTEND_ONLY=1（由 build-service 传入）：变更只涉及 frontend/，
+# 跳过应用镜像构建——容器不需要重建，部署阶段只同步 dist 到 nginx 静态根。
+BUILD_FRONTEND_ONLY="${BUILD_FRONTEND_ONLY:-0}"
+if [ "$BUILD_FRONTEND_ONLY" = "1" ]; then
+    progress done 100 "前端构建完成（frontend-only，跳过应用镜像）"
+    echo "=== 完成：frontend-only 构建（跳过 docker build）==="
+    exit 0
+fi
+
 # 前端产物不进 git，但必须随部署包交付给 nginx/静态托管之外的场景，
 # docker build 会把它打进镜像（见 Dockerfile 的 COPY frontend/dist/）
 progress backend 55 "构建应用镜像"

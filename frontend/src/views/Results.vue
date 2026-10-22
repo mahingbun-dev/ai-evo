@@ -49,7 +49,7 @@
         </div>
       </template>
 
-      <div v-if="result">
+      <div v-if="result" v-loading="resultLoading" element-loading-text="正在加载评测结果，请稍候…">
         <!-- 结果概览 -->
         <el-row :gutter="20">
           <el-col :span="6">
@@ -96,8 +96,8 @@
           <el-divider />
           <h3>评测详情</h3>
 
-          <!-- 统计卡片 - 一致性评测、耗时评测、二分分类使用不同的指标，不显示此卡片 -->
-          <el-row :gutter="20" class="stats-row" v-if="result.evaluation_type !== 'rag' && result.evaluation_type !== 'consistency' && result.evaluation_type !== 'latency' && result.evaluation_type !== 'binary_classification' && result.evaluation_type !== 'safety'">
+          <!-- 统计卡片 - 一致性评测、耗时评测、二分分类、插件评测使用不同的指标，不显示此卡片 -->
+          <el-row :gutter="20" class="stats-row" v-if="result.evaluation_type !== 'rag' && result.evaluation_type !== 'consistency' && result.evaluation_type !== 'latency' && result.evaluation_type !== 'binary_classification' && result.evaluation_type !== 'safety' && result.evaluation_type !== 'plugin'">
             <el-col :span="6">
               <div class="stat-card-small">
                 <div class="stat-label">总题目数</div>
@@ -111,7 +111,13 @@
               </div>
             </el-col>
             <el-col :span="6">
-              <div class="stat-card-small">
+              <!-- 失败数量卡：有失败时可点击查看失败原因汇总（与主表合并后的失败行同源，judge/agent 等通用统计卡共用此入口） -->
+              <div
+                class="stat-card-small"
+                :class="{ 'stat-card-clickable': (result.result.failed_count || 0) > 0 }"
+                :title="(result.result.failed_count || 0) > 0 ? '点击查看失败原因汇总' : ''"
+                @click="openFailureSummary"
+              >
                 <div class="stat-label">失败数量</div>
                 <div class="stat-value danger">{{ result.result.failed_count || '-' }}</div>
               </div>
@@ -124,8 +130,8 @@
             </el-col>
           </el-row>
 
-          <!-- 图表区域 - 一致性评测、耗时评测、二分分类没有评分相关指标，不显示图表 -->
-          <el-row :gutter="20" v-if="result.evaluation_type !== 'rag' && result.evaluation_type !== 'consistency' && result.evaluation_type !== 'latency' && result.evaluation_type !== 'binary_classification' && result.evaluation_type !== 'safety'">
+          <!-- 图表区域 - 一致性评测、耗时评测、二分分类、插件评测没有通用图表，不显示 -->
+          <el-row :gutter="20" v-if="result.evaluation_type !== 'rag' && result.evaluation_type !== 'consistency' && result.evaluation_type !== 'latency' && result.evaluation_type !== 'binary_classification' && result.evaluation_type !== 'safety' && result.evaluation_type !== 'plugin'">
             <!-- 雷达图 - 各维度评分 -->
             <el-col :span="12">
               <el-card>
@@ -143,7 +149,7 @@
             </el-col>
           </el-row>
 
-          <el-row :gutter="20" style="margin-top: 20px;" v-if="result.evaluation_type !== 'rag' && result.evaluation_type !== 'consistency' && result.evaluation_type !== 'latency' && result.evaluation_type !== 'binary_classification' && result.evaluation_type !== 'safety'">
+          <el-row :gutter="20" style="margin-top: 20px;" v-if="result.evaluation_type !== 'rag' && result.evaluation_type !== 'consistency' && result.evaluation_type !== 'latency' && result.evaluation_type !== 'binary_classification' && result.evaluation_type !== 'safety' && result.evaluation_type !== 'plugin'">
             <!-- 饼图 - 成功率 -->
             <el-col :span="12">
               <el-card>
@@ -157,6 +163,56 @@
               <el-card>
                 <template #header>评分趋势</template>
                 <div id="lineChart" style="width: 100%; height: 300px;"></div>
+              </el-card>
+            </el-col>
+          </el-row>
+
+          <!-- 多次执行聚合展示：跨执行的维度对比 / 分数趋势 / 波动统计。
+               v-if 与通用图表区同条件（排除 rag/consistency/latency/binary_classification/safety/plugin）；
+               旧后端无 dimension-trend 端点时 executionTrend 为空数组，整区隐藏 -->
+          <el-row
+            v-if="result.evaluation_type !== 'rag' && result.evaluation_type !== 'consistency' && result.evaluation_type !== 'latency' && result.evaluation_type !== 'binary_classification' && result.evaluation_type !== 'safety' && result.evaluation_type !== 'plugin' && executionTrend.length >= 2"
+            style="margin-top: 20px;"
+          >
+            <el-col :span="24">
+              <el-divider />
+              <h3>多次执行聚合展示</h3>
+            </el-col>
+            <!-- 雷达图 - 多次执行维度对比 -->
+            <el-col :span="12">
+              <el-card>
+                <template #header>多次执行维度对比</template>
+                <div id="trendRadarChart" style="width: 100%; height: 350px;"></div>
+              </el-card>
+            </el-col>
+            <!-- 折线图 - 维度分数趋势 -->
+            <el-col :span="12">
+              <el-card>
+                <template #header>维度分数趋势</template>
+                <div id="trendLineChart" style="width: 100%; height: 300px;"></div>
+              </el-card>
+            </el-col>
+            <!-- 表格 - 跨执行波动 -->
+            <el-col :span="24" style="margin-top: 20px;">
+              <el-card>
+                <template #header>跨执行波动</template>
+                <el-table :data="trendVolatilityRows" style="width: 100%" max-height="360">
+                  <el-table-column prop="name" label="维度" min-width="140" />
+                  <el-table-column label="均值" width="110">
+                    <template #default="{ row }">{{ formatTrendNumber(row.avg) }}</template>
+                  </el-table-column>
+                  <el-table-column label="最优" width="110">
+                    <template #default="{ row }">{{ formatTrendNumber(row.best) }}</template>
+                  </el-table-column>
+                  <el-table-column label="最差" width="110">
+                    <template #default="{ row }">{{ formatTrendNumber(row.worst) }}</template>
+                  </el-table-column>
+                  <el-table-column label="波动幅度" width="130">
+                    <template #default="{ row }">
+                      <span :style="row.range > 1.0 ? 'color:#E6A23C;font-weight:600;' : ''">{{ formatTrendNumber(row.range) }}</span>
+                    </template>
+                  </el-table-column>
+                </el-table>
               </el-card>
             </el-col>
           </el-row>
@@ -177,7 +233,7 @@
                   v-for="(entry, i) in preScriptEntries"
                   :key="i"
                   :value="i"
-                  :label="`第 ${(entry.item.idx ?? i) + 1} 条数据`"
+                  :label="`第 ${detailSeqNo(entry, i, seqNoFromIdx)} 条数据`"
                 />
               </el-select>
             </div>
@@ -1191,13 +1247,809 @@
             </el-table>
           </div>
 
+          <!-- 插件评测结果 -->
+          <div v-if="result.evaluation_type === 'plugin'" class="plugin-result">
+            <!-- 统计卡（trace 合并口径：一份报告两套分数——设计质量综合分 / 真实数据分）
+                 得分必须与样本量同屏：真实数据分的分母只有「通过 + 失败」，
+                 证据不足的检查不进分母，故得分高只代表已判定的少量样本里没有违规 -->
+            <!-- 两条线分开显示：设计质量线（按插件只评一次） / 历史数据线（逐行线程） -->
+            <template v-if="isTraceMode">
+            <div class="trace-line-title">设计质量线（每个插件只评测一次）</div>
+            <el-row :gutter="20">
+              <el-col :span="6">
+                <div class="stat-card-small">
+                  <div class="stat-label">平均综合分（设计质量）</div>
+                  <div class="stat-value highlight">{{ traceCompositeSummary.average_score ?? '-' }}</div>
+                  <div class="trace-note">
+                    <template v-if="traceCompositeSummary.average_score != null">
+                      静态层 + LLM 评审；{{ traceCompositeSummary.measured_count }} 个插件出分
+                    </template>
+                    <template v-else>本次执行无综合分口径（改动前的记录只出真实数据分）</template>
+                  </div>
+                </div>
+              </el-col>
+              <el-col :span="18">
+                <div class="stat-card-small">
+                  <div class="stat-label">设计质量线口径</div>
+                  <div class="trace-note" style="line-height: 1.9;">
+                    只与插件目录有关，与线程无关：同一插件（同版本、同市场路径、同判定方式）
+                    在任务内只跑一次静态层 + judge，其余行复用该结果，只补历史线。
+                    两条线相互独立，不并入计算。
+                  </div>
+                </div>
+              </el-col>
+            </el-row>
+
+            <div class="trace-line-title" style="margin-top: 20px;">历史数据线（逐行线程）</div>
+            <el-row :gutter="20">
+              <el-col :span="8">
+                <div class="stat-card-small">
+                  <div class="stat-label">{{ traceSummary.score_label || '真实数据得分' }}</div>
+                  <div class="stat-value highlight">{{ traceSummary.average_score ?? '-' }}</div>
+                  <div class="trace-note" v-if="traceSummary.average_score != null">
+                    得分只含已判定的 <b>{{ traceSummary.decidable_count ?? 0 }} / {{ traceSummary.applicable_count ?? 0 }}</b> 项检查
+                    <template v-if="traceSummary.conservative_score != null">
+                      （{{ traceSummary.applicable_count - traceSummary.decidable_count }} 项证据不足未计分；若按违规计，下界 {{ traceSummary.conservative_score }}）
+                    </template>
+                  </div>
+                  <el-tag
+                    v-if="traceSummary.score_label === '部分样本得分'"
+                    size="small"
+                    type="warning"
+                    effect="plain"
+                    style="margin-top: 6px;"
+                  >评审不完整，不代表整条线程</el-tag>
+                </div>
+              </el-col>
+              <el-col :span="8">
+                <div class="stat-card-small">
+                  <div class="stat-label">平均判定有效率</div>
+                  <div class="stat-value">{{ traceSummary.average_coverage != null ? traceSummary.average_coverage + '%' : '-' }}</div>
+                  <div class="trace-note">可判定检查 ÷ 适用检查</div>
+                </div>
+              </el-col>
+              <el-col :span="8">
+                <div class="stat-card-small">
+                  <div class="stat-label">{{ traceCoverageLabel }}</div>
+                  <div class="stat-value">{{ traceSummary.average_behavior_coverage != null ? traceSummary.average_behavior_coverage + '%' : '-' }}</div>
+                  <div class="trace-note">只展示、不计分</div>
+                </div>
+              </el-col>
+            </el-row>
+
+            <!-- 设计质量线明细：按插件一条，覆盖行数/复用行数直接说明「只评一次」 -->
+            <el-row :gutter="20" style="margin-top: 20px;" v-if="traceDesignPlugins.length">
+              <el-col :span="24">
+                <el-card>
+                  <template #header>设计质量线明细（按插件）</template>
+                  <el-table :data="traceDesignPlugins" size="small" stripe border>
+                    <el-table-column type="expand">
+                      <template #default="{ row }">
+                        <div style="padding: 4px 12px;">
+                          <template v-if="(row.dimensions || []).length">
+                            <h5>维度评分</h5>
+                            <el-table :data="row.dimensions" size="small" border>
+                              <el-table-column prop="label" label="维度" min-width="140" />
+                              <el-table-column label="权重" width="90">
+                                <template #default="{ row: dim }">{{ dim.weight }}</template>
+                              </el-table-column>
+                              <el-table-column label="得分" width="90">
+                                <template #default="{ row: dim }">
+                                  <span v-if="dim.score !== null && dim.score !== undefined">{{ Number(dim.score).toFixed(3) }}</span>
+                                  <span v-else>未测</span>
+                                </template>
+                              </el-table-column>
+                              <el-table-column prop="grade" label="等级" width="70" />
+                            </el-table>
+                          </template>
+                          <template v-if="(row.skills || []).length">
+                            <h5>Skill 明细</h5>
+                            <el-table :data="row.skills" size="small" border>
+                              <el-table-column prop="name" label="Skill" min-width="180" />
+                              <el-table-column label="综合分" width="100">
+                                <template #default="{ row: skill }">{{ skill.score ?? '未测' }}</template>
+                              </el-table-column>
+                              <el-table-column label="徽章" width="120">
+                                <template #default="{ row: skill }">{{ getBadgeLabel(skill.badge) }}</template>
+                              </el-table-column>
+                              <el-table-column label="已测维度" width="100">
+                                <template #default="{ row: skill }">{{ skill.measured_dimensions }} / {{ skill.dimension_count }}</template>
+                              </el-table-column>
+                              <el-table-column label="各层得分" min-width="220">
+                                <template #default="{ row: skill }">{{ traceSkillLayers(skill) }}</template>
+                              </el-table-column>
+                            </el-table>
+                          </template>
+                          <div class="trace-note">
+                            评测深度：{{ traceDepthLabel(row.depth) }}；
+                            模型用量：{{ traceModelUsageText(row.model_usage) }}；
+                            本插件设计质量评测耗时：{{ row.duration_ms != null ? row.duration_ms + ' ms' : '-' }}
+                          </div>
+                        </div>
+                      </template>
+                    </el-table-column>
+                    <el-table-column prop="plugin" label="插件" min-width="180" />
+                    <el-table-column label="设计质量分" width="120">
+                      <template #default="{ row }">
+                        <el-tag v-if="row.score !== null" :type="getScoreType(row.score)">{{ row.score }}</el-tag>
+                        <span v-else class="trace-note">未出</span>
+                      </template>
+                    </el-table-column>
+                    <el-table-column label="徽章" width="120">
+                      <template #default="{ row }">{{ getBadgeLabel(row.badge) }}</template>
+                    </el-table-column>
+                    <el-table-column prop="confidence_label" label="置信标签" width="120" />
+                    <el-table-column label="覆盖行数" width="100">
+                      <template #default="{ row }">{{ row.covered_rows }}</template>
+                    </el-table-column>
+                    <el-table-column label="复用行数" width="100">
+                      <template #default="{ row }">{{ row.reused_rows }}</template>
+                    </el-table-column>
+                    <el-table-column label="反模式条数" width="100">
+                      <template #default="{ row }">{{ row.anti_pattern_count ?? 0 }}</template>
+                    </el-table-column>
+                  </el-table>
+                  <div class="trace-note">
+                    同一插件在任务内只跑一次静态层与 judge；其余行只跑历史线并复用本结果。
+                    覆盖行数 = 该插件参与评测的数据行数，复用行数 = 其中未重复跑设计质量的行数。
+                  </div>
+                </el-card>
+              </el-col>
+            </el-row>
+
+            <!-- 历史数据线阶段汇总：报告「测评总览」的生成/执行两行；未测阶段显示未测 -->
+            <el-row :gutter="20" style="margin-top: 20px;" v-if="tracePhaseSummary.length">
+              <el-col :span="24">
+                <el-card>
+                  <template #header>历史数据线 · 阶段汇总</template>
+                  <el-table :data="tracePhaseSummary" size="small" stripe border>
+                    <el-table-column prop="label" label="阶段" width="160" />
+                    <el-table-column label="状态" width="110">
+                      <template #default="{ row }">
+                        <el-tag size="small" :type="traceStatusTagType(row.status)">{{ traceStatusLabel(row.status) }}</el-tag>
+                      </template>
+                    </el-table-column>
+                    <el-table-column label="平均可信度" width="130">
+                      <template #default="{ row }">
+                        <span v-if="row.status === 'unmeasured'">—</span>
+                        <span v-else>{{ traceNumber(row.average_score, '/100') }}</span>
+                      </template>
+                    </el-table-column>
+                    <el-table-column label="平均判定有效率" width="150">
+                      <template #default="{ row }">
+                        <span v-if="row.status === 'unmeasured'">—</span>
+                        <span v-else>{{ traceNumber(row.average_coverage, '%') }}</span>
+                      </template>
+                    </el-table-column>
+                    <el-table-column label="可判定 / 适用（跨行求和）" min-width="200">
+                      <template #default="{ row }">
+                        <span v-if="row.status === 'unmeasured'">—</span>
+                        <span v-else>{{ row.decidable }} / {{ row.applicable }}</span>
+                      </template>
+                    </el-table-column>
+                    <el-table-column label="出分行数 / 覆盖行数" width="170">
+                      <template #default="{ row }">{{ row.measured_rows }} / {{ row.row_count }}</template>
+                    </el-table-column>
+                  </el-table>
+                  <div class="trace-note">
+                    未测阶段表示本批线程里没有该阶段任务（例如只调用了 /anc-tms:run、没有调用
+                    testcase-generation）；该阶段不产生检查项，因此不显示 0 计数。
+                  </div>
+                </el-card>
+              </el-col>
+            </el-row>
+            </template>
+
+            <el-row v-else :gutter="20">
+              <el-col :span="6">
+                <div class="stat-card-small">
+                  <div class="stat-label">平均复合分</div>
+                  <div class="stat-value highlight">{{ result.result.average_score ?? '-' }}</div>
+                </div>
+              </el-col>
+              <el-col :span="6">
+                <div class="stat-card-small">
+                  <div class="stat-label">评测对象数</div>
+                  <div class="stat-value">{{ result.result.total ?? '-' }}</div>
+                </div>
+              </el-col>
+              <el-col :span="6">
+                <div class="stat-card-small">
+                  <div class="stat-label">成功</div>
+                  <div class="stat-value success">{{ result.result.success_count ?? '-' }}</div>
+                </div>
+              </el-col>
+              <el-col :span="6">
+                <div class="stat-card-small">
+                  <div class="stat-label">失败</div>
+                  <div class="stat-value danger">{{ result.result.failed_count ?? '-' }}</div>
+                </div>
+              </el-col>
+            </el-row>
+
+            <!-- 判定分布（trace 口径：真实数据分不产徽章/维度分） -->
+            <el-row :gutter="20" style="margin-top: 20px;" v-if="isTraceMode">
+              <el-col :span="12">
+                <el-card>
+                  <template #header>判定分布（逐检查项求和）</template>
+                  <div class="trace-check-summary">
+                    <el-tag type="success" size="large">通过 {{ traceCheckSummary.passed || 0 }}</el-tag>
+                    <el-tag type="danger" size="large">失败 {{ traceCheckSummary.failed || 0 }}</el-tag>
+                    <el-tag type="info" size="large">证据不足 {{ traceCheckSummary.insufficient || 0 }}</el-tag>
+                    <el-tag type="warning" size="large">不适用 {{ traceCheckSummary.not_applicable || 0 }}</el-tag>
+                  </div>
+                  <div class="trace-note" style="margin-top: 8px;">
+                    得分分母 = 通过 {{ traceCheckSummary.passed || 0 }} + 失败 {{ traceCheckSummary.failed || 0 }} = <b>{{ traceDecidable }} 项</b>；
+                    证据不足的 {{ traceCheckSummary.insufficient || 0 }} 项<b>不计分、也不等于通过</b>（缺证据，需补产物或人工复核）；
+                    不适用 {{ traceCheckSummary.not_applicable || 0 }} 项不进任何分母。
+                  </div>
+                  <div class="trace-note">
+                    真实数据分 = 通过 ÷ (通过 + 失败) × 100；判定有效率 = 有效判定 ÷ 已抽取检查项。
+                    必须与判定有效率一起看：有效率低时，得分只代表已判定的少量样本，不代表整条线程、也不代表当前插件版本。
+                    该分数独立于综合分与徽章，不并入排名（plugin-eval 口径）。
+                  </div>
+                </el-card>
+              </el-col>
+              <el-col :span="12">
+                <el-card>
+                  <template #header>评分状态与限制</template>
+                  <div v-for="(count, status) in (result.result.real_data_summary?.status_summary || {})" :key="status" style="font-size: 13px; line-height: 1.9;">
+                    {{ traceStatusLabel(status) }}：<b>{{ count }}</b> 行
+                  </div>
+                  <div style="font-size: 13px; line-height: 1.9;">
+                    评测行数：<b>{{ result.result.total ?? '-' }}</b>，失败 <b class="danger">{{ result.result.failed_count ?? 0 }}</b>
+                  </div>
+                  <div style="font-size: 13px; line-height: 1.9;">
+                    真实数据已测 / 未测行：<b>{{ traceSummary.measured_count ?? 0 }} / {{ traceSummary.unmeasured_count ?? 0 }}</b>
+                    <span style="color: #909399;">（未测行不计失败，原因见明细表）</span>
+                  </div>
+                  <div style="font-size: 13px; line-height: 1.9;">
+                    设计质量线已出 / 未出插件：
+                    <b>{{ traceCompositeSummary.measured_count ?? 0 }} / {{ traceCompositeSummary.unmeasured_count ?? 0 }}</b>
+                    <span style="color: #909399;">（按插件统计；未出=该插件没有跑设计质量评测）</span>
+                  </div>
+                  <div class="trace-note" style="margin-top: 6px;">
+                    两套分数相互独立：设计质量综合分（静态层 + LLM 评审，产徽章与维度分）与
+                    真实数据分（历史线程，不并入综合分/徽章/排名）。
+                  </div>
+                  <div v-if="traceLimitations.length" style="margin-top: 8px;">
+                    <div v-for="(text, idx) in traceLimitations" :key="idx" style="color: #909399; font-size: 12px; line-height: 1.7;">
+                      · {{ text }}
+                    </div>
+                  </div>
+                </el-card>
+              </el-col>
+            </el-row>
+
+            <!-- 方向分项（报告「分项」表的逐行汇总口径） -->
+            <el-row :gutter="20" style="margin-top: 20px;" v-if="isTraceMode && traceDirectionRows.length">
+              <el-col :span="24">
+                <el-card>
+                  <template #header>方向分项（逐行求和，按阶段）</template>
+                  <el-table :data="traceDirectionRows" size="small" stripe>
+                    <el-table-column prop="phase" label="阶段" width="140" />
+                    <el-table-column prop="label" label="方向" width="190" />
+                    <el-table-column label="平均可信度" width="140">
+                      <template #default="{ row }">
+                        <span>{{ row.average_score != null ? row.average_score + '/100' : '未测' }}</span>
+                      </template>
+                    </el-table-column>
+                    <el-table-column label="平均判定有效率" width="160">
+                      <template #default="{ row }">
+                        <span>{{ row.average_coverage != null ? row.average_coverage + '%' : '未测' }}</span>
+                      </template>
+                    </el-table-column>
+                    <el-table-column label="可判定 / 适用（跨行求和）" min-width="200">
+                      <template #default="{ row }">{{ row.measured }} / {{ row.applicable }}</template>
+                    </el-table-column>
+                  </el-table>
+                  <div style="color: #909399; font-size: 12px; margin-top: 8px;">
+                    方向即 plugin-eval 评测口径（执行：报告准确性 / 流程遵循 / 异常处理可信度；
+                    生成：来源一致性 / 需求覆盖 / 用例质量 / 生成流程与报告），按阶段分行。
+                    未测阶段没有检查项，不出现在本表；可信度 = 通过 ÷ (通过 + 失败) × 100。
+                  </div>
+                </el-card>
+              </el-col>
+            </el-row>
+
+            <!-- 徽章分布（trace 合并口径下同样有综合分与徽章；改动前的旧记录无徽章，此时不显示） -->
+            <el-row :gutter="20" style="margin-top: 20px;" v-if="badgeSummaryEntries.length">
+              <el-col :span="24">
+                <el-card>
+                  <template #header>徽章分布</template>
+                  <div class="badge-summary">
+                    <div v-for="entry in badgeSummaryEntries" :key="entry.badge" class="badge-summary-item">
+                      <el-tag :type="getBadgeTagType(entry.badge)" size="large" effect="dark">
+                        {{ getBadgeLabel(entry.badge) }}
+                      </el-tag>
+                      <span class="badge-count">× {{ entry.count }}</span>
+                    </div>
+                  </div>
+                </el-card>
+              </el-col>
+            </el-row>
+
+            <el-row
+              :gutter="20"
+              style="margin-top: 20px;"
+              v-if="!isTraceMode || pluginDimensionRows.length || antiPatternRows.length"
+            >
+              <!-- 维度平均分 -->
+              <el-col :span="12">
+                <el-card>
+                  <template #header>维度平均分（0-1）</template>
+                  <el-table :data="pluginDimensionRows" stripe size="small">
+                    <el-table-column prop="label" label="维度" width="140" />
+                    <el-table-column label="均分" width="100">
+                      <template #default="{ row }">
+                        <span>{{ row.average.toFixed(3) }}</span>
+                      </template>
+                    </el-table-column>
+                    <el-table-column label="分值条" align="center">
+                      <template #default="{ row }">
+                        <el-progress :percentage="Math.round(row.average * 100)" :stroke-width="10" />
+                      </template>
+                    </el-table-column>
+                  </el-table>
+                </el-card>
+              </el-col>
+              <!-- 反模式汇总 -->
+              <el-col :span="12">
+                <el-card>
+                  <template #header>反模式汇总</template>
+                  <el-empty v-if="!antiPatternRows.length" description="未检测到反模式" :image-size="60" />
+                  <el-table v-else :data="antiPatternRows" stripe size="small">
+                    <el-table-column prop="flag" label="标记" width="200" />
+                    <el-table-column prop="count" label="次数" width="70" />
+                    <el-table-column label="最重严重度" width="110">
+                      <template #default="{ row }">{{ row.max_severity != null ? Math.round(row.max_severity * 100) + '%' : '-' }}</template>
+                    </el-table-column>
+                    <el-table-column prop="description" label="说明" show-overflow-tooltip />
+                  </el-table>
+                </el-card>
+              </el-col>
+            </el-row>
+
+            <!-- 逐插件明细 -->
+            <el-divider />
+            <h3>插件明细</h3>
+            <el-table :data="result.result.items || []" style="width: 100%" stripe>
+              <el-table-column type="expand">
+                <template #default="{ row }">
+                  <div class="plugin-expand-detail">
+                    <!-- trace 口径：线程锚点 + 规则 + 逐检查项明细 -->
+                    <template v-if="isTraceMode">
+                      <h5>线程与规则锚点</h5>
+                      <el-descriptions :column="3" size="small" border>
+                        <el-descriptions-item label="被测插件">{{ row.trace?.detected?.plugin || row.target_name || '-' }}</el-descriptions-item>
+                        <el-descriptions-item label="市场收录路径">{{ row.trace?.plugin_source || '-' }}</el-descriptions-item>
+                        <el-descriptions-item label="插件版本">{{ row.trace?.plugin_version || '-' }}</el-descriptions-item>
+                        <el-descriptions-item label="会话 ID">{{ row.trace?.thread_id || row.trace?.detected?.session_id || '-' }}</el-descriptions-item>
+                        <el-descriptions-item label="线程文件">{{ row.trace?.thread_file || '-' }}</el-descriptions-item>
+                        <el-descriptions-item label="线程来源">{{ row.trace?.thread_origin || '-' }}</el-descriptions-item>
+                        <el-descriptions-item label="线程 SHA256" :span="3">
+                          <span style="word-break: break-all;">{{ row.trace?.thread_sha256 || '-' }}</span>
+                        </el-descriptions-item>
+                        <el-descriptions-item label="历史规则">
+                          {{ row.trace?.rule?.file || '-' }} v{{ row.trace?.rule?.version || '-' }}
+                        </el-descriptions-item>
+                        <el-descriptions-item label="规则 SHA256" :span="2">
+                          <span style="word-break: break-all;">{{ row.trace?.rule?.sha256 || '-' }}</span>
+                        </el-descriptions-item>
+                        <el-descriptions-item label="调用识别" :span="3">
+                          {{ traceCountsText(row.trace?.detected?.counts) || '-' }}
+                        </el-descriptions-item>
+                      </el-descriptions>
+                      <template v-if="row.trace?.unavailable_reason">
+                        <el-alert :title="row.trace.unavailable_reason" type="info" :closable="false" style="margin-top: 8px;" />
+                      </template>
+
+                      <!-- 设计质量线（报告「测评总览 / Dimension Scores / Skill 明细 / Anti-Patterns」）
+                           同一插件任务内只评一次，本行展示的是同一份结果 -->
+                      <template v-if="traceCompositeScore(row) !== null">
+                        <h5>设计质量线（静态层 + LLM 评审）</h5>
+                        <el-descriptions :column="4" size="small" border>
+                          <el-descriptions-item label="综合分">{{ traceCompositeScore(row) }}/100</el-descriptions-item>
+                          <el-descriptions-item label="徽章">{{ getBadgeLabel(row.badge) }}</el-descriptions-item>
+                          <el-descriptions-item label="置信标签">{{ row.confidence_label || '-' }}</el-descriptions-item>
+                          <el-descriptions-item label="反模式惩罚">
+                            {{ row.anti_pattern_penalty !== null && row.anti_pattern_penalty !== undefined ? row.anti_pattern_penalty : '-' }}
+                          </el-descriptions-item>
+                          <el-descriptions-item label="评测深度">{{ traceDepthLabel(row.depth) }}</el-descriptions-item>
+                          <el-descriptions-item label="反模式条数">{{ (row.anti_patterns || []).length }}</el-descriptions-item>
+                          <el-descriptions-item label="Skill 数">{{ (row.skills || []).length }}</el-descriptions-item>
+                          <el-descriptions-item label="本行设计质量来源">
+                            {{ row.design_reused ? '复用任务内首次评测' : '本任务首次评测' }}
+                          </el-descriptions-item>
+                        </el-descriptions>
+                        <div class="trace-note">
+                          设计质量线只与插件有关，同一插件在任务内只评一次；本行若为「复用」，
+                          展示的是首次评测得到的同一份结果。历史数据线来自本行线程，两条线相互独立。
+                          维度与各层得分见下方「维度评分 / 各层得分」。
+                        </div>
+
+                        <template v-if="(row.skills || []).length">
+                          <h5>Skill 明细</h5>
+                          <el-table :data="row.skills" size="small" border max-height="360">
+                            <el-table-column prop="name" label="Skill" min-width="180" show-overflow-tooltip />
+                            <el-table-column label="综合分" width="100">
+                              <template #default="{ row: skill }">{{ skill.score !== null && skill.score !== undefined ? skill.score + '/100' : '未测' }}</template>
+                            </el-table-column>
+                            <el-table-column label="徽章" width="120">
+                              <template #default="{ row: skill }">
+                                <el-tag size="small" :type="getBadgeTagType(skill.badge)" effect="dark">
+                                  {{ getBadgeLabel(skill.badge) }}
+                                </el-tag>
+                              </template>
+                            </el-table-column>
+                            <el-table-column label="已测维度" width="100">
+                              <template #default="{ row: skill }">{{ skill.measured_dimensions }} / {{ skill.dimension_count }}</template>
+                            </el-table-column>
+                            <el-table-column label="各层得分" min-width="220">
+                              <template #default="{ row: skill }">
+                                {{ traceSkillLayers(skill) }}
+                              </template>
+                            </el-table-column>
+                            <el-table-column label="反模式" width="90">
+                              <template #default="{ row: skill }">{{ skill.anti_pattern_count || 0 }}</template>
+                            </el-table-column>
+                          </el-table>
+                        </template>
+                      </template>
+
+                      <!-- 真实数据测评指标（报告「真实数据测评指标」一节） -->
+                      <template v-if="tracePhaseBlocks(row).length">
+                        <h5>真实数据测评指标</h5>
+                        <div class="trace-metric-line">
+                          <b>{{ traceScoreLabel(row.real_data) }}</b>；判定有效率：{{ traceNumber(row.real_data?.coverage, '%') }}（可判定 / 适用 {{ traceMeasuredText(row.real_data?.counts) }}）；关键步骤覆盖率：{{ traceCoverageText(row.real_data?.behavior_coverage) }}
+                        </div>
+                        <div class="trace-note">
+                          得分只由已判定的检查得出（通过 ÷ (通过 + 失败)）；本例可判定 {{ traceMeasuredText(row.real_data?.counts) }} 项，
+                          若把证据不足的检查一并按违规计，下界为 {{ traceConservativeScore(row.real_data?.counts) }}。
+                          判定有效率偏低时，得分只代表少量样本，不代表整条线程，也不代表当前插件版本。
+                        </div>
+                        <div class="trace-note">
+                          测评范围：仅关键步骤（规则定义的准备、查证、冻结、执行、业务写、登录、委派、出报、上传与结论节点；只读查询按步骤确认是否调用，连续重试合并为一次）。
+                        </div>
+                        <div class="trace-note">
+                          判定有效率 = 可判定检查 ÷ 适用检查；关键步骤覆盖率 = 至少有一个检查项的关键步骤实例 ÷ 关键步骤实例总数，只展示、不计分。
+                        </div>
+                        <div class="trace-note">
+                          与原有插件综合分独立，不混合计算。检查项数量不等同于业务用例数量。抽取清单完整性：{{ row.real_data?.extraction_complete ? '已完成规则覆盖范围抽取。' : '未穷尽；覆盖率不能代表整条线程。' }}
+                        </div>
+                      </template>
+
+                      <!-- 逐阶段（历史执行/生成可信度）：与报告一节一一对应 -->
+                      <template v-for="phase in tracePhaseBlocks(row)" :key="phase.metric">
+                        <h5>{{ phase.label }}</h5>
+                        <el-alert
+                          v-if="tracePhaseUnmeasured(phase)"
+                          :title="phase.unmeasured_reason || '本批线程未发现该阶段的受支持任务，该阶段未测'"
+                          type="info"
+                          :closable="false"
+                          style="margin-bottom: 8px;"
+                        />
+                        <el-descriptions :column="3" size="small" border>
+                          <el-descriptions-item label="插件">{{ phase.plugin || row.target_name || '-' }}</el-descriptions-item>
+                          <el-descriptions-item label="状态">
+                            <el-tag size="small" :type="traceStatusTagType(phase.status)">{{ traceStatusLabel(phase.status) }}</el-tag>
+                          </el-descriptions-item>
+                          <el-descriptions-item label="可信度得分">
+                            <span v-if="tracePhaseUnmeasured(phase)">—</span>
+                            <span v-else>{{ traceNumber(phase.score, '/100') }}</span>
+                          </el-descriptions-item>
+                          <el-descriptions-item label="判定有效率">
+                            <span v-if="tracePhaseUnmeasured(phase)">—</span>
+                            <span v-else>{{ traceNumber(phase.coverage, '%') }}</span>
+                          </el-descriptions-item>
+                          <el-descriptions-item label="关键步骤覆盖率">
+                            <span v-if="tracePhaseUnmeasured(phase)">—</span>
+                            <span v-else>{{ traceCoverageText(phase.behavior_coverage) }}</span>
+                          </el-descriptions-item>
+                          <el-descriptions-item label="可判定 / 适用检查">
+                            <span v-if="tracePhaseUnmeasured(phase)">—</span>
+                            <span v-else>{{ traceMeasuredText(phase.counts) }}</span>
+                          </el-descriptions-item>
+                          <el-descriptions-item label="通过 / 失败 / 证据不足 / 不适用">
+                            <span v-if="tracePhaseUnmeasured(phase)">—</span>
+                            <span v-else>{{ traceCountsSlash(phase.counts) }}</span>
+                          </el-descriptions-item>
+                          <el-descriptions-item label="独立任务数">{{ phase.source?.independent_user_task_count ?? '-' }}</el-descriptions-item>
+                          <el-descriptions-item label="会话 ID">{{ phase.thread_id || '-' }}</el-descriptions-item>
+                          <el-descriptions-item label="规则文件">{{ phase.rule?.file || '-' }}</el-descriptions-item>
+                          <el-descriptions-item label="规则版本">{{ phase.rule?.version || '-' }}</el-descriptions-item>
+                          <el-descriptions-item label="规则 SHA256">
+                            <span style="word-break: break-all;">{{ phase.rule?.sha256 || '-' }}</span>
+                          </el-descriptions-item>
+                        </el-descriptions>
+
+                        <template v-if="!tracePhaseUnmeasured(phase) && (phase.dimensions || []).length">
+                          <h5>分项</h5>
+                          <el-table :data="phase.dimensions" size="small" border>
+                            <el-table-column prop="label" label="方向" width="180" />
+                            <el-table-column label="可信度" width="130">
+                              <template #default="{ row: dim }">{{ traceNumber(dim.score, '/100') }}</template>
+                            </el-table-column>
+                            <el-table-column label="判定有效率" width="140">
+                              <template #default="{ row: dim }">{{ traceNumber(dim.coverage, '%') }}</template>
+                            </el-table-column>
+                            <el-table-column label="可判定 / 适用" min-width="140">
+                              <template #default="{ row: dim }">{{ dim.measured }} / {{ dim.applicable }}</template>
+                            </el-table-column>
+                          </el-table>
+                        </template>
+
+                        <template v-if="(phase.key_steps || []).length">
+                          <h5>关键步骤</h5>
+                          <el-table :data="traceKeyStepRows(phase)" size="small" border>
+                            <el-table-column prop="name" label="步骤" min-width="150" />
+                            <el-table-column prop="instances" label="实例数" width="80" />
+                            <el-table-column prop="attempts" label="工具尝试次数" width="120" />
+                            <el-table-column prop="achieved" label="最终达成" width="90" />
+                            <el-table-column prop="calls" label="本步调用确认" min-width="190" />
+                            <el-table-column prop="checks" label="检查项数" width="100" />
+                          </el-table>
+                        </template>
+
+                        <template v-if="traceUncoveredRows(phase).length">
+                          <h5>未被检查的关键步骤</h5>
+                          <el-table :data="traceUncoveredRows(phase)" size="small" border>
+                            <el-table-column prop="name" label="类型" min-width="150" />
+                            <el-table-column prop="count" label="数量" width="80" />
+                          </el-table>
+                        </template>
+
+                        <template v-if="(phase.failed_checks || []).length">
+                          <h5>失败项</h5>
+                          <el-table :data="phase.failed_checks" size="small" border>
+                            <el-table-column label="检查 / 对象" width="220">
+                              <template #default="{ row: check }">{{ check.id }} / {{ check.subject }}</template>
+                            </el-table-column>
+                            <el-table-column label="方向" width="150">
+                              <template #default="{ row: check }">{{ check.dimension_label || traceDimensionLabel(check.dimension) }}</template>
+                            </el-table-column>
+                            <el-table-column prop="expectation" label="预期" min-width="200" show-overflow-tooltip />
+                            <el-table-column prop="actual" label="实际" min-width="200" show-overflow-tooltip />
+                            <el-table-column prop="reason" label="判定依据" min-width="220" show-overflow-tooltip />
+                          </el-table>
+                        </template>
+
+                        <template v-if="!tracePhaseUnmeasured(phase) && (phase.evidence || []).length">
+                          <h5>引用证据</h5>
+                          <el-table :data="phase.evidence.slice(0, 50)" size="small" border max-height="300">
+                            <el-table-column prop="id" label="证据 ID" width="130" />
+                            <el-table-column label="来源" width="220" show-overflow-tooltip>
+                              <template #default="{ row: ev }">
+                                {{ ev.source?.line != null ? 'L' + ev.source.line : '' }}
+                                {{ ev.source?.tool_name || ev.source?.role || ev.kind || '' }}
+                              </template>
+                            </el-table-column>
+                            <el-table-column prop="text" label="摘录（最多 500 字）" min-width="320" show-overflow-tooltip />
+                          </el-table>
+                          <div class="trace-note" v-if="phase.evidence.length > 50">
+                            共 {{ phase.evidence.length }} 条，仅展示前 50 条；完整记录见行结果 plugin_eval.raw。
+                          </div>
+                        </template>
+
+                        <template v-if="(phase.limitations || []).length">
+                          <h5>限制与未验证项</h5>
+                          <div v-for="(text, li) in phase.limitations" :key="li" class="trace-note">· {{ text }}</div>
+                        </template>
+
+                        <template v-if="traceModelUsage(phase).length">
+                          <h5>模型用量</h5>
+                          <div v-for="(usage, mi) in traceModelUsage(phase)" :key="mi" class="trace-note">
+                            {{ usage.model }}：{{ usage.tokens }} tokens
+                          </div>
+                        </template>
+                      </template>
+
+                      <template v-if="(row.checks || []).length">
+                        <h5>逐检查项明细（{{ row.checks_total ?? row.checks.length }} 项{{ row.checks_total > row.checks.length ? '，仅展示前 ' + row.checks.length + ' 项' : '' }}）</h5>
+                        <el-table :data="row.checks" size="small" border max-height="420">
+                          <el-table-column label="阶段" width="130">
+                            <template #default="{ row: check }">{{ check.phase_label || tracePhaseLabel(check.phase) }}</template>
+                          </el-table-column>
+                          <el-table-column label="检查 / 对象" width="210">
+                            <template #default="{ row: check }">{{ check.id }} / {{ check.subject }}</template>
+                          </el-table-column>
+                          <el-table-column label="方向" width="150">
+                            <template #default="{ row: check }">{{ check.dimension_label || traceDimensionLabel(check.dimension) }}</template>
+                          </el-table-column>
+                          <el-table-column prop="rule_id" label="检查项" width="150" />
+                          <el-table-column label="判定" width="90">
+                            <template #default="{ row: check }">
+                              <el-tag size="small" :type="traceCheckTagType(check.status)">{{ traceCheckLabel(check.status) }}</el-tag>
+                            </template>
+                          </el-table-column>
+                          <el-table-column prop="expectation" label="预期" min-width="180" show-overflow-tooltip />
+                          <el-table-column prop="actual" label="实际" min-width="180" show-overflow-tooltip />
+                          <el-table-column prop="reason" label="判定依据" min-width="220" show-overflow-tooltip />
+                          <el-table-column label="证据" width="150" show-overflow-tooltip>
+                            <template #default="{ row: check }">{{ (check.evidence_ids || []).slice(0, 3).join(', ') }}</template>
+                          </el-table-column>
+                        </el-table>
+                      </template>
+                    </template>
+                    <!-- 维度与各层得分：非 trace 行恒显示（与原行为一致）；trace 行在有综合分时显示 -->
+                    <template v-if="!isTraceMode || (row.dimensions || []).length || (row.layers || []).length">
+                    <h5>维度评分</h5>
+                    <el-table :data="row.dimensions || []" size="small" border>
+                      <el-table-column prop="label" label="维度" min-width="140" />
+                      <el-table-column label="权重" width="90">
+                        <template #default="{ row: dim }">{{ dim.weight }}</template>
+                      </el-table-column>
+                      <el-table-column label="得分" width="90">
+                        <template #default="{ row: dim }">
+                          <span v-if="dim.score !== null && dim.score !== undefined">{{ dim.score.toFixed(3) }}</span>
+                          <span v-else>未测</span>
+                        </template>
+                      </el-table-column>
+                      <el-table-column prop="grade" label="等级" width="70" />
+                    </el-table>
+                    <h5>各层得分</h5>
+                    <el-table :data="row.layers || []" size="small" border>
+                      <el-table-column prop="layer" label="层" width="120" />
+                      <el-table-column label="层分" width="100">
+                        <template #default="{ row: lr }">{{ lr.score !== undefined ? lr.score.toFixed(3) : '-' }}</template>
+                      </el-table-column>
+                      <el-table-column label="子分" min-width="280">
+                        <template #default="{ row: lr }">
+                          <span class="plugin-sub-scores">
+                            {{ formatSubScores(lr.sub_scores) }}
+                          </span>
+                        </template>
+                      </el-table-column>
+                    </el-table>
+                    </template>
+                    <template v-if="row.warnings && row.warnings.length">
+                      <h5>警告</h5>
+                      <el-alert
+                        v-for="(w, wi) in row.warnings"
+                        :key="wi"
+                        :title="w"
+                        type="warning"
+                        :closable="false"
+                        style="margin-bottom: 6px;"
+                      />
+                    </template>
+                  </div>
+                </template>
+              </el-table-column>
+              <el-table-column label="评测对象" min-width="180" show-overflow-tooltip>
+                <template #default="{ row }">{{ row.target_name || '-' }}</template>
+              </el-table-column>
+              <el-table-column label="类型" width="90">
+                <template #default="{ row }">
+                  <el-tag size="small" effect="plain" type="info">{{ row.target_type === 'plugin' ? '插件' : 'Skill' }}</el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column v-if="isTraceMode" label="设计质量分（任务级）" width="140">
+                <template #default="{ row }">
+                  <el-tag v-if="traceCompositeScore(row) !== null" :type="getScoreType(traceCompositeScore(row))">
+                    {{ traceCompositeScore(row) }}
+                  </el-tag>
+                  <span v-else class="trace-note">未出</span>
+                  <div v-if="traceCompositeScore(row) !== null" class="trace-note">
+                    {{ row.design_reused ? '复用' : '首次' }}
+                  </div>
+                </template>
+              </el-table-column>
+              <el-table-column :label="isTraceMode ? '真实数据分（可判定/适用）' : '复合分'" width="190">
+                <template #default="{ row }">
+                  <template v-if="isTraceMode">
+                    <el-tag v-if="traceRealScore(row) !== null" :type="getScoreType(traceRealScore(row))">
+                      {{ traceRealScore(row) }}
+                    </el-tag>
+                    <span v-else class="trace-note">未测</span>
+                    <span v-if="traceRealScore(row) !== null" class="trace-note">
+                      （{{ traceMeasuredText(row.real_data?.counts) }}）
+                    </span>
+                    <div v-if="traceIsLegacyRow(row)" class="trace-note">
+                      旧口径记录：此列即该行的得分，无综合分
+                    </div>
+                  </template>
+                  <template v-else>
+                    <el-tag v-if="row.score !== null && row.score !== undefined" :type="getScoreType(row.score)">
+                      {{ row.score }}
+                    </el-tag>
+                    <span v-else>-</span>
+                  </template>
+                </template>
+              </el-table-column>
+              <template v-if="isTraceMode">
+                <el-table-column label="徽章" width="100">
+                  <template #default="{ row }">
+                    <el-tag v-if="traceCompositeScore(row) !== null" :type="getBadgeTagType(row.badge)" effect="dark">
+                      {{ getBadgeLabel(row.badge) }}
+                    </el-tag>
+                    <span v-else>-</span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="深度" width="80">
+                  <template #default="{ row }">{{ traceDepthLabel(row.depth) }}</template>
+                </el-table-column>
+                <el-table-column label="判定有效率" width="110">
+                  <template #default="{ row }">
+                    <span>{{ row.real_data?.coverage !== undefined && row.real_data?.coverage !== null ? row.real_data.coverage + '%' : '-' }}</span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="关键步骤覆盖率" width="130">
+                  <template #default="{ row }">
+                    <span>{{ row.real_data?.behavior_coverage?.rate !== undefined ? row.real_data.behavior_coverage.rate.toFixed(1) + '%' : '-' }}</span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="判定（通过/失败/不足）" width="180">
+                  <template #default="{ row }">
+                    <span v-if="row.real_data?.counts">
+                      {{ row.real_data.counts.passed || 0 }} / {{ row.real_data.counts.failed || 0 }} / {{ row.real_data.counts.insufficient || 0 }}
+                    </span>
+                    <span v-else>-</span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="状态" width="110">
+                  <template #default="{ row }">
+                    <el-tag size="small" :type="traceStatusTagType(row.real_data?.status)">
+                      {{ traceStatusLabel(row.real_data?.status) }}
+                    </el-tag>
+                  </template>
+                </el-table-column>
+                <el-table-column label="未测原因" min-width="220" show-overflow-tooltip>
+                  <template #default="{ row }">{{ row.unmeasured_reason || '-' }}</template>
+                </el-table-column>
+              </template>
+              <template v-else>
+                <el-table-column label="徽章" width="110">
+                  <template #default="{ row }">
+                    <el-tag :type="getBadgeTagType(row.badge)" effect="dark">
+                      {{ getBadgeLabel(row.badge) }}
+                    </el-tag>
+                  </template>
+                </el-table-column>
+                <el-table-column label="置信标签" width="110">
+                  <template #default="{ row }">
+                    <el-tag size="small" effect="plain">{{ row.confidence_label || '-' }}</el-tag>
+                  </template>
+                </el-table-column>
+                <el-table-column label="深度" width="90">
+                  <template #default="{ row }">{{ row.depth === 'standard' ? '标准' : '快速' }}</template>
+                </el-table-column>
+                <el-table-column label="反模式" width="90">
+                  <template #default="{ row }">
+                    <el-tag v-if="(row.anti_patterns || []).length" type="danger" size="small">
+                      {{ row.anti_patterns.length }}
+                    </el-tag>
+                    <span v-else>0</span>
+                  </template>
+                </el-table-column>
+              </template>
+            </el-table>
+          </div>
+
           <!-- 详细结果表格 - 仅对 judge / agent / success_rate / dialogue 类型显示 -->
-          <template v-if="result.evaluation_type !== 'rag' && result.evaluation_type !== 'consistency' && result.evaluation_type !== 'latency' && result.evaluation_type !== 'binary_classification' && result.evaluation_type !== 'safety'">
+          <template v-if="result.evaluation_type !== 'rag' && result.evaluation_type !== 'consistency' && result.evaluation_type !== 'latency' && result.evaluation_type !== 'binary_classification' && result.evaluation_type !== 'safety' && result.evaluation_type !== 'plugin'">
             <el-divider />
             <h3>详细结果</h3>
             <el-table :data="resultItems" style="width: 100%" max-height="400">
               <el-table-column label="序号" width="60">
-                <template #default="{ $index }">{{ $index + 1 }}</template>
+                <!-- 合并 failed_items 后 $index 与数据序号错位：序号以数据自带 idx 为准；
+                     idx 全行存在且唯一才按 idx+1（历史脏数据全行 idx=0 时回退位置序号，避免全列显示 1） -->
+                <template #default="{ row, $index }">{{ detailSeqNo(row, $index, seqNoFromIdx) }}</template>
+              </el-table-column>
+              <!-- 状态：区分成功/失败数据行；执行失败与裁判失败可点击查看失败详情，空输入与成功不可点击 -->
+              <el-table-column label="状态" width="90">
+                <template #default="{ row }">
+                  <el-tag v-if="row.success === false" type="danger" class="failure-tag-clickable" @click="openFailureDetail(row)">
+                    执行失败
+                  </el-tag>
+                  <el-tag v-else-if="row.row_status === 'judge_failed'" type="warning" class="failure-tag-clickable" @click="openFailureDetail(row)">
+                    裁判失败
+                  </el-tag>
+                  <el-tag v-else-if="row.row_status === 'empty_input'" type="info">
+                    空输入
+                  </el-tag>
+                  <el-tag v-else type="success">成功</el-tag>
+                </template>
               </el-table-column>
               <el-table-column prop="average_score" label="评分" width="100">
                 <template #default="{ row }">
@@ -1207,27 +2059,6 @@
                 </template>
               </el-table-column>
               <el-table-column prop="judge_count" label="裁判数" width="80" />
-              <!-- 会话摘要 / 会话来源：仅长会话 Agent 评测显示 -->
-              <el-table-column v-if="result.evaluation_type === 'agent'" label="会话摘要" min-width="200" show-overflow-tooltip>
-                <template #default="{ row }">
-                  <div class="cell-preview" @click="openDetail('会话摘要', row.session_summary || row.user_input)">
-                    {{ truncateText(row.session_summary || row.user_input, 80) }}
-                  </div>
-                </template>
-              </el-table-column>
-              <el-table-column v-if="result.evaluation_type === 'agent'" label="会话来源" width="120">
-                <template #default="{ row }">
-                  <el-tag v-if="formatSessionSource(row.session_source)" size="small">{{ formatSessionSource(row.session_source) }}</el-tag>
-                  <span v-else>-</span>
-                </template>
-              </el-table-column>
-              <el-table-column prop="model_output" label="模型输出" min-width="200">
-                <template #default="{ row }">
-                  <div class="cell-preview" @click="openDetail('模型输出', row.model_output)">
-                    {{ truncateText(row.model_output, 80) }}
-                  </div>
-                </template>
-              </el-table-column>
               <el-table-column prop="feedback" label="反馈" min-width="200">
                 <template #default="{ row }">
                   <!-- judge_scores 折叠面板 - 多裁判横向汇总，点击后垂直展开详情 -->
@@ -1237,8 +2068,8 @@
                       v-for="(js, idx) in row.judge_scores"
                       :key="idx"
                       class="judge-score-pill"
-                      :class="{ 'judge-score-pill-clickable': js.feedback || (js.dimension_scores && Object.keys(js.dimension_scores).length > 0) || js.langfuse_trace_url }"
-                      @click.stop="(js.feedback || (js.dimension_scores && Object.keys(js.dimension_scores).length > 0) || js.langfuse_trace_url) && openJudgeDetail(row, idx)"
+                      :class="{ 'judge-score-pill-clickable': js.feedback || js.judge_failed || js.fail_reason || (js.dimension_scores && Object.keys(js.dimension_scores).length > 0) || js.langfuse_trace_url }"
+                      @click.stop="(js.feedback || js.judge_failed || js.fail_reason || (js.dimension_scores && Object.keys(js.dimension_scores).length > 0) || js.langfuse_trace_url) && openJudgeDetail(row, idx)"
                     >
                       裁判{{ js.judge_index !== undefined ? js.judge_index + 1 : idx + 1 }}：{{ js.score !== undefined ? js.score : '-' }}
                     </span>
@@ -1263,19 +2094,20 @@
                   </div>
                 </template>
               </el-table-column>
-              <el-table-column prop="model_raw_response" label="原始响应" min-width="150">
-                <template #default="{ row }">
-                  <div class="cell-preview" @click="openDetail('原始响应', row.model_raw_response)">
-                    {{ truncateText(row.model_raw_response, 60) }}
-                  </div>
-                </template>
-              </el-table-column>
             </el-table>
           </template>
         </div>
       </div>
 
-      <el-empty v-else description="请选择一个已完成的任务查看结果" />
+      <!-- 未选中任务：加载中显示遮罩 spinner（min-height 保证可见），空闲时显示引导 -->
+      <div
+        v-else
+        class="result-empty-placeholder"
+        v-loading="resultLoading"
+        element-loading-text="正在加载评测结果，请稍候…"
+      >
+        <el-empty v-if="!resultLoading" description="请选择一个已完成的任务查看结果" />
+      </div>
     </el-card>
 
     <!-- 内容详情弹窗 -->
@@ -1312,6 +2144,12 @@
           <span style="font-weight: 600; color: #409eff;">{{ judgeDetailDialog.score }}</span>
         </p>
 
+        <!-- 失败原因：该裁判执行/解析失败时显式展示（部分裁判失败行的唯一查看入口） -->
+        <div v-if="judgeDetailDialog.failReason" style="margin-bottom: 8px;">
+          <span style="color: #909399; font-size: 13px;">失败原因：</span>
+          <span style="font-weight: 600; color: #f56c6c;">{{ judgeDetailDialog.failReason }}</span>
+        </div>
+
         <!-- 各维度评分 -->
         <div v-if="judgeDetailDialog.dimensionScores && Object.keys(judgeDetailDialog.dimensionScores).length > 0" style="margin-top: 16px;">
           <p style="font-weight: 600; color: #303133; margin-bottom: 8px;">各维度评分</p>
@@ -1320,8 +2158,13 @@
             :key="name"
             style="padding: 4px 0; font-size: 13px;"
           >
-            <span style="color: #606266;">{{ name }}：</span>
-            <el-tag size="small">{{ score }}</el-tag>
+            <!-- 维度理由 tooltip：有分维度理由显示理由；旧版数据回退整体反馈 -->
+            <el-tooltip placement="top" :content="getDimensionTooltip(name)" popper-class="dimension-feedback-tooltip">
+              <div class="dimension-score-row">
+                <span style="color: #606266;">{{ name }}：</span>
+                <el-tag size="small">{{ score }}{{ dimensionMaxLabel(name, score) }}</el-tag>
+              </div>
+            </el-tooltip>
           </div>
         </div>
 
@@ -1343,6 +2186,110 @@
 
       <template #footer>
         <el-button @click="judgeDetailDialog.visible = false">关闭</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 失败详情弹窗：执行失败 / 裁判失败行的失败阶段、错误信息与现场数据 -->
+    <el-dialog
+      v-model="failureDialog.visible"
+      title="失败详情"
+      width="720px"
+      top="8vh"
+      destroy-on-close
+      class="failure-dialog"
+    >
+      <div v-if="failureDialog.row" class="failure-body">
+        <!-- 失败阶段 -->
+        <div class="failure-section">
+          <p class="failure-section-title">失败阶段</p>
+          <el-tag :type="getFailureStageTagType(failureDialog.row)">{{ getFailureStage(failureDialog.row) }}</el-tag>
+        </div>
+
+        <!-- 错误信息：裁判失败优先展示各裁判 fail_reason，无则回退整行 error -->
+        <div class="failure-section">
+          <p class="failure-section-title">错误信息</p>
+          <template v-if="failureJudgeFailReasons.length > 0">
+            <div v-for="(fr, i) in failureJudgeFailReasons" :key="i" class="failure-error-box">
+              <span class="failure-judge-name">{{ fr.judge }}：</span>
+              <div class="failure-error-text" v-html="renderContent(fr.reason || '暂无错误信息')"></div>
+            </div>
+          </template>
+          <div v-else class="failure-error-box">
+            <div class="failure-error-text" v-html="renderContent(failureDialog.row.error || '暂无错误信息')"></div>
+          </div>
+        </div>
+
+        <!-- 数据输入：非结构化字段逐项展示 -->
+        <div v-if="failureInputEntries.length > 0" class="failure-section">
+          <p class="failure-section-title">数据输入</p>
+          <div v-for="entry in failureInputEntries" :key="entry.key" class="failure-input-row">
+            <span class="failure-input-label">{{ VARIABLE_LABEL_MAP[entry.key] || entry.key }}：</span>
+            <div class="failure-error-text" v-html="renderContent(entry.value)"></div>
+          </div>
+        </div>
+
+        <!-- 模型输出：长文本点击看全文 -->
+        <div v-if="failureDialog.row.model_output" class="failure-section">
+          <p class="failure-section-title">模型输出</p>
+          <div
+            class="failure-error-box failure-error-text failure-model-output"
+            @click="openDetail('模型输出', failureDialog.row.model_output)"
+          >
+            {{ truncateText(failureDialog.row.model_output, 300) }}
+          </div>
+        </div>
+
+        <!-- 脚本产物：由页面脚本产物专区数据驱动渲染，弹窗内不重复展示 -->
+        <el-alert
+          v-if="failureDialog.row.pre_script_results"
+          type="info"
+          :closable="false"
+          show-icon
+          title="该条数据的脚本产物详见上方脚本产物区"
+          class="failure-section"
+        />
+      </div>
+      <template #footer>
+        <el-button v-if="failureDialog.row && failureDialog.row.error" @click="copyContent(failureDialog.row.error)">复制错误信息</el-button>
+        <el-button type="primary" @click="failureDialog.visible = false">关闭</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 失败原因汇总弹窗：统计卡「失败数量」点击打开，按原因分组（与主表合并后的失败行同源） -->
+    <el-dialog
+      v-model="failureSummaryDialog.visible"
+      title="失败原因汇总"
+      width="720px"
+      top="8vh"
+      destroy-on-close
+      class="failure-dialog"
+    >
+      <div class="failure-body">
+        <p class="failure-summary-hint">
+          共 {{ failureSummaryDialog.total }} 条失败，按原因归为 {{ failureReasonGroups.length }} 类；
+          点击行号可查看该条失败的详细信息（行号为「详细结果」表格中的行序）
+        </p>
+        <div v-for="(group, gi) in failureReasonGroups" :key="gi" class="failure-section">
+          <div class="failure-summary-head">
+            <el-tag type="danger" size="small" class="failure-summary-count">{{ group.count }} 条</el-tag>
+            <div class="failure-error-text failure-summary-reason" v-html="renderContent(group.reason)"></div>
+          </div>
+          <div class="failure-summary-rows">
+            <el-tag
+              v-for="r in group.rows"
+              :key="r.pos"
+              size="small"
+              effect="plain"
+              class="failure-tag-clickable"
+              @click="openFailureDetail(r.row)"
+            >
+              第{{ r.pos }}行
+            </el-tag>
+          </div>
+        </div>
+      </div>
+      <template #footer>
+        <el-button type="primary" @click="failureSummaryDialog.visible = false">关闭</el-button>
       </template>
     </el-dialog>
 
@@ -1432,6 +2379,7 @@ import { InfoFilled, ArrowDown, Timer, CircleCheck, Link, Warning, CircleClose, 
 import { taskApi, resultApi } from '@/api'
 import { useTaskPolling } from '@/composables/useTaskPolling'
 import { formatTime } from '@/utils/time'
+import { canUseIdxAsSeqNo, detailSeqNo } from '@/utils/seqno'
 import * as echarts from 'echarts'
 
 const tasks = ref([])
@@ -1439,6 +2387,12 @@ const allTasks = ref([])
 const selectedTaskId = ref(null)
 const result = ref(null)
 const resultItems = ref([])
+// 序号口径：合并后的明细行 idx 全行存在且唯一才按 idx+1 展示（对齐数据集行位
+// 与分数趋势图 x 轴）；历史脏数据（执行链路 payload 缺 idx 回归导致全行 idx=0）
+// 回退位置序号，避免序号列/坐标轴全为 1
+const seqNoFromIdx = computed(() => canUseIdxAsSeqNo(resultItems.value))
+// 任务/版本切换加载态：选任务到结果渲染之间给出可见反馈（此前无任何提示）
+const resultLoading = ref(false)
 
 // 判断是否有裁判评估数据（一致性评测专用）
 const hasJudgeAssessment = computed(() => {
@@ -1458,6 +2412,11 @@ const hasCustomDimensions = computed(() => {
 const executionVersions = ref([])
 const selectedExecutionNumber = ref(null)
 
+// 多次执行维度分数趋势（多次执行聚合展示数据源）：后端按 execution_number 倒序
+// 返回（最近一次在前），前端使用前显式按 execution_number 排序，不依赖传输顺序；
+// 旧后端无 dimension-trend 端点时保持空数组
+const executionTrend = ref([])
+
 const detailDialog = reactive({
   visible: false,
   title: '',
@@ -1471,7 +2430,23 @@ const judgeDetailDialog = reactive({
   score: null,
   feedback: '',
   dimensionScores: null,
+  // 分维度理由：新版 js.dimension_feedbacks 直取；旧版从 judge_details.dimension_details 派生；都没有为 null
+  dimensionFeedbacks: null,
+  // 该裁判失败原因（judge_failed/fail_reason 存在时展示，部分裁判失败行的查看入口）
+  failReason: null,
   traceUrl: null,
+})
+
+// 失败详情弹窗（主表「执行失败 / 裁判失败」状态 tag 点击打开）
+const failureDialog = reactive({
+  visible: false,
+  row: null
+})
+
+// 失败原因汇总弹窗（统计卡「失败数量」点击打开）
+const failureSummaryDialog = reactive({
+  visible: false,
+  total: 0
 })
 
 // 指标说明弹窗
@@ -1501,6 +2476,8 @@ const STRUCTURED_KEYS = new Set([
   'model_answer', 'question', 'ref_answer', 'user_input',
   'custom_dimensions', 'contexts_count',
   'session_summary', 'session_source',
+  // 行级口径字段：内部状态，不作为输入变量列/失败弹窗输入项展示
+  'row_status', 'failed_judge_count',
   // 前处理脚本产物：数组对象，由「脚本产物」专区数据驱动渲染，不作为输入变量列
   'pre_script_results'
 ])
@@ -1880,6 +2857,28 @@ const openJudgeTraceUrl = (url) => {
   }
 }
 
+// 分维度理由取值链：
+// 1) 新版 js.dimension_feedbacks（{维度名: 理由}）为非空对象时直取；
+// 2) 旧版 js.judge_details?.dimension_details 存在时派生 {维度名: 条目.reasoning}（仅取 reasoning 为非空字符串的）；
+// 3) 都没有返回 null（旧版数据无分维度理由，tooltip 回退裁判整体反馈）
+const getDimensionFeedbacks = (js) => {
+  if (!js) return null
+  if (js.dimension_feedbacks && typeof js.dimension_feedbacks === 'object' && Object.keys(js.dimension_feedbacks).length > 0) {
+    return js.dimension_feedbacks
+  }
+  const dimensionDetails = js.judge_details?.dimension_details
+  if (dimensionDetails && typeof dimensionDetails === 'object') {
+    const derived = {}
+    for (const [name, detail] of Object.entries(dimensionDetails)) {
+      if (detail && typeof detail.reasoning === 'string' && detail.reasoning.trim()) {
+        derived[name] = detail.reasoning
+      }
+    }
+    if (Object.keys(derived).length > 0) return derived
+  }
+  return null
+}
+
 // 打开裁判详情弹窗（含 LangFuse Trace 链接）
 const openJudgeDetail = (row, judgeIdx) => {
   const js = row.judge_scores[judgeIdx]
@@ -1888,9 +2887,120 @@ const openJudgeDetail = (row, judgeIdx) => {
   judgeDetailDialog.score = js.score !== undefined ? js.score : null
   judgeDetailDialog.feedback = js.feedback || ''
   judgeDetailDialog.dimensionScores = js.dimension_scores || null
+  judgeDetailDialog.dimensionFeedbacks = getDimensionFeedbacks(js)
+  judgeDetailDialog.failReason = js.judge_failed || js.fail_reason ? (toDisplayText(js.fail_reason) || '该裁判执行失败，未返回原因') : null
   judgeDetailDialog.traceUrl = js.langfuse_trace_url || null
   judgeDetailDialog.visible = true
 }
+
+// 各维度评分行 tooltip 文案：该维度有理由时显示理由；
+// 没有时回退裁判整体反馈（旧版数据），整体反馈也为空则显示暂无理由数据
+const getDimensionTooltip = (name) => {
+  const fb = judgeDetailDialog.dimensionFeedbacks?.[name]
+  if (typeof fb === 'string' && fb.trim()) return fb
+  const overall = judgeDetailDialog.feedback
+  if (overall && overall.trim()) return '旧版数据无分维度理由。该裁判整体反馈：' + overall
+  return '旧版数据无分维度理由。该裁判整体反馈：暂无理由数据'
+}
+
+// 各维度评分展示「得分/最高分」：最高分取当前任务维度配置的 max_score
+// （缺省/非法回退任务 max_score）；任务未选中或维度不在配置中时不显示分母。
+// 非数值得分（CC 协议的 "F" 哨兵=本行不涉及）不拼分母
+const dimensionMaxLabel = (name, score) => {
+  if (typeof score !== 'number' || !Number.isFinite(score)) return ''
+  const task = allTasks.value.find(t => t.id === selectedTaskId.value)
+  const metrics = task?.evaluation_metrics
+  if (!Array.isArray(metrics)) return ''
+  const metric = metrics.find(m => m && m.name === name)
+  if (!metric) return ''
+  const taskMax = task.max_score || 10
+  const raw = Number(metric.max_score)
+  const dimMax = Number.isFinite(raw) && raw > 0 ? raw : taskMax
+  return ` / ${dimMax}`
+}
+
+// ---------------- 失败详情弹窗（执行失败 / 裁判失败行） ----------------
+
+// 打开失败详情弹窗
+const openFailureDetail = (row) => {
+  if (!row) return
+  failureDialog.row = row
+  failureDialog.visible = true
+}
+
+// 打开失败原因汇总弹窗：无失败行时不响应（卡片也无点击态）
+const openFailureSummary = () => {
+  const failedRows = (resultItems.value || []).filter(r => r && r.success === false)
+  if (failedRows.length === 0) return
+  failureSummaryDialog.total = failedRows.length
+  failureSummaryDialog.visible = true
+}
+
+// 失败原因分组：与主表同源的失败行（success === false）按 error 文案归组，
+// 空文案归入「暂无错误信息」；pos 为合并后表格的行序（1 起），点击行号打开该条失败详情
+const failureReasonGroups = computed(() => {
+  const failedRows = (resultItems.value || []).filter(r => r && r.success === false)
+  const groups = new Map()
+  failedRows.forEach((row, i) => {
+    const reason = (typeof row.error === 'string' && row.error.trim()) ? row.error.trim() : '暂无错误信息'
+    if (!groups.has(reason)) {
+      groups.set(reason, { reason, count: 0, rows: [] })
+    }
+    const group = groups.get(reason)
+    group.count += 1
+    group.rows.push({ pos: i + 1, row })
+  })
+  return Array.from(groups.values()).sort((a, b) => b.count - a.count)
+})
+
+// 失败阶段文案：按 row_status 与 error 内容定位失败发生在哪个阶段
+const getFailureStage = (row) => {
+  if (!row) return '执行异常'
+  if (row.row_status === 'pre_script_failed') return '前处理脚本失败'
+  // on_fail=abort 与脚本自定义报错的行不写 row_status（聚合派生为 failed），
+  // 靠 error 文本中的「前处理脚本」字样归因到脚本阶段
+  if (typeof row.error === 'string' && row.error.includes('前处理脚本')) return '前处理脚本失败'
+  if (typeof row.error === 'string' && row.error.startsWith('模型调用失败')) return '模型调用失败'
+  if (typeof row.error === 'string' && row.error.includes('任务已停止')) return '手动停止'
+  if (row.row_status === 'judge_failed') return '裁判评测失败'
+  return '执行异常'
+}
+
+// 失败阶段 tag 颜色：停止为中性，裁判失败为警告，其余失败为危险
+const getFailureStageTagType = (row) => {
+  const stage = getFailureStage(row)
+  if (stage === '手动停止') return 'info'
+  if (stage === '裁判评测失败') return 'warning'
+  return 'danger'
+}
+
+// 裁判失败行：各裁判的 fail_reason 列表（仅取 judge_failed 为真的裁判）
+const failureJudgeFailReasons = computed(() => {
+  const row = failureDialog.row
+  if (!row || !Array.isArray(row.judge_scores)) return []
+  const list = []
+  row.judge_scores.forEach((js, i) => {
+    if (js && js.judge_failed) {
+      list.push({
+        judge: js.judge_index !== undefined ? `裁判${js.judge_index + 1}` : `裁判${i + 1}`,
+        reason: toDisplayText(js.fail_reason)
+      })
+    }
+  })
+  return list
+})
+
+// 失败行数据输入：排除结构化字段与下划线开头的内部字段后的键值对；
+// 用户输入/参考答案等标准字段虽在 STRUCTURED_KEYS（主表输入列不用它们），
+// 但带中文标签且是失败现场的关键上下文，弹窗需要展示
+const failureInputEntries = computed(() => {
+  const row = failureDialog.row
+  if (!row || typeof row !== 'object') return []
+  return Object.entries(row)
+    .filter(([k, v]) => v !== null && v !== undefined && !k.startsWith('_')
+      && (!STRUCTURED_KEYS.has(k) || VARIABLE_LABEL_MAP[k]))
+    .map(([k, v]) => ({ key: k, value: toDisplayText(v) }))
+})
 
 // 打开裁判评估详情
 const openJudgeAssessment = (row) => {
@@ -1966,13 +3076,28 @@ const safePercent = (val) => {
   return (Number(val) * 100).toFixed(1)
 }
 
-// 安全获取 result.items，防止字段不存在时崩溃
+// 安全获取 result.items，防止字段不存在时崩溃；
+// failed_items（模型调用失败/前处理脚本失败/裁判失败等未进入评分的数据行）合并进明细，
+// 合并后按 idx 升序稳定排序（同 idx / 缺失 idx 保持合并前相对顺序），保证主表序号与图表 x 轴连续
 const safeGetItems = (resultData) => {
   if (!resultData) return []
-  if (resultData.items && Array.isArray(resultData.items)) return resultData.items
-  if (resultData.results && Array.isArray(resultData.results)) return resultData.results
-  if (resultData.detail_results && Array.isArray(resultData.detail_results)) return resultData.detail_results
-  return []
+  let items = []
+  if (resultData.items && Array.isArray(resultData.items)) items = resultData.items
+  else if (resultData.results && Array.isArray(resultData.results)) items = resultData.results
+  else if (resultData.detail_results && Array.isArray(resultData.detail_results)) items = resultData.detail_results
+  if (Array.isArray(resultData.failed_items) && resultData.failed_items.length > 0) {
+    items = items
+      .concat(resultData.failed_items)
+      .map((item, order) => ({ item, order }))
+      .sort((a, b) => {
+        const ai = a.item?.idx
+        const bi = b.item?.idx
+        if (ai === bi) return a.order - b.order
+        return (ai ?? Number.MAX_SAFE_INTEGER) - (bi ?? Number.MAX_SAFE_INTEGER)
+      })
+      .map(e => e.item)
+  }
+  return items
 }
 
 // 判断结果是否可渲染图表（异常兼容：failed 不渲染，stopped 有部分结果可渲染）
@@ -1980,14 +3105,6 @@ const isResultRenderable = (r) => {
   if (!r || !r.result) return false
   if (r.status === 'failed') return false
   return true
-}
-
-// 会话来源展示文案（长会话 Agent 评测，兜底直接展示原始值）
-const formatSessionSource = (source) => {
-  if (!source) return ''
-  if (source === 'claude_code') return 'Claude Code'
-  if (source === 'langfuse') return 'Langfuse'
-  return source
 }
 
 // 安全评测辅助函数
@@ -2034,6 +3151,381 @@ const getSafetyLabel = (score) => {
 const getSafetyItemTagType = (flagged) => {
   return flagged ? 'danger' : 'success'
 }
+
+// ---------------- 插件评测（plugin 类型结果渲染辅助） ----------------
+// 数据来源：result_aggregator.aggregate_plugin_results 的聚合结构
+// （average_score/badge_summary/dimension_scores/anti_pattern_summary/items）。
+
+const PLUGIN_DIMENSION_LABELS = {
+  triggering_accuracy: '触发准确性',
+  orchestration_fitness: '编排适配度',
+  output_quality: '输出质量',
+  scope_calibration: '范围校准',
+  progressive_disclosure: '渐进式披露',
+  token_efficiency: 'Token 效率',
+  robustness: '健壮性',
+  structural_completeness: '结构完整性',
+  code_template_quality: '代码模板质量',
+  ecosystem_coherence: '生态一致性'
+}
+
+const PLUGIN_BADGE_LABELS = {
+  platinum: '白金 Platinum',
+  gold: '金牌 Gold',
+  silver: '银牌 Silver',
+  bronze: '铜牌 Bronze',
+  no_badge: '无徽章'
+}
+
+const badgeSummaryEntries = computed(() => {
+  const summary = result.value?.result?.badge_summary || {}
+  return Object.entries(summary).map(([badge, count]) => ({ badge, count }))
+})
+
+const pluginDimensionRows = computed(() => {
+  const dimScores = result.value?.result?.dimension_scores || {}
+  return Object.entries(dimScores)
+    .map(([name, stat]) => ({
+      name,
+      label: PLUGIN_DIMENSION_LABELS[name] || name,
+      average: stat?.average ?? 0,
+      count: stat?.count ?? 0
+    }))
+    .sort((a, b) => b.average - a.average)
+})
+
+const antiPatternRows = computed(() => {
+  const summary = result.value?.result?.anti_pattern_summary || {}
+  return Object.entries(summary)
+    .map(([flag, info]) => ({
+      flag,
+      count: info?.count ?? 0,
+      max_severity: info?.max_severity ?? null,
+      description: info?.description || ''
+    }))
+    .sort((a, b) => b.count - a.count)
+})
+
+const getBadgeLabel = (badge) => PLUGIN_BADGE_LABELS[badge] || badge || '无徽章'
+
+// ---- 插件评测 · 会话 Trace 口径（真实数据分） ----
+// 数据来源：aggregate_plugin_results 的 mode/real_data_summary 与 items[].real_data/trace/checks
+const isTraceMode = computed(() => result.value?.result?.mode === 'trace')
+
+const traceCheckSummary = computed(() => result.value?.result?.real_data_summary?.check_summary || {})
+
+const traceDirectionRows = computed(() => result.value?.result?.real_data_summary?.direction_summary || [])
+
+// 得分卡的口径字段：后端（新聚合）优先，缺失时按 check_summary 现算——
+// 老执行记录里的 aggregate 是改动前算的，不带 score_label/decidable_count/conservative_score
+const traceSummary = computed(() => {
+  const summary = result.value?.result?.real_data_summary || {}
+  const counts = summary.check_summary || {}
+  const decidable = summary.decidable_count ?? ((counts.passed || 0) + (counts.failed || 0))
+  const applicable = summary.applicable_count ?? (decidable + (counts.insufficient || 0))
+  const conservative = summary.conservative_score ?? (
+    applicable ? Math.round((counts.passed || 0) / applicable * 10000) / 100 : null
+  )
+  const partial = Object.keys(summary.status_summary || {}).some((status) => status !== 'complete')
+  return {
+    ...summary,
+    decidable_count: decidable,
+    applicable_count: applicable,
+    conservative_score: conservative,
+    score_label: summary.score_label || (partial ? '部分样本得分' : '真实数据得分')
+  }
+})
+
+// ---- 两套分数（trace 合并口径）：综合分来自静态 + LLM 评审，真实数据分来自历史线程 ----
+// items[] 里 composite_score/real_data_score 是后端改动后新加的键：老执行记录没有这两个键，
+// 那时「行分（score）」装的是真实数据分，故按「键是否存在」区分，不做数值猜测。
+const traceCompositeScore = (row) => {
+  if (!row || row.composite_score === undefined) return null
+  return row.composite_score === null ? null : row.composite_score
+}
+
+const traceRealScore = (row) => {
+  if (!row) return null
+  if (row.real_data_score !== undefined) return row.real_data_score
+  // 老记录（无 real_data_score 键）：行分即真实数据分
+  return row.score ?? null
+}
+
+const traceCompositeSummary = computed(() => {
+  const summary = result.value?.result?.composite_summary
+  if (summary) return summary
+  // 老执行记录没有 composite_summary：按行现算（老行没有 composite_score 键 → 全部算「未出」）
+  const items = result.value?.result?.items || []
+  const scores = items.map(traceCompositeScore).filter((value) => value !== null)
+  return {
+    average_score: scores.length
+      ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length * 100) / 100
+      : null,
+    measured_count: scores.length,
+    unmeasured_count: items.length - scores.length,
+    unit: 'row'
+  }
+})
+
+// 设计质量线：按插件一条（后端 design_quality）；老记录没有该字段，回退为空
+const traceDesignPlugins = computed(() => {
+  const summary = result.value?.result?.design_quality
+  if (summary?.plugins?.length) return summary.plugins
+  return []
+})
+
+// 历史数据线阶段汇总（生成/执行两行，未测阶段保留）
+const tracePhaseSummary = computed(() => result.value?.result?.real_data_summary?.phase_summary || [])
+
+// 覆盖率口径：key_steps=关键步骤覆盖率，其余按行为覆盖率
+const traceCoverageLabel = computed(() => {
+  const scope = result.value?.result?.real_data_summary?.behavior_scope
+  if (scope === 'key_steps') return '平均关键步骤覆盖率'
+  if (scope === 'all') return '平均行为覆盖率'
+  return '平均关键步骤覆盖率'
+})
+
+const tracePhaseLabel = (metric) => HISTORY_PHASE_LABELS[metric] || metric || '-'
+
+const tracePhaseUnmeasured = (phase) =>
+  !!phase && (phase.status === 'unmeasured' || phase.detected === false)
+
+const traceModelUsageText = (usage) => {
+  const rows = Object.entries(usage || {})
+  return rows.length ? rows.map(([m, t]) => `${m}：${Number(t).toLocaleString()} tokens`).join('；') : '无'
+}
+
+// 老执行记录：两套分数的键都不存在，但行分有值 —— 页面要显式说明此列的口径
+const traceIsLegacyRow = (row) =>
+  !!row && row.composite_score === undefined && row.real_data_score === undefined && row.score != null
+
+const traceDepthLabel = (depth) => (depth === 'standard' ? '标准' : depth === 'quick' ? '快速' : '-')
+
+const traceSkillLayers = (skill) =>
+  (skill?.layers || [])
+    .map((l) => `${l.layer} ${l.score !== null && l.score !== undefined ? Number(l.score).toFixed(3) : '未测'}`)
+    .join('；') || '-'
+
+// 得分分母只有「通过 + 失败」：证据不足与不适用都不进分母
+const traceDecidable = computed(() => {
+  const c = traceCheckSummary.value
+  return (c.passed || 0) + (c.failed || 0)
+})
+
+const traceLimitations = computed(() => {
+  const items = result.value?.result?.items || []
+  const texts = []
+  for (const item of items) {
+    for (const text of (item.real_data?.limitations || [])) {
+      if (text && !texts.includes(text)) texts.push(text)
+    }
+  }
+  return texts.slice(0, 6)
+})
+
+const TRACE_STATUS_LABELS = {
+  complete: '完整',
+  partial: '部分样本',
+  unmeasured: '未测'
+}
+
+const traceStatusLabel = (status) => TRACE_STATUS_LABELS[status] || status || '未测'
+
+const traceStatusTagType = (status) => {
+  switch (status) {
+    case 'complete': return 'success'
+    case 'partial': return 'warning'
+    default: return 'info'
+  }
+}
+
+const TRACE_CHECK_LABELS = {
+  passed: '通过',
+  failed: '失败',
+  insufficient: '证据不足',
+  not_applicable: '不适用'
+}
+
+const traceCheckLabel = (status) => TRACE_CHECK_LABELS[status] || status || '-'
+
+const traceCheckTagType = (status) => {
+  switch (status) {
+    case 'passed': return 'success'
+    case 'failed': return 'danger'
+    case 'not_applicable': return 'warning'
+    default: return 'info'
+  }
+}
+
+const traceCountsText = (counts) => {
+  if (!counts || typeof counts !== 'object') return ''
+  return Object.entries(counts).map(([name, n]) => `${name} × ${n}`).join('，')
+}
+
+// 方向名与 plugin-eval 报告同源（reporter.py 的 _DIMENSION_NAMES）：
+// 规则文件里的 dimension 是抽取期的内部键，页面统一展示报告里的方向名。
+// 行结果已带 dimension_label/label，此表只作老行（改动前落库）的兜底。
+const HISTORY_DIMENSION_LABELS = {
+  reporting_accuracy: '报告准确性',
+  procedure_adherence: '流程遵循',
+  error_handling: '异常处理可信度',
+  source_alignment: '来源一致性',
+  coverage: '需求覆盖',
+  case_quality: '用例质量',
+  workflow_reporting: '生成流程与报告'
+}
+
+const HISTORY_PHASE_LABELS = {
+  historical_execution_reliability: '历史执行可信度',
+  historical_generation_reliability: '历史生成可信度'
+}
+
+// 本步调用确认的判定文案（与报告「关键步骤」表一致）
+const TRACE_CALL_LABELS = {
+  passed: '已调用',
+  failed: '缺失（有当时要求）',
+  insufficient: '未见，无强制依据'
+}
+
+const traceDimensionLabel = (key) => HISTORY_DIMENSION_LABELS[key] || key || '-'
+
+const traceNumber = (value, suffix = '') =>
+  (value === null || value === undefined || Number.isNaN(value)) ? '未测' : `${value}${suffix}`
+
+const traceCoverageText = (coverage) => {
+  if (!coverage || coverage.rate === null || coverage.rate === undefined) return '未测'
+  return `${Number(coverage.rate).toFixed(1)}%（${coverage.covered} / ${coverage.total}）`
+}
+
+const traceMeasuredText = (counts) => {
+  const c = counts || {}
+  const measured = (c.passed || 0) + (c.failed || 0)
+  return `${measured} / ${measured + (c.insufficient || 0)}`
+}
+
+const traceCountsSlash = (counts) => {
+  const c = counts || {}
+  return `${c.passed || 0} / ${c.failed || 0} / ${c.insufficient || 0} / ${c.not_applicable || 0}`
+}
+
+// 敏感性下界：证据不足的检查全按违规计的对照值（plugin-eval 口径是 通过 ÷ (通过 + 失败)）
+const traceConservativeScore = (counts) => {
+  const c = counts || {}
+  const applicable = (c.passed || 0) + (c.failed || 0) + (c.insufficient || 0)
+  if (!applicable) return '未测'
+  return `${Math.round((c.passed || 0) / applicable * 10000) / 100}/100`
+}
+
+// 报告「真实数据测评指标」的得分标签：抽取不完整时是「部分样本得分」
+const traceScoreLabel = (realData) => {
+  const data = realData || {}
+  const label = (data.status === 'partial' || data.extraction_complete === false)
+    ? '部分样本得分'
+    : '真实数据得分'
+  const score = data.score
+  return `${label}：${score === null || score === undefined ? '未测' : score + '/100'}`
+}
+
+const traceDimensionRows = (dimensions) => {
+  if (Array.isArray(dimensions)) return dimensions
+  return Object.entries(dimensions || {}).map(([key, value]) => {
+    const counts = (value || {}).counts || {}
+    const measured = (counts.passed || 0) + (counts.failed || 0)
+    return {
+      key,
+      label: traceDimensionLabel(key),
+      score: (value || {}).score,
+      coverage: (value || {}).coverage,
+      measured,
+      applicable: measured + (counts.insufficient || 0),
+      counts
+    }
+  })
+}
+
+// 阶段块：新行走 trace.phases；老行从 trace.history 兜底适配（结构一致，仅方向未带名）
+const tracePhaseBlocks = (row) => {
+  const trace = (row || {}).trace || {}
+  if ((trace.phases || []).length) return trace.phases
+  const history = trace.history
+  if (!history) return []
+  return [{
+    ...history,
+    label: HISTORY_PHASE_LABELS[history.metric] || '历史执行可信度',
+    dimensions: traceDimensionRows(history.dimensions),
+    failed_checks: (row.checks || []).filter((check) => check.status === 'failed')
+  }]
+}
+
+// 关键步骤按步骤名合并（与报告一致：实例数/尝试次数/最终达成/检查项数求和）
+const traceKeyStepRows = (phase) => {
+  const rows = []
+  const index = {}
+  for (const step of phase.key_steps || []) {
+    const key = step.step || step.name || ''
+    let row = index[key]
+    if (!row) {
+      row = index[key] = {
+        key,
+        name: step.name || step.step || '-',
+        instances: 0,
+        attempts: 0,
+        achievedCount: 0,
+        checks: 0,
+        calls: {}
+      }
+      rows.push(row)
+    }
+    row.instances += 1
+    row.attempts += step.attempts || 0
+    if (step.achieved === true) row.achievedCount += 1
+    row.checks += step.check_count || 0
+    if (step.call_check) row.calls[step.call_check] = (row.calls[step.call_check] || 0) + 1
+  }
+  return rows.map((row) => ({
+    ...row,
+    achieved: row.achievedCount,
+    calls: Object.entries(row.calls)
+      .map(([status, n]) => `${TRACE_CALL_LABELS[status] || status} ${n}`)
+      .join('、') || '—'
+  }))
+}
+
+// 未被检查的关键步骤：未覆盖分类里存的是步骤键，按关键步骤表还原步骤名
+const traceUncoveredRows = (phase) => {
+  const uncovered = (phase.behavior_coverage || {}).uncovered_by_category || {}
+  const names = {}
+  for (const step of phase.key_steps || []) names[step.step] = step.name
+  return Object.entries(uncovered).map(([key, count]) => ({ name: names[key] || key, count }))
+}
+
+const traceModelUsage = (phase) => {
+  const usage = phase.model_usage || {}
+  return Object.entries(usage).map(([model, tokens]) => ({
+    model,
+    tokens: typeof tokens === 'number' ? tokens.toLocaleString() : tokens
+  }))
+}
+
+const getBadgeTagType = (badge) => {
+  switch (badge) {
+    case 'platinum': return 'success'
+    case 'gold': return 'warning'
+    case 'silver': return 'primary'
+    case 'bronze': return 'info'
+    default: return 'info'
+  }
+}
+
+const formatSubScores = (subScores) => {
+  if (!subScores || typeof subScores !== 'object') return '-'
+  const entries = Object.entries(subScores)
+  if (!entries.length) return '-'
+  return entries
+    .map(([key, val]) => (typeof val === 'number' ? `${key}: ${val.toFixed(3)}` : `${key}: ${val}`))
+    .join('；')
+}
+
 
 // ---------------- 脚本产物（评测前处理脚本 pre_script_results） ----------------
 // 数据来源：result.items[i].pre_script_results（judge 与 agent 类型通用，见 result_aggregator._format_items）；
@@ -2557,9 +4049,29 @@ const { startPolling, stopPolling, stopAll } = useTaskPolling({
         // W14 轮询走轻端点，载荷不含任务名：从列表行补齐
         const rowName = allTasks.value.find(t => t.id === taskId)?.name
         ElMessage.success(`任务 "${rowName}" 已${updatedTask.status === 'completed' ? '完成' : '结束'}`)
-        // 刷新历史版本
-        resultApi.history(taskId, { limit: 50 }).then(versions => {
+        // 刷新历史版本（轻量模式）并自动加载最新完成版本，避免结果区停留在执行中旧态
+        resultApi.history(taskId, { limit: 50, include_result: false }).then(async versions => {
           executionVersions.value = Array.isArray(versions) ? versions : []
+          if (taskId === selectedTaskId.value) {
+            const latestCompleted = executionVersions.value.find(v => v.status === 'completed')
+            if (latestCompleted) {
+              selectedExecutionNumber.value = latestCompleted.execution_number
+              await loadResultByVersion(latestCompleted.execution_number)
+            }
+          }
+        })
+        // 任务跑完时同步刷新多次执行聚合趋势：running 任务完成后聚合区立即出现/补上
+        // 最新一次，不必手动重选任务（旧后端无端点时静默置空，聚合区整体隐藏）
+        resultApi.dimensionTrend(taskId, 50).then(async trend => {
+          executionTrend.value = Array.isArray(trend) ? trend : []
+          // 趋势晚于结果到达时聚合区刚从隐藏变可见，补一次渲染；
+          // 结果尚未就绪时由 loadResultByVersion 完成后的 renderCharts 兜底
+          await nextTick()
+          if (isResultRenderable(result.value) && executionTrend.value.length >= 2) {
+            renderTrendCharts()
+          }
+        }).catch(() => {
+          executionTrend.value = []
         })
       }
     }
@@ -2584,6 +4096,8 @@ const onTaskChange = async (taskId) => {
   result.value = null
   resultItems.value = []
   executionVersions.value = []
+  // 切换任务时重置多次执行聚合数据，避免残留上个任务的趋势
+  executionTrend.value = []
   selectedExecutionNumber.value = null
 
   if (!taskId) return
@@ -2596,9 +4110,15 @@ const onTaskChange = async (taskId) => {
     startPolling(taskId)
   }
 
+  resultLoading.value = true
   try {
-    const versions = await resultApi.history(taskId, { limit: 50 })
+    // 轻量模式拉版本列表（include_result=false）：结果展示慢的根因是历史接口
+    // 把所有版本的完整 result 一次性传回，而前端只渲染选中的一版
+    const versions = await resultApi.history(taskId, { limit: 50, include_result: false })
     executionVersions.value = Array.isArray(versions) ? versions : []
+
+    // 多次执行维度分数趋势：旧后端无 dimension-trend 端点时静默置空，聚合区整体隐藏
+    executionTrend.value = await resultApi.dimensionTrend(taskId, 50).catch(() => [])
 
     // 自动选中最新 completed 版本；没有则选第一条
     const latestCompleted = executionVersions.value.find(v => v.status === 'completed')
@@ -2611,6 +4131,8 @@ const onTaskChange = async (taskId) => {
     console.error('获取历史版本失败', e)
     // 降级：直接加载当前结果
     await loadResult()
+  } finally {
+    resultLoading.value = false
   }
 }
 
@@ -2620,23 +4142,41 @@ const loadResultByVersion = async (executionNumber) => {
   if (!version) return
 
   const currentTask = allTasks.value.find(t => t.id === selectedTaskId.value)
-  result.value = {
-    task_id: selectedTaskId.value,
-    task_name: currentTask?.name || '',
-    evaluation_type: currentTask?.evaluation_type || '',
-    status: version.status,
-    result: version.result,
-    total_cost: version.total_cost,
-    completed_at: version.completed_at,
-    error_message: version.error_message,
-  }
+  resultLoading.value = true
+  try {
+    // 轻量历史模式下 version.result 为空：从单版端点取全量；旧后端无该端点时
+    // 回退用历史响应内嵌的 version.result，两种部署顺序下都可用
+    let detail = version
+    if (!version.result) {
+      try {
+        detail = await resultApi.historyVersion(selectedTaskId.value, executionNumber)
+      } catch (e) {
+        console.error('获取单版结果失败', e)
+        ElMessage.error('加载该版本结果失败，请稍后重试')
+        return
+      }
+    }
 
-  resultItems.value = safeGetItems(version.result)
-  // 重置脚本产物的数据条目选择，避免跨任务/版本残留旧选中项
-  preScriptSelectedIdx.value = 0
-  await nextTick()
-  if (isResultRenderable(result.value)) {
-    renderCharts()
+    result.value = {
+      task_id: selectedTaskId.value,
+      task_name: currentTask?.name || '',
+      evaluation_type: currentTask?.evaluation_type || '',
+      status: detail.status || version.status,
+      result: detail.result,
+      total_cost: detail.total_cost,
+      completed_at: detail.completed_at,
+      error_message: detail.error_message,
+    }
+
+    resultItems.value = safeGetItems(result.value.result)
+    // 重置脚本产物的数据条目选择，避免跨任务/版本残留旧选中项
+    preScriptSelectedIdx.value = 0
+    await nextTick()
+    if (isResultRenderable(result.value)) {
+      renderCharts()
+    }
+  } finally {
+    resultLoading.value = false
   }
 }
 
@@ -2663,6 +4203,11 @@ const renderCharts = () => {
 
   const res = result.value.result
 
+  // 插件评测类型无 ECharts 图表区（维度条/徽章/明细均为表格化展示）
+  if (result.value.evaluation_type === 'plugin') {
+    return
+  }
+
   // 耗时评测类型单独处理
   if (result.value.evaluation_type === 'latency') {
     nextTick(() => renderLatencyHistogram(res))
@@ -2686,13 +4231,23 @@ const renderCharts = () => {
 
   // 渲染折线图 - 评分趋势
   renderLineChart(resultItems.value)
+
+  // 多次执行聚合展示（通用类型专属；rag/consistency/latency 等专属分支已在上方 return）
+  nextTick(() => renderTrendCharts())
+}
+
+// 渲染前先销毁同 DOM 上的旧实例：任务/版本切换反复 init 会残留实例（控制台告警 + 内存增长）
+const initChart = (dom) => {
+  const existing = echarts.getInstanceByDom(dom)
+  if (existing) existing.dispose()
+  return echarts.init(dom)
 }
 
 const renderRagRadarChart = (metricsSummary) => {
   const chartDom = document.getElementById('ragRadarChart')
   if (!chartDom) return
 
-  const myChart = echarts.init(chartDom)
+  const myChart = initChart(chartDom)
 
   if (!metricsSummary || Object.keys(metricsSummary).length === 0) {
     myChart.setOption({
@@ -2706,14 +4261,29 @@ const renderRagRadarChart = (metricsSummary) => {
     max: 1.0
   }))
   const values = Object.values(metricsSummary).map(d => d.average || 0)
+  const scoreByName = new Map(
+    Object.entries(metricsSummary).map(([name, d]) => [ragMetricNames[name] || name, d.average || 0])
+  )
 
   myChart.setOption({
-    tooltip: {},
+    // 分值直显在指标名下方，不再用悬停 tooltip——雷达 tooltip 粒度是整个数据项
+    // （悬停任意处都全量罗列所有指标），指标多时溢出截断
+    tooltip: { show: false },
     radar: {
       indicator: indicators,
       shape: 'polygon',
       splitNumber: 5,
-      axisName: { color: '#666' }
+      axisName: {
+        fontSize: 12,
+        formatter: (name) => {
+          const score = scoreByName.get(name)
+          return score != null ? `{v|${name}}\n{s|${Number(score).toFixed(3)}}` : name
+        },
+        rich: {
+          v: { color: '#666', fontSize: 12, lineHeight: 16, align: 'center' },
+          s: { color: '#67C23A', fontSize: 12, fontWeight: 600, lineHeight: 16, align: 'center' }
+        }
+      }
     },
     series: [{
       type: 'radar',
@@ -2732,7 +4302,7 @@ const renderRadarChart = (dimensionScores) => {
   const chartDom = document.getElementById('radarChart')
   if (!chartDom) return
 
-  const myChart = echarts.init(chartDom)
+  const myChart = initChart(chartDom)
 
   if (!dimensionScores || Object.keys(dimensionScores).length === 0) {
     myChart.setOption({
@@ -2757,14 +4327,27 @@ const renderRadarChart = (dimensionScores) => {
     max: 10,
     score: data.average
   }))
+  const scoreByName = new Map(validDimensions.map(([name, data]) => [name, data.average]))
 
   myChart.setOption({
-    tooltip: {},
+    // 分值直显在指标名下方，不再用悬停 tooltip——雷达 tooltip 粒度是整个数据项
+    // （悬停任意处都全量罗列所有指标），指标多时溢出截断
+    tooltip: { show: false },
     radar: {
       indicator: indicators,
       shape: 'polygon',
       splitNumber: 5,
-      axisName: { color: '#666' }
+      axisName: {
+        fontSize: 12,
+        formatter: (name) => {
+          const score = scoreByName.get(name)
+          return score != null ? `{v|${name}}\n{s|${Number(score).toFixed(2)}}` : name
+        },
+        rich: {
+          v: { color: '#666', fontSize: 12, lineHeight: 16, align: 'center' },
+          s: { color: '#3662EC', fontSize: 12, fontWeight: 600, lineHeight: 16, align: 'center' }
+        }
+      }
     },
     series: [{
       type: 'radar',
@@ -2783,7 +4366,7 @@ const renderBarChart = (res) => {
   const chartDom = document.getElementById('barChart')
   if (!chartDom) return
 
-  const myChart = echarts.init(chartDom)
+  const myChart = initChart(chartDom)
 
   // 从items中提取评分
   const scores = res.items?.map(item => item.average_score).filter(s => s !== undefined) || []
@@ -2799,7 +4382,7 @@ const renderBarChart = (res) => {
   })
 
   myChart.setOption({
-    tooltip: { trigger: 'axis' },
+    tooltip: { trigger: 'axis', confine: true },
     xAxis: {
       type: 'category',
       data: Object.keys(buckets)
@@ -2821,13 +4404,13 @@ const renderPieChart = (res) => {
   const chartDom = document.getElementById('pieChart')
   if (!chartDom) return
 
-  const myChart = echarts.init(chartDom)
+  const myChart = initChart(chartDom)
 
   const successCount = res.success_count || 0
   const failedCount = res.failed_count || 0
 
   myChart.setOption({
-    tooltip: { trigger: 'item' },
+    tooltip: { trigger: 'item', confine: true },
     series: [{
       type: 'pie',
       radius: ['40%', '70%'],
@@ -2846,15 +4429,18 @@ const renderLineChart = (items) => {
   const chartDom = document.getElementById('lineChart')
   if (!chartDom) return
 
-  const myChart = echarts.init(chartDom)
+  const myChart = initChart(chartDom)
 
-  const scores = items.map(item => item.average_score).filter(s => s !== undefined)
+  // 只统计已评分行（合并进来的失败行 average_score 为 undefined，不参与趋势），
+  // x 轴取数据自带 idx + 1（合并失败行后数组下标会与数据序号错位）；
+  // idx 可信度按全量明细行判定（过滤后的子集可能掩盖重复 idx），脏数据回退位置序号
+  const scoredItems = items.filter(item => item && item.average_score !== undefined)
 
   myChart.setOption({
-    tooltip: { trigger: 'axis' },
+    tooltip: { trigger: 'axis', confine: true },
     xAxis: {
       type: 'category',
-      data: scores.map((_, i) => i + 1)
+      data: scoredItems.map((item, i) => detailSeqNo(item, i, seqNoFromIdx.value))
     },
     yAxis: {
       type: 'value',
@@ -2863,12 +4449,146 @@ const renderLineChart = (items) => {
     },
     series: [{
       type: 'line',
-      data: scores,
+      data: scoredItems.map(item => item.average_score),
       smooth: true,
       areaStyle: { color: 'rgba(54, 98, 236, 0.1)' },
       lineStyle: { color: '#3662EC' },
       itemStyle: { color: '#3662EC' }
     }]
+  })
+}
+
+// ---------------- 多次执行聚合展示（通用评测类型专属） ----------------
+// 数据来源：GET /evaluation/results/{id}/dimension-trend，按 execution_number 升序的
+// {execution_number, dimension_scores} 快照数组；旧后端无该端点时 executionTrend 保持空数组
+
+const TREND_SERIES_COLORS = ['#3662EC', '#67C23A', '#E6A23C', '#F56C6C', '#9254DE', '#00B2FF', '#FF7D00']
+const TREND_MAX_DIMENSIONS = 10
+const TREND_LEGEND_VISIBLE_COUNT = 5
+
+// 维度名并集：按各执行版本中首次出现的顺序收集（稳定），最多保留 10 个
+const collectTrendDimensions = (trend) => {
+  const names = []
+  const seen = new Set()
+  trend.forEach(t => {
+    Object.keys(t?.dimension_scores || {}).forEach(name => {
+      if (!seen.has(name)) {
+        seen.add(name)
+        names.push(name)
+      }
+    })
+  })
+  return names.slice(0, TREND_MAX_DIMENSIONS)
+}
+
+// 取维度平均分：dimension_scores 形如 {维度名: {average, ...}}；
+// 缺失/无值返回 null（图表断口，禁止补 0——补 0 会把缺失画成零分）
+const getTrendDimensionAverage = (t, name) => {
+  const stat = (t?.dimension_scores || {})[name]
+  const avg = stat && typeof stat === 'object' ? stat.average : stat
+  return avg === undefined || avg === null ? null : Number(avg)
+}
+
+// 跨执行波动表：每维度一行（均值/最优/最差/波动幅度），只按有值的执行统计
+const trendVolatilityRows = computed(() => {
+  const trend = executionTrend.value
+  if (!Array.isArray(trend) || trend.length === 0) return []
+  return collectTrendDimensions(trend).map(name => {
+    const values = trend.map(t => getTrendDimensionAverage(t, name)).filter(v => v !== null)
+    if (values.length === 0) return { name, avg: null, best: null, worst: null, range: null }
+    const avg = values.reduce((acc, v) => acc + v, 0) / values.length
+    const best = Math.max(...values)
+    const worst = Math.min(...values)
+    return { name, avg, best, worst, range: best - worst }
+  })
+})
+
+const formatTrendNumber = (v) => (v === null || v === undefined || Number.isNaN(v)) ? '-' : Number(v).toFixed(2)
+
+// 多次执行聚合图表：雷达（最近一次在前）+ 折线（按执行序号升序）
+const renderTrendCharts = () => {
+  const trend = executionTrend.value
+  // 与聚合区模板 v-if 同条件：不足 2 次执行不渲染（防御：容器未挂载时直接跳过）
+  if (!Array.isArray(trend) || trend.length < 2) return
+  renderTrendRadarChart(trend)
+  renderTrendLineChart(trend)
+}
+
+const renderTrendRadarChart = (trend) => {
+  const chartDom = document.getElementById('trendRadarChart')
+  if (!chartDom) return
+  const myChart = initChart(chartDom)
+
+  const dimensions = collectTrendDimensions(trend)
+  if (dimensions.length === 0) {
+    myChart.setOption({ title: { text: '暂无维度数据', left: 'center', top: 'middle' } })
+    return
+  }
+
+  // 后端 dimension-trend 按 execution_number 倒序返回（最近一次在前），这里显式按
+  // execution_number 升序整理后再倒序展示，不依赖传输顺序：最近一次执行排最前
+  const ordered = trend
+    .slice()
+    .sort((a, b) => (a?.execution_number ?? 0) - (b?.execution_number ?? 0))
+    .reverse()
+  const seriesData = ordered.map((t, i) => ({
+    name: `第${t?.execution_number ?? ordered.length - i}次`,
+    value: dimensions.map(name => getTrendDimensionAverage(t, name)),
+    lineStyle: { width: 2 },
+    areaStyle: { opacity: 0.08 }
+  }))
+
+  // legend 默认只勾选最近 5 次，更早的执行默认不勾选（仍可手动打开）
+  const legendSelected = {}
+  ordered.forEach((t, i) => {
+    legendSelected[`第${t?.execution_number ?? ordered.length - i}次`] = i < TREND_LEGEND_VISIBLE_COUNT
+  })
+
+  myChart.setOption({
+    // confine: 雷达维度多时 tooltip 很高，悬停靠下的点会向上溢出图表容器，
+    // 超出部分被卡片遮挡（只露出尾部几行）——限制在图表容器内重新定位
+    tooltip: { trigger: 'item', confine: true },
+    color: TREND_SERIES_COLORS,
+    legend: { type: 'scroll', bottom: 0, selected: legendSelected },
+    radar: {
+      indicator: dimensions.map(name => ({ name, max: 10 })),
+      shape: 'polygon',
+      splitNumber: 5
+    },
+    series: [{ type: 'radar', data: seriesData }]
+  })
+}
+
+const renderTrendLineChart = (trend) => {
+  const chartDom = document.getElementById('trendLineChart')
+  if (!chartDom) return
+  const myChart = initChart(chartDom)
+
+  const dimensions = collectTrendDimensions(trend)
+  if (dimensions.length === 0) {
+    myChart.setOption({ title: { text: '暂无维度数据', left: 'center', top: 'middle' } })
+    return
+  }
+
+  // x 轴按执行序号升序
+  const asc = trend.slice().sort((a, b) => (a?.execution_number ?? 0) - (b?.execution_number ?? 0))
+  const series = dimensions.map(name => ({
+    name,
+    type: 'line',
+    smooth: true,
+    connectNulls: false,
+    // 该执行版本缺失的维度值用 null 断开
+    data: asc.map(t => getTrendDimensionAverage(t, name))
+  }))
+
+  myChart.setOption({
+    tooltip: { trigger: 'axis', confine: true },
+    color: TREND_SERIES_COLORS,
+    legend: { type: 'scroll', bottom: 0 },
+    grid: { left: 40, right: 20, top: 30, bottom: 50 },
+    xAxis: { type: 'category', data: asc.map((t, i) => `第${t?.execution_number ?? i + 1}次`) },
+    yAxis: { type: 'value', min: 0, max: 10 },
+    series
   })
 }
 
@@ -2894,7 +4614,7 @@ const renderLatencyHistogram = (res) => {
   const chartDom = document.getElementById('latencyHistogramChart')
   if (!chartDom) return
 
-  const myChart = echarts.init(chartDom)
+  const myChart = initChart(chartDom)
   const records = res.records || []
   const threshold = res.threshold || 10
 
@@ -2935,6 +4655,7 @@ const renderLatencyHistogram = (res) => {
   myChart.setOption({
     tooltip: {
       trigger: 'axis',
+      confine: true,
       formatter: (params) => {
         const p = params[0]
         return `${p.name}<br/>请求数: ${p.value}`
@@ -2987,6 +4708,15 @@ const renderLatencyHistogram = (res) => {
   margin-bottom: 16px;
 }
 
+/* 未选任务时的占位区：min-height 保证加载遮罩 spinner 可见，不再是无反馈白屏 */
+.result-empty-placeholder {
+  min-height: 360px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+
 .stat-card {
   background: linear-gradient(135deg, #EEF2FF 0%, #E0E7FF 100%);
   border: 1px solid #C7D2FE;
@@ -3005,6 +4735,17 @@ const renderLatencyHistogram = (res) => {
 
 .stats-row {
   margin-bottom: 20px;
+}
+
+/* 失败数量卡可点击态（有失败行时才加此类，hover 反馈暗示可点） */
+.stat-card-clickable {
+  cursor: pointer;
+  transition: box-shadow 0.2s, border-color 0.2s;
+}
+
+.stat-card-clickable:hover {
+  box-shadow: 0 2px 12px rgba(245, 108, 108, 0.25);
+  border-color: #F56C6C;
 }
 
 .stat-label {
@@ -3565,6 +5306,11 @@ const renderLatencyHistogram = (res) => {
   color: #3662EC;
 }
 
+/* 失败状态 tag（执行失败 / 裁判失败，可点击打开失败详情弹窗） */
+.failure-tag-clickable {
+  cursor: pointer;
+}
+
 /* 二分分类 - 指标卡片 */
 .binary-metric-card {
   background: #fff;
@@ -3777,5 +5523,180 @@ const renderLatencyHistogram = (res) => {
 
 .detail-content::-webkit-scrollbar-thumb:hover {
   background: #9CA3AF;
+}
+
+/* 失败详情弹窗 */
+.failure-dialog .el-dialog__header {
+  border-bottom: 1px solid #E5E7EB;
+  padding: 16px 20px;
+  margin: 0;
+}
+
+.failure-dialog .el-dialog__title {
+  font-size: 16px;
+  font-weight: 600;
+  color: #1F2937;
+}
+
+.failure-dialog .el-dialog__footer {
+  border-top: 1px solid #E5E7EB;
+  padding: 12px 20px;
+}
+
+.failure-body {
+  padding: 8px 0;
+}
+
+.failure-section {
+  margin-bottom: 16px;
+}
+
+.failure-section:last-child {
+  margin-bottom: 0;
+}
+
+.failure-section-title {
+  font-weight: 600;
+  color: #303133;
+  margin-bottom: 8px;
+  font-size: 14px;
+}
+
+.failure-error-box {
+  background: #f5f7fa;
+  padding: 12px;
+  border-radius: 6px;
+  font-size: 13px;
+  color: #374151;
+}
+
+.failure-error-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.6;
+}
+
+/* 失败原因汇总弹窗 */
+.failure-summary-hint {
+  margin: 0 0 12px;
+  color: #909399;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.failure-summary-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.failure-summary-count {
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.failure-summary-reason {
+  flex: 1;
+  max-height: 120px;
+  overflow-y: auto;
+}
+
+.failure-summary-rows {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+  padding-left: 4px;
+}
+
+.failure-judge-name {
+  color: #909399;
+  font-size: 13px;
+}
+
+.failure-input-row {
+  display: flex;
+  gap: 4px;
+  padding: 6px 0;
+  border-bottom: 1px dashed #ebeef5;
+}
+
+.failure-input-row:last-child {
+  border-bottom: none;
+}
+
+.failure-input-label {
+  color: #909399;
+  font-size: 13px;
+  flex-shrink: 0;
+}
+
+.failure-model-output {
+  cursor: pointer;
+}
+
+.failure-model-output:hover {
+  color: #3662EC;
+}
+
+/* 裁判详情弹窗：分维度理由 tooltip（popper 挂在 body 上，样式必须全局才生效） */
+.dimension-feedback-tooltip {
+  max-width: 480px;
+  line-height: 1.6;
+}
+
+/* 插件评测结果 */
+.badge-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  padding: 4px 0;
+}
+
+.badge-summary-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.badge-count {
+  font-weight: 600;
+  color: #606266;
+}
+
+.plugin-expand-detail {
+  padding: 8px 16px 8px 8px;
+}
+
+.plugin-expand-detail h5 {
+  margin: 10px 0 6px;
+  color: #303133;
+}
+
+.plugin-sub-scores {
+  font-size: 12px;
+  word-break: break-all;
+}
+
+/* trace 口径：指标行与口径说明（报告正文的网页版） */
+.trace-metric-line {
+  font-size: 13px;
+  line-height: 1.9;
+  color: #303133;
+}
+
+.trace-note {
+  color: #909399;
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.trace-line-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: #303133;
+  margin: 4px 0 10px;
+  padding-left: 8px;
+  border-left: 3px solid #409eff;
 }
 </style>

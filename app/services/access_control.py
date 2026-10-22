@@ -21,7 +21,7 @@ TOCTOU 窗口），供约 30 个端点接入。
 import logging
 from typing import Any, Optional
 
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
@@ -212,12 +212,16 @@ def ensure_model_access(db: Session, user: Any, model_id: str):
     return _check_record_access(user, model, "模型不存在")
 
 
-def ensure_super_admin(request: Any) -> None:
+def ensure_super_admin(request: Request) -> None:
     """超管门禁依赖（W19 补收口）：供 router 级 dependencies 与单端点使用。
 
     与 pre_judge_script_api._ensure_admin 同口径（deny by default：用户
     上下文缺失或非超管一律 403）。request 传 FastAPI Request；经
     Depends 挂在 APIRouter 上时对整组端点生效。
+
+    注解必须是 fastapi.Request，不能写成 Any：FastAPI 依赖注入只按注解
+    识别 Request 对象，Any 会被当成必填 query 参数，所有挂该依赖的端点
+    对所有人（含超管）一律 422。
     """
     user = getattr(request, "state", None)
     user = getattr(user, "user", None) if user is not None else None

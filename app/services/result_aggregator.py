@@ -10,6 +10,21 @@ from app.services.judge_evaluation_engine import JudgeEvaluationResult
 from app.services.evaluators import evaluator_registry
 
 
+def _row_index(result: Dict[str, Any], fallback: int) -> int:
+    """行序号取值口径：_orig_idx（行级落库事实源序号，persist_row_result/
+    load_execution_results 注入）优先，其次 result 自带 idx，最后回退枚举序号。
+
+    背景：judge/agent 默认执行路径曾有 payload 不带 idx 的回归（全部行
+    idx=0 入库），行级表重建行的 row_result JSON 同样可能带着历史脏 idx，
+    _orig_idx 是唯一可信的行身份。
+    """
+    orig = result.get("_orig_idx") if isinstance(result, dict) else None
+    if isinstance(orig, int):
+        return orig
+    idx = result.get("idx", fallback) if isinstance(result, dict) else fallback
+    return idx if isinstance(idx, int) else fallback
+
+
 class ResultAggregator:
     """结果聚合服务"""
 
@@ -147,6 +162,8 @@ class ResultAggregator:
         # 与本分支一致；见上方适配器查找）
 
         # W17：binary_classification 聚合已迁移注册表（见上方适配器查找）
+
+        # W17：plugin（插件评测）聚合已迁移注册表（见上方适配器查找）
 
         # judge/agent 等默认走任务级聚合
         return ResultAggregator(task).aggregate(results)
@@ -312,7 +329,9 @@ class ResultAggregator:
         for idx, result in enumerate(results):
             judge_scores = result.get("judge_scores", [])
             item = {
-                "idx": result.get("idx", idx),
+                # 行序号优先取 _orig_idx（行级表重建行的事实源序号，历史 row_result
+                # JSON 里 idx 可能全为 0），无行身份再回退 idx / 枚举序号
+                "idx": _row_index(result, idx),
                 "success": True,
                 "model_output": result.get("model_output", ""),
                 "model_raw_response": result.get("model_raw_response", ""),
@@ -325,6 +344,8 @@ class ResultAggregator:
                         "score": js.get("score"),
                         "feedback": js.get("feedback"),
                         "dimension_scores": js.get("dimension_scores"),
+                        # 分维度评分理由（新裁判输出才有；旧数据缺该键时为 None）
+                        "dimension_feedbacks": js.get("dimension_feedbacks"),
                         "evaluation_target_name": js.get("evaluation_target_name") or f"裁判{i+1}",
                         "langfuse_trace_id": js.get("langfuse_trace_id"),
                         "langfuse_trace_url": js.get("langfuse_trace_url"),
@@ -358,18 +379,35 @@ class ResultAggregator:
         return items
 
     def _format_failed_items(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """格式化失败结果"""
+        """格式化失败结果（携带输入上下文与模型输出，便于结果页定位失败原因）"""
+        # 结构化字段（已单独处理或无需平铺的字段），平铺口径与 _format_items 一致：
+        # 排除下划线开头键与值为 None 的键
+        structured_keys = {
+            "idx", "success", "error", "model_output", "model_raw_response",
+            "judge_scores", "judge_details", "average_score", "feedback",
+            "dimension_scores", "input_data", "row_status", "pre_script_results",
+            "judge_count", "failed_judge_count",
+        }
         items = []
 
         for idx, result in enumerate(results):
             item = {
-                "idx": result.get("idx", idx),
+                # 与 _format_items 同口径：优先 _orig_idx（行级表事实源序号）
+                "idx": _row_index(result, idx),
                 "success": False,
                 "error": result.get("error", "Unknown error"),
+                # or "" 兜底：键存在但值为 None（如 judge_failed 行）时按空串处理
+                "model_output": result.get("model_output") or "",
+                # 失败行无 row_status 时按 derive_row_status 口径默认 failed
+                "row_status": result.get("row_status") or "failed",
             }
             # on_fail=abort 失败的条目保留脚本结果，便于定位失败脚本
             if result.get("pre_script_results"):
                 item["pre_script_results"] = result["pre_script_results"]
+            # 平铺输入变量（与 _format_items 同口径：排除结构化字段、下划线开头与 None 值）
+            for k, v in result.items():
+                if k not in structured_keys and not k.startswith("_") and v is not None:
+                    item[k] = v
             items.append(item)
 
         return items
@@ -577,6 +615,489 @@ class ResultAggregator:
             "total_successes": total_successes,
         }
 
+
+    @staticmethod
+    def aggregate_plugin_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        聚合插件评测结果（每行一个插件/skill，行分为复合分 0-100）
+
+        trace 口径（plugin_eval.mode == "trace"）：一行一份合并报告 —— 行 ``average_score``
+        与其余来源一致表示综合分（静态 + LLM 评审），真实数据分单独汇总为 ``real_data_summary``，
+        两套互不并入；trace 另出 ``composite_summary``（综合分侧的行数与均分）。
+
+        Args:
+            results: 插件评测行结果列表
+
+        Returns:
+            聚合后的结果：平均复合分、徽章分布、维度均分、反模式汇总、逐项明细
+            （trace 口径另出 mode、real_data_summary 与 composite_summary）
+        """
+        if not results:
+            return {
+                "total": 0,
+                "success_count": 0,
+                "failed_count": 0,
+                "average_score": 0,
+                "badge_summary": {},
+                "dimension_scores": {},
+                "anti_pattern_summary": {},
+                "market": None,
+                "evaluator": None,
+                "mode": None,
+                "real_data_summary": None,
+                "composite_summary": None,
+                "design_quality": None,
+                "items": [],
+            }
+
+        successful_results = [r for r in results if r.get("success", False)]
+        failed_results = [r for r in results if not r.get("success", False)]
+
+        # 口径判定：任一行来自 trace（历史/真实数据）即按 trace 聚合
+        # （行级 evaluation_mode 优先：全行失败时 plugin_eval 已置空，仍需按 trace 渲染）
+        mode = "trace" if any(
+            r.get("evaluation_mode") == "trace"
+            or (r.get("plugin_eval") or {}).get("mode") == "trace"
+            for r in results
+        ) else None
+
+        # 设计质量线按插件只评一次：明细/徽章/维度/反模式的「设计侧」汇总必须按插件去重，
+        # 否则同一插件 N 行会把同一份结果重复计 N 次
+        design_once = mode == "trace" and any(
+            (r.get("plugin_eval") or {}).get("design") for r in successful_results
+        )
+        design_rows: List[Dict[str, Any]] = []
+        if design_once:
+            seen_plugins = set()
+            for r in successful_results:
+                key = str(r.get("target_name") or "")
+                if key in seen_plugins:
+                    continue
+                seen_plugins.add(key)
+                design_rows.append(r)
+        else:
+            design_rows = list(successful_results)
+
+        # 平均复合分（0-100；失败行 average_score 为 None 自动排除）
+        scores = [r.get("average_score") for r in design_rows if r.get("average_score") is not None]
+        average_score = sum(scores) / len(scores) if scores else 0
+
+        # 徽章分布（trace 旧口径的行不产徽章，只统计真有综合分的行，避免「全 no_badge」的误导分布）
+        badge_summary: Dict[str, int] = {}
+        for r in design_rows:
+            if mode == "trace" and not (r.get("plugin_eval") or {}).get("composite"):
+                continue
+            badge = r.get("badge") or "no_badge"
+            badge_summary[badge] = badge_summary.get(badge, 0) + 1
+
+        # 维度均分（0-1；未测维度 None 自动排除）
+        dimension_acc: Dict[str, List[float]] = {}
+        for r in design_rows:
+            for dim_name, dim_score in (r.get("dimension_scores") or {}).items():
+                if isinstance(dim_score, (int, float)):
+                    dimension_acc.setdefault(dim_name, []).append(float(dim_score))
+        dimension_scores = {
+            dim: {
+                "average": round(sum(vals) / len(vals), 4),
+                "count": len(vals),
+            }
+            for dim, vals in dimension_acc.items()
+        }
+
+        # 反模式汇总（同一 flag 计数 + 最重严重度 + 首条描述）
+        anti_pattern_summary: Dict[str, Dict[str, Any]] = {}
+        for r in design_rows:
+            for ap in r.get("anti_patterns") or []:
+                flag = ap.get("flag", "UNKNOWN")
+                entry = anti_pattern_summary.setdefault(
+                    flag,
+                    {"count": 0, "max_severity": 0.0, "description": ap.get("description", "")},
+                )
+                entry["count"] += 1
+                entry["max_severity"] = max(entry["max_severity"], float(ap.get("severity", 0) or 0))
+
+        # 逐项明细（供前端与导出复用）
+        items = []
+        for r in successful_results:
+            eval_detail = r.get("plugin_eval") or {}
+            composite = eval_detail.get("composite") or {}
+            item = {
+                "idx": r.get("idx", 0),
+                "target_name": r.get("target_name", ""),
+                "target_type": r.get("target_type", ""),
+                "score": r.get("average_score"),
+                "badge": r.get("badge", "no_badge"),
+                "confidence_label": composite.get("confidence_label", ""),
+                "depth": eval_detail.get("depth", ""),
+                "duration_ms": eval_detail.get("duration_ms"),
+                "anti_pattern_penalty": composite.get("anti_pattern_penalty"),
+                "dimension_scores": r.get("dimension_scores") or {},
+                "dimensions": composite.get("dimensions", []),
+                "anti_patterns": r.get("anti_patterns") or [],
+                "market": r.get("market_info") or None,
+                "evaluator": (r.get("plugin_eval") or {}).get("evaluator") or None,
+                "layers": [
+                    {
+                        "layer": lr.get("layer"),
+                        "score": lr.get("score"),
+                        "sub_scores": lr.get("sub_scores"),
+                    }
+                    for lr in eval_detail.get("layers", [])
+                ],
+                "warnings": eval_detail.get("warnings", []),
+                "model_usage": eval_detail.get("model_usage", {}),
+                # trace 口径专属：真实数据分与线程锚点（非 trace 行恒为 None/空）
+                "real_data": r.get("real_data") or None,
+                "trace": r.get("trace") or None,
+                "checks": r.get("checks") or [],
+                "checks_total": r.get("checks_total"),
+                "unmeasured_reason": (r.get("trace") or {}).get("unavailable_reason") or "",
+                # 两套分数的显式取值（trace 行才加：旧落库记录没有这两个键，
+                # 前端据此区分「旧口径行分即真实数据分」与「本次未出综合分」）
+                **(
+                    {
+                        # trace 行的 average_score 即综合分（没出综合分时为 None）
+                        "composite_score": (
+                            r.get("average_score") if composite.get("score") is not None else None
+                        ),
+                        "real_data_score": (r.get("real_data") or {}).get("score"),
+                        "skills": eval_detail.get("skills") or [],
+                        # 设计质量线：是否复用任务内首次评测（页面据此标注）
+                        "design_reused": bool(r.get("design_reused")),
+                        "design": eval_detail.get("design") or None,
+                    }
+                    if mode == "trace"
+                    else {}
+                ),
+            }
+            items.append(item)
+        failed_items = [
+            {
+                "idx": r.get("idx", 0),
+                "success": False,
+                "error": r.get("error", ""),
+            }
+            for r in failed_results
+        ]
+
+        # 市场来源的版本锚点：全部行指向同一市场同一 commit 时提到顶层，
+        # 便于直接回答「这次评的是哪个版本的插件」（manual 来源为 None）
+        market_rows = [i["market"] for i in items if i.get("market")]
+        market = None
+        if market_rows and len({(m.get("market_id"), m.get("commit")) for m in market_rows}) == 1:
+            market = market_rows[0]
+
+        # 评测动作自身的版本锚点（plugin-eval 也来自市场，随懒加载更新）
+        evaluator_rows = [i["evaluator"] for i in items if i.get("evaluator")]
+        evaluator = evaluator_rows[0] if evaluator_rows else None
+
+        real_data_summary = ResultAggregator._summarize_real_data(successful_results, mode)
+        composite_summary = ResultAggregator._summarize_composite(successful_results, mode)
+        design_quality = ResultAggregator._summarize_design_quality(successful_results, mode)
+
+        return {
+            "total": len(results),
+            "success_count": len(successful_results),
+            "failed_count": len(failed_results),
+            "success_rate": len(successful_results) / len(results) if results else 0,
+            "average_score": round(average_score, 2),
+            "badge_summary": badge_summary,
+            "dimension_scores": dimension_scores,
+            "anti_pattern_summary": anti_pattern_summary,
+            "market": market,
+            "evaluator": evaluator,
+            "mode": mode,
+            "real_data_summary": real_data_summary,
+            "composite_summary": composite_summary,
+            "design_quality": design_quality,
+            "items": items,
+            "failed_items": failed_items,
+            "completed_at": datetime.now().isoformat(),
+        }
+
+    @staticmethod
+    def _summarize_composite(
+        successful_results: List[Dict[str, Any]], mode: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        """trace 口径的设计质量线汇总（非 trace 返回 None）
+
+        ``average_score`` 即综合分。设计质量线按插件只评一次：任务内同一插件无论覆盖
+        多少行，都只算一个样本（``unit="plugin"``）；改动前的旧记录没有 ``design`` 标记，
+        仍按行统计（``unit="row"``），保证历史结果不变。
+        """
+        if mode != "trace":
+            return None
+
+        design_once = any(
+            (r.get("plugin_eval") or {}).get("design") for r in successful_results
+        )
+        scores: List[float] = []
+        seen = set()
+        for r in successful_results:
+            composite = (r.get("plugin_eval") or {}).get("composite") or {}
+            score = composite.get("score")
+            if not isinstance(score, (int, float)):
+                continue
+            if design_once:
+                key = str(r.get("target_name") or "")
+                if key in seen:
+                    continue
+                seen.add(key)
+            scores.append(float(score))
+        if design_once:
+            names = {
+                str(r.get("target_name") or "")
+                for r in successful_results
+                if str(r.get("target_name") or "")
+            }
+            total = len(names) if names else (1 if scores else 0)
+        else:
+            total = len(successful_results)
+        return {
+            "average_score": round(sum(scores) / len(scores), 2) if scores else None,
+            "measured_count": len(scores),
+            "unmeasured_count": max(0, total - len(scores)),
+            "unit": "plugin" if design_once else "row",
+        }
+
+    @staticmethod
+    def _summarize_design_quality(
+        successful_results: List[Dict[str, Any]], mode: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        """设计质量线明细（按插件一条，任务内只评一次）
+
+        页面据此单独渲染「设计质量线」：综合分/徽章/维度/各层/Skill 明细/模型用量，
+        并给出该插件覆盖了多少行、其中多少行复用了首次评测。
+        """
+        if mode != "trace":
+            return None
+
+        plugins: Dict[str, Dict[str, Any]] = {}
+        for r in successful_results:
+            ev = r.get("plugin_eval") or {}
+            composite = ev.get("composite") or {}
+            score = composite.get("score")
+            name = str(r.get("target_name") or "")
+            entry = plugins.get(name)
+            if entry is None:
+                entry = plugins[name] = {
+                    "plugin": name,
+                    "score": None,
+                    "badge": "",
+                    "confidence_label": "",
+                    "anti_pattern_penalty": None,
+                    "dimensions": [],
+                    "layers": [],
+                    "skills": [],
+                    "depth": ev.get("depth") or "",
+                    "model_usage": {},
+                    "duration_ms": None,
+                    "covered_rows": 0,
+                    "reused_rows": 0,
+                    "anti_pattern_count": 0,
+                    "evaluator": ev.get("evaluator") or None,
+                }
+            entry["covered_rows"] += 1
+            entry["anti_pattern_count"] = max(
+                entry["anti_pattern_count"], len(r.get("anti_patterns") or [])
+            )
+            if r.get("design_reused"):
+                entry["reused_rows"] += 1
+            if entry["score"] is None and isinstance(score, (int, float)):
+                design = ev.get("design") or {}
+                entry.update({
+                    "score": round(float(score), 2),
+                    "badge": ev.get("badge") or composite.get("badge") or "",
+                    "confidence_label": composite.get("confidence_label") or "",
+                    "anti_pattern_penalty": composite.get("anti_pattern_penalty"),
+                    "dimensions": composite.get("dimensions") or [],
+                    "layers": ev.get("layers") or [],
+                    "skills": ev.get("skills") or [],
+                    "depth": ev.get("depth") or "",
+                    "model_usage": design.get("model_usage") or {},
+                    "duration_ms": design.get("duration_ms"),
+                })
+        return {
+            "evaluated_count": sum(1 for p in plugins.values() if p["score"] is not None),
+            "plugins": [
+                p for name, p in plugins.items() if name or p["score"] is not None
+            ],
+        }
+
+    @staticmethod
+    def _summarize_real_data(
+        successful_results: List[Dict[str, Any]], mode: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        """trace 口径的真实数据分汇总（非 trace 返回 None，保持既有结果结构不变）
+
+        - average_score：已测行的真实数据分均值（未测行 score 为 None 自动排除）
+        - unmeasured_count：内容不足以判定的行数（无原始会话 / 无规则 / 未识别）
+        - check_summary：逐行判定计数求和（通过/失败/证据不足/不适用）
+        - average_behavior_coverage：已测行的关键步骤覆盖率均值
+        - score_label：得分标签。plugin-eval 对「评审不完整」的线程一律标「部分样本得分」
+          （report.md: `部分样本得分` vs `真实数据得分`），有任一行未评审完整即按部分样本标；
+        - decidable_count / applicable_count：得分下方那一行必须同屏的样本量——
+          有效判定分母只有「通过 + 失败」，证据不足的检查不进分母，因此得分高
+          只代表「已判定的少量样本里没有违规」，不代表整条线程；
+        - conservative_score：把证据不足的检查一并计入违规时的下界（敏感性对照，
+          不是 plugin-eval 指标；plugin-eval 的口径是 通过 ÷ (通过 + 失败)）；
+        - direction_summary：方向（报告「分项」表）逐行求和后的可判定/适用与均值。
+          **只统计已探测到任务的阶段**：未测阶段的检查集为空，若把它的方向也拼进来，
+          页面会出现整行 0/0 的假分项（与报告「两阶段各一节」的结构不符）。
+        - phase_summary：逐阶段汇总（报告「测评总览」的生成/执行两行），未测阶段保留
+          status=unmeasured 与空计数，页面据此显示「未测」而不是 0。
+        - behavior_scope：覆盖率口径（key_steps=关键步骤 / all=全部行为），列名随它切换。
+        """
+        if mode != "trace":
+            return None
+
+        scores: List[float] = []
+        coverages: List[float] = []
+        behaviors: List[float] = []
+        status_summary: Dict[str, int] = {}
+        partial = False
+        check_summary = {
+            "passed": 0, "failed": 0, "insufficient": 0, "not_applicable": 0, "measured": 0,
+        }
+        # 方向 → {label, phase, 分数列表, 有效率列表, measured/applicable 求和}
+        direction_acc: Dict[str, Dict[str, Any]] = {}
+        # 阶段 → 汇总（未测阶段也保留，页面显示未测而非 0）
+        phase_acc: Dict[str, Dict[str, Any]] = {}
+        behavior_scopes = set()
+        for r in successful_results:
+            real_data = r.get("real_data") or {}
+            status = str(real_data.get("status") or "unmeasured")
+            status_summary[status] = status_summary.get(status, 0) + 1
+            if status != "complete" or real_data.get("extraction_complete") is False:
+                partial = True
+            score = real_data.get("score")
+            if isinstance(score, (int, float)):
+                scores.append(float(score))
+            coverage = real_data.get("coverage")
+            if isinstance(coverage, (int, float)):
+                coverages.append(float(coverage))
+            behavior = real_data.get("behavior_coverage") or {}
+            behavior_rate = behavior.get("rate")
+            if isinstance(behavior_rate, (int, float)):
+                behaviors.append(float(behavior_rate))
+            if behavior.get("scope"):
+                behavior_scopes.add(str(behavior["scope"]))
+            for key in check_summary:
+                value = (real_data.get("counts") or {}).get(key)
+                if isinstance(value, (int, float)):
+                    check_summary[key] += int(value)
+            for phase in (r.get("trace") or {}).get("phases") or []:
+                metric = str(phase.get("metric") or phase.get("label") or "")
+                phase_row = phase_acc.setdefault(
+                    metric,
+                    {
+                        "metric": metric,
+                        "label": phase.get("label") or metric,
+                        "status": phase.get("status") or "unmeasured",
+                        "detected": phase.get("detected"),
+                        "scores": [],
+                        "coverages": [],
+                        "decidable": 0,
+                        "applicable": 0,
+                        "measured_rows": 0,
+                        "row_count": 0,
+                    },
+                )
+                phase_row["row_count"] += 1
+                if phase.get("status") != "unmeasured":
+                    phase_row["status"] = phase.get("status")
+                if phase.get("detected") is True:
+                    phase_row["detected"] = True
+                if isinstance(phase.get("score"), (int, float)):
+                    phase_row["scores"].append(float(phase["score"]))
+                    phase_row["measured_rows"] += 1
+                if isinstance(phase.get("coverage"), (int, float)):
+                    phase_row["coverages"].append(float(phase["coverage"]))
+                counts = phase.get("counts") or {}
+                measured = counts.get("measured")
+                if not isinstance(measured, (int, float)):
+                    measured = int(counts.get("passed", 0) or 0) + int(counts.get("failed", 0) or 0)
+                applicable = counts.get("applicable")
+                if not isinstance(applicable, (int, float)):
+                    applicable = int(measured) + int(counts.get("insufficient", 0) or 0)
+                phase_row["decidable"] += int(measured)
+                phase_row["applicable"] += int(applicable)
+                # 未测阶段没有检查项：不参与方向分项（否则整行 0/0）
+                if phase.get("status") == "unmeasured" or phase.get("detected") is False:
+                    continue
+                for dim in phase.get("dimensions") or []:
+                    row = direction_acc.setdefault(
+                        dim.get("key") or dim.get("label") or "",
+                        {"label": dim.get("label") or dim.get("key") or "",
+                         "phase": phase.get("label") or metric,
+                         "phase_metric": metric,
+                         "phase_status": phase.get("status") or "",
+                         "scores": [], "coverages": [], "measured": 0, "applicable": 0},
+                    )
+                    if isinstance(dim.get("score"), (int, float)):
+                        row["scores"].append(float(dim["score"]))
+                    if isinstance(dim.get("coverage"), (int, float)):
+                        row["coverages"].append(float(dim["coverage"]))
+                    row["measured"] += int(dim.get("measured") or 0)
+                    row["applicable"] += int(dim.get("applicable") or 0)
+
+        def _mean(values: List[float]) -> Optional[float]:
+            return round(sum(values) / len(values), 2) if values else None
+
+        decidable = check_summary["measured"] or (
+            check_summary["passed"] + check_summary["failed"]
+        )
+        applicable = decidable + check_summary["insufficient"]
+
+        return {
+            "average_score": _mean(scores),
+            "score_label": "部分样本得分" if partial else "真实数据得分",
+            "decidable_count": decidable,
+            "applicable_count": applicable,
+            # 敏感性下界：证据不足的检查全部按违规计的对照值（非 plugin-eval 指标）
+            "conservative_score": (
+                round(check_summary["passed"] / applicable * 100, 2) if applicable else None
+            ),
+            "measured_count": len(scores),
+            "unmeasured_count": len(successful_results) - len(scores),
+            "status_summary": status_summary,
+            "average_coverage": _mean(coverages),
+            "average_behavior_coverage": _mean(behaviors),
+            "behavior_scope": (
+                behavior_scopes.pop() if len(behavior_scopes) == 1 else
+                ("mixed" if behavior_scopes else "")
+            ),
+            "check_summary": check_summary,
+            "phase_summary": [
+                {
+                    "metric": row["metric"],
+                    "label": row["label"],
+                    "status": row["status"],
+                    "detected": row["detected"],
+                    "average_score": _mean(row["scores"]),
+                    "average_coverage": _mean(row["coverages"]),
+                    "measured_rows": row["measured_rows"],
+                    "row_count": row["row_count"],
+                    "decidable": row["decidable"],
+                    "applicable": row["applicable"],
+                }
+                for row in phase_acc.values()
+            ],
+            "direction_summary": [
+                {
+                    "key": key,
+                    "label": row["label"],
+                    "phase": row["phase"],
+                    "phase_metric": row["phase_metric"],
+                    "phase_status": row["phase_status"],
+                    "average_score": _mean(row["scores"]),
+                    "average_coverage": _mean(row["coverages"]),
+                    "measured": row["measured"],
+                    "applicable": row["applicable"],
+                }
+                for key, row in direction_acc.items()
+            ],
+        }
 
     @staticmethod
     def aggregate_binary_classification_results(

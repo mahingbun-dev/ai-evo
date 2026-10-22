@@ -60,6 +60,9 @@ deepeval/
 # 离线 claude CLI（由 build-service 按 tools/claude-bin.json 下载就位，产物不入库）
 claude-local/
 .claude-bin-version
+# 离线 git 运行时（由 build-service 按 tools/git-bin.json 下载就位，产物不入库）
+git-local/
+.git-bin-version
 
 # ===== 构建产物与部署包（由 CI / 打包脚本生成，不再入库）=====
 frontend/dist/
@@ -85,4 +88,9 @@ output/
 frontend/.playwright-cli/
 # 某些工具在根目录误生成的空目录
 None/
+# ===== 评测参考项目 vendor（clone 自开源项目，仅供本地读码参考，不入库）=====
+vendor/
+
+# ===== 本地虚拟环境（本地开发用 uv venv .venv 创建，不入库）=====
+.venv/
 .mimosa/

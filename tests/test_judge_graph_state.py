@@ -47,6 +47,8 @@ class TestBuildStateInput:
         assert state["scored_dimensions"] == []
         assert state["final_score"] == 0.0
         assert state["final_feedback"] == ""
+        # 分维度理由初始为空 dict（由 aggregate_scores 节点填充）
+        assert state["final_dimension_feedbacks"] == {}
 
     def test_build_state_input_empty_task(self):
         """Test state building with task that has minimal attributes"""
@@ -67,6 +69,8 @@ class TestBuildStateInput:
         assert state["scoring_steps"] == []
         # 空 metrics -> dimension_dependencies 应为空
         assert state["dimension_dependencies"] == {}
+        # 最终输出段初始值：分维度理由为空 dict
+        assert state["final_dimension_feedbacks"] == {}
 
     def test_build_state_input_with_dependencies(self):
         """Test build_state_input: metric with dependencies correctly fills dimension_dependencies"""

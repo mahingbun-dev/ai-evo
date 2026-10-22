@@ -29,9 +29,9 @@ PKG_NAME="${SNAPSHOT_PACKAGE:-ai-evo-offline-snapshot}"
 : "${GITLAB_UPLOAD_TOKEN:?需要设置 GITLAB_UPLOAD_TOKEN（需 write_package_registry 权限）}"
 
 # 鉴权方式：GitLab 的 Deploy Token 只认 Basic 鉴权，用 PRIVATE-TOKEN 头会返回 401
-# （已实测）。用户名就是创建时显示的那个（形如 gitlab+deploy-token-173），
+# （已实测）。用户名就是创建时显示的那个（形如 gitlab+deploy-token-<id>），
 # 不是敏感信息；项目访问令牌用 Basic 鉴权同样可用，所以统一走 Basic。
-GITLAB_UPLOAD_USER="${GITLAB_UPLOAD_USER:-gitlab+deploy-token-173}"
+GITLAB_UPLOAD_USER="${GITLAB_UPLOAD_USER:-gitlab+deploy-token-1}"
 AUTH=(-u "${GITLAB_UPLOAD_USER}:${GITLAB_UPLOAD_TOKEN}")
 
 log_info() { echo -e "\033[0;32m[INFO]\033[0m $1"; }

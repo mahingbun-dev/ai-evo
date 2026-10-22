@@ -4,9 +4,12 @@ anc-hub file-store 文件服务（MCP streamable-HTTP 通道）
 通过 anc-hub 的 MCP 端点访问 file-store：
 - file-store__file_download 分块下载（服务端单块上限 1MB），落盘后 sha256 + size 双校验
 - file_query 远端文件检索（名称子串/上传时间/上传者过滤，分页），驱动「从 anc-hub 导入」页签
+- file-store__file_upload 三段式上传（begin/chunk/commit），导出文档上传后凭 file_id 复用
 
 协议顺序（参考 anc-gateway/scripts/hub-file-download.py 的 McpClient 成熟实现）：
     initialize → notifications/initialized → tools/call（携带 mcp-session-id header）→ DELETE 收尾
+插件工具经 call_tool 元工具转发（中台已把插件工具从 tools/list 收口）：
+    tools/call name=call_tool arguments={name: "插件__工具", arguments: {...}}
 响应为 SSE 时取最后一个非空 data: 行；偶发空响应自动重试一次。
 
 端点从环境变量 ANC_HUB_MCP_ENDPOINT 读取，缺省时回退 Settings（.env），均缺失时抛出中文错误。
@@ -29,6 +32,8 @@ TLS 证书默认严格校验；自签名内网端点需显式设 AIEVO_HUB_TLS_I
   与执行时 match_files 的文件系统 glob 同语义）
 - hub_match_preview 匹配预览：取数据集首条含 hub_file 字段样本的登记索引匹配
 """
+# norm-exempt: api-trace —— 本模块是生产 MCP 客户端（非用例执行链路），不经 ui_shared 附件通道
+# norm-exempt: attach-truncation —— 下方 [:N] 是异常消息限长，不是 allure/api_trace 证据附件
 import base64
 import fnmatch
 import hashlib
@@ -79,6 +84,14 @@ UNPACK_DIRNAME = "unpacked"
 
 DOWNLOAD_TOOL = "file-store__file_download"
 QUERY_TOOL = "file-store__file_query"
+UPLOAD_TOOL = "file-store__file_upload"
+
+# 中台把插件工具收口到 call_tool 元工具：tools/list 只暴露中台自身工具，
+# 插件工具调用形态为 tools/call → call_tool → {name: 插件__工具, arguments: {...}}
+HUB_CALL_TOOL = "call_tool"
+
+# 上传缺省单块 512KB（file-store begin 返回 chunk_max_bytes 时以其为准再收敛）
+HUB_UPLOAD_CHUNK = 512 * 1024
 
 def _hub_sso_cookie_name() -> str:
     """承载平台登录态的 Cookie 名（HUB_SSO_COOKIE_NAME 配置；留空表示禁用 Cookie 通道）"""
@@ -283,6 +296,17 @@ class HubMcpClient:
             raise HubFileError(f"{method}: JSON-RPC error: {obj['error']}")
         return obj.get("result", obj) if isinstance(obj, dict) else obj
 
+    def call_plugin_tool(self, name: str, arguments: Optional[Dict[str, Any]] = None):
+        """调用中台插件工具：经 call_tool 元工具转发
+
+        中台迭代后插件工具不再直接出现在 tools/list，直调会被拒绝并返回
+        decision=use_call_tool / status=moved；统一走 call_tool 包装。
+        """
+        return self.call("tools/call", {
+            "name": HUB_CALL_TOOL,
+            "arguments": {"name": name, "arguments": arguments or {}},
+        })
+
     def close(self):
         """DELETE 会话收尾（静默失败）"""
         if not self.session_id:
@@ -329,6 +353,13 @@ def _extract_tool_payload(result: Any) -> Dict[str, Any]:
     if not isinstance(obj, dict):
         raise HubFileError(
             "无法从工具结果解析 payload: " + json.dumps(result, ensure_ascii=False, default=str)[:500]
+        )
+    # 中台已把插件工具收口到 call_tool（decision=use_call_tool / status=moved）：
+    # 正常链路不会命中；命中说明中台调用形态再次变化，给出可读提示而非裸 JSON
+    if obj.get("decision") == "use_call_tool" or obj.get("status") == "moved":
+        raise HubFileError(
+            "anc-hub 中台已收口插件工具，需经 call_tool 调用: "
+            + str(obj.get("hint") or obj.get("message") or "")[:300]
         )
     # anc-hub 登录闸门的拒绝卡（decision=reject）：message 是面向用户的中文
     # 提示（如「需要先建立登录身份……」），直接透出，别包一层 JSON
@@ -505,13 +536,10 @@ class HubFileService:
                             raise HubFileError(
                                 f"文件 {file_id} 分块数超过上限 {MAX_DOWNLOAD_CHUNKS}，中止下载"
                             )
-                        res = cli.call("tools/call", {
-                            "name": DOWNLOAD_TOOL,
-                            "arguments": {
-                                "file_id": file_id,
-                                "offset": offset,
-                                "max_bytes": self.chunk_size,
-                            },
+                        res = cli.call_plugin_tool(DOWNLOAD_TOOL, {
+                            "file_id": file_id,
+                            "offset": offset,
+                            "max_bytes": self.chunk_size,
                         })
                         pl = _extract_tool_payload(res)
                         data = base64.b64decode(pl.get("data_base64") or "")
@@ -710,8 +738,71 @@ class HubFileService:
         with HubMcpClient(endpoint, timeout=self.timeout, bearer_token=self.bearer_token) as cli:
             cli.call("initialize", _MCP_INITIALIZE_PARAMS)
             cli.call("notifications/initialized", notify=True)
-            result = cli.call("tools/call", {"name": QUERY_TOOL, "arguments": arguments})
+            result = cli.call_plugin_tool(QUERY_TOOL, arguments)
         return _extract_tool_payload(result)
+
+    # ------------------------------------------------------------------
+    # 上传（file_upload 三段式）
+    # ------------------------------------------------------------------
+    def upload_bytes(self, filename: str, data: bytes) -> Dict[str, Any]:
+        """把内存字节上传到 anc-hub file-store，返回 {file_id, filename, size, sha256}
+
+        begin(filename, total_size, sha256) → chunk(upload_id, seq, data_base64)*
+        → commit(upload_id)；begin 声明的 sha256 由服务端在 commit 时校验，
+        不匹配拒入库。commit 前任何失败都 abort 放弃服务端分块会话。
+        """
+        if not data:
+            raise HubFileError("上传内容为空（data 为 0 字节）")
+        clean_name = sanitize_hub_name(filename, fallback="aievo_export")
+        sha256 = hashlib.sha256(data).hexdigest()
+
+        endpoint = self._endpoint or get_hub_endpoint()
+        with HubMcpClient(endpoint, timeout=self.timeout, bearer_token=self.bearer_token) as cli:
+            cli.call("initialize", _MCP_INITIALIZE_PARAMS)
+            cli.call("notifications/initialized", notify=True)
+            begin = _extract_tool_payload(cli.call_plugin_tool(UPLOAD_TOOL, {
+                "action": "begin",
+                "filename": clean_name,
+                "total_size": len(data),
+                "sha256": sha256,
+            }))
+            upload_id = begin.get("upload_id") if isinstance(begin, dict) else None
+            if not upload_id:
+                raise HubFileError(f"file_upload begin 未返回 upload_id：{begin!r}")
+            chunk_limit = HUB_UPLOAD_CHUNK
+            if isinstance(begin.get("chunk_max_bytes"), int) and begin["chunk_max_bytes"] > 0:
+                chunk_limit = max(1, min(begin["chunk_max_bytes"], HUB_DOWNLOAD_CHUNK))
+            try:
+                for seq in range(0, (len(data) + chunk_limit - 1) // chunk_limit):
+                    piece = data[seq * chunk_limit:(seq + 1) * chunk_limit]
+                    _extract_tool_payload(cli.call_plugin_tool(UPLOAD_TOOL, {
+                        "action": "chunk",
+                        "upload_id": upload_id,
+                        "seq": seq,
+                        "data_base64": base64.b64encode(piece).decode("ascii"),
+                    }))
+                committed = _extract_tool_payload(cli.call_plugin_tool(UPLOAD_TOOL, {
+                    "action": "commit", "upload_id": upload_id,
+                }))
+            except Exception:
+                # 释放服务端分块会话；abort 自身失败不掩盖原始异常
+                try:
+                    cli.call_plugin_tool(UPLOAD_TOOL, {
+                        "action": "abort", "upload_id": upload_id,
+                    })
+                except Exception:
+                    logger.warning("file_upload abort 失败（忽略）：upload_id=%s", upload_id)
+                raise
+
+        file_id = committed.get("file_id") if isinstance(committed, dict) else None
+        if not file_id:
+            raise HubFileError(f"file_upload commit 未返回 file_id：{committed!r}")
+        return {
+            "file_id": file_id,
+            "filename": committed.get("filename") or clean_name,
+            "size": committed.get("size") if committed.get("size") is not None else len(data),
+            "sha256": committed.get("sha256") or sha256,
+        }
 
 
 # ---------------------------------------------------------------------------

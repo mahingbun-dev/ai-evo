@@ -76,7 +76,9 @@ def zip_post(zip_bytes: bytes, filename: str, calls=None):
         if method == "notifications/initialized":
             return FakeResp("")
         if method == "tools/call":
-            args = msg["params"]["arguments"]
+            # 中台收口后：tools/call → call_tool → 插件工具
+            assert msg["params"]["name"] == "call_tool"
+            args = msg["params"]["arguments"]["arguments"]
             offset = args.get("offset", 0)
             chunk = zip_bytes[offset:offset + args.get("max_bytes", 1 << 20)]
             eof = offset + len(chunk) >= len(zip_bytes)
@@ -125,9 +127,14 @@ def make_attempt_zip_bytes() -> bytes:
         "allure/results.json": "[]",
     }
     buf = BytesIO()
+    # 成员时间戳固定：zipfile 默认写当前时间，同一测试内多次调用会得到不同字节，
+    # 使 sha256 断言跨秒偶发失败
+    fixed_time = (2026, 1, 1, 0, 0, 0)
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for name, content in members.items():
-            zf.writestr(name, content.encode("utf-8"))
+            info = zipfile.ZipInfo(name, date_time=fixed_time)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            zf.writestr(info, content.encode("utf-8"))
     return buf.getvalue()
 
 

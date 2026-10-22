@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from app.services.harness_adapter import (
+    SYSTEM_PROMPT_ARGV_LIMIT_BYTES,
     ClaudeCodeAdapter,
     HarnessAdapter,
     normalize_judge_result,
@@ -60,6 +61,47 @@ class TestNormalizeJudgeResult:
     def test_finish_reason_passthrough(self):
         result = normalize_judge_result({"score": 5}, finish_reason="max_turns")
         assert result["finish_reason"] == "max_turns"
+
+    def test_dimension_feedbacks_passthrough(self):
+        """裁判输出分维度理由时透传为 {维度名: 理由} 映射"""
+        result = normalize_judge_result({
+            "score": 8,
+            "feedback": "ok",
+            "dimension_scores": {"a": 6},
+            "dimension_feedbacks": {"a": "内容准确", "b": "结构清晰"},
+        })
+        assert result["dimension_feedbacks"] == {"a": "内容准确", "b": "结构清晰"}
+
+    def test_dimension_feedbacks_invalid_entries_filtered(self):
+        """键或值非（非空）字符串的条目被过滤，仅保留合法条目"""
+        result = normalize_judge_result({
+            "score": 8,
+            "dimension_feedbacks": {
+                "a": "有效理由",
+                "b": "",      # 空字符串 → 过滤
+                "c": "   ",   # 纯空白 → 过滤
+                "d": 123,     # 值非字符串 → 过滤
+                "e": None,    # 值为 None → 过滤
+            },
+        })
+        assert result["dimension_feedbacks"] == {"a": "有效理由"}
+
+    def test_dimension_feedbacks_missing_no_key(self):
+        """裁判未输出 dimension_feedbacks 时结果不含该键（旧形态兼容）"""
+        result = normalize_judge_result({"score": 5, "dimension_scores": {}})
+        assert "dimension_feedbacks" not in result
+
+    def test_dimension_feedbacks_all_invalid_no_key(self):
+        """条目全部非法时同样不输出该键"""
+        result = normalize_judge_result({"score": 5, "dimension_feedbacks": {"a": "", "b": None}})
+        assert "dimension_feedbacks" not in result
+
+    def test_dimension_feedbacks_non_dict_dropped(self):
+        """非 dict（裁判违反协议输出 list/str/数字）优雅丢弃该字段而非抛错"""
+        for bad in (["a", "b"], "内容准确", 123):
+            result = normalize_judge_result({"score": 5, "dimension_feedbacks": bad})
+            assert result["score"] == 5.0
+            assert "dimension_feedbacks" not in result
 
 
 class TestHarnessAdapterRun:
@@ -228,3 +270,84 @@ class TestClaudeCodeAdapter:
         ):
             with pytest.raises(RuntimeError, match="无返回内容"):
                 adapter._execute_raw("sys", "user prompt", 10)
+
+
+class TestClaudeCodeAdapterArgvGuard:
+    """argv 安全兜底：system_prompt 超限降级并入首条消息（execve E2BIG 修复）"""
+
+    @staticmethod
+    def _patch_sdk_capture(captured):
+        """patch _run_with_prompt 并捕获每次调用的 (options.system_prompt, prompt)"""
+        responses = iter([VALID_JSON, VALID_JSON, VALID_JSON, VALID_JSON])
+
+        async def fake_run(options, prompt):
+            captured.append((options.system_prompt, prompt))
+            return next(responses)
+
+        return patch("app.services.claude_code_judge_agent._run_with_prompt", side_effect=fake_run)
+
+    def _execute(self, system_prompt, prompt, captured):
+        adapter = ClaudeCodeAdapter({"model": "m", "timeout_seconds": 10, "max_turns": 2})
+        with self._patch_sdk_capture(captured), patch(
+            "app.services.claude_code_config_service.ClaudeCodeConfigService.get_sdk_env", return_value={}
+        ):
+            adapter._execute_raw(system_prompt, prompt, 10)
+
+    def test_small_system_prompt_passthrough(self):
+        captured = []
+        self._execute("短系统提示", "user prompt", captured)
+        sp, prompt = captured[0]
+        assert sp == "短系统提示"
+        assert prompt == "user prompt"
+
+    def test_oversized_system_prompt_demoted_into_prompt(self):
+        # 50000 汉字 = 150000B，超 100KB argv 安全阈值（生产 Errno 7 场景量级）
+        big = "评" * 50000
+        captured = []
+        self._execute(big, "user prompt", captured)
+        sp, prompt = captured[0]
+        assert sp is None  # SDK 不再传 --system-prompt flag
+        assert prompt.startswith(big)
+        assert "\n\n---\n" in prompt
+        assert prompt.endswith("user prompt")
+
+    def test_byte_boundary_passthrough(self):
+        # 恰好 100000B（ASCII 单字节）不降级
+        boundary = "a" * SYSTEM_PROMPT_ARGV_LIMIT_BYTES
+        captured = []
+        self._execute(boundary, "p", captured)
+        assert captured[0][0] == boundary
+        assert captured[0][1] == "p"
+
+    def test_byte_boundary_demoted(self):
+        captured = []
+        self._execute("a" * (SYSTEM_PROMPT_ARGV_LIMIT_BYTES + 1), "p", captured)
+        assert captured[0][0] is None
+        assert captured[0][1].startswith("a" * (SYSTEM_PROMPT_ARGV_LIMIT_BYTES + 1))
+
+    def test_empty_system_prompt_untouched(self):
+        captured = []
+        self._execute("", "user prompt", captured)
+        assert captured[0] == ("", "user prompt")
+
+    def test_retry_path_keeps_demotion(self):
+        # run_prompt 首次解析失败重试：两次调用对同一超限 system_prompt 处理一致
+        big = "评" * 50000
+        adapter = ClaudeCodeAdapter({"model": "m", "timeout_seconds": 10, "max_turns": 2})
+        captured = []
+        responses = iter(["非 JSON 文本", VALID_JSON])
+
+        async def fake_run(options, prompt):
+            captured.append((options.system_prompt, prompt))
+            return next(responses)
+
+        with patch("app.services.claude_code_judge_agent._run_with_prompt", side_effect=fake_run), patch(
+            "app.services.claude_code_config_service.ClaudeCodeConfigService.get_sdk_env", return_value={}
+        ):
+            adapter.run_prompt(big, "user prompt", 10)
+        assert len(captured) == 2
+        assert all(sp is None for sp, _ in captured)
+        assert captured[0][1].endswith("user prompt")
+        # 重试 prompt 在降级后的首条消息尾部附加格式纠正指令
+        assert "无法解析为 JSON" in captured[1][1]
+        assert "user prompt" in captured[1][1]

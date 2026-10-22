@@ -29,7 +29,7 @@ def test_conformance_local_passes():
 def test_manifest_identity():
     m = build_manifest()
     assert m.name == "ai-evo"
-    assert m.version == "1.1.0"
+    assert m.version == "1.3.0"
     # 直接调用型插件：消费/生产 Struct 载荷
     assert {c.fq_name for c in m.consumes} == {"google.protobuf.Struct"}
     assert {c.fq_name for c in m.produces} == {"google.protobuf.Struct"}

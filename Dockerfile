@@ -39,6 +39,18 @@ RUN ln -sf /opt/claude/bin/claude /usr/local/bin/claude \
     && /usr/local/bin/claude --version
 ENV CLAUDE_CODE_PATH=/usr/local/bin/claude
 
+# 安装 git 运行时（插件市场 git 克隆的运行时依赖，见 plugin_marketplace_service）
+# 离线安装：与 claude-local 同款模式——运行镜像基础 python:3.12-slim 不含 git，
+# 构建机（部署机）无外网 apt 源；git-local/ 由 tools/prepare-git-bin.sh 在有外网
+# 的开发机上从同版本基础镜像提取（git 2.47.3 + git-core + 递归 .so 依赖 +
+# templates，校验和见 tools/git-bin.json）。
+COPY git-local/ /usr/local/git-runtime/
+COPY git-local/usrshare/templates/ /usr/share/git-core/templates/
+ENV PATH=/usr/local/git-runtime/bin:$PATH
+ENV GIT_EXEC_PATH=/usr/local/git-runtime/libexec/git-core
+ENV LD_LIBRARY_PATH=/usr/local/git-runtime/lib
+RUN git --version
+
 # 复制应用代码
 COPY app/ app/
 # executor 小包（纯标准库）：app/core/config.py 顶层 import executor.sandbox_params

@@ -76,7 +76,7 @@ if [ "${1:-}" = "--upload" ]; then
     : "${GITLAB_UPLOAD_TOKEN:?--upload 需要设置 GITLAB_UPLOAD_TOKEN}"
     GITLAB_HOST="${GITLAB_HOST:-https://gitlab.example.com}"
     GITLAB_PROJECT_ID="${GITLAB_PROJECT_ID:-152361}"
-    GITLAB_UPLOAD_USER="${GITLAB_UPLOAD_USER:-gitlab+deploy-token-173}"
+    GITLAB_UPLOAD_USER="${GITLAB_UPLOAD_USER:-gitlab+deploy-token-1}"
     BASE="$GITLAB_HOST/api/v4/projects/$GITLAB_PROJECT_ID/packages/generic/ai-evo-claude-bin/$VERSION"
     curl -sS --fail -u "$GITLAB_UPLOAD_USER:$GITLAB_UPLOAD_TOKEN" \
         --upload-file "$OUT_DIR/claude-bin.tar.gz" "$BASE/claude-bin.tar.gz" >/dev/null

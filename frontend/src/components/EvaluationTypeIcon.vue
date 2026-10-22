@@ -23,7 +23,8 @@ import {
   CircleCheck,
   Cpu,
   Warning,
-  DataAnalysis
+  DataAnalysis,
+  Box
 } from '@element-plus/icons-vue'
 
 const props = defineProps({
@@ -32,7 +33,7 @@ const props = defineProps({
     required: true,
     validator: (value) => [
       'judge', 'consistency', 'success_rate', 'rag', 'latency', 'binary',
-      'agent', 'safety', 'dialogue'
+      'agent', 'plugin', 'safety', 'dialogue'
     ].includes(value)
   },
   size: {
@@ -87,6 +88,11 @@ const typeConfig = {
     label: 'Agent 评测',
     icon: Cpu,
     type: 'danger'
+  },
+  plugin: {
+    label: '插件评测',
+    icon: Box,
+    type: 'warning'
   },
   safety: {
     label: '安全评测',

@@ -52,6 +52,54 @@ class TestEnsureSuperAdmin:
         assert ensure_super_admin(_req(SUPER)) is None
 
 
+class TestEnsureSuperAdminViaHttp:
+    """必须走 TestClient 真实依赖解析：直调函数测不出注入问题。
+
+    事故回归锚点（2026-10-16）：签名写成 request: Any 时，FastAPI 把
+    request 解析成必填 query 参数，router 级门禁端点对所有人（含超管）
+    一律 422 missing query param——上面的直调用例全部照常通过。
+    """
+
+    @staticmethod
+    def _client(user):
+        from fastapi import APIRouter, Depends, FastAPI, Request
+        from fastapi.testclient import TestClient
+
+        app = FastAPI()
+
+        @app.middleware("http")
+        async def _inject_user(request: Request, call_next):
+            if user is not None:
+                request.state.user = user
+            return await call_next(request)
+
+        router = APIRouter(prefix="/gated", dependencies=[Depends(ensure_super_admin)])
+
+        @router.get("")
+        async def gated():
+            return {"ok": True}
+
+        app.include_router(router)
+        return TestClient(app)
+
+    def test_super_passes_without_query_param(self):
+        resp = self._client(SUPER).get("/gated")
+        assert resp.status_code == 200, f"超管被拒：{resp.status_code} {resp.text[:200]}"
+        assert resp.json() == {"ok": True}
+
+    def test_no_422_for_any_user(self):
+        """依赖解析失败的 422 不应对任何角色出现（含未登录）"""
+        for user in (NORMAL, None):
+            resp = self._client(user).get("/gated")
+            assert resp.status_code != 422, f"user={user} 出现依赖注入 422：{resp.text[:200]}"
+
+    def test_non_super_403(self):
+        assert self._client(NORMAL).get("/gated").status_code == 403
+
+    def test_missing_user_403(self):
+        assert self._client(None).get("/gated").status_code == 403
+
+
 class TestRouterLevelGates:
     ROUTERS = [
         "app.api.stats_api:router",
