@@ -129,6 +129,7 @@ class EvaluationTaskService:
         latency_config: Optional[Dict] = None,
         binary_metrics_config: Optional[Dict] = None,
         plugin_config: Optional[Dict] = None,
+        safety_config: Optional[Dict] = None,
         multi_judge_config: Optional[Dict] = None,
         parallel_config: Optional[Dict] = None,
         evaluation_scene: Optional[str] = None,
@@ -163,7 +164,8 @@ class EvaluationTaskService:
         """创建评测任务"""
         # 验证评测类型
         # W12-2：latency 白名单激活（执行/聚合/导出链早已就绪，此前仅因白名单缺席被拒）
-        valid_evaluation_types = ["judge", "consistency", "success_rate", "rag", "binary_classification", "agent", "latency", "plugin"]
+        # M3 QE3-1：safety 白名单放行（双通道红队引擎就绪，见 app/services/redteam/）
+        valid_evaluation_types = ["judge", "consistency", "success_rate", "rag", "binary_classification", "agent", "latency", "plugin", "safety"]
         if evaluation_type not in valid_evaluation_types:
             raise ValueError(f"不支持的评测类型: {evaluation_type}，可选值: {valid_evaluation_types}")
 
@@ -178,6 +180,13 @@ class EvaluationTaskService:
                     "插件评测需要指定评测对象：请选择包含 plugin_path/skill_content 字段的数据集，"
                     "或在插件评测配置中填写插件路径 / 内联 SKILL.md 内容"
                 )
+
+        # 安全评测配置校验（M3 QE3-1）：攻击面白名单/样本来源/样本库存在性/
+        # 变异数/被攻击模型必填；通过后补 pack_version 快照（重跑口径可复现）
+        if evaluation_type == "safety":
+            safety_config = self._validate_safety_config(
+                safety_config, dataset_id=dataset_id, model_provider=model_provider
+            )
 
         # 验证裁判引擎
         if judge_engine and judge_engine not in ("claude_agent", "graph"):
@@ -206,6 +215,15 @@ class EvaluationTaskService:
                     first_data = {}
                 if "session_messages" not in first_data:
                     raise ValueError("长会话 Agent 评测要求数据集包含 session_messages 字段，请在数据集管理页通过「会话文件导入」创建")
+        elif evaluation_type == "safety" and str((safety_config or {}).get("sample_source")) == "pack":
+            # 安全评测内置样本库直跑：题目总数 = 选中类目的样本数（变异体运行期生成不计入创建期基数）
+            from app.services.redteam import load_pack
+
+            pack = load_pack(
+                (safety_config or {}).get("pack") or "redteam_pack_v1",
+                categories=(safety_config or {}).get("categories"),
+            )
+            total_questions = len(pack["samples"])
 
         # 待评测数据配置校验（契约 v3 §五）：targets 必填、script_output 行、@ 引用标记；
         # pre_scripts/steps 旧字段仅兼容接收，写路径一律置 None（targets 为唯一事实源，维度顺序即步骤）
@@ -272,6 +290,8 @@ class EvaluationTaskService:
             latency_config=latency_config,
             binary_metrics_config=binary_metrics_config,
             plugin_config=plugin_config,
+            # M3 QE3-1：安全评测配置（校验通过后含 pack_version 快照）
+            safety_config=safety_config if evaluation_type == "safety" else None,
             multi_judge_config=multi_judge_config,
             judge_count=judge_count,
             # W4：创建时裁判配置快照（judge_model 为空时为 None，
@@ -331,7 +351,7 @@ class EvaluationTaskService:
     _TASK_LIST_DEFERRED_COLUMNS = (
         "result", "model_config", "consistency_config", "success_rate_config",
         "rag_config", "latency_config", "multi_judge_config", "parallel_config",
-        "plugin_config",
+        "plugin_config", "safety_config",
     )
 
     def get_tasks(
@@ -455,6 +475,20 @@ class EvaluationTaskService:
             model_output_source=effective_output_source,
             model_output_field=effective_output_field,
         )
+
+        # 安全评测配置校验（M3 QE3-1）：字段缺省时取任务既有值合并成最终态
+        # （避免只改类目/样本来源/数据集的局部更新绕过校验）；校验通过后
+        # 的归一化结果（含 pack_version 快照）回写 kwargs 参与落库
+        if effective_type == "safety":
+            effective_safety = (
+                kwargs.get("safety_config") if "safety_config" in kwargs
+                else getattr(task, "safety_config", None)
+            )
+            kwargs["safety_config"] = self._validate_safety_config(
+                effective_safety,
+                dataset_id=effective_dataset_id,
+                model_provider=effective_provider,
+            )
 
         # 契约 v3 §五（保守语义）：pre_scripts 与 steps 仅在 payload 显式携带时置 None
         # （targets 为唯一事实源、维度顺序即步骤）；未携带时保留存量值，
@@ -748,6 +782,123 @@ class EvaluationTaskService:
                 and str(plugin_config.get("market_plugin") or "").strip()
             )
         )
+
+    # ---------- 安全评测配置校验（M3 QE3-1） ----------
+
+    #: 四类攻击面白名单（M3 首批）
+    _SAFETY_CATEGORIES = ("prompt_injection", "jailbreak", "sensitive_content", "factual_assertion")
+    #: 样本来源：pack=内置样本库直跑（无数据集）/ dataset=数据集行作为攻击样本
+    _SAFETY_SAMPLE_SOURCES = ("pack", "dataset")
+
+    def _validate_safety_config(
+        self,
+        safety_config: Optional[Dict],
+        dataset_id: Optional[str] = None,
+        model_provider: Optional[str] = None,
+    ) -> Dict:
+        """safety 类型配置校验并归一化（失败抛 ValueError→API 400）
+
+        - 攻击面类目：非空子集（缺省全四类）；
+        - 样本来源：pack（内置样本库直跑，要求无数据集且样本库存在）/
+          dataset（数据集行作攻击样本，要求数据集存在）；
+        - 变异增强：count 收敛到 1-3；
+        - 安全评测攻击被测模型：必须选择 model_provider；
+        - 通过后补 pack_version 快照（库升级后老任务仍按创建时版本口径解释）。
+        """
+        if safety_config is None:
+            safety_config = {}
+        if not isinstance(safety_config, dict):
+            raise ValueError("safety_config 必须是对象")
+
+        # 攻击面类目
+        categories = safety_config.get("categories")
+        if categories is None:
+            categories = list(self._SAFETY_CATEGORIES)
+        if not isinstance(categories, list) or not categories:
+            raise ValueError("安全评测至少选择一个攻击面类目")
+        unknown = [c for c in categories if c not in self._SAFETY_CATEGORIES]
+        if unknown:
+            raise ValueError(
+                f"不支持的攻击面类目: {unknown}，可选值: {', '.join(self._SAFETY_CATEGORIES)}"
+            )
+        safety_config = dict(safety_config)
+        safety_config["categories"] = categories
+
+        # 被攻击模型（红队攻击目标）
+        if not model_provider:
+            raise ValueError("安全评测需要选择被评测模型（攻击目标，model_provider）")
+
+        # 样本来源
+        sample_source = str(safety_config.get("sample_source") or ("dataset" if dataset_id else "pack")).strip()
+        if sample_source not in self._SAFETY_SAMPLE_SOURCES:
+            raise ValueError(
+                f"不支持的安全评测样本来源: {sample_source}，可选值: {', '.join(self._SAFETY_SAMPLE_SOURCES)}"
+            )
+        if sample_source == "dataset" and not dataset_id:
+            raise ValueError("样本来源为「数据集」时必须先选择数据集（可由内置样本库一键导入后编辑）")
+        if sample_source == "pack" and dataset_id:
+            raise ValueError("样本来源为「内置样本库」时不需要选择数据集；要编辑样本请改用数据集来源")
+        safety_config["sample_source"] = sample_source
+
+        # 内置样本库存在性 + 版本快照
+        if sample_source == "pack":
+            from app.services.redteam import load_pack
+            from app.services.redteam.pack import get_pack_version
+
+            pack_name = str(safety_config.get("pack") or "redteam_pack_v1")
+            try:
+                load_pack(pack_name, categories=categories)
+                safety_config["pack"] = pack_name
+                safety_config["pack_version"] = get_pack_version(pack_name)
+            except ValueError as e:
+                raise ValueError(f"内置样本库不可用: {e}")
+
+        # 变异增强
+        mutation = safety_config.get("mutation")
+        if mutation is None:
+            mutation = {"enabled": False, "count": 1}
+        if not isinstance(mutation, dict):
+            raise ValueError("safety_config.mutation 必须是对象")
+        mutation = dict(mutation)
+        if not isinstance(mutation.get("enabled"), bool):
+            mutation["enabled"] = bool(mutation.get("enabled", False))
+        try:
+            count = int(mutation.get("count", 1))
+        except (TypeError, ValueError):
+            count = 1
+        mutation["count"] = max(1, min(count, 3))
+        safety_config["mutation"] = mutation
+
+        # 双通道开关结构归一化（未配置=双通道全开）
+        channels = safety_config.get("channels")
+        if channels is None:
+            channels = {}
+        if not isinstance(channels, dict):
+            raise ValueError("safety_config.channels 必须是对象")
+        channels = dict(channels)
+        if not isinstance(channels.get("deterministic"), dict):
+            channels["deterministic"] = {}
+        if not isinstance(channels.get("judge_rubric"), dict):
+            channels["judge_rubric"] = {}
+        safety_config["channels"] = channels
+
+        # M3 QE3-2 deepeval 收敛：bias/toxicity 等遗留指标并入 safety 类型
+        # metric 开关（可选增强通道，超管直调端点已标废弃）
+        metrics = safety_config.get("metrics")
+        if metrics is None:
+            metrics = []
+        if not isinstance(metrics, list):
+            raise ValueError("safety_config.metrics 必须是数组")
+        from app.services.safety_evaluator import _SAFETY_METRICS as _DEEPEVAL_SAFETY_METRICS
+
+        unknown_metrics = [m for m in metrics if m not in _DEEPEVAL_SAFETY_METRICS]
+        if unknown_metrics:
+            raise ValueError(
+                f"不支持的安全评测指标: {unknown_metrics}，可选值: {list(_DEEPEVAL_SAFETY_METRICS)}"
+            )
+        safety_config["metrics"] = metrics
+
+        return safety_config
 
     def _validate_script_targets(
         self,

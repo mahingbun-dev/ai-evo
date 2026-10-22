@@ -163,28 +163,44 @@ class TestLatencyWhitelist:
         assert db.add.called
         assert task.evaluation_type == "latency"
 
-    @pytest.mark.parametrize("denied_type", ["safety", "dialogue"])
-    def test_safety_dialogue_still_rejected(self, denied_type):
-        """safety/dialogue 仍不在后端白名单（后端未实现执行链，前端禁用）"""
+    def test_create_task_accepts_safety(self):
+        """M3 QE3-1：safety 进入后端白名单（双通道红队引擎就绪）
+
+        类型白名单必须放行——后续 ValueError（如未选被攻击模型）属
+        safety_config 校验，不是「不支持的评测类型」。
+        """
+        service, db = _service_with_db()
+        try:
+            service.create_task(name="安全评测", evaluation_type="safety")
+        except ValueError as e:
+            assert "不支持的评测类型" not in str(e)
+        except Exception:
+            # mock db 落库环节异常可接受——类型白名单已通过
+            pass
+
+    def test_dialogue_still_rejected(self):
+        """dialogue 并入 agent 类型多轮配置（M3 口径），不单独成类型——保持拒绝"""
         service, db = _service_with_db()
         with pytest.raises(ValueError, match="不支持的评测类型"):
-            service.create_task(name="x", evaluation_type=denied_type)
+            service.create_task(name="x", evaluation_type="dialogue")
 
 
-class TestFrontendPlannedTypesDisabled:
-    """前端 safety/dialogue 选项禁用并标注「规划中」（W12-2 前端侧）"""
+class TestFrontendSafetyEnabled:
+    """前端类型选项状态（M3 QE3-1 更新）：safety 放行可选，dialogue 移除
+    （并入 agent 类型多轮配置，不单独成类型）"""
 
     def _tasks_vue(self) -> str:
         path = Path(__file__).resolve().parents[2] / "frontend" / "src" / "views" / "Tasks.vue"
         return path.read_text(encoding="utf-8")
 
-    def test_safety_option_disabled_with_planned_label(self):
+    def test_safety_option_enabled_without_disabled(self):
         content = self._tasks_vue()
-        assert 'label="安全评测（规划中）" value="safety" disabled' in content
+        assert '<el-option label="安全评测" value="safety" />' in content
+        assert 'value="safety" disabled' not in content
 
-    def test_dialogue_option_disabled_with_planned_label(self):
+    def test_dialogue_option_removed(self):
         content = self._tasks_vue()
-        assert 'label="对话评测（规划中）" value="dialogue" disabled' in content
+        assert 'value="dialogue"' not in content
 
     def test_latency_option_remains_selectable(self):
         """latency 选项保持可选（后端已激活）"""

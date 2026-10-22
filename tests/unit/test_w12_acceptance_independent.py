@@ -171,8 +171,9 @@ class TestW12Item2LatencyActivation:
         assert dispatched["task"] is task
         assert results == [{"idx": 0, "success": True}]
 
-    def test_frontend_exactly_safety_dialogue_disabled_with_planned_label(self):
-        """前端选项状态矩阵：safety/dialogue 必须带 disabled 且标注「规划中」；
+    def test_frontend_safety_enabled_dialogue_removed_latency_enabled(self):
+        """前端选项状态矩阵（M3 QE3-1 更新）：safety 放行不得禁用且不再标
+        「规划中」；dialogue 选项移除（并入 agent 多轮配置不单独成类型）；
         latency 不得禁用（解析属性级断言，区别于子串匹配）"""
         vue = (WORKTREE_ROOT / "frontend" / "src" / "views" / "Tasks.vue").read_text(encoding="utf-8")
         option_re = re.compile(
@@ -181,10 +182,10 @@ class TestW12Item2LatencyActivation:
         options = {m.group("value"): (m.group("label"), m.group("attrs"))
                    for m in option_re.finditer(vue)}
 
-        for planned in ("safety", "dialogue"):
-            label, attrs = options[planned]
-            assert "disabled" in attrs, f"{planned} 选项必须禁用"
-            assert "规划中" in label, f"{planned} 选项必须标注「规划中」"
+        label, attrs = options["safety"]
+        assert "disabled" not in attrs, "safety 已放行（M3），不得禁用"
+        assert "规划中" not in label, "safety 已可用，不得再标「规划中」"
+        assert "dialogue" not in options, "dialogue 并入 agent 多轮配置（M3 口径），选项应移除"
         label, attrs = options["latency"]
         assert "disabled" not in attrs, "latency 已激活，不得禁用"
 

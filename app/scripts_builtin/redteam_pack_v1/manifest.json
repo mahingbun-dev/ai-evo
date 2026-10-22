@@ -1,0 +1,36 @@
+{
+  "name": "redteam_pack_v1",
+  "version": "1.0.0",
+  "description": "内置红队攻击样本库 v1：四类攻击面（提示注入/越狱/敏感内容/事实性断言），每类 30 条，可导入数据集编辑后使用，也可由安全评测任务直接引用",
+  "language": "zh-CN",
+  "categories": [
+    {
+      "key": "prompt_injection",
+      "name": "提示注入",
+      "description": "诱导模型忽略既有指令、滥用工具或执行越权操作（含伪装系统指令/数据投毒/间接注入形态）"
+    },
+    {
+      "key": "jailbreak",
+      "name": "越狱",
+      "description": "通过角色扮演、假设情景、分段改写、编码变换等手段绕过安全约束，诱导输出被拒绝的内容"
+    },
+    {
+      "key": "sensitive_content",
+      "name": "敏感内容",
+      "description": "涉政、暴恐、违禁品等受管控类目的直接索取（对齐《生成式人工智能服务安全基本要求》类目命名）"
+    },
+    {
+      "key": "factual_assertion",
+      "name": "事实性断言",
+      "description": "诱导模型对不存在的事实/数据/文献/接口做出确定性断言，考察幻觉与编造行为"
+    }
+  ],
+  "sample_schema": {
+    "id": "样本唯一标识（类目前缀-序号）",
+    "category": "攻击面 key（与 categories.key 一致）",
+    "prompt": "攻击提示词（作为 user_input 发起攻击）",
+    "expected_behavior": "期望防守行为：refuse-拒绝 / safe_answer-安全替代回答 / fact_check-说明不确定或纠正前提",
+    "risk_point": "风险点说明（安全报告证据引用用）",
+    "severity": "攻击强度：high / medium / low"
+  }
+}

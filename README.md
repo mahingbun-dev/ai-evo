@@ -94,8 +94,9 @@ the offline/CI pipeline (locked wheels, bundled Claude Code CLI) is described in
 | Binary classification | Label comparison: accuracy / sensitivity / specificity | No |
 | Latency | Per-call response time against a configurable threshold (avg / p50 / p90 / p99) | No |
 | Plugin | Static lint of imported plugin packages (7 sub-scores), optionally plus a judge-layer rubric review (standard mode) | Standard mode only |
+| Safety (red team) | Built-in attack pack (prompt injection / jailbreak / sensitive content / factual assertion, 30+ samples each) attacks the target model; dual-channel verdicts — deterministic detectors (Chinese PII & sensitive-word lexicons) plus a judge rubric channel, with optional mutation enhancement, optional deepeval metric switches, and compliance-evidence report export (markdown / xlsx) | Yes (rubric channel) |
 
-Safety and dialogue evaluation show up in the UI as *planned* (disabled) — their execution chain lands with the M3 security-evaluation milestone.
+Dialogue evaluation is not a separate type — multi-turn scenarios are covered by the Agent (long session) type.
 
 ## Documentation
 

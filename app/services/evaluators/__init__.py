@@ -22,6 +22,8 @@ from app.services.evaluators import rag as _rag  # noqa: F401,E402
 from app.services.evaluators import binary_classification as _binary  # noqa: F401,E402
 from app.services.evaluators import latency as _latency  # noqa: F401,E402
 from app.services.evaluators import plugin as _plugin  # noqa: F401,E402
+# M3 QE3-1：safety（安全评测）——双通道红队引擎（确定性检测器 + 裁判 rubric）
+from app.services.evaluators import safety as _safety  # noqa: F401,E402
 
 __all__ = [
     "BaseEvaluator",

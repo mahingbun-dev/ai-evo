@@ -1363,6 +1363,187 @@ class EvaluationExecutor:
 
         return result
 
+    # ==================== 安全评测（M3 QE3-1 双通道红队引擎） ====================
+
+    @staticmethod
+    def _safety_sample_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+        """从 payload 提取攻击样本元数据（pack 直跑与数据集来源同构）"""
+        dataset_item = payload.get("_dataset_item") if isinstance(payload, dict) else None
+        data = dataset_item.get("data") if isinstance(dataset_item, dict) else None
+        if not isinstance(data, dict):
+            data = {}
+        return {
+            "id": data.get("attack_sample_id", "") or "",
+            "prompt": payload.get("user_input", "") or "",
+            "attack_category": data.get("attack_category", "") or "",
+            "attack_sample_id": data.get("attack_sample_id", "") or "",
+            "expected_behavior": data.get("expected_behavior", "") or "",
+            "risk_point": data.get("risk_point", "") or "",
+            "severity": data.get("severity", "") or "",
+            "mutated_from": data.get("mutated_from", "") or "",
+            "is_mutation": bool(data.get("is_mutation", False)),
+        }
+
+    def execute_batch_safety(
+        self,
+        payloads: List[Dict[str, Any]],
+        task,
+    ) -> List[Dict[str, Any]]:
+        """批量执行安全评测（红队攻击 + 双通道判定）
+
+        流程：
+        1. 变异增强（可选）：裁判模型对每条样本改写 N 个变体，追加为二次
+           攻击行（变异失败跳过该样本变体，不阻断任务）；
+        2. 并发对每条样本调用被测模型发起攻击；
+        3. 双通道判定（确定性检测器 + 裁判 rubric），行级 write-through 落库。
+        """
+        safety_config = getattr(task, "safety_config", None) or {}
+        mutation_config = safety_config.get("mutation") or {}
+        if mutation_config.get("enabled"):
+            from app.services.redteam import mutate_samples
+
+            samples = [self._safety_sample_from_payload(p) for p in payloads]
+            variants = mutate_samples(task, samples, int(mutation_config.get("count", 1) or 1))
+            if variants:
+                base_payload = dict(payloads[0])
+                base_payload.pop("user_input", None)
+                base_payload.pop("idx", None)
+                base_payload.pop("_orig_idx", None)
+                base_payload.pop("_dataset_item", None)
+                appended = []
+                for offset, variant in enumerate(variants, start=1):
+                    # 变体行：样本字段落在 _dataset_item.data（与数据集来源同构），
+                    # 行序号在原始样本之后续号（行级落库键唯一）
+                    variant_payload = dict(base_payload)
+                    variant_payload["user_input"] = variant["prompt"]
+                    variant_payload["idx"] = len(payloads) + offset - 1
+                    variant_payload["_orig_idx"] = len(payloads) + offset - 1
+                    variant_payload["_dataset_item"] = {
+                        "data": {
+                            "attack_category": variant.get("attack_category", ""),
+                            "attack_sample_id": variant.get("id", ""),
+                            "expected_behavior": variant.get("expected_behavior", ""),
+                            "risk_point": variant.get("risk_point", ""),
+                            "severity": variant.get("severity", ""),
+                            "mutated_from": variant.get("mutated_from", ""),
+                            "is_mutation": True,
+                        },
+                    }
+                    appended.append(variant_payload)
+                payloads = payloads + appended
+                logger.info(
+                    "[execute_batch_safety] 变异增强追加 %d 个变体行（总量 %d）",
+                    len(appended), len(payloads),
+                )
+
+        # 红队引擎按批构建（双通道配置随任务初始化）
+        from app.services.redteam import RedTeamSafetyEngine
+
+        self._safety_engine = RedTeamSafetyEngine(task)
+
+        results = []
+        total = len(payloads)
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            future_to_idx = {
+                executor.submit(self._evaluate_single_safety, payload, task): (pos, payload)
+                for pos, payload in enumerate(payloads)
+            }
+
+            for future in as_completed(future_to_idx):
+                pos, payload = future_to_idx[future]
+                try:
+                    result = future.result()
+                    results.append(result)
+                    self._update_progress(len(results), total)
+                except SoftTimeLimitExceeded:
+                    # 软超时不得按行失败吞掉（P0-E/W3-4）：上抛触发收尾
+                    raise
+                except Exception as e:
+                    logger.exception(f"安全评测执行失败 (idx={pos})")
+                    results.append({
+                        "idx": pos,
+                        "error": str(e),
+                        "success": False,
+                    })
+
+                # 行级 write-through（W3-2）：每行终态即时幂等落库
+                self._persist_row_result(pos, payload, results[-1])
+
+                if self.stop_event.is_set():
+                    logger.info(f"安全评测任务 {self.task_id} 收到停止信号，已完成 {len(results)}/{total}")
+                    for f in future_to_idx:
+                        if not f.done():
+                            f.cancel()
+                    break
+
+        results.sort(key=lambda x: x.get("idx", 0))
+        return results
+
+    def _evaluate_single_safety(
+        self,
+        payload: Dict[str, Any],
+        task,
+    ) -> Dict[str, Any]:
+        """执行单条安全评测：攻击被测模型 → 双通道判定
+
+        步骤：
+        1. 提取攻击样本元数据（payload user_input + 数据集/样本库字段）；
+        2. 调用被测模型（W4 快照优先）发起攻击；
+        3. RedTeamSafetyEngine 双通道判定（确定性检测器命中即 fail + 裁判 rubric）。
+        """
+        from app.services.model_caller import ModelCallerSync
+
+        if self.stop_event.is_set():
+            return {"idx": payload.get("idx", 0), "success": False, "error": "任务已停止"}
+
+        idx = payload.get("idx", 0)
+        result = {"idx": idx, "success": False}
+        sample = self._safety_sample_from_payload(payload)
+
+        try:
+            # 攻击样本元数据平铺进行结果（Results 安全视图/报告导出消费）
+            result.update({
+                "attack_category": sample["attack_category"],
+                "attack_sample_id": sample["attack_sample_id"],
+                "expected_behavior": sample["expected_behavior"],
+                "risk_point": sample["risk_point"],
+                "mutated_from": sample["mutated_from"],
+                "is_mutation": sample["is_mutation"],
+            })
+
+            from app.services.config_snapshot import resolve_model_call_config
+
+            model_config, _config_source = resolve_model_call_config(task)
+            messages = [{"role": "user", "content": sample["prompt"]}]
+            model_caller = ModelCallerSync()
+            call_result = model_caller.call(messages, model_config, {})
+
+            if not call_result.get("success"):
+                raise RuntimeError(f"模型调用失败: {call_result.get('error', '未知错误')}")
+
+            model_reply = call_result.get("content", "") or ""
+            result["model_output"] = model_reply
+            result["user_input"] = sample["prompt"]
+
+            engine = getattr(self, "_safety_engine", None)
+            if engine is None:
+                from app.services.redteam import RedTeamSafetyEngine
+
+                engine = self._safety_engine = RedTeamSafetyEngine(task)
+            verdict = engine.evaluate_reply(sample, model_reply)
+
+            result.update({
+                "success": True,
+                "safety": verdict,
+                "safety_passed": verdict.get("passed"),
+            })
+        except Exception as e:
+            logger.exception("安全评测执行失败")
+            result["error"] = str(e)
+
+        return result
+
     def _evaluate_single_rag(
         self,
         payload: Dict[str, Any],

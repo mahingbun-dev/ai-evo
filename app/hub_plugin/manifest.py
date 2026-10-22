@@ -551,15 +551,18 @@ TOOL_ROUTES: Dict[str, _ROUTE_TYPE] = {
         "desc": (
             "把指定执行版本的结果导出为文档并上传 anc-hub file-store，返回 file_id（用 "
             "file-store 的 file_download 分块下载）。format=markdown 出全量人读报告（任务元信息/"
-            "配置摘要/汇总指标/逐题明细含裁判评语全文；失败版本只出失败简报）；format=json 出无损"
-            "结构。同版本同格式幂等：重复导出直接复用已上传的 file_id（响应 cached=true）"
+            "配置摘要/汇总指标/逐题明细含裁判评语全文；失败版本只出失败简报；safety 任务自动切换"
+            "「安全评测报告（合规证据）」——检查项对齐《生成式人工智能服务安全基本要求》类目命名，"
+            "含结果/证据/复测建议）；format=json 出无损结构；format=xlsx（仅 safety 任务）出安全"
+            "评测合规报告工作簿（检查项汇总/违规证据/复测建议三工作表），可作门禁材料外发。"
+            "同版本同格式幂等：重复导出直接复用已上传的 file_id（响应 cached=true）"
         ),
         "schema": {
             "type": "object",
             "properties": {
                 "task_id": {"type": "string", "description": "任务 ID"},
                 "execution_number": {"type": "integer", "description": "执行序号（第几次执行，从 1 起）"},
-                "format": {"type": "string", "description": "导出格式：markdown（全量报告，默认）/ json（无损）"},
+                "format": {"type": "string", "description": "导出格式：markdown（全量报告，默认；safety 任务出合规安全报告）/ json（无损）/ xlsx（仅 safety 任务，安全合规报告工作簿）"},
             },
             "required": ["task_id", "execution_number"],
         },

@@ -38,6 +38,7 @@ from app.api.hub_import_api import router as hub_import_router, dataset_router a
 from app.api.webhook_api import router as webhook_router
 from app.api.api_key_api import router as api_key_router
 from app.api.plugin_marketplace_api import router as plugin_marketplace_router
+from app.api.redteam_api import router as redteam_router
 from app.middleware.auth_middleware import AuthMiddleware
 from app.db.session import engine, Base
 from app.core.config import get_settings, validate_runtime_settings
@@ -261,6 +262,8 @@ app.include_router(hub_import_dataset_router, prefix=settings.API_V1_STR)
 app.include_router(hub_import_router, prefix=settings.API_V1_STR)
 app.include_router(deepseek_harness_config_router, prefix=settings.API_V1_STR)
 app.include_router(plugin_marketplace_router, prefix=settings.API_V1_STR + "/evaluation")
+# M3 QE3-1：红队攻击样本库（/api/v1/evaluation/redteam——列表 + 导入数据集）
+app.include_router(redteam_router, prefix=settings.API_V1_STR + "/evaluation")
 # M1 QE1-3：webhook 端点 CRUD 与送达历史（/api/v1/webhooks）
 app.include_router(webhook_router, prefix=settings.API_V1_STR)
 # M1 QE1-4：API Key 管理（/api/v1/api-keys，登录态专用——不进 scope 注册表）

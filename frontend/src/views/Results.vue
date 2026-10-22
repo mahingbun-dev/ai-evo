@@ -1538,9 +1538,9 @@
             </el-table>
           </div>
 
-          <!-- 安全评测结果 -->
+          <!-- 安全评测结果（M3 QE3-1 双通道红队口径） -->
           <div v-if="result.evaluation_type === 'safety'">
-            <!-- 安全告警提示 -->
+            <!-- 违规告警横幅 -->
             <el-alert
               v-if="hasSafetyAlerts"
               :title="safetyAlertTitle"
@@ -1550,164 +1550,246 @@
               style="margin-bottom: 20px;"
             >
               <template #default>
-                <div>检测到 {{ safetyAlertCount }} 个安全问题，请仔细审查</div>
+                <div>检出 {{ safetyAlertCount }} 条违规（攻击成功），请展开明细查看证据与复测建议</div>
               </template>
             </el-alert>
+            <el-alert
+              v-else-if="result.result?.executed"
+              title="防守成功：本轮攻击样本全部通过双通道检测"
+              type="success"
+              :closable="false"
+              show-icon
+              style="margin-bottom: 20px;"
+            />
 
-            <!-- 安全评测指标卡片 -->
+            <!-- 红队总览：样本数 / 违规数 / 防御率 / 变异体防御率 -->
             <el-row :gutter="20">
               <el-col :span="6">
-                <el-card shadow="hover" class="safety-metric-card">
-                  <div class="safety-metric-icon">
-                    <el-icon :size="32" color="#e6a23c"><Warning /></el-icon>
-                  </div>
-                  <div class="safety-metric-name">偏见检测</div>
-                  <div class="safety-metric-value">
-                    <el-tag :type="getSafetyTagType(result.result.bias_score)" size="large">
-                      {{ getSafetyLabel(result.result.bias_score) }}
-                    </el-tag>
-                  </div>
-                  <div class="safety-metric-score">
-                    {{ result.result.bias_score != null ? (result.result.bias_score * 100).toFixed(1) + '%' : '-' }}
-                  </div>
-                </el-card>
-              </el-col>
-              <el-col :span="6">
-                <el-card shadow="hover" class="safety-metric-card">
-                  <div class="safety-metric-icon">
-                    <el-icon :size="32" color="#f56c6c"><CircleClose /></el-icon>
-                  </div>
-                  <div class="safety-metric-name">毒性检测</div>
-                  <div class="safety-metric-value">
-                    <el-tag :type="getSafetyTagType(result.result.toxicity_score)" size="large">
-                      {{ getSafetyLabel(result.result.toxicity_score) }}
-                    </el-tag>
-                  </div>
-                  <div class="safety-metric-score">
-                    {{ result.result.toxicity_score != null ? (result.result.toxicity_score * 100).toFixed(1) + '%' : '-' }}
-                  </div>
-                </el-card>
-              </el-col>
-              <el-col :span="6">
-                <el-card shadow="hover" class="safety-metric-card">
-                  <div class="safety-metric-icon">
-                    <el-icon :size="32" color="#409eff"><User /></el-icon>
-                  </div>
-                  <div class="safety-metric-name">个人信息泄露</div>
-                  <div class="safety-metric-value">
-                    <el-tag :type="getSafetyTagType(result.result.pii_score)" size="large">
-                      {{ getSafetyLabel(result.result.pii_score) }}
-                    </el-tag>
-                  </div>
-                  <div class="safety-metric-score">
-                    {{ result.result.pii_score != null ? (result.result.pii_score * 100).toFixed(1) + '%' : '-' }}
-                  </div>
-                </el-card>
-              </el-col>
-              <el-col :span="6">
-                <el-card shadow="hover" class="safety-metric-card">
-                  <div class="safety-metric-icon">
-                    <el-icon :size="32" color="#67c23a"><CircleCheck /></el-icon>
-                  </div>
-                  <div class="safety-metric-name">综合安全分</div>
-                  <div class="safety-metric-value">
-                    <el-tag :type="getSafetyTagType(result.result.overall_safety_score)" size="large">
-                      {{ getSafetyLabel(result.result.overall_safety_score) }}
-                    </el-tag>
-                  </div>
-                  <div class="safety-metric-score">
-                    {{ result.result.overall_safety_score != null ? (result.result.overall_safety_score * 100).toFixed(1) + '%' : '-' }}
-                  </div>
-                </el-card>
-              </el-col>
-            </el-row>
-
-            <!-- 安全评测概览 -->
-            <el-row :gutter="20" style="margin-top: 20px;" v-if="result.result.total_questions">
-              <el-col :span="6">
                 <div class="stat-card-small">
-                  <div class="stat-label">总检测数</div>
-                  <div class="stat-value">{{ result.result.total_questions ?? '-' }}</div>
+                  <div class="stat-label">攻击样本数</div>
+                  <div class="stat-value">{{ result.result?.executed ?? '-' }}</div>
                 </div>
               </el-col>
               <el-col :span="6">
                 <div class="stat-card-small">
-                  <div class="stat-label">安全通过</div>
-                  <div class="stat-value success">{{ result.result.passed_count ?? '-' }}</div>
+                  <div class="stat-label">违规（攻击成功）</div>
+                  <div class="stat-value danger">{{ result.result?.violations ?? '-' }}</div>
                 </div>
               </el-col>
               <el-col :span="6">
                 <div class="stat-card-small">
-                  <div class="stat-label">风险检出</div>
-                  <div class="stat-value danger">{{ result.result.flagged_count ?? '-' }}</div>
+                  <div class="stat-label">防御率</div>
+                  <div class="stat-value highlight">{{ safePercent(result.result?.defense_rate) }}%</div>
                 </div>
               </el-col>
               <el-col :span="6">
                 <div class="stat-card-small">
-                  <div class="stat-label">通过率</div>
-                  <div class="stat-value highlight">{{ safePercent(result.result.pass_rate) }}%</div>
+                  <div class="stat-label">变异体防御率</div>
+                  <div class="stat-value">{{ result.result?.mutation?.defense_rate != null ? safePercent(result.result.mutation.defense_rate) + '%' : '未开启' }}</div>
+                  <div class="stat-sub">变异体 {{ result.result?.mutation?.variants || 0 }} 条</div>
                 </div>
               </el-col>
             </el-row>
 
-            <!-- 安全评测逐条明细 -->
+            <!-- 双通道命中分布（+ deepeval 指标开关，M3 QE3-2） -->
+            <el-row :gutter="20" style="margin-top: 20px;">
+              <el-col :span="12">
+                <div class="stat-card-small">
+                  <div class="stat-label">确定性通道（PII/敏感词，命中即 fail）</div>
+                  <div class="stat-value">命中 {{ result.result?.by_channel?.deterministic?.triggered ?? 0 }} 条</div>
+                </div>
+              </el-col>
+              <el-col :span="12">
+                <div class="stat-card-small">
+                  <div class="stat-label">裁判 rubric 通道</div>
+                  <div class="stat-value">
+                    违规 {{ result.result?.by_channel?.judge_rubric?.violations ?? 0 }} 条
+                    <span v-if="result.result?.by_channel?.judge_rubric?.unavailable" class="stat-sub">
+                      （{{ result.result.by_channel.judge_rubric.unavailable }} 条通道不可用，不计违规）
+                    </span>
+                  </div>
+                </div>
+              </el-col>
+            </el-row>
+            <el-row v-if="hasSafetyDeepeval" :gutter="20" style="margin-top: 20px;">
+              <el-col :span="24">
+                <div class="stat-card-small">
+                  <div class="stat-label">deepeval 指标通道（可选增强）</div>
+                  <div class="safety-metric-list">
+                    <el-tag
+                      v-for="(stats, metric) in result.result.by_channel.deepeval.metrics"
+                      :key="metric"
+                      :type="stats.violations > 0 ? 'danger' : 'success'"
+                      size="small"
+                      style="margin-right: 8px;"
+                    >
+                      {{ metric }}：违规 {{ stats.violations }}<template v-if="stats.unavailable">（不可用 {{ stats.unavailable }}）</template>
+                    </el-tag>
+                  </div>
+                </div>
+              </el-col>
+            </el-row>
+
+            <!-- 攻击面类目统计 -->
             <el-divider />
-            <h3>安全评测明细</h3>
-            <el-table
-              :data="result.result.items || []"
-              style="width: 100%"
-              max-height="450"
-              stripe
-            >
+            <h3>攻击面类目统计</h3>
+            <el-table :data="safetyCategoryRows" style="width: 100%" max-height="300" stripe>
+              <el-table-column label="攻击面" prop="name" min-width="140" />
+              <el-table-column label="样本数" prop="total" width="100" />
+              <el-table-column label="违规数" width="100">
+                <template #default="{ row }">
+                  <span :style="row.violations > 0 ? 'color: #f56c6c; font-weight: 600;' : ''">{{ row.violations }}</span>
+                </template>
+              </el-table-column>
+              <el-table-column label="防御率" width="180">
+                <template #default="{ row }">
+                  <el-progress
+                    :percentage="Math.round((row.defense_rate || 0) * 100)"
+                    :status="(row.defense_rate || 0) >= 0.9 ? 'success' : ((row.defense_rate || 0) >= 0.7 ? 'warning' : 'exception')"
+                    :stroke-width="14"
+                    :text-inside="true"
+                  />
+                </template>
+              </el-table-column>
+            </el-table>
+
+            <!-- 类目热力（M3 QE3-3：攻击面 × 检出通道违规集中度，颜色越深越集中） -->
+            <div class="safety-heatmap-card">
+              <div class="safety-heatmap-title">
+                类目热力：攻击面 × 检出通道
+                <span class="safety-heatmap-sub">单元格为该类目在该通道的违规/命中条数；悬停查看明细</span>
+              </div>
+              <div id="safetyCategoryHeatmap" class="safety-heatmap-chart"></div>
+              <div v-if="!safetyHeatmapRows.length" class="safety-heatmap-empty">暂无类目数据</div>
+            </div>
+
+            <!-- 逐条明细（违规行筛选 + 证据引用） -->
+            <el-divider />
+            <div class="safety-detail-header">
+              <h3 style="margin: 0;">攻击明细</h3>
+              <el-checkbox v-model="safetyOnlyViolations">仅看违规行</el-checkbox>
+            </div>
+            <el-table :data="safetyItems" style="width: 100%" max-height="450" stripe>
+              <el-table-column type="expand">
+                <template #default="{ row }">
+                  <div class="safety-evidence-panel">
+                    <!-- 证据引用串：评审/合规材料可直接引用定位到行 -->
+                    <div class="evidence-cite">
+                      <span class="cite-label">证据引用</span>
+                      <code>{{ safetyEvidenceCite(row) }}</code>
+                    </div>
+                    <el-descriptions :column="2" size="small" border style="margin-bottom: 12px;">
+                      <el-descriptions-item label="样本 ID">{{ row.attack_sample_id || '-' }}</el-descriptions-item>
+                      <el-descriptions-item label="期望行为">{{ safetyExpectedBehaviorLabel(row.expected_behavior) }}</el-descriptions-item>
+                      <el-descriptions-item label="风险点">{{ row.risk_point || '-' }}</el-descriptions-item>
+                      <el-descriptions-item label="样本溯源">
+                        {{ row.is_mutation ? `变体（改写自 ${row.mutated_from || '-'}）` : '原始样本' }}
+                      </el-descriptions-item>
+                    </el-descriptions>
+                    <div v-if="(row.safety?.channels?.deterministic?.findings || []).length" class="evidence-block">
+                      <div class="evidence-block-title">确定性通道证据（掩码展示，不泄露原文）</div>
+                      <ul class="evidence-list">
+                        <li v-for="(f, i) in row.safety.channels.deterministic.findings" :key="i">
+                          <el-tag size="small" type="danger">{{ f.label }}</el-tag>
+                          <code class="evidence-text">{{ f.masked || f.evidence }}</code>
+                          <span v-if="f.note" class="evidence-note">{{ f.note }}</span>
+                        </li>
+                      </ul>
+                    </div>
+                    <div
+                      v-if="row.safety?.channels?.judge_rubric?.reason || row.safety?.channels?.judge_rubric?.evidence"
+                      class="evidence-block"
+                    >
+                      <div class="evidence-block-title">裁判 rubric 证据</div>
+                      <div class="evidence-text-block">{{ row.safety.channels.judge_rubric.reason }}</div>
+                      <div v-if="row.safety.channels.judge_rubric.evidence" class="evidence-quote">
+                        回复摘录：「{{ row.safety.channels.judge_rubric.evidence }}」
+                      </div>
+                    </div>
+                    <div
+                      v-if="row.safety?.channels?.deepeval && Object.keys(row.safety.channels.deepeval).length"
+                      class="evidence-block"
+                    >
+                      <div class="evidence-block-title">deepeval 指标证据（M3 QE3-2）</div>
+                      <div class="evidence-metric-list">
+                        <span v-for="(m, key) in row.safety.channels.deepeval" :key="key" class="evidence-metric-item">
+                          <el-tag
+                            size="small"
+                            :type="m.metric_unavailable ? 'info' : (m.success === false ? 'danger' : 'success')"
+                          >
+                            {{ key }}：{{ m.metric_unavailable ? '不可用（不计违规）' : (m.success === false ? `违规（score=${m.score}）` : `通过（score=${m.score}）`) }}
+                          </el-tag>
+                          <span v-if="m.reason" class="evidence-note">{{ m.reason }}</span>
+                        </span>
+                      </div>
+                    </div>
+                    <div v-if="!hasSafetyEvidence(row)" class="evidence-empty">
+                      本行无通道证据（双通道均未命中，防守成功行）
+                    </div>
+                  </div>
+                </template>
+              </el-table-column>
               <el-table-column label="序号" width="60">
                 <template #default="{ $index }">{{ $index + 1 }}</template>
               </el-table-column>
-              <el-table-column label="输入内容" min-width="200" show-overflow-tooltip>
+              <el-table-column label="攻击面" width="110">
+                <template #default="{ row }">{{ row.attack_category_name || '未分类' }}</template>
+              </el-table-column>
+              <el-table-column label="变异" width="60">
                 <template #default="{ row }">
-                  <div class="cell-preview" @click="openDetail('输入内容', row.user_input || row.input)">
-                    {{ truncateText(row.user_input || row.input, 60) }}
+                  <el-tag v-if="row.is_mutation" size="small" type="warning">变体</el-tag>
+                  <span v-else>-</span>
+                </template>
+              </el-table-column>
+              <el-table-column label="攻击内容" min-width="180" show-overflow-tooltip>
+                <template #default="{ row }">
+                  <div class="cell-preview" @click="openDetail('攻击内容', row.user_input)">
+                    {{ truncateText(row.user_input, 50) }}
                   </div>
                 </template>
               </el-table-column>
-              <el-table-column label="模型输出" min-width="200" show-overflow-tooltip>
+              <el-table-column label="模型回复" min-width="180" show-overflow-tooltip>
                 <template #default="{ row }">
-                  <div class="cell-preview" @click="openDetail('模型输出', row.model_output)">
-                    {{ truncateText(row.model_output, 60) }}
+                  <div class="cell-preview" @click="openDetail('模型回复', row.model_output)">
+                    {{ truncateText(row.model_output, 50) }}
                   </div>
                 </template>
               </el-table-column>
-              <el-table-column label="偏见检测" width="100">
+              <el-table-column label="确定性通道" width="130">
                 <template #default="{ row }">
-                  <el-tag :type="getSafetyItemTagType(row.bias_flagged)" size="small">
-                    {{ row.bias_flagged ? '检出' : '通过' }}
+                  <el-tooltip
+                    v-if="row.safety?.channels?.deterministic?.triggered"
+                    :content="safetyFindingsTooltip(row)"
+                    placement="top"
+                  >
+                    <el-tag type="danger" size="small">命中（证据）</el-tag>
+                  </el-tooltip>
+                  <el-tag v-else type="success" size="small">未命中</el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column label="裁判 rubric" width="130">
+                <template #default="{ row }">
+                  <el-tooltip
+                    v-if="row.safety?.channels?.judge_rubric?.reason"
+                    :content="row.safety.channels.judge_rubric.reason"
+                    placement="top"
+                  >
+                    <el-tag :type="safetyJudgeTagType(row)" size="small">{{ safetyJudgeLabel(row) }}</el-tag>
+                  </el-tooltip>
+                  <el-tag v-else :type="safetyJudgeTagType(row)" size="small">{{ safetyJudgeLabel(row) }}</el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column label="综合判定" width="100">
+                <template #default="{ row }">
+                  <el-tag :type="getSafetyItemTagType(row.safety?.violation)" size="small">
+                    {{ row.safety?.violation ? '违规' : '防守成功' }}
                   </el-tag>
                 </template>
               </el-table-column>
-              <el-table-column label="毒性检测" width="100">
+              <el-table-column label="严重度" width="90">
                 <template #default="{ row }">
-                  <el-tag :type="getSafetyItemTagType(row.toxicity_flagged)" size="small">
-                    {{ row.toxicity_flagged ? '检出' : '通过' }}
-                  </el-tag>
-                </template>
-              </el-table-column>
-              <el-table-column label="PII 泄露" width="100">
-                <template #default="{ row }">
-                  <el-tag :type="getSafetyItemTagType(row.pii_flagged)" size="small">
-                    {{ row.pii_flagged ? '检出' : '通过' }}
-                  </el-tag>
-                </template>
-              </el-table-column>
-              <el-table-column label="综合状态" width="100">
-                <template #default="{ row }">
-                  <el-tag :type="row.flagged ? 'danger' : 'success'" size="small">
-                    {{ row.flagged ? '风险' : '安全' }}
-                  </el-tag>
-                </template>
-              </el-table-column>
-              <el-table-column label="评分" width="100">
-                <template #default="{ row }">
-                  <el-tag v-if="row.score !== undefined" :type="getSafetyItemTagType(row.score < 0.5)">
-                    {{ row.score.toFixed(2) }}
+                  <el-tag v-if="row.safety?.severity" :type="safetySeverityTagType(row.safety.severity)" size="small">
+                    {{ { high: '高', medium: '中', low: '低' }[row.safety.severity] || row.safety.severity }}
                   </el-tag>
                   <span v-else>-</span>
                 </template>
@@ -3614,49 +3696,219 @@ const isResultRenderable = (r) => {
   return true
 }
 
-// 安全评测辅助函数
+// 安全评测辅助函数（M3 QE3-1 双通道红队口径）
+// 聚合结构来自 evaluators/safety.aggregate_safety_results：
+// {executed, violations, defense_rate, by_category, by_channel, mutation, items}
 const hasSafetyAlerts = computed(() => {
   if (!result.value?.result || result.value.evaluation_type !== 'safety') return false
-  return (result.value.result.flagged_count || 0) > 0
+  return (result.value.result.violations || 0) > 0
 })
 
 const safetyAlertTitle = computed(() => {
   if (!result.value?.result) return ''
-  const count = result.value.result.flagged_count || 0
-  return `安全风险告警：发现 ${count} 条风险内容`
+  const violations = result.value.result.violations || 0
+  return `安全评测告警：${violations} 条攻击成功（模型被攻破）`
 })
 
 const safetyAlertType = computed(() => {
   if (!result.value?.result) return 'warning'
-  const count = result.value.result.flagged_count || 0
-  if (count > 10) return 'error'
-  if (count > 0) return 'warning'
+  const violations = result.value.result.violations || 0
+  if (violations > 10) return 'error'
+  if (violations > 0) return 'warning'
   return 'success'
 })
 
 const safetyAlertCount = computed(() => {
-  return result.value?.result?.flagged_count || 0
+  return result.value?.result?.violations || 0
 })
 
-const getSafetyTagType = (score) => {
-  if (score == null) return 'info'
-  // 安全评分：分数越高越安全
-  if (score >= 0.8) return 'success'
-  if (score >= 0.6) return ''
-  if (score >= 0.4) return 'warning'
-  return 'danger'
+// 攻击面类目统计行（by_category 对象 → 表格行）
+const safetyCategoryRows = computed(() => {
+  const byCategory = result.value?.result?.by_category || {}
+  return Object.entries(byCategory).map(([key, row]) => ({
+    key,
+    ...row
+  }))
+})
+
+// deepeval 指标通道（M3 QE3-2）：启用且有逐指标统计时显示
+const hasSafetyDeepeval = computed(() => {
+  const metrics = result.value?.result?.by_channel?.deepeval?.metrics
+  return !!(metrics && Object.keys(metrics).length)
+})
+
+// 明细行：违规行筛选 + 攻击面中文名
+const safetyOnlyViolations = ref(false)
+const safetyItems = computed(() => {
+  const items = result.value?.result?.items || []
+  const nameMap = {
+    prompt_injection: '提示注入',
+    jailbreak: '越狱',
+    sensitive_content: '敏感内容',
+    factual_assertion: '事实性断言'
+  }
+  const rows = items.map(row => ({
+    ...row,
+    attack_category_name: nameMap[row.attack_category] || row.attack_category || '未分类'
+  }))
+  return safetyOnlyViolations.value
+    ? rows.filter(row => row.safety?.violation)
+    : rows
+})
+
+// 确定性通道命中证据 tooltip（PII/敏感词原文摘录 + 掩码展示）
+const safetyFindingsTooltip = (row) => {
+  const findings = row.safety?.channels?.deterministic?.findings || []
+  if (!findings.length) return ''
+  return findings.map(f => `${f.label}: ${f.masked || f.evidence}`).join('\n')
 }
 
-const getSafetyLabel = (score) => {
-  if (score == null) return '-'
-  if (score >= 0.8) return '安全'
-  if (score >= 0.6) return '良好'
-  if (score >= 0.4) return '注意'
-  return '风险'
+const safetyJudgeTagType = (row) => {
+  const judge = row.safety?.channels?.judge_rubric
+  if (!judge || judge.unavailable) return 'info'
+  return judge.violation ? 'danger' : 'success'
+}
+
+const safetyJudgeLabel = (row) => {
+  const judge = row.safety?.channels?.judge_rubric
+  if (!judge) return '-'
+  if (judge.unavailable) return '不可用'
+  return judge.violation ? '违规' : '未违规'
+}
+
+const safetySeverityTagType = (severity) => {
+  if (severity === 'high') return 'danger'
+  if (severity === 'medium') return 'warning'
+  return 'info'
 }
 
 const getSafetyItemTagType = (flagged) => {
   return flagged ? 'danger' : 'success'
+}
+
+// ---------------- 安全专视图扩展（M3 QE3-3：类目热力 + 证据引用） ----------------
+
+// 类目热力：行 = 攻击面类目（by_category 顺序），列 = 检出通道
+// （确定性命中 / 裁判违规 / 各 deepeval 指标），值 = 该类目在该通道的违规/命中条数。
+// by_channel 只有全局计数，交叉计数从 items 逐行统计（与聚合口径一致：
+// 确定性看 triggered、裁判看 violation、deepeval 逐指标看 success===false 且非不可用）
+const safetyHeatmapRows = computed(() => {
+  return safetyCategoryRows.value.map(row => row.name || row.key)
+})
+
+const safetyHeatmapCols = computed(() => {
+  const cols = ['确定性命中', '裁判违规']
+  const metrics = result.value?.result?.by_channel?.deepeval?.metrics || {}
+  cols.push(...Object.keys(metrics))
+  return cols
+})
+
+const safetyHeatmapData = computed(() => {
+  const rowKeys = safetyCategoryRows.value.map(row => row.key)
+  const metricCols = Object.keys(result.value?.result?.by_channel?.deepeval?.metrics || {})
+  const counts = rowKeys.map(() => safetyHeatmapCols.value.map(() => 0))
+  const items = result.value?.result?.items || []
+  for (const row of items) {
+    if (!row?.safety) continue
+    const y = rowKeys.indexOf(row.attack_category || 'uncategorized')
+    if (y < 0) continue
+    const channels = row.safety.channels || {}
+    if (channels.deterministic?.triggered) counts[y][0] += 1
+    if (channels.judge_rubric?.violation) counts[y][1] += 1
+    const deepeval = channels.deepeval || {}
+    for (const [mi, metricKey] of metricCols.entries()) {
+      const m = deepeval[metricKey]
+      if (m && m.success === false && !m.metric_unavailable) counts[y][2 + mi] += 1
+    }
+  }
+  return counts
+})
+
+// 类目热力渲染（与其它类型图表同款 initChart 销毁重建模式）
+const renderSafetyHeatmap = () => {
+  const chartDom = document.getElementById('safetyCategoryHeatmap')
+  if (!chartDom) return
+
+  const myChart = initChart(chartDom)
+  const rows = safetyHeatmapRows.value
+  const cols = safetyHeatmapCols.value
+  if (!rows.length) return
+
+  const data = []
+  let maxVal = 0
+  safetyHeatmapData.value.forEach((rowCounts, y) => {
+    rowCounts.forEach((count, x) => {
+      data.push([x, y, count])
+      if (count > maxVal) maxVal = count
+    })
+  })
+
+  myChart.setOption({
+    tooltip: {
+      confine: true,
+      formatter: (p) => `${rows[p.value[1]]} × ${cols[p.value[0]]}：${p.value[2]} 条`
+    },
+    grid: { left: 110, right: 60, top: 10, bottom: 60 },
+    xAxis: {
+      type: 'category',
+      data: cols,
+      splitArea: { show: true },
+      axisLabel: { fontSize: 12 }
+    },
+    yAxis: {
+      type: 'category',
+      data: rows,
+      splitArea: { show: true },
+      axisLabel: { fontSize: 12 }
+    },
+    visualMap: {
+      min: 0,
+      max: Math.max(maxVal, 1),
+      calculable: false,
+      orient: 'horizontal',
+      left: 'center',
+      bottom: 0,
+      text: ['违规集中', '无违规'],
+      inRange: {
+        // 浅绿 → 黄 → 红：0 违规安全色，集中处显眼红
+        color: ['#f0f9eb', '#f3d19e', '#f56c6c']
+      },
+      itemWidth: 12,
+      itemHeight: 80
+    },
+    series: [{
+      type: 'heatmap',
+      data,
+      label: { show: true, fontSize: 12, color: '#303133' },
+      emphasis: {
+        itemStyle: { shadowBlur: 6, shadowColor: 'rgba(0, 0, 0, 0.3)' }
+      }
+    }]
+  })
+}
+
+// 证据引用串（评审/合规材料可复制引用，定位到任务 + 执行版本 + 样本 + 攻击面）
+const safetyEvidenceCite = (row) => {
+  const taskId = result.value?.task_id || '-'
+  const exec = selectedExecutionNumber.value ?? '-'
+  const sample = row.attack_sample_id || `row-${(row.idx ?? 0) + 1}`
+  const origin = row.is_mutation && row.mutated_from ? `（变体←${row.mutated_from}）` : ''
+  return `${taskId} / 第${exec}次执行 / ${sample}${origin} / ${row.attack_category_name || row.attack_category || '-'}`
+}
+
+const safetyExpectedBehaviorLabel = (behavior) => {
+  const map = { refuse: '应拒绝作答', safe_answer: '应安全作答', fact_check: '应核实后作答' }
+  return map[behavior] || behavior || '-'
+}
+
+const hasSafetyEvidence = (row) => {
+  const channels = row.safety?.channels || {}
+  return !!(
+    (channels.deterministic?.findings || []).length ||
+    channels.judge_rubric?.reason ||
+    channels.judge_rubric?.evidence ||
+    (channels.deepeval && Object.keys(channels.deepeval).length)
+  )
 }
 
 // ---------------- 插件评测（plugin 类型结果渲染辅助） ----------------
@@ -4898,6 +5150,12 @@ const renderCharts = () => {
     return
   }
 
+  // 安全评测类型单独处理（M3 QE3-3：类目热力图）
+  if (result.value.evaluation_type === 'safety') {
+    nextTick(() => renderSafetyHeatmap())
+    return
+  }
+
   // 渲染雷达图 - 各维度评分
   renderRadarChart(res.dimension_scores)
 
@@ -5510,6 +5768,155 @@ const renderLatencyHistogram = (res) => {
   border-radius: 8px;
   padding: 15px;
   text-align: center;
+}
+
+/* 安全评测 deepeval 指标通道标签行（M3 QE3-2） */
+.safety-metric-list {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+}
+
+/* ---------------- 安全专视图扩展（M3 QE3-3：类目热力 + 证据引用） ---------------- */
+
+.safety-heatmap-card {
+  margin-top: 20px;
+  padding: 16px;
+  border: 1px solid #ebeef5;
+  border-radius: 8px;
+  position: relative;
+}
+
+.safety-heatmap-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: #303133;
+  margin-bottom: 8px;
+}
+
+.safety-heatmap-sub {
+  font-size: 12px;
+  font-weight: 400;
+  color: #909399;
+  margin-left: 8px;
+}
+
+.safety-heatmap-chart {
+  width: 100%;
+  height: 260px;
+}
+
+.safety-heatmap-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #909399;
+  font-size: 13px;
+}
+
+.safety-evidence-panel {
+  padding: 8px 12px 12px;
+}
+
+.evidence-cite {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.evidence-cite .cite-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: #606266;
+  white-space: nowrap;
+}
+
+.evidence-cite code {
+  font-size: 12px;
+  color: #409eff;
+  background: #ecf5ff;
+  border-radius: 4px;
+  padding: 2px 8px;
+  word-break: break-all;
+}
+
+.evidence-block {
+  margin-bottom: 12px;
+}
+
+.evidence-block-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #303133;
+  margin-bottom: 6px;
+}
+
+.evidence-list {
+  margin: 0;
+  padding-left: 4px;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.evidence-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.evidence-text {
+  font-size: 12px;
+  color: #f56c6c;
+  background: #fef0f0;
+  border-radius: 4px;
+  padding: 2px 6px;
+}
+
+.evidence-note {
+  font-size: 12px;
+  color: #909399;
+}
+
+.evidence-text-block {
+  font-size: 13px;
+  color: #606266;
+  line-height: 1.6;
+}
+
+.evidence-quote {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #909399;
+  border-left: 3px solid #dcdfe6;
+  padding-left: 10px;
+  line-height: 1.6;
+}
+
+.evidence-metric-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: flex-start;
+}
+
+.evidence-metric-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.evidence-empty {
+  font-size: 12px;
+  color: #c0c4cc;
 }
 
 .stats-row {

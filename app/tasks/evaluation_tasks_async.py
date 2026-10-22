@@ -388,6 +388,28 @@ def _load_dataset(task, db) -> List[Dict[str, Any]]:
     from app.services.dataset_snapshot_service import DatasetSnapshotService
 
     if not task.dataset_id:
+        # M3 QE3-1：安全评测「内置样本库」来源——无数据集时由 redteam_pack
+        # 合成数据项（与数据集行同构：data.user_input=攻击提示词 + 攻击面元数据），
+        # 后续媒体处理/Payload 生成/行级落库链路零改动
+        if getattr(task, "evaluation_type", "") == "safety":
+            safety_config = getattr(task, "safety_config", None) or {}
+            if str(safety_config.get("sample_source") or "pack") == "pack":
+                from app.services.redteam import load_pack, pack_samples_as_dataset_rows
+
+                pack = load_pack(
+                    safety_config.get("pack") or "redteam_pack_v1",
+                    categories=safety_config.get("categories"),
+                )
+                rows = pack_samples_as_dataset_rows(pack["samples"])
+                log = logging.getLogger(__name__)
+                log.info(
+                    "[_load_dataset] safety 内置样本库 %s@%s 载入 %d 条（类目 %s）",
+                    pack["name"], pack["version"], len(rows), pack["categories"],
+                )
+                return [
+                    {"id": row["attack_sample_id"], "index": i, "data": row}
+                    for i, row in enumerate(rows)
+                ]
         return []
 
     # 优先从快照加载数据

@@ -91,16 +91,17 @@
             <el-option label="二分分类评测" value="binary_classification" />
             <el-option label="Agent评测" value="agent" />
             <el-option label="插件评测" value="plugin" />
-            <!-- W12-2：safety/dialogue 后端尚未实现执行链（deepeval 接入列入 M3-W16），
-                 前端禁用并标注「规划中」，防止创建后无法执行的任务 -->
-            <el-option label="安全评测（规划中）" value="safety" disabled />
-            <el-option label="对话评测（规划中）" value="dialogue" disabled />
+            <!-- M3 QE3-1：safety 放行（双通道红队引擎就绪：确定性检测器 + 裁判 rubric
+                 + 内置样本库 redteam_pack_v1 + 变异增强）；dialogue 并入 agent 类型
+                 多轮配置项，不单独成类型（方案 M3 宣传口径） -->
+            <el-option label="安全评测" value="safety" />
           </el-select>
         </el-form-item>
 
         <!-- 评测配置区 -->
         <el-divider content-position="left">评测配置</el-divider>
-        <el-form-item label="数据集">
+        <!-- 数据集：安全评测「内置样本库」直跑不需要数据集（样本由 pack 合成） -->
+        <el-form-item label="数据集" v-if="!(form.evaluation_type === 'safety' && form.safety_config?.sample_source === 'pack')">
           <el-select v-model="form.dataset_id" placeholder="请选择数据集" style="width: 100%">
             <el-option v-for="ds in datasets" :key="ds.id" :label="ds.name" :value="ds.id" />
           </el-select>
@@ -3372,10 +3373,22 @@ const handleEvaluationTypeChange = (newType) => {
       loadMarketplaces()
     }
   } else if (newType === 'safety') {
-    // 安全评测不使用裁判配置
+    // 安全评测（M3 QE3-1 红队）：不使用裁判配置；safety_config 默认四类攻击面
+    // 全选 + 内置样本库直跑 + 变异关闭 + 双通道全开（pack 直跑不需要数据集）
     form.value.judge_variable_config = []
     form.value.judge_count = 0
-    form.value.safety_config = {}
+    form.value.safety_config = {
+      categories: ['prompt_injection', 'jailbreak', 'sensitive_content', 'factual_assertion'],
+      sample_source: 'pack',
+      pack: 'redteam_pack_v1',
+      mutation: { enabled: false, count: 1 },
+      channels: {
+        deterministic: { enabled: true, custom_words: [] },
+        judge_rubric: { enabled: true }
+      },
+      metrics: []
+    }
+    form.value.dataset_id = null
   } else if (newType === 'dialogue') {
     // 对话评测使用默认裁判配置
     form.value.judge_variable_config = JSON.parse(JSON.stringify(DEFAULT_JUDGE_VARIABLE_CONFIG))
@@ -4218,6 +4231,25 @@ const submitForm = async () => {
         return
       }
     }
+    // 安全评测（M3 QE3-1）：被攻击模型必填 + 样本来源与数据集一致性 + 类目非空
+    if (form.value.evaluation_type === 'safety') {
+      const sc = form.value.safety_config || {}
+      if (!form.value.model_provider?.trim()) {
+        ElMessage.error('安全评测需要选择被评测模型（红队攻击目标）')
+        return
+      }
+      if (!Array.isArray(sc.categories) || sc.categories.length === 0) {
+        ElMessage.error('安全评测至少选择一个攻击面类目')
+        return
+      }
+      if (sc.sample_source === 'dataset' && !form.value.dataset_id) {
+        ElMessage.error('攻击样本来源为「数据集」时必须选择数据集（可由内置样本库一键导入后编辑）')
+        return
+      }
+      if (sc.sample_source === 'pack' && form.value.dataset_id) {
+        form.value.dataset_id = null
+      }
+    }
     // 校验：所有引用到数据集字段的变量配置必须指定字段
     const datasetFieldVars = (form.value.judge_variable_config || []).filter(
       v => v.source === 'dataset_field' && (!v.source_config?.field || !v.source_config.field.toString().trim())
@@ -4324,7 +4356,8 @@ const submitForm = async () => {
       // 会话背景说明注入场景描述（供裁判提示词使用）
       submitData.scene_desc = submitData.agent_config?.session_context || submitData.scene_desc
     }
-    // 安全评测：清空裁判相关配置，保留 safety_config
+    // 安全评测（M3 QE3-1）：清空裁判相关配置、保留 safety_config 与被评测模型
+    // （模型是红队攻击目标）；pack 直跑不带数据集
     if (submitData.evaluation_type === 'safety') {
       submitData.judge_model = ''
       submitData.judge_count = 0
@@ -4336,6 +4369,12 @@ const submitForm = async () => {
       submitData.evaluation_metrics = []
       submitData.judge_prompt = ''
       submitData.template_id = ''
+      submitData.model_output_source = null
+      submitData.model_output_field = null
+      if (submitData.safety_config?.sample_source === 'pack') {
+        submitData.dataset_id = null
+      }
+      submitData.safety_config = submitData.safety_config || {}
     }
     // 插件评测：按来源组装 plugin_config（source 为表单态不提交），清空未用配置
     if (submitData.evaluation_type === 'plugin') {

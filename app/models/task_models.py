@@ -69,6 +69,10 @@ class EvaluationTask(Base):
     # 插件评测配置（depth: quick/standard；plugin_path/skill_content 为任务级评测对象兜底来源）
     plugin_config = Column(JSON, nullable=True, comment="插件评测配置")
 
+    # 安全评测配置（M3 QE3-1：{categories, sample_source, pack, pack_version,
+    # mutation:{enabled,count}, channels:{deterministic, judge_rubric}}）
+    safety_config = Column(JSON, nullable=True, comment="安全评测配置（M3：攻击面/样本来源/变异增强/双通道开关）")
+
     # 裁判数量配置
     judge_count = Column(Integer, default=6, comment="裁判数量")
 

@@ -1,17 +1,31 @@
 """
 安全评测器
 
-提供 Bias、Toxicity、PIILeakage 等安全评测能力。
+M3 QE3-1 重构为双通道红队引擎（见 app/services/redteam/）：
+
+- 通道一（确定性）：中文 PII（手机号/身份证/银行卡）+ 敏感词词表检测，
+  命中即 fail、证据高亮（redteam.detectors）；
+- 通道二（裁判 rubric）：四类攻击面（提示注入/越狱/敏感内容/事实性断言）
+  动态安全维度，裁判模型判定（redteam.rubric + redteam.engine）；
+- 内置攻击样本库 redteam_pack_v1（每类 ≥30 条，带版本）与变异增强选项
+  （redteam.pack / redteam.mutator）；
+- safety 类型任务执行链入口：app/services/evaluators/safety.py。
+
+本模块下方保留的 deepeval 指标方法（bias/toxicity/pii_leakage 等）为
+遗留直调通道：仅超管端点 /safety-evaluation 使用（M3 计划：保留一个迭代
+后废弃），bias/toxicity 等指标已并入 safety 类型 metric 开关，不再作为
+safety 类型的执行链路。
 
 功能：
-- evaluate_bias: 评测偏见
-- evaluate_toxicity: 评测毒性
-- evaluate_pii_leakage: 评测个人信息泄露
-- evaluate_non_advice: 评测不当建议
-- evaluate_misuse: 评测滥用
-- evaluate_role_violation: 评测角色违规
-- evaluate_all: 并行执行所有安全指标评测
-- evaluate_batch: 批量评测安全指标（Semaphore 并发控制）
+- evaluate_bias: 评测偏见（遗留）
+- evaluate_toxicity: 评测毒性（遗留）
+- evaluate_pii_leakage: 评测个人信息泄露（遗留）
+- evaluate_non_advice: 评测不当建议（遗留）
+- evaluate_misuse: 评测滥用（遗留）
+- evaluate_role_violation: 评测角色违规（遗留）
+- evaluate_all: 并行执行所有安全指标评测（遗留）
+- evaluate_batch: 批量评测安全指标（Semaphore 并发控制，遗留）
+- RedTeamSafetyEngine: 双通道红队引擎（safety 类型执行链使用，re-export）
 """
 import asyncio
 import logging
@@ -19,6 +33,10 @@ from typing import Any, Dict, List, Optional
 
 from app.services import deepeval_adapter
 from app.services.deepeval_result_transformer import TransformedMetricResult
+
+# M3 QE3-1：红队引擎 re-export（safety 类型执行链经 safety_evaluator 可达，
+# 与本模块历史定位「安全评测器」保持单一入口）
+from app.services.redteam.engine import RedTeamSafetyEngine  # noqa: F401
 
 logger = logging.getLogger(__name__)
 

@@ -42,7 +42,7 @@ scopes.register_api_key_route(
 class CreateTaskRequest(BaseModel):
     name: str = Field(..., description="任务名称")
     description: Optional[str] = Field(None, description="任务描述")
-    evaluation_type: str = Field(..., description="评测类型：judge/consistency/success_rate/rag/binary_classification/plugin")
+    evaluation_type: str = Field(..., description="评测类型：judge/consistency/success_rate/rag/binary_classification/agent/latency/plugin/safety")
     eval_model_config: Optional[Dict[str, Any]] = Field(None, description="模型配置")
     model_provider: Optional[str] = Field(None, description="模型提供商")
     model_endpoint: Optional[str] = Field(None, description="模型端点")
@@ -60,6 +60,9 @@ class CreateTaskRequest(BaseModel):
     latency_config: Optional[Dict[str, Any]] = Field(None, description="耗时评测配置")
     binary_metrics_config: Optional[Dict[str, Any]] = Field(None, description="二分分类评测配置")
     plugin_config: Optional[Dict[str, Any]] = Field(None, description="插件评测配置（depth/plugin_path/skill_content）")
+    # M3 QE3-1 安全评测配置：{categories, sample_source: pack|dataset, pack,
+    # pack_version, mutation:{enabled,count}, channels:{deterministic, judge_rubric}}
+    safety_config: Optional[Dict[str, Any]] = Field(None, description="安全评测配置（M3：攻击面/样本来源/变异增强/双通道开关）")
     multi_judge_config: Optional[Dict[str, Any]] = Field(None, description="多裁判配置")
     judge_count: Optional[int] = Field(6, description="裁判数量")
     parallel_config: Optional[Dict[str, Any]] = Field(None, description="并行执行配置")
@@ -151,6 +154,8 @@ class UpdateTaskRequest(BaseModel):
     binary_metrics_config: Optional[Dict[str, Any]] = None
     # 插件评测配置
     plugin_config: Optional[Dict[str, Any]] = None
+    # M3 QE3-1 安全评测配置（局部更新语义：携带即覆盖）
+    safety_config: Optional[Dict[str, Any]] = None
     # 关联的评测模板ID
     template_id: Optional[str] = None
     # 评测目标配置（多评测目标）
@@ -291,6 +296,8 @@ class TaskConfigResponse(BaseModel):
     parallel_config: Optional[Dict[str, Any]] = None
     binary_metrics_config: Optional[Dict[str, Any]] = None
     plugin_config: Optional[Dict[str, Any]] = None
+    # M3 QE3-1 安全评测配置（编辑回显用，from_attributes 自动带出）
+    safety_config: Optional[Dict[str, Any]] = None
     template_id: Optional[str] = None
     # 评测前处理脚本编排
     pre_scripts: Optional[List[Dict[str, Any]]] = None
@@ -508,6 +515,7 @@ def create_task(
         latency_config=body.latency_config,
         binary_metrics_config=body.binary_metrics_config,
         plugin_config=body.plugin_config,
+        safety_config=body.safety_config,
         multi_judge_config=body.multi_judge_config,
         parallel_config=body.parallel_config,
         evaluation_scene=body.evaluation_scene,
@@ -1298,7 +1306,7 @@ def get_result_history_version(
 
 
 class ExecutionExportRequest(BaseModel):
-    format: str = Field("markdown", description="导出格式：markdown（全量报告）| json（无损）")
+    format: str = Field("markdown", description="导出格式：markdown（全量报告；safety 任务出安全评测合规报告）| json（无损）| xlsx（仅 safety 任务：安全评测合规报告工作簿）")
 
 
 @results_router.post("/{task_id}/history/{execution_number}/export", summary="导出指定执行版本的结果文档")
@@ -1312,9 +1320,13 @@ def export_result_history_version(
     """把单次执行结果渲染成文档并上传 anc-hub file-store，返回 file_id（W9：对象级归属校验）
 
     插件 task_execution_export 工具的入口：markdown 为全量人读报告（failed/stopped
-    只出失败简报），json 为无损结构。同版本同格式幂等——exported_files 已登记的
-    file_id 直接复用（cached=true），不重复上传。上传以调用者平台登录态
-    （平台登录态 Cookie，名由 HUB_SSO_COOKIE_NAME 配置）执行，file-store 侧落调用者身份审计。
+    只出失败简报），json 为无损结构。M3 QE3-2：safety 任务的 markdown 自动切换为
+    「安全评测报告（合规证据）」模板（检查项对齐《生成式人工智能服务安全基本
+    要求》类目命名 → 结果 → 证据 → 复测建议），并可显式 format=xlsx 导出三工作表
+    证据工作簿（检查项汇总/违规证据/复测建议），作为门禁材料外发。同版本同格式
+    幂等——exported_files 已登记的 file_id 直接复用（cached=true），不重复上传。
+    上传以调用者平台登录态（平台登录态 Cookie，名由 HUB_SSO_COOKIE_NAME 配置）执行，
+    file-store 侧落调用者身份审计。
     """
     from types import SimpleNamespace
 
@@ -1327,8 +1339,8 @@ def export_result_history_version(
     from app.services import result_report
     from app.services.evaluation_task_service import TaskExecutionRecordService
 
-    if body.format not in ("markdown", "json"):
-        raise HTTPException(status_code=400, detail=f"不支持的导出格式: {body.format}（仅 markdown/json）")
+    if body.format not in ("markdown", "json", "xlsx"):
+        raise HTTPException(status_code=400, detail=f"不支持的导出格式: {body.format}（仅 markdown/json/xlsx）")
 
     task = ensure_task_access(db, request.state.user, task_id)
     record_service = TaskExecutionRecordService(db)
@@ -1365,8 +1377,12 @@ def export_result_history_version(
             **{k: cached_entry[k] for k in ("file_id", "filename", "size", "sha256") if cached_entry.get(k)},
         }
 
-    data = (result_report.build_markdown_export(record, task) if body.format == "markdown"
-            else result_report.build_json_export(record, task))
+    # M3 QE3-2：xlsx 仅 safety 任务（安全评测合规报告工作簿）；safety 任务的
+    # markdown 自动切换为安全评测报告模板（合规证据口径）
+    if body.format == "xlsx" and task.evaluation_type != "safety":
+        raise HTTPException(status_code=400, detail="xlsx 导出仅支持 safety 类型任务（安全评测合规报告工作簿）")
+
+    data = result_report.build_export_bytes(record, task, body.format)
     filename = result_report.export_filename(
         task.name, execution_number, body.format,
         completed_at=record.completed_at if isinstance(record.completed_at, datetime) else None,

@@ -320,6 +320,14 @@ export const pluginMarketplaceApi = {
   plugins: (id) => request.get(`/evaluation/plugin-marketplaces/${id}/plugins`)
 }
 
+// 红队攻击样本库API（M3 安全评测）：列表 + 导入为数据集（可导入可编辑）
+export const redteamApi = {
+  // 内置样本库列表：[{name, version, categories: [{key, name, sample_count}]}]
+  packs: () => request.get('/evaluation/redteam/packs'),
+  // 样本库导入为数据集 → {dataset_id, dataset_name, pack, pack_version, categories, imported_count}
+  importPack: (packName, data) => request.post(`/evaluation/redteam/packs/${encodeURIComponent(packName)}/import-dataset`, data)
+}
+
 // 批量操作API
 export const batchApi = {
   run: (taskIds) => request.post('/evaluation/tasks/batch-run', { task_ids: taskIds }),
