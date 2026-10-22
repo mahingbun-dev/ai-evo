@@ -182,14 +182,21 @@ class TestW10T3DrainHintEdges:
         assert "可等任务完成后再发版" in logf.getvalue()
 
     def test_compose_stop_grace_period_value(self):
-        """worker stop_grace_period == 7200s（独立复验 compose 文件）"""
+        """worker stop_grace_period == 7200s（独立复验 compose 文件）
+
+        M1 QE1-3 三队列拆分新增 worker-maint（消费 maint 队列的秒级维护
+        任务，如 webhook 投递）：300s 退出窗口足够且刻意与长任务区分
+        （口径同 test_celery_queue_split.WORKER_STOP_GRACE 与 compose 注释）；
+        除 worker/worker-maint 外的其它服务不得被误改（不得出现缩短的宽限期）。
+        """
         compose = yaml.safe_load(
             (REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
         )
         assert compose["services"]["worker"]["stop_grace_period"] == "7200s"
+        assert compose["services"]["worker-maint"]["stop_grace_period"] == "300s"
         # 其它服务不得被误改
         for name, svc in compose["services"].items():
-            if name != "worker":
+            if name not in ("worker", "worker-maint"):
                 assert "stop_grace_period" not in svc or svc["stop_grace_period"] == "7200s"
 
 

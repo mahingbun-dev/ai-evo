@@ -215,6 +215,12 @@ class Settings(BaseSettings):
     # 最新的启用中 evaluation 角色模型。仅 flag 开启时生效
     DEEPEVAL_PLATFORM_MODEL_ID: str = ""
 
+    # M1 QE1-3 webhook SSRF 防护开关（默认关=拒绝内网目标）：webhook URL 校验
+    # （app/services/webhook_url_guard.py）默认拒绝 localhost/私网/链路本地
+    # 地址；企业内网接收端场景（本产品自托管部署常见）置 true 显式放行，
+    # 由部署者自行承担内网目标面
+    WEBHOOK_ALLOW_PRIVATE_TARGETS: bool = False
+
     @property
     def langfuse_config(self) -> Optional[Dict[str, str]]:
         """获取 LangFuse 配置字典，如果未启用则返回 None"""

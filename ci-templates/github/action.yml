@@ -1,0 +1,48 @@
+name: 'AI-Evo Gate'
+description: '触发 AI-Evo 评测任务并按门禁判定给出步骤结论（exit 0=通过 / 1=门禁失败 / 2=错误）'
+inputs:
+  aievo-url:
+    description: '平台地址（如 https://aievo.example.com）'
+    required: true
+  aievo-api-key:
+    description: 'API Key（aievo_sk_ 开头，需持 tasks:run + tasks:read scope）'
+    required: true
+  task-id:
+    description: '评测任务 ID'
+    required: true
+  timeout:
+    description: '最长等待秒数'
+    required: false
+    default: '7200'
+  interval:
+    description: '轮询间隔秒数'
+    required: false
+    default: '5'
+  python-version:
+    description: '安装 aievo-cli 使用的 Python 版本'
+    required: false
+    default: '3.11'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: 安装 Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: 安装 aievo-cli
+      shell: bash
+      run: pip install aievo-cli
+
+    - name: 评测门禁（exit 0=通过 / 1=门禁失败 / 2=错误）
+      shell: bash
+      env:
+        AIEVO_URL: ${{ inputs.aievo-url }}
+        AIEVO_API_KEY: ${{ inputs.aievo-api-key }}
+        AIEVO_TASK_ID: ${{ inputs.task-id }}
+        AIEVO_TIMEOUT: ${{ inputs.timeout }}
+        AIEVO_INTERVAL: ${{ inputs.interval }}
+      run: |
+        aievo config add "$AIEVO_URL" "$AIEVO_API_KEY"
+        aievo run "$AIEVO_TASK_ID" --wait --timeout "$AIEVO_TIMEOUT" --interval "$AIEVO_INTERVAL" --json

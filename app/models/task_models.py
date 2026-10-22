@@ -137,6 +137,14 @@ class EvaluationTask(Base):
     # 关联的评测模板ID
     template_id = Column(String, nullable=True, comment="关联的评测模板ID")
 
+    # 门禁配置（M1 QE1-2，评测即门禁）：{enabled, mode: all|any, thresholds:
+    # [{metric, op, value}]}，metric 取 total_score/pass_rate/dimension:<维度名>
+    # （verification_* 随 M2 扩展）。空=未启用门禁（存量任务行为不变）
+    gate_config = Column(
+        JSON, nullable=True,
+        comment="门禁配置（M1）：{enabled, mode: all|any, thresholds:[{metric,op,value}]},空=未启用",
+    )
+
 
 class TaskExecutionLog(Base):
     """任务执行日志表"""
@@ -180,6 +188,14 @@ class TaskExecutionRecord(Base):
 
     # 导出登记（插件 task_execution_export 幂等复用）：{format: {file_id, filename, size, sha256, uploaded_at}}
     exported_files = Column(JSON, nullable=True, comment="已上传 anc-hub file-store 的导出文档登记（按格式幂等复用 file_id）")
+
+    # 门禁判定结果（M1 QE1-2）：{verdict: passed|failed|error, checks:
+    # [{metric, op, value, actual, passed}], evaluated_at}。失败/停止收尾由
+    # TaskExecutionRecordService 统一落 error verdict；空=该次执行未启用门禁
+    gate_result = Column(
+        JSON, nullable=True,
+        comment="门禁判定（M1）：{verdict: passed|failed|error, checks:[...], evaluated_at},空=未启用门禁",
+    )
 
 
 class EvaluationResult(Base):

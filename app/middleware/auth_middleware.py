@@ -1,8 +1,15 @@
 """
 鉴权中间件
-全局拦截请求，校验 Authorization: Bearer <JWT>
+全局拦截请求，校验 Authorization: Bearer <JWT 或 API Key>
+
+M1 QE1-1：Bearer token 以 ``aievo_sk_`` 开头走 API Key 分支（CI/CLI 长期凭证，
+app/services/api_key_service.py）——sha256 比对 + 有效期/吊销/用户活跃校验 +
+认证失败节流（app/services/api_key_throttle.py）+ scope 路由注册表
+default-deny（app/core/scopes.py）；其余 token 走既有 JWT 分支，行为不变。
 """
 import logging
+from datetime import datetime, timezone
+
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -10,6 +17,9 @@ from starlette.responses import JSONResponse
 from app.services.jwt_service import decode_token
 from app.db.session import SessionLocal
 from app.models.user_models import User
+from app.services.api_key_service import API_KEY_TOKEN_PREFIX, parse_api_key, verify_api_key
+from app.services.api_key_throttle import ApiKeyAuthThrottle
+from app.core import scopes as scope_constants
 
 logger = logging.getLogger(__name__)
 
@@ -30,8 +40,44 @@ WHITELIST_PREFIXES = [
 ]
 
 
+def _build_user_dict(user: User) -> dict:
+    """User ORM 行 → request.state.user 字典（session 关闭前提取全部属性）"""
+    return {
+        "user_code": user.user_code,
+        "username": user.username,
+        "user_name": user.user_name,
+        "email": user.email,
+        "employee_id": user.employee_id,
+        "org_code": user.org_code,
+        "org_name": user.org_name,
+        "position_name": user.position_name,
+        "user_type": user.user_type,
+        "super_admin_flag": user.super_admin_flag,
+        "application_admin": user.application_admin,
+        "is_active": user.is_active,
+        "last_login_at": user.last_login_at,
+        "created_at": user.created_at,
+        "updated_at": user.updated_at,
+    }
+
+
+def _client_ip(request: Request) -> str:
+    """直连对端 IP（节流计数口径）。
+
+    不采信 X-Forwarded-For：该头可伪造，采信等于让攻击者每次请求换 IP
+    绕过计数；反代部署下按直连地址（反代 IP）计数，全员共享额度偏保守，
+    与 fail-open 语义同为「宁松勿断」的护栏取向。
+    """
+    return request.client.host if request.client else "unknown"
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
     """鉴权中间件"""
+
+    def __init__(self, app, api_key_throttle: ApiKeyAuthThrottle = None):
+        super().__init__(app)
+        # 节流器可注入（tests/security 传假 Redis）；缺省接全局 Redis 连接口径
+        self._api_key_throttle = api_key_throttle or ApiKeyAuthThrottle()
 
     async def dispatch(self, request: Request, call_next):
         # WebSocket 请求直接透传：BaseHTTPMiddleware 的 call_next 机制
@@ -61,6 +107,11 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 status_code=401
             )
         token = auth_header[7:].strip()
+
+        # 步骤1.5（M1 QE1-1）：aievo_sk_ 前缀走 API Key 分支，之后逻辑与
+        # JWT 分支完全隔离（JWT 路径行为不变）
+        if token.startswith(API_KEY_TOKEN_PREFIX):
+            return await self._authenticate_api_key(request, token, call_next)
 
         # 步骤2: 校验 JWT 签名与有效期
         payload = decode_token(token)
@@ -93,25 +144,86 @@ class AuthMiddleware(BaseHTTPMiddleware):
                     status_code=403
                 )
 
-            user_dict = {
-                "user_code": user.user_code,
-                "username": user.username,
-                "user_name": user.user_name,
-                "email": user.email,
-                "employee_id": user.employee_id,
-                "org_code": user.org_code,
-                "org_name": user.org_name,
-                "position_name": user.position_name,
-                "user_type": user.user_type,
-                "super_admin_flag": user.super_admin_flag,
-                "application_admin": user.application_admin,
-                "is_active": user.is_active,
-                "last_login_at": user.last_login_at,
-                "created_at": user.created_at,
-                "updated_at": user.updated_at,
-            }
+            user_dict = _build_user_dict(user)
 
         # 将用户字典写入 request.state
         request.state.user = user_dict
+        # JWT 登录态：无 scope 概念（require_scope 依赖据此放行）
+        request.state.auth_type = "jwt"
+        request.state.api_key_scopes = None
+
+        return await call_next(request)
+
+    async def _authenticate_api_key(self, request: Request, token: str, call_next):
+        """API Key 分支（M1 QE1-1）：节流 → sha256 认证 → 用户活跃 → scope 路由闸
+
+        统一失败文案「API Key 无效或已失效」（不区分 hash 错/吊销/过期，
+        防探测）；内部 reason 只进日志。
+        """
+        path = request.url.path
+        ip = _client_ip(request)
+        throttle = self._api_key_throttle
+
+        # 节流前置：锁定期内不查库不比对，直接 429
+        prefix = parse_api_key(token) or "malformed"
+        if throttle.is_locked(ip, prefix):
+            middleware_logger.warning(
+                f"[AUTH] 429 - API Key 认证失败锁定中，路径: {path}, ip: {ip}")
+            return JSONResponse(
+                {"code": 429, "message": "认证失败次数过多，请稍后再试"},
+                status_code=429
+            )
+
+        with SessionLocal() as db:
+            record, reason = verify_api_key(db, token)
+            if record is None:
+                throttle.record_failure(ip, prefix)
+                middleware_logger.warning(
+                    f"[AUTH] 401 - API Key 无效（{reason}），路径: {path}, ip: {ip}")
+                return JSONResponse(
+                    {"code": 401, "message": "API Key 无效或已失效"},
+                    status_code=401
+                )
+
+            # 用户活跃校验（与 JWT 分支同口径：禁用账号 403）
+            user = db.get(User, record.user_code)
+            if user is None or not user.is_active:
+                throttle.record_failure(ip, prefix)
+                middleware_logger.warning(
+                    f"[AUTH] 403 - API Key 所属用户不可用，路径: {path}, "
+                    f"user_code={record.user_code}")
+                return JSONResponse(
+                    {"code": 403, "message": "账号已被禁用，请联系管理员"},
+                    status_code=403
+                )
+
+            # scope 路由注册表（default-deny）：API Key 仅放行显式注册的
+            # scope 化端点；命中后再校验该 Key 是否持有所需 scope
+            required_scope = scope_constants.match_api_key_route(request.method, path)
+            if required_scope is None:
+                middleware_logger.warning(
+                    f"[AUTH] 403 - API Key 访问未注册端点，路径: {request.method} {path}")
+                return JSONResponse(
+                    {"code": 403, "message": "API Key 无权访问该端点"},
+                    status_code=403
+                )
+            granted = scope_constants.normalize_scopes(record.scopes)
+            if required_scope not in granted:
+                middleware_logger.warning(
+                    f"[AUTH] 403 - API Key 缺少 scope {required_scope}，路径: {path}, "
+                    f"ip: {ip}")
+                return JSONResponse(
+                    {"code": 403, "message": f"API Key 缺少所需 scope：{required_scope}"},
+                    status_code=403
+                )
+
+            # 认证成功：刷新 last_used_at（审计口径），提取用户属性
+            record.last_used_at = datetime.now(timezone.utc)
+            db.commit()
+            user_dict = _build_user_dict(user)
+
+        request.state.user = user_dict
+        request.state.auth_type = "api_key"
+        request.state.api_key_scopes = granted
 
         return await call_next(request)

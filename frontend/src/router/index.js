@@ -63,6 +63,12 @@ const routes = [
     meta: { title: 'A/B 对比测试' }
   },
   {
+    path: '/dev-settings',
+    name: 'DevSettings',
+    component: () => import('@/views/DevSettings.vue'),
+    meta: { title: '开发者设置' }
+  },
+  {
     path: '/teams',
     name: 'Teams',
     component: () => import('@/views/Teams.vue'),

@@ -1,6 +1,6 @@
 # AgentEvo — Self-hosted Agent Quality Engineering Platform
 
-AgentEvo is a self-hosted Agent quality engineering platform — the positioning is *evaluation as a release gate*: model and Agent changes pass evaluation before they ship. Live today: model configs, dataset management, pre-evaluation scripts, 8 evaluation types with AI judges, result analytics and A/B testing. The release-gate loop itself (threshold gates, API keys, CI CLI, webhooks) lands with the next milestone (M1). Built with FastAPI + Vue 3 + Celery, deployable as a single Docker Compose stack.
+AgentEvo is a self-hosted Agent quality engineering platform — the positioning is *evaluation as a release gate*: model and Agent changes pass evaluation before they ship. Live today: model configs, dataset management, pre-evaluation scripts, 8 evaluation types with AI judges, result analytics and A/B testing, plus the release-gate loop — threshold gates configured on evaluation tasks (with a verdict banner on results and a gate column in execution history), API Keys with scoped permissions, webhook notifications, the developer-settings console for keys/webhooks, and the `aievo-cli` command line for CI (exit codes 0=passed / 1=gate failed / 2=error, with GitHub/GitLab/Jenkins templates under `ci-templates/`). Built with FastAPI + Vue 3 + Celery, deployable as a single Docker Compose stack.
 
 ![Home](docs/assets/00-home.png)
 
@@ -101,6 +101,7 @@ Safety and dialogue evaluation show up in the UI as *planned* (disabled) — the
 
 - [User guide (中文, with screenshots)](docs/user_guide.md)
 - [Quick start (中文)](QUICK_START.md)
+- [CI gate templates — GitHub Actions / GitLab / Jenkins](ci-templates/README.md) and the [`aievo-cli`](cli/README.md) command line that powers them
 - API docs are served by the backend at `/api-docs` once running
 
 ## Security notes

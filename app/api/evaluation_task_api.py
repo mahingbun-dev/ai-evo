@@ -10,8 +10,31 @@ from datetime import datetime
 from app.db.session import get_db
 from app.services.access_control import ensure_task_access
 from app.services.evaluation_task_service import EvaluationTaskService, TaskExecutionLogService
+from app.core import scopes
+from app.core.scopes import require_scope
 
 logger = logging.getLogger(__name__)
+
+# M1 QE1-2：门禁查询端点进 API Key 路由注册表（default-deny 白名单）——
+# CLI（QE1-5）持 tasks:read scope 的 Key 轮询门禁状态；页面端点走 JWT 不受影响
+scopes.register_api_key_route(
+    "GET", "/api/v1/evaluation/tasks/{task_id}/executions/{execution_number}",
+    scopes.TASKS_READ)
+scopes.register_api_key_route(
+    "GET", "/api/v1/evaluation/tasks/{task_id}/gate", scopes.TASKS_READ)
+# M1 QE1-4：run 触发（tasks:run）与结果读取（results:read）scope 化——
+# API Key 可触发运行与读取结果（CLI/CI 门禁链路），浏览器 JWT 路径不变
+scopes.register_api_key_route(
+    "POST", "/api/v1/evaluation/tasks/{task_id}/run", scopes.TASKS_RUN)
+scopes.register_api_key_route(
+    "GET", "/api/v1/evaluation/results/{task_id}", scopes.RESULTS_READ)
+scopes.register_api_key_route(
+    "GET", "/api/v1/evaluation/results/{task_id}/history", scopes.RESULTS_READ)
+scopes.register_api_key_route(
+    "GET", "/api/v1/evaluation/results/{task_id}/history/{execution_number}",
+    scopes.RESULTS_READ)
+scopes.register_api_key_route(
+    "GET", "/api/v1/evaluation/results/{task_id}/dimension-trend", scopes.RESULTS_READ)
 
 
 # ==================== Request Models ====================
@@ -66,6 +89,9 @@ class CreateTaskRequest(BaseModel):
     template_id: Optional[str] = Field(None, description="关联的评测模板ID")
     # 评测前处理脚本编排（pre_judge_scripts，串行执行，输出进入裁判变量体系 script_output）
     pre_scripts: Optional[List[Dict[str, Any]]] = Field(None, description="评测前处理脚本编排列表")
+    # M1 QE1-6 门禁配置：{mode: all|any, thresholds: [{metric, op, value}]}；
+    # None/空 = 未启用门禁（编辑表单「门禁配置」折叠区提交）
+    gate_config: Optional[Dict[str, Any]] = Field(None, description="门禁配置（空=未启用）")
 
 
 class UpdateTaskRequest(BaseModel):
@@ -118,6 +144,8 @@ class UpdateTaskRequest(BaseModel):
     validation_enabled: Optional[bool] = None
     # 评测前处理脚本编排
     pre_scripts: Optional[List[Dict[str, Any]]] = None
+    # M1 QE1-6 门禁配置（局部更新语义：携带即覆盖，None=关闭门禁）
+    gate_config: Optional[Dict[str, Any]] = None
 
 
 # ==================== Response Models ====================
@@ -242,6 +270,8 @@ class TaskConfigResponse(BaseModel):
     template_id: Optional[str] = None
     # 评测前处理脚本编排
     pre_scripts: Optional[List[Dict[str, Any]]] = None
+    # M1 QE1-6 门禁配置（编辑回显用，from_attributes 自动带出）
+    gate_config: Optional[Dict[str, Any]] = None
     # 不包含执行结果字段：result, total_cost, completed_at, progress, total_questions, completed_questions
     created_at: datetime
 
@@ -354,6 +384,9 @@ class ExecutionRecordResponse(BaseModel):
     # W4（P0-C）配置归因锚点：执行开始写创建时双快照、结束写实际使用配置摘要
     # （仅掩码凭据+指纹，无明文 api_key）
     config_snapshot: Optional[Dict[str, Any]] = None
+    # M1 QE1-2 门禁判定：{verdict: passed|failed|error, checks, evaluated_at}；
+    # 空 = 该次执行未启用门禁（含全部存量执行记录）
+    gate_result: Optional[Dict[str, Any]] = None
 
     @field_serializer('started_at')
     def serialize_started_at(self, value: datetime) -> str:
@@ -452,6 +485,7 @@ def create_task(
         validation_enabled=body.validation_enabled,
         template_id=body.template_id,
         pre_scripts=body.pre_scripts,
+        gate_config=body.gate_config,
     )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -754,13 +788,23 @@ def delete_task(
     return {"message": "删除成功"}
 
 
-@router.post("/{task_id}/run", response_model=TaskResponse, summary="执行评测")
+@router.post(
+    "/{task_id}/run",
+    response_model=TaskResponse,
+    summary="执行评测",
+    dependencies=[Depends(require_scope(scopes.TASKS_RUN))],
+)
 def run_task(
     task_id: str,
     request: Request,
     db: Session = Depends(get_db),
 ):
-    """执行评测任务（提交到 APScheduler 线程池；W9：对象级归属校验）"""
+    """执行评测任务（提交到 APScheduler 线程池；W9：对象级归属校验）
+
+    M1 QE1-4：scope 化——API Key 持 tasks:run 可触发（CI 门禁链路），
+    浏览器 JWT 路径不受影响；归属校验对两种凭证同一口径（API Key 按
+    所属用户身份判团队）。
+    """
     task = ensure_task_access(db, request.state.user, task_id)
 
     # 允许重新运行已停止或失败的任务
@@ -866,7 +910,10 @@ def get_task_executions(
     limit: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
 ):
-    """获取任务的执行历史记录列表（W9：对象级归属校验）"""
+    """获取任务的执行历史记录列表（W9：对象级归属校验）
+
+    M1 QE1-2：响应含每版 gate_result（门禁判定，空=未启用门禁）。
+    """
     ensure_task_access(db, request.state.user, task_id)
 
     from app.services.evaluation_task_service import TaskExecutionRecordService
@@ -875,12 +922,88 @@ def get_task_executions(
     return records
 
 
+@router.get(
+    "/{task_id}/executions/{execution_number}",
+    response_model=ExecutionRecordResponse,
+    summary="获取单次执行记录（含门禁判定）",
+    dependencies=[Depends(require_scope(scopes.TASKS_READ))],
+)
+def get_task_execution(
+    task_id: str,
+    execution_number: int,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """获取任务指定执行序号的完整执行记录（M1 QE1-2，CLI/agent 消费）
+
+    含 result 与 gate_result（门禁判定 {verdict, checks, evaluated_at}；
+    空 = 该次执行未启用门禁）。轻量轮询（只要门禁 verdict）用
+    GET /{task_id}/gate。
+    """
+    ensure_task_access(db, request.state.user, task_id)
+
+    from app.services.evaluation_task_service import TaskExecutionRecordService
+    record_service = TaskExecutionRecordService(db)
+    record = record_service.get_record_by_number(task_id, execution_number)
+    if not record:
+        raise HTTPException(status_code=404, detail=f"执行版本不存在: 第 {execution_number} 次")
+    return record
+
+
+@router.get(
+    "/{task_id}/gate",
+    summary="门禁状态（CLI/agent 轮询专用轻端点）",
+    dependencies=[Depends(require_scope(scopes.TASKS_READ))],
+)
+def get_task_gate(
+    task_id: str,
+    request: Request,
+    execution_number: Optional[int] = Query(
+        None, description="指定执行序号（缺省=最新一次执行）"),
+    db: Session = Depends(get_db),
+):
+    """门禁轮询轻端点（M1 QE1-2）：任务状态 + 最新执行的门禁判定
+
+    CLI（QE1-5 aievo run --gate）轮询口径：verdict=passed/failed/error 即
+    终态（分别映射退出码 0/1/2）；running/pending 且未出 verdict 时继续轮询。
+    SQL 只取标量列 + gate_config/gate_result 两个小 JSON 列，不碰 result
+    大列（与 /status 轮询端点同轻量化口径）。
+    """
+    task = ensure_task_access(db, request.state.user, task_id)
+
+    from app.services.evaluation_task_service import TaskExecutionRecordService
+    record_service = TaskExecutionRecordService(db)
+    resolved_number = execution_number or task.execution_count or 0
+    record = (
+        record_service.get_record_by_number(task_id, resolved_number)
+        if resolved_number > 0 else None
+    )
+
+    from app.services.gate_service import gate_enabled
+
+    gate_result = record.gate_result if record is not None else None
+    return {
+        "task_id": task_id,
+        "status": task.status,
+        "execution_number": resolved_number or None,
+        "gate_enabled": gate_enabled(task.gate_config),
+        "gate_mode": (task.gate_config or {}).get("mode") if isinstance(task.gate_config, dict) else None,
+        "verdict": gate_result.get("verdict") if isinstance(gate_result, dict) else None,
+        "gate_result": gate_result,
+    }
+
+
 # ==================== Results Endpoints ====================
 
 results_router = APIRouter(prefix="/evaluation/results", tags=["评测结果"])
 
 
-@results_router.get("/{task_id}", response_model=EvaluationResultResponse, summary="获取评测结果")
+@results_router.get(
+    "/{task_id}",
+    response_model=EvaluationResultResponse,
+    summary="获取评测结果",
+    dependencies=[Depends(require_scope(scopes.RESULTS_READ))],
+)
 def get_result(
     task_id: str,
     request: Request,
@@ -923,7 +1046,11 @@ def get_result(
     )
 
 
-@results_router.get("/{task_id}/history", summary="获取所有历史版本结果")
+@results_router.get(
+    "/{task_id}/history",
+    summary="获取所有历史版本结果",
+    dependencies=[Depends(require_scope(scopes.RESULTS_READ))],
+)
 def get_result_history(
     task_id: str,
     request: Request,
@@ -956,6 +1083,8 @@ def get_result_history(
             "error_message": None,
             "started_at": task.created_at.isoformat() if task.created_at else None,
             "completed_at": task.completed_at.isoformat() if task.completed_at else None,
+            # M1 QE1-6：兼容记录无执行记录行，无门禁判定
+            "gate_result": None,
         }
         return [compatibility_record]
 
@@ -972,12 +1101,17 @@ def get_result_history(
             "error_message": r.error_message,
             "started_at": r.started_at.isoformat() if r.started_at else None,
             "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+            "gate_result": r.gate_result,
         }
         for r in records
     ]
 
 
-@results_router.get("/{task_id}/dimension-trend", summary="获取跨执行版本的维度评分趋势")
+@results_router.get(
+    "/{task_id}/dimension-trend",
+    summary="获取跨执行版本的维度评分趋势",
+    dependencies=[Depends(require_scope(scopes.RESULTS_READ))],
+)
 def get_dimension_trend(
     task_id: str,
     request: Request,
@@ -1010,7 +1144,11 @@ def get_dimension_trend(
     return trend
 
 
-@results_router.get("/{task_id}/history/{execution_number}", summary="获取指定历史版本的完整结果")
+@results_router.get(
+    "/{task_id}/history/{execution_number}",
+    summary="获取指定历史版本的完整结果",
+    dependencies=[Depends(require_scope(scopes.RESULTS_READ))],
+)
 def get_result_history_version(
     task_id: str,
     execution_number: int,
@@ -1037,6 +1175,7 @@ def get_result_history_version(
             "error_message": record.error_message,
             "started_at": record.started_at.isoformat() if record.started_at else None,
             "completed_at": record.completed_at.isoformat() if record.completed_at else None,
+            "gate_result": record.gate_result,
         }
 
     # 兼容旧任务：无执行记录但任务有结果时，按 history 的兼容口径从任务本体取
@@ -1055,6 +1194,7 @@ def get_result_history_version(
         "error_message": None,
         "started_at": task.created_at.isoformat() if task.created_at else None,
         "completed_at": task.completed_at.isoformat() if task.completed_at else None,
+        "gate_result": None,
     }
 
 

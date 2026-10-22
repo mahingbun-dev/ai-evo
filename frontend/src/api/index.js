@@ -290,7 +290,9 @@ export const taskApi = {
   // 迁移单个旧版任务配置（steps 合并进 score_details、pre_scripts 转为 script_output 待评测数据行，幂等）
   migrateConfig: (id) => request.post(`/evaluation/tasks/${id}/migrate-config`),
   // 批量迁移全部旧版任务配置（幂等；返回 {total, migrated, skipped, errors}）
-  migrateAllLegacy: () => request.post('/evaluation/tasks/migrate-legacy-all')
+  migrateAllLegacy: () => request.post('/evaluation/tasks/migrate-legacy-all'),
+  // 门禁状态轻量查询（M1：{verdict, gate_enabled, gate_result, ...}，可带 execution_number 查指定版本）
+  gate: (id, params) => request.get(`/evaluation/tasks/${id}/gate`, { params })
 }
 
 // 评测结果API
@@ -329,6 +331,21 @@ export const abTestApi = {
   getSession: (id) => request.get(`/ab-test/sessions/${id}`),
   saveSession: (data) => request.post('/ab-test/sessions', data),
   deleteSession: (id) => request.delete(`/ab-test/sessions/${id}`)
+}
+
+// API Key 管理（M1 开发者设置）：明文 token 仅创建响应返回一次
+export const apiKeyApi = {
+  list: () => request.get('/api-keys'),
+  create: (data) => request.post('/api-keys', data),
+  revoke: (id) => request.delete(`/api-keys/${id}`)
+}
+
+// Webhook 管理（M1 开发者设置）：secret 仅创建响应返回一次
+export const webhookApi = {
+  list: () => request.get('/webhooks'),
+  create: (data) => request.post('/webhooks', data),
+  remove: (id) => request.delete(`/webhooks/${id}`),
+  deliveries: (id, params) => request.get(`/webhooks/${id}/deliveries`, { params })
 }
 
 // 用户文档API

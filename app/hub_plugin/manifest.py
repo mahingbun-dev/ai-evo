@@ -1,4 +1,4 @@
-"""工具清单：23 个 MCP 工具的单一事实源。
+"""工具清单：25 个 MCP 工具的单一事实源。
 
 每个工具的 route 声明 HTTP 方法、URL 模板、参数去向与 input schema，
 manifest 的 ToolDecl 与 handle 的分发共用这一张表，杜绝声明与实现漂移。
@@ -35,12 +35,14 @@ from .result_summary import (
 
 PLUGIN_NAME = "ai-evo"
 # 中台规则：同版本号契约不可变（VERSION_CONFLICT 拒绝注册）——凡动工具/描述/schema/消息契约必须升此号
-PLUGIN_VERSION = "1.3.0"
+# 1.4.0（M1 QE1-2）：新增 run_task_with_gate / get_gate_status 两工具（评测即门禁）
+PLUGIN_VERSION = "1.4.0"
 PLUGIN_DESCRIPTION = (
     "AI 评测平台（ai-evo）代理：数据集管理与导入（经 anc-hub file-store 的 file_id）、"
     "评测任务的创建/修改/删除与执行、任务轻量状态轮询与执行历史、"
     "单次执行明细分页查询与结果文档导出（markdown/json 上传 file-store 返回 file_id）、"
-    "评测结果摘要查询与任务日志。"
+    "评测结果摘要查询、任务日志与评测门禁（评测即门禁：触发执行后按门禁 verdict 轮询，"
+    "agent 可作为门禁调用方）。"
     "调用方需有平台登录态（经 anc-hub 登录后透传），所有操作以真实用户身份执行并落审计。"
 )
 
@@ -396,6 +398,51 @@ TOOL_ROUTES: Dict[str, _ROUTE_TYPE] = {
             "type": "object",
             "properties": {
                 "task_id": {"type": "string", "description": "任务 ID"},
+            },
+            "required": ["task_id"],
+        },
+    },
+    "run_task_with_gate": {
+        "method": "POST",
+        "path": "/api/v1/evaluation/tasks/{task_id}/run",
+        "path_params": ["task_id"],
+        "body": False,
+        "desc": (
+            "以门禁口径触发评测执行（M1 评测即门禁）：任务配置了门禁阈值"
+            "（gate_config）时，本次执行的聚合结果会被判定 passed/failed/error 并随执行记录落库。"
+            "本工具触发后立即返回，门禁终态用 get_gate_status 轮询——verdict=passed/failed/error "
+            "即终态（语义同 CI：passed=放行 / failed=质量不达标 / error=执行或配置异常）；"
+            "未配置门禁的任务调用本工具等同 task_run（get_gate_status 返回 gate_enabled=false）"
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "description": "任务 ID（需已在平台配置门禁阈值）"},
+            },
+            "required": ["task_id"],
+        },
+    },
+    "get_gate_status": {
+        "method": "GET",
+        "path": "/api/v1/evaluation/tasks/{task_id}/gate",
+        "path_params": ["task_id"],
+        "query_params": ["execution_number"],
+        "body": False,
+        "desc": (
+            "查询评测门禁状态（M1，轮询专用轻端点）：返回任务状态、是否启用门禁与指定执行"
+            "（缺省最新一次）的门禁判定 {verdict: passed|failed|error, checks: 逐阈值实际值, "
+            "evaluated_at}。agent 作为门禁调用方的判定口径：verdict 非 null 即终态——"
+            "passed=放行、failed=质量不达标、error=执行失败/停止或门禁配置异常；"
+            "verdict 为 null 且任务 running 时继续轮询，gate_enabled=false 表示任务未启用门禁"
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "description": "任务 ID"},
+                "execution_number": {
+                    "type": "integer",
+                    "description": "执行序号（第几次执行，从 1 起；缺省=最新一次）",
+                },
             },
             "required": ["task_id"],
         },

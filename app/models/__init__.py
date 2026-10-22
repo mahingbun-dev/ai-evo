@@ -17,6 +17,8 @@ from app.models.team_models import Team
 from app.models.audit_models import OperationLog
 from app.models.stats_models import TaskExecutionStats, WeeklyCoverageConfig, WeeklyPlanTask
 from app.models.plugin_marketplace_models import PluginMarketplace
+from app.models.api_key_models import ApiKey
+from app.models.webhook_models import WebhookEndpoint, WebhookDelivery
 
 __all__ = [
     # 原有模型
@@ -65,4 +67,9 @@ __all__ = [
     "WeeklyPlanTask",
     # 插件市场（插件评测评测对象来源）
     "PluginMarketplace",
+    # API Key（M1 QE1-1，门禁闭环 CI/CLI 凭证）
+    "ApiKey",
+    # Webhook（M1 QE1-3，门禁闭环通知面）
+    "WebhookEndpoint",
+    "WebhookDelivery",
 ]

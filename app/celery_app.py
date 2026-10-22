@@ -42,9 +42,8 @@ celery_app = Celery(
 #     消息投进多个队列（重复消费）；
 #   - 路由表（TASK_ROUTES）是队列归属的单一事实源：新增任务必须在此登记；
 #   - 维护任务统一约定落在 app.tasks.maintenance.* 命名空间（glob 自动路由
-#     maint）。当前仓库尚无维护任务，这条路由是给条目 2-4（工作区归档清理）
-#     预留的命名约定；maint 队列的消费者（worker-maint）同样随 2-4 落地时
-#     再增补 compose 服务——在那之前不要投递 maintenance 任务（无人消费）。
+#     maint）。M1 QE1-3 起 webhook 投递任务（webhook_delivery.deliver_webhook）
+#     落该命名空间；消费者为 compose 的 worker-maint 服务。
 # --------------------------------------------------------------------------
 QUEUE_EVAL = "eval"
 QUEUE_INGEST = "ingest"

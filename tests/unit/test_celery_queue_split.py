@@ -19,11 +19,13 @@
      - 未注入 = 全量三队列（api 等生产者容器/本地开发）；
      - 注入单队列 → 队列声明收敛为该队列（worker 即只消费它）；
      - 拼错队列名 / 空串 → RuntimeError fail-fast（不静默消费错队列）。
-  3. compose 两个 worker 定义完整且同口径（worker=eval，服务名保持不变以
-     兼容部署保活脚本；worker-ingest=ingest）：队列 env、无 command/entrypoint
-     覆盖（走 entrypoint 预检）、healthcheck（inspect ping 定点问本容器）、
-     stop_grace_period=7200s（W10-3）、日志轮转（W13，json-file 50m×3）、
-     共享 uploads/logs 卷、等 volume-init 完成、加固字段。
+  3. compose 各 worker 定义完整且同口径（worker=eval，服务名保持不变以
+     兼容部署保活脚本；worker-ingest=ingest；worker-maint=maint，M1 QE1-3
+     补齐的维护队列消费者）：队列 env、无 command/entrypoint 覆盖（走
+     entrypoint 预检）、healthcheck（inspect ping 定点问本容器）、
+     stop_grace_period（eval/ingest=7200s 长任务口径；maint=300s 秒级任务）、
+     日志轮转（W13，json-file 50m×3）、共享 uploads/logs 卷、等 volume-init
+     完成、加固字段。
 """
 from pathlib import Path
 
@@ -35,8 +37,17 @@ pytestmark = pytest.mark.unit  # W8 分类门禁：纯静态断言，无 docker/
 REPO_ROOT = Path(__file__).resolve().parents[2]
 COMPOSE_PATH = REPO_ROOT / "docker-compose.yml"
 
-# 拆分后的两个 worker 服务：服务名 → 绑定队列（与 app/celery_app.py 对齐）
-WORKER_QUEUE_BINDING = {"worker": "eval", "worker-ingest": "ingest"}
+# 拆分后的 worker 服务：服务名 → 绑定队列（与 app/celery_app.py 对齐）。
+# M1 QE1-3 补 worker-maint（webhook 投递等维护任务的消费者）
+WORKER_QUEUE_BINDING = {
+    "worker": "eval",
+    "worker-ingest": "ingest",
+    "worker-maint": "maint",
+}
+
+# stop_grace_period 口径：eval/ingest 为长任务（task_time_limit 7200s）对齐
+# 7200s（W10-3）；maint 是秒级投递任务，300s 退出窗口足够
+WORKER_STOP_GRACE = {"worker": "7200s", "worker-ingest": "7200s", "worker-maint": "300s"}
 
 
 @pytest.fixture(scope="module")
@@ -207,7 +218,7 @@ class TestComposeWorkerSplit:
         test = svc["healthcheck"]["test"]
         assert " ".join(test).startswith("CMD-SHELL celery -A app.celery_app inspect ping")
         assert "-d celery@$$HOSTNAME" in " ".join(test)
-        assert svc["stop_grace_period"] == "7200s"
+        assert svc["stop_grace_period"] == WORKER_STOP_GRACE[svc_name], svc_name
         assert svc["logging"]["driver"] == "json-file"
         assert svc["logging"]["options"] == {"max-size": "50m", "max-file": "3"}
 

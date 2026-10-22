@@ -28,7 +28,13 @@
               >
                 <div style="display:flex; justify-content:space-between; align-items:center;">
                   <span>第 {{ v.execution_number }} 次执行</span>
-                  <el-tag size="small" :type="getStatusTagType(v.status)">{{ v.status }}</el-tag>
+                  <span style="display:flex; gap:4px; align-items:center;">
+                    <!-- M1：门禁判定随版本摘要返回（未启用门禁不显示） -->
+                    <el-tag v-if="v.gate_result?.verdict" size="small" :type="gateVerdictTagType(v.gate_result.verdict)">
+                      {{ gateVerdictLabel(v.gate_result.verdict) }}
+                    </el-tag>
+                    <el-tag size="small" :type="getStatusTagType(v.status)">{{ v.status }}</el-tag>
+                  </span>
                 </div>
                 <div style="font-size:11px; color:#909399;">{{ formatTime(v.completed_at || v.started_at) }}</div>
               </el-option>
@@ -89,6 +95,45 @@
         </div>
         <div v-else-if="result.status === 'stopped'" class="status-alert">
           <el-alert type="warning" :closable="false" show-icon title="此次执行已被停止，以下展示停止前的部分结果" />
+        </div>
+
+        <!-- M1 门禁横幅：本次执行的门禁判定（通过绿/未通过红/错误橙）+ 逐阈值实际值表 -->
+        <div v-if="result.gate_result?.verdict" class="gate-banner" :class="`gate-${result.gate_result.verdict}`">
+          <div class="gate-banner-head">
+            <el-icon class="gate-banner-icon">
+              <CircleCheckFilled v-if="result.gate_result.verdict === 'passed'" />
+              <CircleCloseFilled v-else-if="result.gate_result.verdict === 'failed'" />
+              <WarningFilled v-else />
+            </el-icon>
+            <span class="gate-banner-title">
+              门禁判定：{{ result.gate_result.verdict === 'passed' ? '通过（PASSED）' : result.gate_result.verdict === 'failed' ? '未通过（FAILED）' : '错误（ERROR）' }}
+            </span>
+            <span v-if="result.gate_result.mode" class="gate-banner-mode">
+              判定方式：{{ result.gate_result.mode === 'any' ? '任一阈值通过' : '全部阈值须通过' }}
+            </span>
+            <span v-if="result.gate_result.evaluated_at" class="gate-banner-time">{{ formatTime(result.gate_result.evaluated_at) }}</span>
+          </div>
+          <el-table v-if="(result.gate_result.checks || []).length" :data="result.gate_result.checks" size="small" class="gate-checks-table">
+            <el-table-column label="指标" min-width="200">
+              <template #default="{ row }">{{ gateMetricLabel(row.metric) }}</template>
+            </el-table-column>
+            <el-table-column label="阈值" width="120">
+              <template #default="{ row }">{{ row.op }} {{ row.value }}</template>
+            </el-table-column>
+            <el-table-column label="实际值" width="110">
+              <template #default="{ row }">{{ row.actual ?? '不可用' }}</template>
+            </el-table-column>
+            <el-table-column label="结果" width="90">
+              <template #default="{ row }">
+                <el-tag :type="row.passed ? 'success' : 'danger'" size="small">
+                  {{ row.passed ? '通过' : '未通过' }}
+                </el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column prop="note" label="说明" min-width="140">
+              <template #default="{ row }">{{ row.note || '-' }}</template>
+            </el-table-column>
+          </el-table>
         </div>
 
         <!-- 详细结果 -->
@@ -2375,7 +2420,7 @@
 <script setup>
 import { ref, reactive, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import { ElMessage } from 'element-plus'
-import { InfoFilled, ArrowDown, Timer, CircleCheck, Link, Warning, CircleClose, User } from '@element-plus/icons-vue'
+import { InfoFilled, ArrowDown, Timer, CircleCheck, CircleCheckFilled, CircleClose, CircleCloseFilled, Warning, WarningFilled, Link, User } from '@element-plus/icons-vue'
 import { taskApi, resultApi } from '@/api'
 import { useTaskPolling } from '@/composables/useTaskPolling'
 import { formatTime } from '@/utils/time'
@@ -3068,6 +3113,17 @@ const openJudgeAssessment = (row) => {
 const getStatusTagType = (status) => {
   const map = { pending: 'info', running: 'warning', completed: 'success', failed: 'danger', stopped: 'info' }
   return map[status] || 'info'
+}
+
+// M1 门禁 verdict 展示口径（横幅/版本下拉共用；语义与 gate_service 对齐）
+const gateVerdictLabel = (verdict) => ({ passed: '通过', failed: '未通过', error: '错误' }[verdict] || verdict)
+const gateVerdictTagType = (verdict) => ({ passed: 'success', failed: 'danger', error: 'warning' }[verdict] || 'info')
+// 指标可读名：total_score/pass_rate 为固定口径，dimension:<名> 拆出维度名
+const gateMetricLabel = (metric) => {
+  if (metric === 'total_score') return '任务均分'
+  if (metric === 'pass_rate') return '行通过率（0-1）'
+  if (typeof metric === 'string' && metric.startsWith('dimension:')) return `维度均分：${metric.slice('dimension:'.length)}`
+  return metric
 }
 
 // 安全地计算百分比，防止 null * 100 崩溃
@@ -4166,6 +4222,8 @@ const loadResultByVersion = async (executionNumber) => {
       total_cost: detail.total_cost,
       completed_at: detail.completed_at,
       error_message: detail.error_message,
+      // M1 门禁判定：单版端点随结果返回（null=该版未启用门禁，横幅不显示）
+      gate_result: detail.gate_result || null,
     }
 
     resultItems.value = safeGetItems(result.value.result)
@@ -4706,6 +4764,68 @@ const renderLatencyHistogram = (res) => {
 
 .status-alert {
   margin-bottom: 16px;
+}
+
+/* M1 门禁横幅：通过绿/未通过红/错误橙，浅底色 + 左侧色条 */
+.gate-banner {
+  margin-bottom: 16px;
+  padding: 14px 16px;
+  border-radius: 8px;
+  border: 1px solid var(--el-color-success-light-7);
+  border-left: 4px solid var(--el-color-success);
+  background: var(--el-color-success-light-9);
+}
+
+.gate-banner.gate-failed {
+  border-color: var(--el-color-danger-light-7);
+  border-left-color: var(--el-color-danger);
+  background: var(--el-color-danger-light-9);
+}
+
+.gate-banner.gate-error {
+  border-color: var(--el-color-warning-light-7);
+  border-left-color: var(--el-color-warning);
+  background: var(--el-color-warning-light-9);
+}
+
+.gate-banner-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+  flex-wrap: wrap;
+}
+
+.gate-banner-head .gate-banner-icon {
+  font-size: 18px;
+}
+
+.gate-banner.gate-passed .gate-banner-icon {
+  color: var(--el-color-success);
+}
+
+.gate-banner.gate-failed .gate-banner-icon {
+  color: var(--el-color-danger);
+}
+
+.gate-banner.gate-error .gate-banner-icon {
+  color: var(--el-color-warning);
+}
+
+.gate-banner-title {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.gate-banner-mode,
+.gate-banner-time {
+  font-size: 12px;
+  color: #909399;
+}
+
+.gate-checks-table {
+  margin-top: 8px;
+  background: transparent;
 }
 
 /* 未选任务时的占位区：min-height 保证加载遮罩 spinner 可见，不再是无反馈白屏 */

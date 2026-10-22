@@ -33,7 +33,7 @@ DEFAULT_TIMEOUT_SECONDS = 30.0
 
 
 class AievoHubPlugin(hubkit.Plugin):
-    """把 ai-evo 的 23 个核心操作暴露为 anc-hub MCP 工具。"""
+    """把 ai-evo 的 25 个核心操作暴露为 anc-hub MCP 工具。"""
 
     def __init__(self) -> None:
         self._base = os.environ.get("AIEVO_API_BASE", DEFAULT_API_BASE).rstrip("/")

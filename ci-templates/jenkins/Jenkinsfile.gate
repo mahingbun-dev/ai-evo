@@ -1,0 +1,30 @@
+// Jenkins 声明式流水线片段：AI-Evo 评测门禁
+//
+// 前置：在 Jenkins 凭据中添加 Secret text：
+//   aievo-api-key  → API Key（aievo_sk_ 开头，需持 tasks:run + tasks:read scope）
+// 环境变量 AIEVO_URL / AIEVO_TASK_ID 按流水线实际情况注入。
+//
+// 退出码：0=门禁通过；1=门禁失败（质量不达标，stage 置 FAILURE 卡发版）；
+//         2=错误（认证/网络/超时等基础设施故障，同样 FAILURE，需人工区分）
+
+pipeline {
+    agent any
+    environment {
+        AIEVO_URL      = 'https://aievo.example.com'
+        AIEVO_TASK_ID  = 'task_xxx'
+        AIEVO_TIMEOUT  = '7200'
+    }
+    stages {
+        stage('AI-Evo 评测门禁') {
+            steps {
+                withCredentials([string(credentialsId: 'aievo-api-key', variable: 'AIEVO_API_KEY')]) {
+                    sh '''
+                        pip install --quiet aievo-cli
+                        aievo config add "$AIEVO_URL" "$AIEVO_API_KEY"
+                        aievo run "$AIEVO_TASK_ID" --wait --timeout "$AIEVO_TIMEOUT" --json
+                    '''
+                }
+            }
+        }
+    }
+}

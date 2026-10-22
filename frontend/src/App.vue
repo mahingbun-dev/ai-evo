@@ -63,6 +63,10 @@
             <el-icon><Switch /></el-icon>
             <span>A/B 对比测试</span>
           </el-menu-item>
+          <el-menu-item index="/dev-settings">
+            <el-icon><Key /></el-icon>
+            <span>开发者设置</span>
+          </el-menu-item>
           <el-menu-item index="/teams" v-if="isSuperAdmin">
             <el-icon><Share /></el-icon>
             <span>团队管理</span>
@@ -120,7 +124,7 @@
 <script setup>
 import { ref, computed, onMounted, provide } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Plus, User, Monitor, Cpu, HomeFilled, FolderOpened, List, Document, DataAnalysis, Fold, Expand, Switch, QuestionFilled, Clock, Share, ChatDotRound, TrendCharts, Files } from '@element-plus/icons-vue'
+import { Plus, User, Monitor, Cpu, HomeFilled, FolderOpened, List, Document, DataAnalysis, Fold, Expand, Switch, QuestionFilled, Clock, Share, ChatDotRound, TrendCharts, Files, Key } from '@element-plus/icons-vue'
 import { authApi, getToken, clearToken } from '@/api/index.js'
 
 const route = useRoute()

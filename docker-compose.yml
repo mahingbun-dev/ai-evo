@@ -147,8 +147,8 @@ services:
   #     CELERY_WORKER_QUEUES 把 task_queues 收敛为 eval（多队列用逗号分隔）；
   #   - 队列名拼错会在容器启动时 fail-fast（celery_app._resolve_task_queues
   #     校验只认 eval/ingest/maint），不会静默消费错队列；
-  #   - maint（清理/迁移）队列当前无任务也无消费者，随条目 2-4 归档清理落地
-  #     时再增补 worker-maint 服务与 app.tasks.maintenance.* 任务。
+  #   - maint（清理/webhook 投递）队列由 worker-maint 独立消费（M1 QE1-3
+  #     起 webhook 投递任务 app.tasks.maintenance.* 落该队列）。
   # 本服务名/容器名保持 worker / ai-evo-worker 不变：scripts/ensure_worker.sh
   # （部署机 cron 每 5 分钟保活）与 scripts/do_deploy.sh（应急旁路脚本）均点名
   # ai-evo-worker 容器名，改名会破坏保活链路（worker-ingest 暂只有
@@ -327,6 +327,71 @@ services:
       - /home/app:rw,exec,nosuid,nodev,uid=10002,gid=10002,mode=0750,size=${TMPFS_HOME_SIZE:-1g}
     # W13：日志轮转 + healthcheck（celery inspect ping 定点问本 worker，
     # 与 worker 同款；容器名不同、各自探各自的）
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.celery_app inspect ping -d celery@$$HOSTNAME --timeout 10"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+      start_period: 90s
+    restart: unless-stopped
+    networks:
+      - ai-evo-net
+
+  # M1 QE1-3：worker-maint 消费 maint 队列（ARCH-2-1 三队列拆分的补齐面）。
+  # 首个维护任务是 webhook 投递（app.tasks.maintenance.webhook_delivery，
+  # glob 路由自动落 maint）——通知面与评测/导入隔离消费：webhook 接收端
+  # 慢/挂不占用 eval/ingest 并发。与 worker-ingest 同口径定义（队列 env/
+  # 加固/健康探活/日志轮转），stop_grace_period 用 300s：maint 任务为秒级
+  # HTTP 投递，无长任务需要 2h 退出窗口（7200s 是 eval/ingest 长任务的口径）。
+  worker-maint:
+    image: ai-evo:${IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile.online
+      args:
+        - NODE_IMAGE=${NODE_IMAGE:-node:24-slim}
+        - PY_IMAGE=${PY_IMAGE:-python:3.12-slim}
+        - PIP_INDEX_URL=${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+        - NPM_REGISTRY=${NPM_REGISTRY:-https://registry.npmmirror.com}
+    container_name: ai-evo-worker-maint
+    depends_on:
+      redis:
+        condition: service_started
+      # ARCH-0-1：等卷属主迁移完成再起（见上方 volume-init）
+      volume-init:
+        condition: service_completed_successfully
+    env_file:
+      - .env
+    environment:
+      - SERVICE_TYPE=worker
+      # 本 worker 只消费 maint 队列（机制见上方 ARCH-2-1 注释块）
+      - CELERY_WORKER_QUEUES=maint
+      - LANGFUSE_ENABLED=false
+      - OPENBLAS_CORETYPE=GENERIC
+      - MKL_DEBUG_CPU_TYPE=5
+      # 外呼代理接线与 worker 同款（webhook 投递是出网面，SSRF 防护另由
+      # 应用层 webhook_url_guard 把关，proxy 是第二道兜底）
+      - HTTP_PROXY=${WORKER_EGRESS_PROXY:-}
+      - HTTPS_PROXY=${WORKER_EGRESS_PROXY:-}
+      - http_proxy=${WORKER_EGRESS_PROXY:-}
+      - https_proxy=${WORKER_EGRESS_PROXY:-}
+      - NO_PROXY=${WORKER_NO_PROXY:-localhost,127.0.0.1,::1,api,redis,postgres,executor,egress}
+      - no_proxy=${WORKER_NO_PROXY:-localhost,127.0.0.1,::1,api,redis,postgres,executor,egress}
+    stop_grace_period: 300s
+    volumes:
+      - ${LOGS_VOLUME:-./logs}:/app/logs
+      - ${UPLOADS_VOLUME:-./uploads}:/app/uploads
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,exec,nosuid,size=${TMPFS_TMP_SIZE:-1g}
+      - /home/app:rw,exec,nosuid,uid=10002,gid=10002,mode=0750,size=${TMPFS_HOME_SIZE:-1g}
     logging:
       driver: json-file
       options:

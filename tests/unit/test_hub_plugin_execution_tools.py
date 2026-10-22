@@ -473,7 +473,7 @@ def test_manifest_declares_new_tools():
         route = TOOL_ROUTES[name]
         assert route["method"] in ("GET", "POST")
         assert route["schema"]["required"], name
-    assert PLUGIN_VERSION == "1.3.0"
+    assert PLUGIN_VERSION == "1.4.0"  # M1 QE1-2 新增两门禁工具升位
 
 
 def test_manifest_export_route_timeout_declared():

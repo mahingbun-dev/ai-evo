@@ -9,6 +9,8 @@ from datetime import datetime
 from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict
 from app.db.session import get_db
 from app.core.config import get_settings
+from app.core import scopes
+from app.core.scopes import require_scope
 from app.services.access_control import (
     ensure_dataset_access,
     ensure_super_admin,
@@ -33,6 +35,18 @@ from pathlib import Path
 import logging
 
 logger = logging.getLogger(__name__)
+
+# M1 QE1-5：数据集创建与导入进 API Key 路由注册表（default-deny 白名单）——
+# CLI（aievo datasets upload）持 datasets:write scope 的 Key 建集并导入；
+# 列表/详情等读端点暂不开放（保持攻击面最小），页面端点走 JWT 不受影响
+scopes.register_api_key_route(
+    "POST", "/api/v1/evaluation/datasets", scopes.DATASETS_WRITE)
+scopes.register_api_key_route(
+    "POST", "/api/v1/evaluation/datasets/{dataset_id}/import/excel",
+    scopes.DATASETS_WRITE)
+scopes.register_api_key_route(
+    "POST", "/api/v1/evaluation/datasets/{dataset_id}/import/json",
+    scopes.DATASETS_WRITE)
 
 
 def _slim_item_data(data):
@@ -377,7 +391,8 @@ def export_dataset_excel(
     )
 
 
-@router.post("", response_model=DatasetResponse, summary="创建数据集")
+@router.post("", response_model=DatasetResponse, summary="创建数据集",
+             dependencies=[Depends(require_scope(scopes.DATASETS_WRITE))])
 def create_dataset(
     body: CreateDatasetRequest,
     request: Request,
@@ -565,7 +580,8 @@ def cleanup_duplicates(
     }
 
 
-@router.post("/{dataset_id}/import/excel", response_model=ImportResponse, summary="从Excel导入数据")
+@router.post("/{dataset_id}/import/excel", response_model=ImportResponse, summary="从Excel导入数据",
+             dependencies=[Depends(require_scope(scopes.DATASETS_WRITE))])
 async def import_from_excel(
     dataset_id: str,
     request: Request,
@@ -595,7 +611,8 @@ async def import_from_excel(
             os.remove(tmp_path)
 
 
-@router.post("/{dataset_id}/import/json", response_model=ImportResponse, summary="从JSON导入数据")
+@router.post("/{dataset_id}/import/json", response_model=ImportResponse, summary="从JSON导入数据",
+             dependencies=[Depends(require_scope(scopes.DATASETS_WRITE))])
 def import_from_json(
     dataset_id: str,
     body: ImportJsonRequest,

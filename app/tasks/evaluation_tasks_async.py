@@ -232,9 +232,32 @@ def run_evaluation_async(task_id: str, stop_event: Optional[StopEventProtocol] =
         aggregated_result["config_snapshot"] = snapshot_used(task)
         log_service.add_log(task_id, "info", "结果聚合完成")
 
+        # ========== 步骤6.5: 门禁判定（M1 QE1-2，评测即门禁） ==========
+        # 聚合完成后按 task.gate_config 判定并随执行记录落库；未启用门禁
+        # 返回 None 不落列。失败/停止收尾路径由 fail_record/stop_record 统一
+        # 落 error verdict（含软超时与 celery on_failure 链路）。
+        gate_result = None
+        try:
+            from app.services.gate_service import evaluate_gate
+
+            gate_result = evaluate_gate(getattr(task, "gate_config", None), aggregated_result)
+            if gate_result is not None:
+                log_service.add_log(
+                    task_id, "info",
+                    f"门禁判定完成：verdict={gate_result.get('verdict')} "
+                    f"（{sum(1 for c in gate_result.get('checks', []) if c.get('passed'))}/"
+                    f"{len(gate_result.get('checks', []))} 项通过）",
+                )
+        except Exception as gate_err:  # noqa: BLE001 - 门禁判定失败不阻断结果落库
+            logger.warning(f"门禁判定失败（不影响评测结果落库）: {gate_err}")
+            from app.services.gate_service import build_error_gate_result
+
+            gate_result = build_error_gate_result(
+                getattr(task, "gate_config", None), f"门禁判定异常：{gate_err}")
+
         # ========== 步骤7: 存储结果 ==========
         log_service.add_log(task_id, "info", "开始存储结果")
-        task_service.complete_task(task_id, aggregated_result)
+        task_service.complete_task(task_id, aggregated_result, gate_result=gate_result)
         log_service.add_log(task_id, "info", "任务完成")
 
         return {

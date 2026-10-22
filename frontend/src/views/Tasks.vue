@@ -1105,6 +1105,69 @@
             </el-button>
           </el-form-item>
         </template>
+
+        <!-- M1 门禁配置：评测即门禁——执行完成按阈值自动判定，CLI `aievo run --wait` 据此卡发布 -->
+        <el-form-item label="门禁配置">
+          <div class="gate-config-block">
+            <div class="gate-config-head">
+              <el-switch v-model="gateEnabledUi" :disabled="dialogBusy" @change="onGateToggle" />
+              <span class="gate-config-tip">启用后每次执行完成自动按阈值判定（通过/失败），供 CI 卡发布</span>
+            </div>
+            <template v-if="gateEnabledUi">
+              <el-radio-group v-model="gateMode" size="small" class="gate-mode-group" :disabled="dialogBusy">
+                <el-radio-button value="all">全部阈值须通过（all）</el-radio-button>
+                <el-radio-button value="any">任一阈值通过即通过（any）</el-radio-button>
+              </el-radio-group>
+              <el-table :data="gateThresholds" size="small" style="width: 100%">
+                <el-table-column label="指标" min-width="220">
+                  <template #default="{ row }">
+                    <el-select v-model="row.metric" placeholder="选择指标" :disabled="dialogBusy">
+                      <el-option v-for="m in gateMetricOptions" :key="m.value" :label="m.label" :value="m.value" />
+                    </el-select>
+                  </template>
+                </el-table-column>
+                <el-table-column label="比较" width="100">
+                  <template #default="{ row }">
+                    <el-select v-model="row.op" :disabled="dialogBusy">
+                      <el-option v-for="o in GATE_OPS" :key="o" :label="o" :value="o" />
+                    </el-select>
+                  </template>
+                </el-table-column>
+                <el-table-column label="阈值" width="150">
+                  <template #default="{ row }">
+                    <el-input-number
+                      v-model="row.value"
+                      :controls="false"
+                      :disabled="dialogBusy"
+                      placeholder="数值"
+                      style="width: 100%"
+                    />
+                  </template>
+                </el-table-column>
+                <el-table-column width="70">
+                  <template #default="{ $index }">
+                    <el-button
+                      type="danger"
+                      size="small"
+                      circle
+                      :icon="Delete"
+                      :disabled="dialogBusy"
+                      @click="gateThresholds.splice($index, 1)"
+                    />
+                  </template>
+                </el-table-column>
+              </el-table>
+              <el-button
+                size="small"
+                :icon="Plus"
+                class="gate-add-btn"
+                :disabled="dialogBusy"
+                @click="gateThresholds.push({ metric: 'total_score', op: '>=', value: null })"
+              >添加阈值</el-button>
+              <div class="gate-config-tip">指标口径：任务均分 / 行通过率（0-1）/ 各维度均分；指标不可用时判 error（CI 按错误处理，不算质量失败）</div>
+            </template>
+          </div>
+        </el-form-item>
       </el-form>
 
       <!-- 指令预览对话框 -->
@@ -1172,6 +1235,15 @@
         <el-table-column label="状态" width="80">
           <template #default="{ row }">
             {{ row.status === 'completed' ? '成功' : row.status === 'failed' ? '失败' : row.status }}
+          </template>
+        </el-table-column>
+        <!-- M1 门禁判定：未启用门禁的执行显示 - -->
+        <el-table-column label="门禁" width="90">
+          <template #default="{ row }">
+            <el-tag v-if="row.gate_result?.verdict" :type="gateVerdictTagType(row.gate_result.verdict)" size="small">
+              {{ gateVerdictLabel(row.gate_result.verdict) }}
+            </el-tag>
+            <span v-else>-</span>
           </template>
         </el-table-column>
         <el-table-column label="开始时间" width="175">
@@ -1419,6 +1491,57 @@ const dialogBusy = computed(() => submitting.value || promptPreviewing.value || 
 
 // 待删除的模板ID（仅标记，任务保存时才真正删除）
 const pendingDeleteTemplateId = ref(null)
+
+// ---------- M1 门禁配置（表单态：gate_config 落库形状为 {mode, thresholds}，null=未启用） ----------
+const GATE_OPS = ['>=', '>', '<=', '<', '==']
+const gateEnabledUi = ref(false)
+const gateMode = ref('all')
+const gateThresholds = ref([])
+
+// 指标口径与后端 gate_service 对齐：total_score=任务均分、pass_rate=行通过率(0-1)、
+// dimension:<维度名>=维度均分（维度列表随当前表单的评测维度联动）
+const gateMetricOptions = computed(() => {
+  const opts = [
+    { value: 'total_score', label: '任务均分（total_score）' },
+    { value: 'pass_rate', label: '行通过率（pass_rate，0-1）' }
+  ]
+  for (const metric of (form.value.evaluation_metrics || [])) {
+    const name = metric && metric.name
+    if (name) opts.push({ value: `dimension:${name}`, label: `维度均分：${name}` })
+  }
+  return opts
+})
+
+// 打开弹窗时从任务 gate_config 同步到表单态
+const applyGateConfig = (gateConfig) => {
+  const cfg = gateConfig && typeof gateConfig === 'object' ? gateConfig : null
+  gateEnabledUi.value = !!cfg
+  gateMode.value = cfg?.mode === 'any' ? 'any' : 'all'
+  gateThresholds.value = (Array.isArray(cfg?.thresholds) ? cfg.thresholds : [])
+    .filter(t => t && t.metric)
+    .map(t => ({ metric: t.metric, op: GATE_OPS.includes(t.op) ? t.op : '>=', value: t.value ?? null }))
+}
+
+// 开关切换：首次启用给一行默认阈值
+const onGateToggle = (enabled) => {
+  if (enabled && gateThresholds.value.length === 0) {
+    gateThresholds.value = [{ metric: 'total_score', op: '>=', value: null }]
+  }
+}
+
+// 提交前收集：过滤无效行（指标/数值缺失）；有效行全空 = 未启用（落 null）
+const collectGateConfig = () => {
+  if (!gateEnabledUi.value) return null
+  const thresholds = gateThresholds.value
+    .filter(t => t.metric && t.value !== null && t.value !== '' && !Number.isNaN(Number(t.value)))
+    .map(t => ({ metric: t.metric, op: t.op || '>=', value: Number(t.value) }))
+  if (thresholds.length === 0) return null
+  return { mode: gateMode.value === 'any' ? 'any' : 'all', thresholds }
+}
+
+// 门禁 verdict 展示口径（执行历史列表与结果页横幅共用语义）
+const gateVerdictLabel = (verdict) => ({ passed: '通过', failed: '未通过', error: '错误' }[verdict] || verdict)
+const gateVerdictTagType = (verdict) => ({ passed: 'success', failed: 'danger', error: 'warning' }[verdict] || 'info')
 
 // 是否选择了已有模板（用于动态切换按钮文字）
 const isExistingTemplate = computed(() => {
@@ -2358,6 +2481,8 @@ const openDialog = async (row = null) => {
     // steps/pre_scripts 已废弃：不进入表单状态（展示归一化已分别并入 score_details / evaluation_targets）
     delete form.value.steps
     delete form.value.pre_scripts
+    // M1 门禁配置回填表单态
+    applyGateConfig(taskDetail.gate_config)
     // 脚本统一落库前的历史引用归一化：script_output 行的 builtin:<name> 改写为脚本记录 id（保存即固化）
     for (const target of (form.value.evaluation_targets || [])) {
       if (target?.source === 'script_output' && target.source_config?.script_id) {
@@ -2424,6 +2549,8 @@ const openDialog = async (row = null) => {
     }
     // 新建任务无旧版结构
     legacyConfigDetected.value = false
+    // M1 门禁配置默认关闭
+    applyGateConfig(null)
   }
   dialogVisible.value = true
 
@@ -3738,6 +3865,8 @@ const submitForm = async () => {
     if (!submitData.dataset_id) {
       submitData.dataset_id = null
     }
+    // M1 门禁配置：表单态收集为落库形状（null=未启用）
+    submitData.gate_config = collectGateConfig()
     // 对话评测：使用裁判配置，保留 judge_variable_config
     if (submitData.evaluation_type === 'dialogue') {
       submitData.template_id = ''
@@ -4534,6 +4663,31 @@ const removeDependency = (metric, index) => {
   font-size: 13px;
   line-height: 1.6;
   color: #303133;
+}
+
+/* M1 门禁配置块（表单内全宽编辑区） */
+.gate-config-block {
+  width: 100%;
+}
+
+.gate-config-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.gate-config-tip {
+  font-size: 12px;
+  color: #909399;
+  line-height: 1.5;
+}
+
+.gate-mode-group {
+  margin: 10px 0;
+}
+
+.gate-add-btn {
+  margin: 8px 0;
 }
 
 /* 请求链变量树形选择样式 */

@@ -153,6 +153,7 @@ class EvaluationTaskService:
         pre_scripts: Optional[List[Dict]] = None,
         model_output_source: Optional[str] = None,
         model_output_field: Optional[str] = None,
+        gate_config: Optional[Dict] = None,
     ) -> EvaluationTask:
         """创建评测任务"""
         # 验证评测类型
@@ -286,6 +287,8 @@ class EvaluationTaskService:
             template_id=template_id,
             # 契约 v3 §五：pre_scripts 一律写 None（脚本编排迁入 evaluation_targets 的 script_output 行）
             pre_scripts=None,
+            # M1 QE1-6：门禁配置（{mode, thresholds}；None=未启用）
+            gate_config=gate_config,
         )
 
         self.db.add(task)
@@ -1110,8 +1113,9 @@ class EvaluationTaskService:
         task_id: str,
         result: Dict[str, Any],
         total_cost: Optional[float] = None,
+        gate_result: Optional[Dict[str, Any]] = None,
     ) -> Optional[EvaluationTask]:
-        """完成任务，同时写入执行历史记录"""
+        """完成任务，同时写入执行历史记录（gate_result：M1 QE1-2 门禁判定）"""
         task = self.get_task(task_id)
         if not task:
             return None
@@ -1137,25 +1141,15 @@ class EvaluationTaskService:
             logger.warning(f"数据库操作异常（complete_task commit）: {e}")
             self.db.rollback()
             # 使用新的数据库会话重试
-            self._retry_with_new_session(lambda: self._complete_task_internal(task_id, result, total_cost))
+            self._retry_with_new_session(
+                lambda: self._complete_task_internal(task_id, result, total_cost))
             # 重试路径：更新统计记录
             self._retry_update_stats_complete(task_id)
+            self._complete_record_with_gate(task_id, result, total_cost, gate_result)
             return self.get_task(task_id)
 
         # 同步写入执行历史记录
-        exec_service = TaskExecutionRecordService(self.db)
-        try:
-            exec_service.complete_record(task_id, task.execution_count or 1, result, total_cost)
-        except OperationalError as e:
-            logger.warning(f"数据库操作异常（complete_record）: {e}")
-            # 执行记录失败不影响主流程，使用新会话重试
-            from app.db.session import SessionLocal
-            new_db = SessionLocal()
-            try:
-                new_exec_service = TaskExecutionRecordService(new_db)
-                new_exec_service.complete_record(task_id, task.execution_count or 1, result, total_cost)
-            finally:
-                new_db.close()
+        self._complete_record_with_gate(task_id, result, total_cost, gate_result)
 
         # 更新统计记录
         from app.services.stats_service import StatsService
@@ -1188,6 +1182,33 @@ class EvaluationTaskService:
                 new_db.commit()
         finally:
             new_db.close()
+
+    def _complete_record_with_gate(
+        self,
+        task_id: str,
+        result: Dict[str, Any],
+        total_cost: Optional[float],
+        gate_result: Optional[Dict[str, Any]],
+    ) -> None:
+        """complete_record 薄封装（M1 QE1-2 带 gate_result）：断连时新会话重试，
+        执行记录写失败不影响任务主流程（与既有口径一致）"""
+        task = self.get_task(task_id)
+        execution_number = (task.execution_count or 1) if task else 1
+        exec_service = TaskExecutionRecordService(self.db)
+        try:
+            exec_service.complete_record(
+                task_id, execution_number, result, total_cost, gate_result=gate_result)
+        except OperationalError as e:
+            logger.warning(f"数据库操作异常（complete_record）: {e}")
+            # 执行记录失败不影响主流程，使用新会话重试
+            from app.db.session import SessionLocal
+            new_db = SessionLocal()
+            try:
+                new_exec_service = TaskExecutionRecordService(new_db)
+                new_exec_service.complete_record(
+                    task_id, execution_number, result, total_cost, gate_result=gate_result)
+            finally:
+                new_db.close()
 
     def _retry_with_new_session(self, func):
         """使用新数据库会话执行操作"""
@@ -1570,14 +1591,71 @@ class TaskExecutionRecordService:
         except Exception as e:
             logger.warning(f"写入实际使用配置摘要失败（task_id={record.task_id}）: {e}")
 
+    def _attach_gate_error_verdict(self, record: TaskExecutionRecord, reason: str) -> None:
+        """M1 QE1-2：失败/停止收尾统一落门禁 error verdict
+
+        执行没跑完就没有聚合，门禁无从判定——启用门禁的任务在 fail/stop
+        收尾时落 error verdict（CLI 退出码 2，与质量不达标的 failed 严格
+        区分）；未启用门禁不落（列保持 NULL）。已有判定不覆盖。失败仅
+        告警，不影响收尾主流程（与 config_snapshot 附加写同口径）。
+        """
+        try:
+            if record.gate_result is not None:
+                return
+            task = self.db.query(EvaluationTask).filter(
+                EvaluationTask.id == record.task_id
+            ).first()
+            if task is None:
+                return
+            from app.services.gate_service import build_error_gate_result
+
+            gate_result = build_error_gate_result(task.gate_config, reason)
+            if gate_result is not None:
+                record.gate_result = gate_result
+        except Exception as e:
+            logger.warning(f"写入门禁 error verdict 失败（task_id={record.task_id}）: {e}")
+
+    def _emit_webhook_events(self, task_id: str, execution_number: int,
+                             status: str, gate_result: Optional[Dict[str, Any]]) -> None:
+        """M1 QE1-3：执行终态事件旁路派发（task.execution.completed/failed、gate.failed）
+
+        旁路能力（与 alert_service 同口径）：任何失败只记 warning，
+        绝不打断评测收尾主流程。门禁 verdict=failed 额外发 gate.failed。
+        """
+        try:
+            from app.services import webhook_service
+
+            task = self.db.query(EvaluationTask).filter(
+                EvaluationTask.id == task_id
+            ).first()
+            team_code = task.team_code if task is not None else None
+            if status == "completed":
+                events = [("task.execution.completed", status)]
+                if isinstance(gate_result, dict) and gate_result.get("verdict") == "failed":
+                    events.append(("gate.failed", status))
+            else:
+                events = [("task.execution.failed", status)]
+            for event, event_status in events:
+                webhook_service.dispatch_event(
+                    event, team_code,
+                    webhook_service.build_execution_payload(
+                        task_id=task_id, execution_number=execution_number,
+                        status=event_status, team_code=team_code,
+                        gate_result=gate_result),
+                    db=self.db,
+                )
+        except Exception as e:  # noqa: BLE001 - 旁路：绝不抛出
+            logger.warning(f"webhook 事件派发失败（task_id={task_id}）: {e}")
+
     def complete_record(
         self,
         task_id: str,
         execution_number: int,
         result: Dict[str, Any],
         total_cost: Optional[float] = None,
+        gate_result: Optional[Dict[str, Any]] = None,
     ) -> Optional[TaskExecutionRecord]:
-        """标记执行记录为已完成"""
+        """标记执行记录为已完成（gate_result：M1 QE1-2 聚合后的门禁判定）"""
         record = self._get_current_record(task_id, execution_number)
         if not record:
             # 如果记录不存在，创建一个新记录（兼容旧任务或create_record失败的情况）
@@ -1588,6 +1666,7 @@ class TaskExecutionRecordService:
                 status="completed",
                 result=result,
                 total_cost=total_cost,
+                gate_result=gate_result,
                 started_at=beijing_now(),
                 completed_at=beijing_now(),
             )
@@ -1595,14 +1674,19 @@ class TaskExecutionRecordService:
             self._attach_used_config_summary(record)
             self.db.add(record)
             self.db.commit()
+            # M1 QE1-3：完成事件旁路派发（含 gate.failed）
+            self._emit_webhook_events(task_id, execution_number, "completed", gate_result)
             return record
         record.status = "completed"
         record.result = result
         record.total_cost = total_cost
+        record.gate_result = gate_result
         record.completed_at = beijing_now()
         # W4：执行结束写入该次实际使用的配置摘要（归因锚点）
         self._attach_used_config_summary(record)
         self.db.commit()
+        # M1 QE1-3：完成事件旁路派发（含 gate.failed）
+        self._emit_webhook_events(task_id, execution_number, "completed", gate_result)
         return record
 
     def fail_record(self, task_id: str, execution_number: int, error: str) -> Optional[TaskExecutionRecord]:
@@ -1624,6 +1708,8 @@ class TaskExecutionRecordService:
             self._attach_used_config_summary(record)
             self.db.add(record)
             self.db.commit()
+            # M1 QE1-3：失败事件旁路派发
+            self._emit_webhook_events(task_id, execution_number, "failed", None)
             return record
         record.status = "failed"
         record.error_message = error
@@ -1631,7 +1717,11 @@ class TaskExecutionRecordService:
         record.completed_at = beijing_now()
         # W4：执行结束写入该次实际使用的配置摘要（归因锚点）
         self._attach_used_config_summary(record)
+        # M1 QE1-2：失败收尾落门禁 error verdict（断点续跑前上一轮失败可查）
+        self._attach_gate_error_verdict(record, f"评测失败：{error}")
         self.db.commit()
+        # M1 QE1-3：失败事件旁路派发（该轮 gate_result 若已存在则随事件带给订阅方）
+        self._emit_webhook_events(task_id, execution_number, "failed", record.gate_result)
         return record
 
     def stop_record(
@@ -1663,6 +1753,8 @@ class TaskExecutionRecordService:
         record.completed_at = beijing_now()
         # W4：执行结束写入该次实际使用的配置摘要（归因锚点）
         self._attach_used_config_summary(record)
+        # M1 QE1-2：停止收尾落门禁 error verdict（续跑开新执行序号，本轮判定即终态）
+        self._attach_gate_error_verdict(record, "评测被停止，门禁无法判定")
         self.db.commit()
         return record
 
@@ -1687,6 +1779,7 @@ class TaskExecutionRecordService:
                 TaskExecutionRecord.error_message,
                 TaskExecutionRecord.started_at,
                 TaskExecutionRecord.completed_at,
+                TaskExecutionRecord.gate_result,
             )
             .filter(TaskExecutionRecord.task_id == task_id)
             .order_by(TaskExecutionRecord.execution_number.desc())
@@ -1702,6 +1795,9 @@ class TaskExecutionRecordService:
                 "error_message": r.error_message,
                 "started_at": r.started_at.isoformat() if r.started_at else None,
                 "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+                # M1 QE1-6：摘要携带门禁判定（结果页版本列表直接渲染 verdict，
+                # 免逐版拉全量）；gate_result 是小 JSON 列，不违反摘要轻量化口径
+                "gate_result": r.gate_result,
             }
             for r in rows
         ]
