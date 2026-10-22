@@ -123,3 +123,12 @@ volume-init、AUTH_JWT_SECRET fail-fast 等）全部保留，不受本次同步�
 | export 端点测试与脱敏后源码口径失配（恒 401） | 测试补 `HUB_SSO_COOKIE_NAME` 配置注入，断言对齐新文案 |
 | `test_arch_3_3_image_scan` 缺 `ensure_git_bin` 桩 | `_wire` 夹具补桩（与增量自带测试同款） |
 | `test_deploy_frontend_only` 读 `.gitlab-ci.yml`（本仓库线无此文件） | 文件缺席时 skip（企业 CI 线专属断言） |
+
+CI 轮次补充修复（本地无 PG/无镜像扫描环境覆盖不到的面）：
+
+| 问题 | 修复 |
+|---|---|
+| `test_migration_w9` 三方合并残留 `W9_HEAD` 未定义引用（CI 带 PG 实测抓出） | 对齐源版本 `upgrade head` |
+| trivy 新披露 CVE：Pillow 12.3.0（CRITICAL×3+HIGH 若干）、aiohttp 3.14.3（HIGH×2）——依赖版本本同步未动，系漏洞库时效致基线同样扫红 | 主镜像与 script-runner 镜像 Pillow→13.0.0、aiohttp→3.14.4；`RUNNER_IMAGE_PACKAGES` 静态清单门禁同步 |
+
+最终 CI：Backend tests / Docker build / Frontend build / trivy 四项全绿。
