@@ -1,6 +1,6 @@
-# AgentEvo — Self-hosted AI Evaluation Platform
+# AgentEvo — Self-hosted Agent Quality Engineering Platform
 
-Systematically and quantitatively evaluate the response quality of LLMs and Agents — model configs, dataset management, pre-evaluation scripts, 9 evaluation types with AI judges, result analytics and A/B testing. Built with FastAPI + Vue 3 + Celery, deployable as a single Docker Compose stack.
+AgentEvo is a self-hosted Agent quality engineering platform — the positioning is *evaluation as a release gate*: model and Agent changes pass evaluation before they ship. Live today: model configs, dataset management, pre-evaluation scripts, 8 evaluation types with AI judges, result analytics and A/B testing. The release-gate loop itself (threshold gates, API keys, CI CLI, webhooks) lands with the next milestone (M1). Built with FastAPI + Vue 3 + Celery, deployable as a single Docker Compose stack.
 
 ![Home](docs/assets/00-home.png)
 
@@ -21,8 +21,8 @@ Preparation → Evaluation → Analysis, in one platform:
 | Model configs | OpenAI / Anthropic compatible endpoints, custom HTTP (import from curl), runtime variable injection, streaming connectivity test |
 | Datasets | Excel import (dynamic fields), Agent session file import, media fields, field-level validation |
 | Script library | Pre-evaluation scripts (zip / folder packages), `model.py` contract declaration, online file-tree editing, scaffold templates |
-| Evaluation tasks | AI judge / Agent long-session / consistency / success-rate / RAG retrieval / binary classification, batch runs, real-time progress over WebSocket |
-| Judge engines | Claude Code judge, DeepSeek Harness judge, generic LLM judge graph; per-task evaluation dimensions |
+| Evaluation tasks | AI judge / Agent long-session / consistency / success-rate / RAG retrieval / binary classification / latency / plugin, batch runs, real-time progress over WebSocket |
+| Judge engines | Claude Code judge (default) and the generic LLM judge graph are live; the DeepSeek harness judge is adapter-ready with task-flow wiring landing at M8; per-task evaluation dimensions |
 | Results & analytics | Score details, run-to-run history, Excel/JSON/CSV export, trend statistics, side-by-side A/B comparison |
 | Administration | Teams and user enable/disable (super admin), audit log, built-in user guide |
 
@@ -92,6 +92,10 @@ the offline/CI pipeline (locked wheels, bundled Claude Code CLI) is described in
 | Success rate | Share of successful calls | No |
 | RAG retrieval | Precision / recall and 4 more retrieval metrics | Partial |
 | Binary classification | Label comparison: accuracy / sensitivity / specificity | No |
+| Latency | Per-call response time against a configurable threshold (avg / p50 / p90 / p99) | No |
+| Plugin | Static lint of imported plugin packages (7 sub-scores), optionally plus a judge-layer rubric review (standard mode) | Standard mode only |
+
+Safety and dialogue evaluation show up in the UI as *planned* (disabled) — their execution chain lands with the M3 security-evaluation milestone.
 
 ## Documentation
 
