@@ -23,6 +23,7 @@ Preparation → Evaluation → Analysis, in one platform:
 | Script library | Pre-evaluation scripts (zip / folder packages), `model.py` contract declaration, online file-tree editing, scaffold templates |
 | Evaluation tasks | AI judge / Agent long-session / consistency / success-rate / RAG retrieval / binary classification, batch runs, real-time progress over WebSocket |
 | Judge engines | Claude Code judge, DeepSeek Harness judge, generic LLM judge graph; per-task evaluation dimensions |
+| Judge concurrency pool | Global cap on judge LLM concurrency: independent limits per graph / claude_agent / harness / plugin engine, lease heartbeat and zombie reclamation, super-admin monitor and config page |
 | Results & analytics | Score details, run-to-run history, Excel/JSON/CSV export, trend statistics, side-by-side A/B comparison |
 | Administration | Teams and user enable/disable (super admin), audit log, built-in user guide |
 
