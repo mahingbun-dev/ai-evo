@@ -385,3 +385,28 @@ def test_plugin_evaluator_uses_plugin_engine(monkeypatch):
     monkeypatch.setattr(evaluator, "_evaluate_legacy", lambda *a, **k: {"success": True})
     evaluator.evaluate(plugin_path="/tmp/x")
     assert calls == ["plugin"]
+
+
+def test_plugin_evaluator_trace_uses_plugin_engine(monkeypatch):
+    """evaluate_trace 的最外层包裹必须有测试守住：漏掉后长达数十分钟的 trace 评测
+    会静默不占 plugin 额度（限额失控），且行级行为本身察觉不到"""
+    from app.services import plugin_evaluator as mod
+
+    calls = []
+
+    class Ctx:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(mod, "judge_pool_slot", lambda engine, meta=None: (calls.append(engine), Ctx())[1])
+    evaluator = mod.PluginEvaluator(engine="legacy")
+    # 只验入池位置，不真跑评测（真实实现会起子进程/评数十分钟）
+    monkeypatch.setattr(
+        evaluator, "_evaluate_trace_unpooled", lambda *a, **k: {"success": True, "evaluation_mode": "trace"}
+    )
+    result = evaluator.evaluate_trace("/tmp/x")
+    assert result["success"] is True
+    assert calls == ["plugin"]
