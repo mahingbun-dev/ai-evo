@@ -12,6 +12,7 @@ import logging
 from typing import Dict, Any, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from langgraph.graph.state import CompiledStateGraph
+from app.services.judge_pool.context import capture_context, run_in_context
 from .judge_graph_builder import compile_judge_graph
 from .judge_graph_state import JudgeAgentState
 import uuid
@@ -152,8 +153,9 @@ class JudgeLangGraphAgent:
         results = []
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # 每次 submit 单独复制任务上下文（同一 Context 不可被多线程并发进入）
             futures = {
-                executor.submit(self.run, state_input, i): i
+                executor.submit(run_in_context, capture_context(), self.run, state_input, i): i
                 for i in range(judge_count)
             }
             for future in as_completed(futures):

@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 from jsonpath import jsonpath
 
+from app.services.judge_pool import judge_pool_slot
+
 logger = logging.getLogger(__name__)
 
 
@@ -380,7 +382,8 @@ class JudgeResponseParser:
             from app.services.model_caller import ModelCallerSync
 
             model_caller = ModelCallerSync()
-            result = model_caller.call(messages, self.judge_config, {})
+            with judge_pool_slot("graph", meta={"call_site": "response_parser"}):
+                result = model_caller.call(messages, self.judge_config, {})
 
             if result.get("success"):
                 content = result.get("content", "")

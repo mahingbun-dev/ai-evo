@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+from app.services.judge_pool.context import capture_context, run_in_context
 from app.services.metric_scoring import format_score_range, metric_max_score
 
 logger = logging.getLogger(__name__)
@@ -108,9 +109,17 @@ class ClaudeCodeJudgeAgent:
         max_workers = min(judge_count, 4)
         results: List[Dict[str, Any]] = []
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # 每次 submit 单独复制任务上下文（同一 Context 不可被多线程并发进入）
             futures = {
                 executor.submit(
-                    self._run_single, config, system_prompt, user_prompt, session_file, i
+                    run_in_context,
+                    capture_context(),
+                    self._run_single,
+                    config,
+                    system_prompt,
+                    user_prompt,
+                    session_file,
+                    i,
                 ): i
                 for i in range(judge_count)
             }

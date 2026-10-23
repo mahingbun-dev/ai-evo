@@ -37,6 +37,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
+from app.services.judge_pool.context import capture_context, run_in_context
 from app.services.plugin_eval import engine as plugin_engine
 from app.services.plugin_eval.parser import detect_target, parse_plugin, parse_skill, parse_skill_content
 from app.services.plugin_eval.static_layer import StaticAnalyzer
@@ -1311,7 +1312,14 @@ class PluginEvaluator:
 
         results = {}
         with ThreadPoolExecutor(max_workers=4) as pool:
-            for key, parsed in pool.map(_call, assessments):
+            # 每次提交单独复制任务上下文（同一 Context 不可被多线程并发进入）；
+            # 按提交顺序取结果，与原先 pool.map 的迭代/异常语义一致
+            futures = [
+                pool.submit(run_in_context, capture_context(), _call, item)
+                for item in assessments
+            ]
+            for future in futures:
+                key, parsed = future.result()
                 results[key] = parsed
 
         raw_scores = {

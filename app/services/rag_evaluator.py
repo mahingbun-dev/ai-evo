@@ -11,6 +11,8 @@ import logging
 import re
 from typing import Dict, List, Any, Optional
 
+from app.services.judge_pool import judge_pool_slot
+
 logger = logging.getLogger(__name__)
 
 
@@ -464,7 +466,8 @@ class LLMRagEvaluator:
                 "provider": "openai",
                 "model_type": "gpt-4o-mini",
             }
-            result = ModelCallerSync.call(messages, config)
+            with judge_pool_slot("graph", meta={"call_site": "rag_evaluator"}):
+                result = ModelCallerSync.call(messages, config)
             if result.get("success"):
                 content = result.get("content", "")
                 logger.warning("LLM裁判原始响应末尾: %r", content[-300:])
