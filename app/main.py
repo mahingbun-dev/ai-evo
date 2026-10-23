@@ -36,6 +36,7 @@ from app.api.deepseek_harness_config_api import router as deepseek_harness_confi
 from app.api.hub_file_api import router as hub_file_router
 from app.api.hub_import_api import router as hub_import_router, dataset_router as hub_import_dataset_router
 from app.api.plugin_marketplace_api import router as plugin_marketplace_router
+from app.api.judge_pool_api import router as judge_pool_router
 from app.middleware.auth_middleware import AuthMiddleware
 from app.db.session import engine, Base
 from app.core.config import get_settings, validate_runtime_settings
@@ -259,6 +260,7 @@ app.include_router(hub_import_dataset_router, prefix=settings.API_V1_STR)
 app.include_router(hub_import_router, prefix=settings.API_V1_STR)
 app.include_router(deepseek_harness_config_router, prefix=settings.API_V1_STR)
 app.include_router(plugin_marketplace_router, prefix=settings.API_V1_STR + "/evaluation")
+app.include_router(judge_pool_router, prefix=settings.API_V1_STR)
 
 # WebSocket 路由（不需要 API_V1_STR 前缀）
 app.include_router(task_status_router)
