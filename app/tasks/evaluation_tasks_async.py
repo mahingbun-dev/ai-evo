@@ -15,6 +15,7 @@ from celery.exceptions import SoftTimeLimitExceeded
 from app.core.config import get_settings
 from app.db.session import engine, SessionLocal
 from app.services.evaluation_task_service import EvaluationTaskService, TaskExecutionLogService
+from app.services.judge_pool.errors import JudgePoolAborted, JudgePoolTimeout
 
 logger = logging.getLogger(__name__)
 
@@ -596,7 +597,10 @@ def _execute_evaluation(task, payloads: List[Dict], db, task_id: str, stop_event
     # 专用路径保留供适配器委托与直调使用
 
     executor = EvaluationExecutor(
-        max_workers=min(task.judge_count or 4, 4),
+        max_workers=4,
+        # 行并发改由任务级 concurrency 决定（与裁判数量解耦：judge_count<4 的
+        # 任务此前被钳到裁判数，行并行度被无谓压低）；存量任务缺字段时回退 4
+        concurrency=getattr(task, "concurrency", None),
         task_id=task_id,
         stop_event=stop_event,
         langfuse_host=langfuse_host,
@@ -626,6 +630,7 @@ def _execute_rag_evaluation(
 
     executor = EvaluationExecutor(
         max_workers=4,
+        concurrency=getattr(task, "concurrency", None),
         task_id=task_id,
         stop_event=stop_event,
         langfuse_host=langfuse_host,
@@ -720,9 +725,18 @@ def _execute_consistency_evaluation(task, payloads: List[Dict], db, task_id: str
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
-                consistency_result = loop.run_until_complete(
-                    evaluator.evaluate_single(user_input, repeat_count, use_judge)
-                )
+                # 行级 judge 上下文：一致性评测启用裁判时同样在池里排队，
+                # 绑定任务/行/停止信号才能归属租约并在排队期响应停止
+                from app.services.judge_pool import bind_judge_context
+
+                with bind_judge_context(
+                    eval_task_id=task_id,
+                    row_idx=payload.get("idx", idx),
+                    stop_checker=stop_event,
+                ):
+                    consistency_result = loop.run_until_complete(
+                        evaluator.evaluate_single(user_input, repeat_count, use_judge)
+                    )
             finally:
                 _restore_event_loop(prev_loop)
                 loop.close()
@@ -747,6 +761,9 @@ def _execute_consistency_evaluation(task, payloads: List[Dict], db, task_id: str
 
         except SoftTimeLimitExceeded:
             # W3-4：软超时不得按行失败吞掉（P0-E），上抛触发收尾
+            raise
+        except JudgePoolAborted:
+            # 池等待期间任务被停止：上抛走停止收尾，不记该行评测失败
             raise
         except Exception as e:
             logger.exception(f"一致性评测执行失败 (idx={idx})")
@@ -1145,6 +1162,13 @@ def _execute_plugin_evaluation(task, payloads: List[Dict], task_id: str, db, sto
         except SoftTimeLimitExceeded:
             # W3-4：软超时不得按行失败吞掉（P0-E），上抛触发收尾
             raise
+        except JudgePoolTimeout:
+            # 池等待超时不能按行失败慢速消耗（每行都要再等满 wait_timeout）：
+            # 与软超时同等上抛，任务带着明确的超时信息快速失败
+            raise
+        except JudgePoolAborted:
+            # 池等待期间任务被停止：上抛走停止收尾，不伪装成插件评测失败
+            raise
         except Exception as e:
             logger.exception(f"插件评测执行失败 (idx={idx})")
             failed_item = {
@@ -1299,6 +1323,13 @@ def _execute_plugin_trace_evaluation(task, payloads: List[Dict], task_id: str, d
 
         except SoftTimeLimitExceeded:
             # W3-4：软超时不得按行失败吞掉（P0-E），上抛触发收尾
+            raise
+        except JudgePoolTimeout:
+            # 池等待超时不能按行失败慢速消耗（trace 行本身可合法占用池位数十分钟，
+            # 逐行再等满 wait_timeout 会让任务卡数小时）：与软超时同等上抛快速失败
+            raise
+        except JudgePoolAborted:
+            # 池等待期间任务被停止：上抛走停止收尾，不伪装成 trace 评测失败
             raise
         except Exception as e:
             logger.exception(f"插件 trace 评测执行失败 (idx={idx})")

@@ -1,7 +1,8 @@
 """
 并发评测执行器
 
-使用ThreadPoolExecutor实现最大并发数为4的评测执行，
+使用ThreadPoolExecutor实现评测执行：行并发数取任务 concurrency
+（缺省 4，钳制 1~64），总并发仍受 judge 并发池限额约束，
 支持通过 threading.Event 中断任务执行。
 """
 import json
@@ -15,6 +16,7 @@ from typing import List, Dict, Any, Optional
 from celery.exceptions import SoftTimeLimitExceeded
 
 from app.db.session import engine, SessionLocal
+from app.services.judge_pool.errors import JudgePoolAborted
 from app.services.metric_scoring import has_custom_dimension_max
 
 logger = logging.getLogger(__name__)
@@ -36,12 +38,13 @@ class EvaluationExecutor:
         langfuse_host: str = "",
         execution_number: Optional[int] = None,
         progress_offset: int = 0,
+        concurrency: Optional[int] = None,
     ):
         """
         初始化执行器
 
         Args:
-            max_workers: 最大并发数
+            max_workers: 最大并发数（未传 concurrency 时的行级并发数）
             task_id: 任务ID，用于日志和进度更新
             stop_event: 停止信号，设置后执行器在下一个检查点退出
             langfuse_host: LangFuse 服务地址（用于 LangGraph 裁判追踪）
@@ -49,8 +52,12 @@ class EvaluationExecutor:
                 非任务执行链路（单测直调等），跳过行级 write-through
             progress_offset: 进度偏移（W3 断点续跑：本轮已跳过的已完成行数，
                 使续跑进度显示为累计值而非从零回退）
+            concurrency: 任务级行并发数（EvaluationTask.concurrency）；None 时
+                沿用 max_workers，钳制到 1~64
         """
-        self.max_workers = min(max_workers, 4)  # 最大并发数为4
+        self.concurrency = concurrency
+        base = concurrency if concurrency is not None else max_workers
+        self.max_workers = max(1, min(int(base or 1), 64))
         self.task_id = task_id
         self.stop_event = stop_event or threading.Event()
         self.langfuse_host = langfuse_host
@@ -107,6 +114,10 @@ class EvaluationExecutor:
                     # 软超时不得按行失败吞掉（P0-E/W3-4）：立即上抛触发收尾，
                     # 已落库行保留，由 run_evaluation_async 标记任务失败
                     raise
+                except JudgePoolAborted:
+                    # 池等待期间任务被停止：按停止落行，不能被下面的宽 except
+                    # 洗成「评测执行失败」（停止不是裁判/评测错误）
+                    results.append({"idx": pos, "success": False, "error": "任务已停止"})
                 except Exception as e:
                     logger.exception(f"评测执行失败 (idx={pos})")
                     results.append({
@@ -443,6 +454,26 @@ class EvaluationExecutor:
             }
 
     def _evaluate_single(
+        self,
+        payload: Dict[str, Any],
+        task,
+    ) -> Dict[str, Any]:
+        """单条评测入口：先把 judge 上下文绑到本行工作线程再执行
+
+        裁判调用在池里排队时，只有工作线程携带 eval_task_id/row_idx/stop_checker，
+        才能把租约归属记到本行、并在排队期间响应停止信号（JudgePoolAborted）。
+        薄包装不消费 task 的任何新属性——单测直调（MockTask 无 concurrency）不受影响。
+        """
+        from app.services.judge_pool import bind_judge_context
+
+        with bind_judge_context(
+            eval_task_id=self.task_id,
+            row_idx=payload.get("idx", 0),
+            stop_checker=self.stop_event,
+        ):
+            return self._evaluate_single_inner(payload, task)
+
+    def _evaluate_single_inner(
         self,
         payload: Dict[str, Any],
         task,
@@ -970,6 +1001,9 @@ class EvaluationExecutor:
                 except SoftTimeLimitExceeded:
                     # 软超时不得按行失败吞掉（P0-E/W3-4）：上抛触发收尾
                     raise
+                except JudgePoolAborted:
+                    # 池等待期间任务被停止：按停止落行，不伪装成 RAG 评测失败
+                    results.append({"idx": pos, "success": False, "error": "任务已停止"})
                 except Exception as e:
                     logger.exception(f"RAG 评测执行失败 (idx={pos})")
                     results.append({
@@ -1167,6 +1201,25 @@ class EvaluationExecutor:
         return result
 
     def _evaluate_single_rag(
+        self,
+        payload: Dict[str, Any],
+        task,
+    ) -> Dict[str, Any]:
+        """单条 RAG 评测入口：先把 judge 上下文绑到本行工作线程再执行
+
+        同 _evaluate_single：RAG 指标裁判也要在池等待期响应停止信号，
+        并把租约归属记到本行。
+        """
+        from app.services.judge_pool import bind_judge_context
+
+        with bind_judge_context(
+            eval_task_id=self.task_id,
+            row_idx=payload.get("idx", 0),
+            stop_checker=self.stop_event,
+        ):
+            return self._evaluate_single_rag_inner(payload, task)
+
+    def _evaluate_single_rag_inner(
         self,
         payload: Dict[str, Any],
         task,
@@ -1540,6 +1593,7 @@ def _call_rag_api(
     payload = {"question": question, "top_k": top_k}
 
     try:
+        # norm-exempt: api-trace —— 这是调用被评测方 RAG 接口取上下文，非前端 UI 请求
         response = requests.post(
             endpoint,
             json=payload,

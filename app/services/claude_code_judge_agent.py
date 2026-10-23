@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from app.services.judge_pool.context import capture_context, run_in_context
+from app.services.judge_pool.errors import JudgePoolAborted
 from app.services.metric_scoring import format_score_range, metric_max_score
 
 logger = logging.getLogger(__name__)
@@ -126,6 +127,9 @@ class ClaudeCodeJudgeAgent:
             for future in as_completed(futures):
                 try:
                     results.append(future.result())
+                except JudgePoolAborted:
+                    # 停止信号导致的池中止不记裁判失败：上抛交给任务停止收尾
+                    raise
                 except Exception as e:
                     logger.error(f"[CCJudge] 并行执行中裁判 {futures[future]} 失败: {e}")
                     # W2-1 失败显式标记：score 置 None + judge_failed=True，
@@ -173,6 +177,10 @@ class ClaudeCodeJudgeAgent:
                 result["langfuse_trace_id"] = trace_id
                 result["langfuse_trace_url"] = trace_url
             return result
+        except JudgePoolAborted:
+            # 池等待期间任务被停止：停止不是裁判失败，上抛交给停止收尾链路，
+            # 不能被下面的宽 except 记成 judge_failed=True/llm_error
+            raise
         except Exception as e:
             logger.exception(f"[CCJudge] 裁判 {judge_index} 执行失败")
             if trace:
