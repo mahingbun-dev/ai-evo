@@ -72,6 +72,9 @@ class EvaluationTask(Base):
     # 裁判数量配置
     judge_count = Column(Integer, default=6, comment="裁判数量")
 
+    # 行级并发数（裁判池总闸之外的每任务并行度）
+    concurrency = Column(Integer, default=4, server_default="4", comment="行级并发数")
+
     # 裁判模型配置快照（W4，P0-C：创建时对 task.judge_model 指向的 ModelConfig
     # 深拷贝快照，口径字段+掩码凭据，严禁明文 api_key；执行时快照优先）
     judge_model_config = Column(JSON, nullable=True, comment="裁判模型配置快照（W4 创建时写入，仅掩码凭据）")
