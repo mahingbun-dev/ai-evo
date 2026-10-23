@@ -113,7 +113,14 @@ class EvaluationExecutor:
 
                 except SoftTimeLimitExceeded:
                     # 软超时不得按行失败吞掉（P0-E/W3-4）：立即上抛触发收尾，
-                    # 已落库行保留，由 run_evaluation_async 标记任务失败
+                    # 已落库行保留，由 run_evaluation_async 标记任务失败。
+                    # 上抛前先置停止信号：raise 会先走 with 块的 __exit__
+                    # （shutdown(wait=True)），排队行还卡在 judge_pool.acquire
+                    # 里最长等 wait_timeout（900s）；软超时 6600s / 硬超时
+                    # 7200s 只剩 600s 余量，等不完就撞硬 SIGKILL，留下幽灵
+                    # 等待者扩散到其他任务。置位后池等待 ≤2s 内以
+                    # JudgePoolAborted 退出
+                    self.stop_event.set()
                     raise
                 except JudgePoolAborted:
                     # 池等待期间任务被停止：按停止落行，不能被下面的宽 except
@@ -1005,7 +1012,11 @@ class EvaluationExecutor:
                     results.append(result)
                     self._update_progress(len(results), total)
                 except SoftTimeLimitExceeded:
-                    # 软超时不得按行失败吞掉（P0-E/W3-4）：上抛触发收尾
+                    # 软超时不得按行失败吞掉（P0-E/W3-4）：上抛触发收尾。
+                    # 先置停止信号，否则 with 块 __exit__ 的 shutdown(wait=True)
+                    # 会等排队行在 judge_pool.acquire 里耗到 wait_timeout，
+                    # 撞硬超时 SIGKILL 后留下幽灵等待者（详见 execute_batch）
+                    self.stop_event.set()
                     raise
                 except JudgePoolAborted:
                     # 池等待期间任务被停止：按停止落行，不伪装成 RAG 评测失败
@@ -1084,7 +1095,11 @@ class EvaluationExecutor:
                     results.append(result)
                     self._update_progress(len(results), total)
                 except SoftTimeLimitExceeded:
-                    # 软超时不得按行失败吞掉（P0-E/W3-4）：上抛触发收尾
+                    # 软超时不得按行失败吞掉（P0-E/W3-4）：上抛触发收尾。
+                    # 先置停止信号，否则 with 块 __exit__ 的 shutdown(wait=True)
+                    # 会等排队行在 judge_pool.acquire 里耗到 wait_timeout，
+                    # 撞硬超时 SIGKILL 后留下幽灵等待者（详见 execute_batch）
+                    self.stop_event.set()
                     raise
                 except Exception as e:
                     logger.exception(f"耗时评测执行失败 (idx={pos})")
