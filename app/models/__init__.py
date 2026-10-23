@@ -22,6 +22,7 @@ from app.models.webhook_models import WebhookEndpoint, WebhookDelivery
 from app.models.sso_models import SsoOidcConfig, SsoTeamMapping, LdapConfig
 from app.models.schedule_models import TaskSchedule, WeeklyReport
 from app.models.share_models import ShareLink
+from app.models.license_models import PlatformLicense
 
 __all__ = [
     # 原有模型
@@ -83,4 +84,6 @@ __all__ = [
     "WeeklyReport",
     # 报告分享链接（M5 QE5-4）
     "ShareLink",
+    # 平台 License（M6 QE6-1，企业授权）
+    "PlatformLicense",
 ]

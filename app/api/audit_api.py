@@ -3,8 +3,9 @@
 
 QE4-4 审计补全：写端点审计由 audited(action, resource_type) 路由依赖统一落库
 （覆盖面由 tests/unit/test_audit_coverage.py 静态断言把关）；本文件提供超管
-查询面与导出面——导出（xlsx/csv）挂企业功能位 AUDIT_EXPORT_ENABLED（默认关，
-关闭时 404，能力不存在而非权限不足）。
+查询面与导出面——导出（xlsx/csv）自 M6 QE6-2 起挂企业功能位
+audit_export（entitlements 门面统一判定，未授权 403 + upgrade_required 标识），
+AUDIT_EXPORT_ENABLED 降级为运维紧急停止总闸（默认开；False 时授权方也 404）。
 """
 import csv
 import io
@@ -17,6 +18,7 @@ from datetime import datetime
 
 from app.core.config import get_settings
 from app.db.session import get_db
+from app.services import entitlements
 from app.services.audit_service import get_operation_logs
 
 
@@ -119,7 +121,8 @@ def _row_values(log: OperationLogResponse) -> list:
     ]
 
 
-@router.get("/export", summary="导出审计日志（xlsx/csv，企业功能位）")
+@router.get("/export", summary="导出审计日志（xlsx/csv，企业功能位）",
+            dependencies=[Depends(entitlements.require_feature("audit_export"))])
 def export_audit_logs(
     request: Request,
     format: str = Query("csv", description="导出格式：csv / xlsx"),
@@ -131,7 +134,9 @@ def export_audit_logs(
     end_time: Optional[datetime] = Query(None, description="结束时间（同列表）"),
     db: Session = Depends(get_db),
 ):
-    """导出审计日志（仅超管；企业功能位 AUDIT_EXPORT_ENABLED 开启才可用，否则 404）
+    """导出审计日志（仅超管；M6 QE6-2 起授权闸=license 功能位 audit_export，
+    未授权 403 + upgrade_required；AUDIT_EXPORT_ENABLED 为紧急停止总闸，
+    False 时授权方也 404——能力被管理员关闭，与未购买 403 区分口径）
 
     单次导出上限 AUDIT_EXPORT_MAX_ROWS（默认 1 万行）：超限返回 400 提示收窄
     过滤条件——审计整表可能远大于常规导出，防一次请求拖垮内存。
@@ -142,8 +147,10 @@ def export_audit_logs(
 
     settings = get_settings()
     if not settings.AUDIT_EXPORT_ENABLED:
-        # 功能位未开：404（能力不存在），与权限不足（403）区分口径
-        raise HTTPException(status_code=404, detail="审计导出未启用（企业功能位 AUDIT_EXPORT_ENABLED）")
+        # 紧急停止总闸：license 正常但管理员显式关闭（404=能力不存在）
+        raise HTTPException(
+            status_code=404,
+            detail="审计导出已被管理员关闭（AUDIT_EXPORT_ENABLED=false，紧急停止闸）")
 
     if format not in ("csv", "xlsx"):
         raise HTTPException(status_code=400, detail="format 仅支持 csv / xlsx")

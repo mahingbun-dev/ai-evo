@@ -22,7 +22,7 @@
 | 评测任务 | AI 裁判员 / Agent 长会话 / 一致性 / 成功率 / RAG 检索 / 二分分类等类型，批量运行、实时进度（WebSocket）；评测模板版本化（打版、字段级 diff、恢复，M5 起）；任务级 cron 定时（5 段表达式、北京时间、可选时段限制——经既有运行入口投递，团队配额与任务互斥照常生效；扫描循环在 api 进程内，Redis 锁 + `next_run_at` CAS 认领保证多 api 单写，不引 Celery beat，M5 起） |
 | 裁判引擎 | Claude Code 裁判（默认）与通用 LLM 裁判图可用；DeepSeek Harness 裁判适配就绪、任务流 M8 接通；评测维度动态配置 |
 | 结果与分析 | 评分明细、历史对比、Excel/JSON/CSV 导出、趋势统计、双模型 A/B 并排对比；A/B 模板版本对照（同任务两模板版本的任务化实验，M5 起）；周报（每周一 08:00 北京时间聚合上周覆盖度/提效/门禁通过率生成 markdown，Statistics 归档可回看，推送订阅 `weekly.report.ready` 事件的 webhook，SMTP 邮件可选，M5 起）；免登录只读报告分享（M5 起：token 链接带有效期/行级范围/可吊销，`/share/:token` 只读页） |
-| 管理 | 团队与成员启停/角色管理（三角色 owner/engineer/viewer——写操作 owner+engineer，viewer 全站只读；超管保留全局）、审计日志（全部写端点由声明式 `audited` 依赖统一留痕，注册表静态断言把关覆盖面；csv/xlsx 导出挂 `AUDIT_EXPORT_ENABLED` 企业功能位，默认关）、内置使用文档 |
+| 管理 | 团队与成员启停/角色管理（三角色 owner/engineer/viewer——写操作 owner+engineer，viewer 全站只读；超管保留全局）、审计日志（全部写端点由声明式 `audited` 依赖统一留痕，注册表静态断言把关覆盖面；csv/xlsx 导出为企业功能位 audit_export——license 授权后可用，未授权 403+upgrade_required 且前端按钮锁定，另有企业端点旁路静态断言看守）、离线 License 管理（M6：超管上传 Ed25519 签名 license 开通企业档位与功能位——审计导出/报告白标水印；验签失败/过期只降级开源版并醒目告警，不阻断核心评测；生成工具 `tools/license/gen.py`）、用量计量（M6：每次执行的模型 token 用量——被测与裁判调用统一计量——按月度运行数与团队 token 聚合，`GET /admin/usage/summary` 供 license 续约对账；超额只告警不阻断）、内置使用文档 |
 
 本地账号密码登录：首个注册用户自动成为超级管理员；密码 PBKDF2-HMAC-SHA256 哈希存储，会话为 HS256 JWT（`Authorization: Bearer`）。企业统一身份：`AUTH_METHODS`（`local,oidc,ldap` 任意组合，单选 `oidc`/`ldap` 即纯企业身份部署——关闭本地登录注册）开启 OIDC SSO（授权码 + PKCE S256）与 LDAP/AD 只读认证（search+bind，滤值 RFC 4515 转义、空密码直拒）；超管在「开发者设置」配置 IdP / 目录（含连通性自检）；首次企业登录自动开户（JIT）或按邮箱映射既有账号，目录组与 SSO 组共用 groups→团队映射。
 

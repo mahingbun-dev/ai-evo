@@ -455,6 +455,13 @@ export const ldapApi = {
   testConnectivity: (data) => request.post('/auth/ldap/test', data)
 }
 
+// License 管理（M6 QE6-1，超管开发者设置页）：上传为 multipart 文件；
+// status 返回生效档位 effective_tier/降级原因/规模与功能位
+export const licenseApi = {
+  status: () => request.get('/admin/license/status'),
+  upload: (formData) => request.post('/admin/license', formData)
+}
+
 // OSS 直传上传API（企业内网 OSS 可选功能，地址经 VITE_OSS_BASE_URL 构建时注入；未配置则功能不可用）
 const OSS_BASE_URL = import.meta.env?.VITE_OSS_BASE_URL || ''
 const OSS_TENANT_CODE = import.meta.env?.VITE_OSS_TENANT_CODE || ''

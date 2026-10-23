@@ -250,10 +250,12 @@ class Settings(BaseSettings):
     # 与 webhook 同口径——放行内网目标的决定权在部署管理员而非任务创建者）
     HTTP_ASSERT_ALLOW_PRIVATE_TARGETS: bool = False
 
-    # M4 QE4-4 审计导出（xlsx/csv）企业功能位（默认关）：审计日志整表导出
-    # 属企业治理诉求，非默认能力——开启后超管可在审计页导出（单次上限
-    # AUDIT_EXPORT_MAX_ROWS 行，防全表拖库打爆内存）；关闭时端点 404
-    AUDIT_EXPORT_ENABLED: bool = False
+    # M4 QE4-4 审计导出紧急停止总闸（M6 QE6-2 起语义升级）：授权闸已移交
+    # license 功能位 audit_export（app/services/entitlements.py，未授权 403
+    # + upgrade_required）；本开关默认 true，仅作运维紧急停止——false 时
+    # 即使企业 license 已授权也 404（能力被管理员关闭）。单次导出上限
+    # AUDIT_EXPORT_MAX_ROWS 行（防全表拖库打爆内存）
+    AUDIT_EXPORT_ENABLED: bool = True
     AUDIT_EXPORT_MAX_ROWS: int = 10000
 
     # M5 QE5-3 周报邮件推送（可选，默认未配置=跳过邮件只走 webhook）：SMTP
@@ -266,6 +268,20 @@ class Settings(BaseSettings):
     SMTP_USE_TLS: bool = True
     SMTP_FROM: str = ""
     WEEKLY_REPORT_EMAIL_TO: str = ""
+    # M6 QE6-3 用量超额告警邮件收件人（逗号分隔；未配置=超额只走告警 webhook
+    # 与 logs/alerts.log，不发邮件——与周报邮件同款 SMTP 凭据）。超额口径：
+    # 月度评测运行数超 license max_monthly_runs，只告警不阻断（每日至多一封）
+    USAGE_ALERT_EMAIL_TO: str = ""
+
+    # M6 QE6-1 license 验签公钥（Ed25519 裸公钥 32 字节，base64）：缺省为仓库
+    # 测试密钥对公钥（tools/license/keys/test_signing_key.pub，开发/CI 用）；
+    # 生产部署必须覆盖为厂商签发公钥——否则测试私钥签出的 license 也能过验签
+    # （等于没设防）。license 上传与验签见 app/services/license_service.py，
+    # 生成工具 tools/license/gen.py（生产私钥厂商持有，不入库）
+    LICENSE_PUBLIC_KEY: str = "AmIfRV9ImNO5nDUAQJv8gM67qoc9wH5EUdVDiP5irAQ="
+    # license 上传文件大小上限（字节）：license 是小 JSON 信封，64KB 已远超
+    # 正常体积，防超大文件拖垮解析
+    LICENSE_MAX_BYTES: int = 64 * 1024
 
     @property
     def auth_methods(self) -> set:

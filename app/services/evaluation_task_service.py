@@ -1885,6 +1885,24 @@ class TaskExecutionRecordService:
     def __init__(self, db: Session):
         self.db = db
 
+    def _attach_model_usage(self, record: Optional[TaskExecutionRecord]) -> None:
+        """M6 QE6-3 收尾收割：把进程内模型 token 计量写进执行记录。
+
+        采集漏斗见 app/services/model_caller.py（被测+裁判 API 调用统一收口；
+        CC 裁判由 usage_sink 喂入）。complete/fail/stop 三个终态路径都调本方法
+        ——失败/停止的运行同样消耗了用量；api 进程不经评测链路，收集器恒空，
+        自然落 NULL。计量失败绝不影响收尾主流程。
+        """
+        if record is None:
+            return
+        try:
+            from app.services import model_caller
+            usage = model_caller.collect_usage()
+            if usage:
+                record.model_usage = usage
+        except Exception as e:  # noqa: BLE001 — 计量是旁路，不阻断收尾
+            logger.warning(f"模型用量收割失败（不影响执行记录收尾）: {e}")
+
     def create_record(self, task_id: str, execution_number: int) -> TaskExecutionRecord:
         """创建执行记录（任务开始时调用）"""
         record_id = f"exec_{uuid.uuid4().hex[:12]}"
@@ -2071,6 +2089,8 @@ class TaskExecutionRecordService:
             )
             self._attach_start_config_snapshot(record)
             self._attach_used_config_summary(record)
+            # M6 QE6-3：终态收割模型 token 计量（旁路，失败不影响收尾）
+            self._attach_model_usage(record)
             self.db.add(record)
             self.db.commit()
             # M1 QE1-3：完成事件旁路派发（含 gate.failed）
@@ -2083,6 +2103,8 @@ class TaskExecutionRecordService:
         record.completed_at = beijing_now()
         # W4：执行结束写入该次实际使用的配置摘要（归因锚点）
         self._attach_used_config_summary(record)
+        # M6 QE6-3：终态收割模型 token 计量（旁路，失败不影响收尾）
+        self._attach_model_usage(record)
         self.db.commit()
         # M1 QE1-3：完成事件旁路派发（含 gate.failed）
         self._emit_webhook_events(task_id, execution_number, "completed", gate_result)
@@ -2105,6 +2127,8 @@ class TaskExecutionRecordService:
             )
             self._attach_start_config_snapshot(record)
             self._attach_used_config_summary(record)
+            # M6 QE6-3：终态收割模型 token 计量（旁路，失败不影响收尾）
+            self._attach_model_usage(record)
             self.db.add(record)
             self.db.commit()
             # M1 QE1-3：失败事件旁路派发
@@ -2116,6 +2140,8 @@ class TaskExecutionRecordService:
         record.completed_at = beijing_now()
         # W4：执行结束写入该次实际使用的配置摘要（归因锚点）
         self._attach_used_config_summary(record)
+        # M6 QE6-3：终态收割模型 token 计量（旁路，失败不影响收尾）
+        self._attach_model_usage(record)
         # M1 QE1-2：失败收尾落门禁 error verdict（断点续跑前上一轮失败可查）
         self._attach_gate_error_verdict(record, f"评测失败：{error}")
         self.db.commit()
@@ -2144,6 +2170,8 @@ class TaskExecutionRecordService:
             )
             self._attach_start_config_snapshot(record)
             self._attach_used_config_summary(record)
+            # M6 QE6-3：终态收割模型 token 计量（旁路，失败不影响收尾）
+            self._attach_model_usage(record)
             self.db.add(record)
             self.db.commit()
             return record
@@ -2152,6 +2180,8 @@ class TaskExecutionRecordService:
         record.completed_at = beijing_now()
         # W4：执行结束写入该次实际使用的配置摘要（归因锚点）
         self._attach_used_config_summary(record)
+        # M6 QE6-3：终态收割模型 token 计量（旁路，失败不影响收尾）
+        self._attach_model_usage(record)
         # M1 QE1-2：停止收尾落门禁 error verdict（续跑开新执行序号，本轮判定即终态）
         self._attach_gate_error_verdict(record, "评测被停止，门禁无法判定")
         self.db.commit()

@@ -34,3 +34,19 @@ export const canManageTeam = (user, teamCode) => {
   const userTeam = String(user?.org_code || '').trim() || 'DEFAULT'
   return userRole(user) === 'owner' && (userTeam === (String(teamCode || '').trim() || 'DEFAULT'))
 }
+
+/**
+ * 企业功能位判定（M6 QE6-2，与后端 app/services/entitlements.py 同口径）：
+ * license 为 App 根组件注入的 licenseInfo（/auth/status 附带的 license 块，
+ * 形如 { tier, enterprise, features: { audit_export: { enabled, label, reserved }, ... } }）。
+ * 未登录/未加载/未声明位一律 false（默认降级开源版）。
+ */
+export const hasEntitlement = (license, feature) =>
+  Boolean(license?.features?.[feature]?.enabled)
+
+/** 企业功能锁标文案：未授权显示升级提示，预留位显示规划中 */
+export const entitlementLockTip = (license, feature) => {
+  const f = license?.features?.[feature]
+  if (f?.enabled) return ''
+  return f?.reserved ? `「${f.label}」规划中（企业版预留位）` : `「${f?.label || feature}」为企业版功能，未授权时锁定`
+}

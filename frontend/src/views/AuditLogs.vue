@@ -48,17 +48,21 @@
           <el-form-item>
             <el-button type="primary" @click="handleSearch">查询</el-button>
             <el-button @click="handleReset">重置</el-button>
-            <el-dropdown style="margin-left: 12px;" @command="handleExport">
-              <el-button :loading="exporting">
-                导出<el-icon style="margin-left: 4px;"><arrow-down /></el-icon>
-              </el-button>
-              <template #dropdown>
-                <el-dropdown-menu>
-                  <el-dropdown-item command="csv">CSV</el-dropdown-item>
-                  <el-dropdown-item command="xlsx">Excel (xlsx)</el-dropdown-item>
-                </el-dropdown-menu>
-              </template>
-            </el-dropdown>
+            <!-- M6 QE6-2：审计导出=企业功能位 audit_export，未授权禁用+锁标 -->
+            <el-tooltip :disabled="auditExportEnabled" :content="auditExportLockTip" placement="top">
+              <el-dropdown style="margin-left: 12px;" @command="handleExport">
+                <el-button :loading="exporting" :disabled="!auditExportEnabled">
+                  导出<el-icon style="margin-left: 4px;"><arrow-down /></el-icon>
+                  <el-icon v-if="!auditExportEnabled" style="margin-left: 2px;"><Lock /></el-icon>
+                </el-button>
+                <template #dropdown>
+                  <el-dropdown-menu>
+                    <el-dropdown-item command="csv">CSV</el-dropdown-item>
+                    <el-dropdown-item command="xlsx">Excel (xlsx)</el-dropdown-item>
+                  </el-dropdown-menu>
+                </template>
+              </el-dropdown>
+            </el-tooltip>
           </el-form-item>
         </el-form>
       </div>
@@ -138,11 +142,17 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, computed, inject, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
-import { ArrowDown } from '@element-plus/icons-vue'
+import { ArrowDown, Lock } from '@element-plus/icons-vue'
 import { auditApi } from '@/api'
 import { formatTime } from '@/utils/time'
+import { hasEntitlement, entitlementLockTip } from '@/utils/permissions'
+
+// M6 QE6-2：license 授权信息（App 根组件注入）——审计导出企业功能位锁标
+const licenseInfo = inject('licenseInfo', null)
+const auditExportEnabled = computed(() => hasEntitlement(licenseInfo?.value, 'audit_export'))
+const auditExportLockTip = computed(() => entitlementLockTip(licenseInfo?.value, 'audit_export'))
 
 const logs = ref([])
 const loading = ref(false)
@@ -247,9 +257,13 @@ const viewDetail = (row) => {
   detailDialogVisible.value = true
 }
 
-// QE4-4：审计导出（csv/xlsx，企业功能位 AUDIT_EXPORT_ENABLED 开启才可用，
-// 未启用时后端 404 并带回提示；导出按当前筛选条件收窄）
+// QE6-2：审计导出（企业功能位 audit_export）：license 授权后可用，未授权
+// 403+upgrade_required（按钮已锁，此处兜底网络态）；导出按当前筛选条件收窄
 const handleExport = async (format) => {
+  if (!auditExportEnabled.value) {
+    ElMessage.warning(auditExportLockTip.value)
+    return
+  }
   exporting.value = true
   try {
     const params = { format, ...filters.value }
@@ -265,13 +279,15 @@ const handleExport = async (format) => {
     link.click()
     URL.revokeObjectURL(url)
   } catch (e) {
-    // 404=企业功能位未启用；400=超行数上限（提示收窄条件）；blob 响应需先解包
+    // 403=企业功能位未授权（detail 为 {code,message} 对象）；404=紧急停止闸；
+    // 400=超行数上限；blob 响应需先解包
     let detail = e?.response?.data?.detail
     if (!detail && e?.response?.data instanceof Blob) {
       try {
         detail = JSON.parse(await e.response.data.text())?.detail
       } catch { /* 保底走默认提示 */ }
     }
+    if (detail && typeof detail === 'object') detail = detail.message
     ElMessage.error(detail || '导出审计日志失败')
   } finally {
     exporting.value = false

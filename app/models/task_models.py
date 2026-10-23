@@ -239,6 +239,13 @@ class TaskExecutionRecord(Base):
     # 导出登记（插件 task_execution_export 幂等复用）：{format: {file_id, filename, size, sha256, uploaded_at}}
     exported_files = Column(JSON, nullable=True, comment="已上传 anc-hub file-store 的导出文档登记（按格式幂等复用 file_id）")
 
+    # M6 QE6-3 用量计量：本次执行**全部**模型调用（被测 + 各裁判引擎）的 token
+    # 用量聚合，形如 {model: {prompt_tokens, completion_tokens, total_tokens}}；
+    # 采集漏斗见 app/services/model_caller.py（成功调用按 raw.usage 尽力提取），
+    # 供 /admin/usage/summary 做月度/团队聚合与 license 规模对账；缺失为 NULL
+    model_usage = Column(JSON, nullable=True,
+                         comment="模型 token 用量聚合（M6 QE6-3）：{model: {prompt_tokens, completion_tokens, total_tokens}}")
+
     # 门禁判定结果（M1 QE1-2）：{verdict: passed|failed|error, checks:
     # [{metric, op, value, actual, passed}], evaluated_at}。失败/停止收尾由
     # TaskExecutionRecordService 统一落 error verdict；空=该次执行未启用门禁

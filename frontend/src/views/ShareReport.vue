@@ -104,6 +104,13 @@
         </el-table>
       </el-card>
     </template>
+
+    <!-- M6 QE6-2：品牌页脚与水印（开源版显示；企业 license 授权
+         report_white_label / report_watermark 后由服务端 branding 关闭） -->
+    <div v-if="report?.branding?.show_brand" class="brand-footer">
+      Powered by <strong>AgentEvo</strong> · 私有化 Agent 质量工程平台
+    </div>
+    <div v-if="report?.branding?.show_watermark" class="report-watermark">AgentEvo · 开源版</div>
   </div>
 </template>
 
@@ -223,4 +230,26 @@ onMounted(async () => {
 }
 .gate-label { font-weight: 600; }
 .gate-time { color: #909399; font-size: 12px; }
+
+/* M6 QE6-2：品牌页脚（开源版传播位；report_white_label 授权后服务端关闭） */
+.brand-footer {
+  margin-top: 16px;
+  text-align: center;
+  color: #909399;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+/* 汇总页水印：右下角固定半透明标识（report_watermark 授权后关闭） */
+.report-watermark {
+  position: fixed;
+  right: 18px;
+  bottom: 14px;
+  color: rgba(144, 147, 153, 0.32);
+  font-size: 13px;
+  letter-spacing: 1px;
+  pointer-events: none;
+  user-select: none;
+  z-index: 10;
+}
 </style>

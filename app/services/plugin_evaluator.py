@@ -37,6 +37,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
+from app.services import model_caller
 from app.services.plugin_eval import engine as plugin_engine
 from app.services.plugin_eval.parser import detect_target, parse_plugin, parse_skill, parse_skill_content
 from app.services.plugin_eval.static_layer import StaticAnalyzer
@@ -731,6 +732,10 @@ def _cc_query(prompt: str, model: str, timeout: float = 300.0, usage_sink: dict 
         if tokens:
             usage_model = output.get("model") or model
             usage_sink[usage_model] = usage_sink.get(usage_model, 0) + tokens
+            # M6 QE6-3：CC 裁判走 SDK 子进程不过 model_caller 漏斗，在此喂
+            # 进程内计量收集器（只有总量，prompt/completion 拆分留 0）——
+            # 与被测/传统裁判调用的计量同池，任务收尾统一收割落执行记录
+            model_caller.record_usage_totals(usage_model, tokens)
 
     if output.get("errored"):
         return {"unmeasured": True, "error": "judge Claude Code 调用返回错误结果"}

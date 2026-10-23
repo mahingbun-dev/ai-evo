@@ -224,6 +224,54 @@
               : `目录连通失败：${ldapTestResult.error}`"
           />
         </el-tab-pane>
+        <!-- ==================== License 授权（M6 QE6-1，超管） ==================== -->
+        <el-tab-pane v-if="isSuperAdmin" label="License" name="license">
+          <el-alert
+            :type="licenseAlertType"
+            :closable="false"
+            show-icon
+            class="sso-alert"
+            :title="licenseAlertTitle"
+          />
+          <el-descriptions :column="2" border class="license-desc" v-loading="licenseLoading">
+            <el-descriptions-item label="生效档位">
+              <el-tag :type="licenseStatus.enterprise ? 'success' : 'info'">
+                {{ licenseStatus.enterprise ? 'Enterprise（企业版）' : 'OSS（开源版）' }}
+              </el-tag>
+            </el-descriptions-item>
+            <el-descriptions-item label="授权状态">
+              <el-tag :type="statusTagType(licenseStatus.status)">{{ statusLabel(licenseStatus.status) }}</el-tag>
+            </el-descriptions-item>
+            <el-descriptions-item label="授权客户">{{ licenseStatus.customer || '-' }}</el-descriptions-item>
+            <el-descriptions-item label="到期时间">
+              {{ licenseStatus.expires_at ? formatTime(licenseStatus.expires_at) : '永久授权' }}
+            </el-descriptions-item>
+            <el-descriptions-item label="用户规模上限">{{ licenseStatus.max_users ?? '不限' }}</el-descriptions-item>
+            <el-descriptions-item label="月度运行上限">{{ licenseStatus.max_monthly_runs ?? '不限' }}</el-descriptions-item>
+            <el-descriptions-item label="企业功能位" :span="2">
+              <template v-if="(licenseStatus.features || []).length">
+                <el-tag v-for="f in licenseStatus.features" :key="f" size="small" class="scope-tag">{{ featureLabel(f) }}</el-tag>
+              </template>
+              <span v-else class="placeholder-text">未授权任何企业功能位</span>
+            </el-descriptions-item>
+            <el-descriptions-item label="文件指纹" :span="2">
+              <code class="key-prefix">{{ (licenseStatus.fingerprint || '').slice(0, 16) }}…</code>
+            </el-descriptions-item>
+          </el-descriptions>
+          <div class="tab-toolbar">
+            <input
+              ref="licenseFileInput"
+              type="file"
+              accept=".json,application/json"
+              style="display: none"
+              @change="onLicenseFileChange"
+            />
+            <el-button type="primary" :loading="licenseUploading" @click="pickLicenseFile">
+              上传 license 文件
+            </el-button>
+            <span class="tab-tip">Ed25519 离线验签，上传即生效；验签失败或过期只降级开源版，核心评测不受影响</span>
+          </div>
+        </el-tab-pane>
       </el-tabs>
     </el-card>
 
@@ -360,7 +408,7 @@
 import { ref, computed, inject, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus } from '@element-plus/icons-vue'
-import { apiKeyApi, webhookApi, ssoApi, ldapApi } from '@/api'
+import { apiKeyApi, webhookApi, ssoApi, ldapApi, licenseApi } from '@/api'
 import { canWrite } from '@/utils/permissions'
 
 // App 根组件共享用户信息：SSO 配置是超管功能位，非超管隐藏该 Tab
@@ -767,6 +815,76 @@ const testLdap = async () => {
   }
 }
 
+// ---------- License 授权（M6 QE6-1，超管） ----------
+const licenseLoading = ref(false)
+const licenseUploading = ref(false)
+const licenseFileInput = ref(null)
+const emptyLicenseStatus = () => ({
+  status: 'missing', tier: 'oss', effective_tier: 'oss', enterprise: false,
+  customer: '', expires_at: null, max_users: null, max_monthly_runs: null,
+  features: [], message: '', fingerprint: '', loaded_at: null
+})
+const licenseStatus = ref(emptyLicenseStatus())
+
+const FEATURE_LABELS = {
+  audit_export: '审计导出',
+  report_white_label: '报告白标',
+  report_watermark: '报告水印',
+  project_rbac: '项目级 RBAC（预留）',
+  scim: 'SCIM 同步（预留）',
+  admin_api: 'Admin API（预留）'
+}
+const featureLabel = (f) => FEATURE_LABELS[f] || f
+
+const statusLabel = (s) => ({
+  valid: '有效',
+  expired: '已过期（降级开源版）',
+  invalid_signature: '验签失败（降级开源版）',
+  missing: '未安装'
+}[s] || s)
+
+const statusTagType = (s) => ({
+  valid: 'success', expired: 'warning', invalid_signature: 'danger', missing: 'info'
+}[s] || 'info')
+
+const licenseAlertType = computed(() => statusTagType(licenseStatus.value.status))
+const licenseAlertTitle = computed(() => {
+  const s = licenseStatus.value
+  if (s.status === 'valid' && s.enterprise) return `企业版授权有效（客户：${s.customer}）`
+  return s.message || '未上传 license：按开源版运行，核心评测不受影响，企业功能位锁定'
+})
+
+const loadLicenseStatus = async () => {
+  licenseLoading.value = true
+  try {
+    licenseStatus.value = { ...emptyLicenseStatus(), ...await licenseApi.status() }
+  } catch (e) {
+    ElMessage.error(e.message || '加载 license 状态失败')
+  } finally {
+    licenseLoading.value = false
+  }
+}
+
+const pickLicenseFile = () => licenseFileInput.value?.click()
+
+const onLicenseFileChange = async (ev) => {
+  const file = ev.target.files?.[0]
+  ev.target.value = '' // 允许连续重传同一文件
+  if (!file) return
+  licenseUploading.value = true
+  try {
+    const form = new FormData()
+    form.append('file', file)
+    licenseStatus.value = { ...emptyLicenseStatus(), ...await licenseApi.upload(form) }
+    ElMessage.success(licenseStatus.value.status === 'valid'
+      ? 'license 已生效' : `license 已上传（当前状态：${statusLabel(licenseStatus.value.status)}）`)
+  } catch (e) {
+    ElMessage.error(e.message || '上传失败')
+  } finally {
+    licenseUploading.value = false
+  }
+}
+
 // ---------- 公共 ----------
 const formatTime = (value) => {
   if (!value) return ''
@@ -794,6 +912,7 @@ onMounted(() => {
     loadSsoMappings()
     loadSsoMethods()
     loadLdapConfig()
+    loadLicenseStatus()
   }
 })
 </script>
@@ -902,5 +1021,11 @@ onMounted(() => {
   grid-template-columns: repeat(4, 1fr);
   gap: 8px;
   width: 100%;
+}
+
+/* M6 QE6-1：License 状态卡 */
+.license-desc {
+  margin-bottom: 16px;
+  max-width: 760px;
 }
 </style>

@@ -120,6 +120,20 @@ def run_evaluation_async(task_id: str, stop_event: Optional[StopEventProtocol] =
         # 注意：start_task 已在 API 层调用，此处不重复调用
         log_service.add_log(task_id, "info", f"任务配置读取完成: {task.name}")
 
+        # ========== M6 QE6-3 用量计量 ==========
+        # 进程内模型 token 计量清零（本任务全程累计，收尾由 complete/fail/stop
+        # record 收割写入 task_execution_records.model_usage）；worker 为 prefork
+        # 池一进程一任务，无跨任务串账
+        from app.services import model_caller as _model_caller
+        _model_caller.reset_usage_tracking()
+        # 月度运行数超额对账（license max_monthly_runs）：只告警不阻断——
+        # 检查/告警任何异常都在 usage_service 内吞掉，评测照常执行
+        try:
+            from app.services.usage_service import check_run_overage
+            check_run_overage(db)
+        except Exception as _e:  # noqa: BLE001 — 计量旁路，不阻断评测
+            logging.getLogger(__name__).warning(f"月度用量超额检查异常（忽略）: {_e}")
+
         # W3：本次执行序号（start_task 已原子递增 execution_count 并创建执行记录，
         # 与 stop_task/complete_task 的 execution_count 同口径）
         execution_number = getattr(task, "execution_count", None) or 1

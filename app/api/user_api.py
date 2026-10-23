@@ -295,14 +295,18 @@ async def check_auth_status(request: Request):
 
     未登录/凭证无效时返回 401 并带 message——调用方（前端路由守卫、部署冒烟）
     才能据状态码区分「已登录」与「登录态不可用」。is_authenticated 字段保持向后兼容。
+
+    M6 QE6-2：已登录响应附带 license 块（tier + 企业功能位授权表）——前端
+    据此渲染企业功能锁标（未登录分支不带：无登录态锁标无渲染场景）。
     """
+    from app.services import entitlements
     user_dict = _auth_user_dict(request)
     if not user_dict:
         return JSONResponse(
             content={"is_authenticated": False, "user": None, "message": "未提供认证信息或登录已失效"},
             status_code=401
         )
-    return {"is_authenticated": True, "user": user_dict}
+    return {"is_authenticated": True, "user": user_dict, "license": entitlements.status_view()}
 
 
 @auth_router.post("/logout", summary="退出登录")

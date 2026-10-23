@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session
 
 from app.models.share_models import ShareLink
 from app.models.task_models import EvaluationTask, TaskExecutionRecord
+from app.services import entitlements
 from app.services.stats_service import BEIJING_TZ, beijing_now
 
 logger = logging.getLogger(__name__)
@@ -242,4 +243,11 @@ class ShareLinkService:
             "gate_result": gate_result,
             "total_cost": total_cost,
             "completed_at": completed_at.isoformat() if completed_at else None,
+            # M6 QE6-2 报告白标/水印：免登录页拿不到 /auth/status，授权判定
+            # 由服务端算好内嵌（enterprise 授权对应位后隐藏水印/品牌页脚；
+            # 开源版两者均显示——品牌传播位）
+            "branding": {
+                "show_watermark": not entitlements.has("report_watermark"),
+                "show_brand": not entitlements.has("report_white_label"),
+            },
         }

@@ -137,9 +137,13 @@ const isLoginPage = computed(() => route.path === '/login')
 const currentUser = ref(null)
 const isSuperAdmin = computed(() => currentUser.value?.superAdminFlag === 1 || currentUser.value?.super_admin_flag === 1)
 
+// M6 QE6-2：license 授权信息（/auth/status 附带 tier+功能位表，企业功能锁标渲染依据）
+const licenseInfo = ref(null)
+
 // 向子组件提供用户信息
 provide('currentUser', currentUser)
 provide('isSuperAdmin', isSuperAdmin)
+provide('licenseInfo', licenseInfo)
 
 // 获取当前用户信息
 const fetchCurrentUser = async () => {
@@ -147,6 +151,7 @@ const fetchCurrentUser = async () => {
     const result = await authApi.status()
     if (result.is_authenticated && result.user) {
       currentUser.value = result.user
+      licenseInfo.value = result.license || null
     }
   } catch (e) {
     console.warn('获取用户信息失败:', e)

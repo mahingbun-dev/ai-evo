@@ -3,13 +3,114 @@
 根据模型类型自动选择合适的调用方式
 """
 import logging
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+import threading
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import httpx
 
 from app.utils.llm_retry import with_llm_retry, with_llm_retry_async, is_retryable_llm_error
 
 logger = logging.getLogger(__name__)
+
+
+# ==================== M6 QE6-3：模型调用 token 计量 ====================
+#
+# 被测模型调用（evaluation_executor）与裁判调用（judge_client 传统裁判图 /
+# anthropic 裁判节点）全部经过本模块的 call() 漏斗——在漏斗处按响应 raw.usage
+# 尽力提取 token 用量（OpenAI 兼容 prompt/completion_tokens、Anthropic
+# input/output_tokens 两种形态统一），累计到进程内收集器；任务链路在
+# run_evaluation_async 开始时 reset、收尾（complete/fail/stop record）collect
+# 写入 task_execution_records.model_usage（见 evaluation_task_service）。
+#
+# 进程模型：celery worker 为 prefork 池（app/celery_app.py），一子进程同时
+# 只跑一个任务；executor 内部 ThreadPoolExecutor 的行级并发线程共享同一
+# 收集器（锁保护累加），计量不丢行。api 进程不经评测链路，收集器恒空。
+# Claude Code 裁判走 SDK 子进程不过本漏斗，由 plugin_evaluator._cc_query 的
+# usage_sink 就近喂 record_usage_totals（只有 total，无 prompt/completion 拆分）。
+
+_USAGE_LOCK = threading.Lock()
+_USAGE_ACCUMULATOR: Dict[str, Dict[str, int]] = {}
+
+
+def record_usage(model: str, prompt_tokens: int = 0, completion_tokens: int = 0,
+                 total_tokens: Optional[int] = None) -> None:
+    """累计一次模型调用的 token 用量（线程安全；缺失维度按 0 记）"""
+    if not model:
+        return
+    total = int(total_tokens if total_tokens is not None
+                else (prompt_tokens + completion_tokens))
+    with _USAGE_LOCK:
+        slot = _USAGE_ACCUMULATOR.setdefault(model, {"prompt_tokens": 0,
+                                                     "completion_tokens": 0,
+                                                     "total_tokens": 0})
+        slot["prompt_tokens"] += int(prompt_tokens or 0)
+        slot["completion_tokens"] += int(completion_tokens or 0)
+        slot["total_tokens"] += total
+
+
+def record_usage_totals(model: str, total_tokens: int) -> None:
+    """只有总量的调用（如 Claude Code SDK 上报）记总量，拆分维度留 0"""
+    record_usage(model, total_tokens=total_tokens)
+
+
+def reset_usage_tracking() -> None:
+    """任务开始时清零（worker 子进程内一次一任务；跨任务残留即计量串账）"""
+    with _USAGE_LOCK:
+        _USAGE_ACCUMULATOR.clear()
+
+
+def collect_usage() -> Dict[str, Dict[str, int]]:
+    """收割当前累计（返回深拷贝；空 dict=无计量数据，落库按 NULL 口径）"""
+    with _USAGE_LOCK:
+        return {m: dict(v) for m, v in _USAGE_ACCUMULATOR.items()}
+
+
+def _extract_usage(raw: Any) -> Optional[Dict[str, int]]:
+    """从响应 raw 里尽力提取 usage（两种形态统一），无则 None（不猜值）"""
+    if not isinstance(raw, dict):
+        return None
+    usage = raw.get("usage")
+    if not isinstance(usage, dict):
+        return None
+
+    def _num(v: Any) -> int:
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return 0
+
+    # OpenAI 兼容：prompt_tokens/completion_tokens/total_tokens
+    if "prompt_tokens" in usage or "completion_tokens" in usage or "total_tokens" in usage:
+        prompt = _num(usage.get("prompt_tokens"))
+        completion = _num(usage.get("completion_tokens"))
+        total = _num(usage.get("total_tokens")) or (prompt + completion)
+        return {"prompt_tokens": prompt, "completion_tokens": completion,
+                "total_tokens": total}
+    # Anthropic 形态：input_tokens/output_tokens
+    if "input_tokens" in usage or "output_tokens" in usage:
+        prompt = _num(usage.get("input_tokens"))
+        completion = _num(usage.get("output_tokens"))
+        return {"prompt_tokens": prompt, "completion_tokens": completion,
+                "total_tokens": prompt + completion}
+    return None
+
+
+def _meter_call_result(result: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
+    """call() 漏斗收口：成功结果提取 usage → 进程内累计 + 附到返回值。
+
+    尽力而为口径：raw 无 usage（自定义 HTTP 未返回/解析裁剪）则不记也不报错；
+    返回值附 usage 供调用方行级归因（不改变既有 success/content/raw 契约）。
+    """
+    if not isinstance(result, dict) or not result.get("success"):
+        return result
+    usage = _extract_usage(result.get("raw"))
+    if usage is None:
+        return result
+    model = str(config.get("model_type") or config.get("provider") or "unknown")
+    record_usage(model, usage["prompt_tokens"], usage["completion_tokens"],
+                 usage["total_tokens"])
+    result["usage"] = {"model": model, **usage}
+    return result
 
 
 # 动态导入，避免未安装时报错
@@ -216,7 +317,8 @@ class ModelCaller:
             else:
                 return await ModelCaller._call_http(messages, config, runtime_variables, debug)
 
-        return await _execute_with_retry_async(_dispatch)
+        # M6 QE6-3：漏斗收口计量（被测与裁判调用统一过这里）
+        return _meter_call_result(await _execute_with_retry_async(_dispatch), config)
 
     @staticmethod
     async def _call_openai(
@@ -589,7 +691,8 @@ class ModelCallerSync:
             else:
                 return ModelCallerSync._call_http(messages, config, runtime_variables)
 
-        return _execute_with_retry(_dispatch)
+        # M6 QE6-3：漏斗收口计量（被测与裁判调用统一过这里）
+        return _meter_call_result(_execute_with_retry(_dispatch), config)
 
     @staticmethod
     def _call_openai(

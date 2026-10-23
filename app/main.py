@@ -41,6 +41,10 @@ from app.api.sso_api import router as sso_router
 from app.api.plugin_marketplace_api import router as plugin_marketplace_router
 from app.api.redteam_api import router as redteam_router
 from app.api.share_api import manage_router as share_manage_router, public_router as share_public_router
+# M6 QE6-1：License 管理（超管上传与状态查询）
+from app.api.license_api import router as license_router
+# M6 QE6-3：用量计量汇总（超管续约对账）
+from app.api.usage_api import router as usage_router
 from app.middleware.auth_middleware import AuthMiddleware
 from app.db.session import engine, Base
 from app.core.config import get_settings, validate_runtime_settings
@@ -179,6 +183,17 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"迁移内置前处理脚本失败（不阻断启动）: {e}")
 
+    # M6 QE6-1：license 启动加载 + 验签 + 缓存——失败只降级 oss 不阻断启动
+    # （license_service 内部保证任何异常都降级；此处 try/except 是 DB 整体
+    # 不可用时的第二道兜底，与上面两个启动步骤同口径）
+    try:
+        from app.db.session import SessionLocal
+        from app.services import license_service
+        with SessionLocal() as db:
+            license_service.load_from_db(db)
+    except Exception as e:
+        logger.warning(f"license 启动加载失败（降级开源版运行，不阻断启动）: {e}")
+
     # TaskScheduler 现在是无状态的，不需要显式启动
     # Celery Worker 由独立进程管理
     logger.info("TaskScheduler (Celery) 已初始化")
@@ -308,6 +323,10 @@ app.include_router(api_key_router, prefix=settings.API_V1_STR)
 # M4 QE4-1：OIDC SSO（/api/v1/auth/oidc/* + /api/v1/auth/methods；配置面
 # 超管专用，登录三端点匿名走中间件白名单）
 app.include_router(sso_router, prefix=settings.API_V1_STR)
+# M6 QE6-1：License 管理（/api/v1/admin/license*，超管专用）
+app.include_router(license_router, prefix=settings.API_V1_STR)
+# M6 QE6-3：用量计量（/api/v1/admin/usage/summary，超管专用）
+app.include_router(usage_router, prefix=settings.API_V1_STR)
 
 # WebSocket 路由（不需要 API_V1_STR 前缀）
 app.include_router(task_status_router)
