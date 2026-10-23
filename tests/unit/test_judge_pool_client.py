@@ -126,6 +126,59 @@ def test_redis_error_fail_open(monkeypatch):
     assert c.release(lease) is False
 
 
+class _BrokenStopChecker:
+    """生产 stop_checker（RedisStopSignalChecker）断连时的行为：is_set 直接抛"""
+
+    def __init__(self):
+        self.calls = 0
+
+    def is_set(self):
+        self.calls += 1
+        raise ConnectionError("redis down")
+
+
+def test_stop_checker_error_falls_through_to_fail_open():
+    """停止判定抛异常不得穿出 slot：Redis 同时不可用时按 fail-open 放行"""
+
+    class Boom(JudgePoolClient):
+        def _try_acquire(self, *a, **k):
+            raise ConnectionError("redis down")
+
+    checker = _BrokenStopChecker()
+    c = Boom(redis_client=object())
+
+    lease = c.acquire(Engine.GRAPH, stop_checker=checker)
+
+    assert lease.unavailable is True
+    assert checker.calls >= 1, "停止判定必须被尝试过（不是被跳过）"
+
+
+def test_stop_checker_error_raises_when_fail_open_disabled(monkeypatch):
+    """fail_open=False 时仍按原样上抛 Redis 异常（不是被停止判定抢先抛出）"""
+    from dataclasses import replace
+
+    monkeypatch.setattr(
+        client_mod, "load_config", lambda force=False: replace(_cfg(), fail_open=False)
+    )
+
+    class Boom(JudgePoolClient):
+        def _try_acquire(self, *a, **k):
+            raise ConnectionError("redis down")
+
+    c = Boom(redis_client=object())
+    with pytest.raises(ConnectionError):
+        c.acquire(Engine.GRAPH, stop_checker=_BrokenStopChecker())
+
+
+def test_stop_checker_error_does_not_abort_waiting(monkeypatch):
+    """探测失败按「未停止」处理：Redis 正常时继续排队到超时，不得误报中止"""
+    c = StubClient([AcquireResult(False, 1, [], 0)])
+    monkeypatch.setattr(c, "_sleep", lambda s: None)
+
+    with pytest.raises(JudgePoolTimeout):
+        c.acquire(Engine.GRAPH, wait_timeout=0, stop_checker=_BrokenStopChecker())
+
+
 def test_context_binding():
     with bind_judge_context(eval_task_id="t1", row_idx=3):
         from app.services.judge_pool.context import current_judge_context

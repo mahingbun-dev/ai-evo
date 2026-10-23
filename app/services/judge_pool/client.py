@@ -105,7 +105,17 @@ class JudgePoolClient:
         backoff = 0.2
 
         while True:
-            if stop_checker is not None and stop_checker.is_set():
+            # 停止判定必须包异常：生产的 stop_checker 是 RedisStopSignalChecker
+            # （裸 Redis EXISTS，自身无保护）。Redis 一断，异常会直接穿出
+            # judge_pool_slot，让每次裁判调用都以 ConnectionError 失败，
+            # fail_open 形同虚设。探测失败按「未停止」继续，交给下一行的
+            # _try_acquire fail-open 分支处理；只有 is_set() 明确返回 True 才中止
+            try:
+                stopped = bool(stop_checker.is_set()) if stop_checker is not None else False
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[judge_pool] 停止信号探测失败，按未停止处理: {e}")
+                stopped = False
+            if stopped:
                 self._drop_waiter(engine, lease_id)
                 raise JudgePoolAborted(f"并发池等待被中止（引擎 {engine.value}）")
             try:
