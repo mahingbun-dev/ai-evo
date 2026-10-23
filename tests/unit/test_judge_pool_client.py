@@ -411,3 +411,116 @@ def test_snapshot_error_masked_with_type_and_truncated():
     assert snap["error"].startswith("RuntimeError: ")
     message = snap["error"].split(": ", 1)[1]
     assert len(message) <= 200
+
+
+# ---------------------------------------------------------------------------
+# 续约必须保留申请时写入的完整详情（RENEW_SCRIPT 用 HSET 整值覆盖）
+# ---------------------------------------------------------------------------
+
+
+class _LeaseStoreRedis:
+    """最小假 redis：租约 zset 成员 + 详情哈希，按 RENEW_SCRIPT 的真实语义覆盖整值"""
+
+    def __init__(self):
+        self.zsets = {}
+        self.hashes = {}
+
+    def hget(self, key, member):
+        return self.hashes.get(key, {}).get(member)
+
+    def eval(self, script, numkeys, *args):
+        keys, argv = list(args[:numkeys]), list(args[numkeys:])
+        if script != client_mod.lua.RENEW_SCRIPT:
+            raise AssertionError(f"未预期的脚本调用: {script[:60]!r}")
+        zkey, hkey = keys
+        lease_id, _expire_at, detail_json = argv
+        if lease_id not in self.zsets.get(zkey, set()):
+            return 0
+        self.hashes.setdefault(hkey, {})[lease_id] = detail_json  # 与 Lua 的 HSET 一致：整值替换
+        return 1
+
+
+class _StoreStubClient(JudgePoolClient):
+    """申请阶段直接落库，让 renew 走真实 _lua_renew + 假 redis"""
+
+    def __init__(self, store):
+        super().__init__(redis_client=store)
+        self.store = store
+
+    def _try_acquire(self, engine, lease_id, detail, cfg):
+        self.store.zsets.setdefault(leases_key(engine), set()).add(lease_id)
+        self.store.hashes.setdefault(lease_data_key(engine), {})[lease_id] = json.dumps(
+            detail, ensure_ascii=False
+        )
+        return AcquireResult(True, 1, [], -1)
+
+
+def test_renew_preserves_full_lease_detail(monkeypatch):
+    clock = [1_700_000_000_000]
+    monkeypatch.setattr(client_mod, "_now_ms", lambda: clock[0])
+
+    store = _LeaseStoreRedis()
+    c = _StoreStubClient(store)
+    with bind_judge_context(eval_task_id="ev-1", celery_task_id="cel-1", row_idx=7):
+        lease = c.acquire(Engine.GRAPH, meta={"call_site": "judge"})
+    hkey = lease_data_key(Engine.GRAPH)
+    before = json.loads(store.hashes[hkey][lease.lease_id])
+
+    clock[0] += 30_000
+    assert c.renew(lease) is True
+    clock[0] += 30_000
+    assert c.renew(lease) is True
+
+    after = json.loads(store.hashes[hkey][lease.lease_id])
+    assert after["eval_task_id"] == "ev-1"
+    assert after["celery_task_id"] == "cel-1"
+    assert after["row_idx"] == 7
+    assert after["host"] == before["host"]
+    assert after["pid"] == before["pid"]
+    assert after["thread"] == before["thread"]
+    assert after["meta"] == {"call_site": "judge"}
+    assert after["acquired_at"] == before["acquired_at"]
+    assert after["lease_id"] == lease.lease_id
+    assert after["engine"] == "graph"
+    assert after["last_renew_at"] == clock[0]
+
+    c.release(lease)
+
+
+def test_renew_falls_back_to_stored_detail_when_lease_has_none(monkeypatch):
+    """老代码路径/测试构造的 Lease 不带 detail：续约时从 Redis 读回并合并"""
+    clock = [1_700_000_000_000]
+    monkeypatch.setattr(client_mod, "_now_ms", lambda: clock[0])
+
+    store = _LeaseStoreRedis()
+    c = _StoreStubClient(store)
+    with bind_judge_context(eval_task_id="ev-2", row_idx=5):
+        granted = c.acquire(Engine.GRAPH)
+    c.release(granted)
+
+    hkey = lease_data_key(Engine.GRAPH)
+    stored = json.loads(store.hashes[hkey][granted.lease_id])
+    store.zsets[leases_key(Engine.GRAPH)].add(granted.lease_id)  # 模拟租约仍在
+
+    legacy = Lease(Engine.GRAPH, granted.lease_id, granted.acquired_at_ms)
+    clock[0] += 30_000
+    assert c.renew(legacy) is True
+
+    after = json.loads(store.hashes[hkey][legacy.lease_id])
+    assert after["eval_task_id"] == stored["eval_task_id"] == "ev-2"
+    assert after["row_idx"] == 5
+    assert after["last_renew_at"] == clock[0]
+
+
+def test_renew_returns_false_and_clears_lease_when_record_deleted():
+    store = _LeaseStoreRedis()
+    c = _StoreStubClient(store)
+    lease = c.acquire(Engine.GRAPH)
+    assert current_lease(Engine.GRAPH) is lease
+
+    # 模拟扫描回收/管理员强释放：zset 成员与详情哈希都被删
+    store.zsets[leases_key(Engine.GRAPH)].discard(lease.lease_id)
+    store.hashes[lease_data_key(Engine.GRAPH)].pop(lease.lease_id, None)
+
+    assert c.renew(lease) is False
+    assert current_lease(Engine.GRAPH) is None

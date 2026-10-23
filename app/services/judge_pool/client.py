@@ -31,6 +31,7 @@ class Lease:
     reentrant: bool = False
     unavailable: bool = False
     lost: bool = False
+    detail: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -120,7 +121,7 @@ class JudgePoolClient:
             self._record_expired(engine, result.expired_details)
 
             if result.acquired:
-                lease = Lease(engine, lease_id, detail["acquired_at"], meta)
+                lease = Lease(engine, lease_id, detail["acquired_at"], meta, detail=detail)
                 set_current_lease(engine, lease)
                 get_heartbeat().register(lease, threading.current_thread())
                 record_event("acquire", engine=engine.value, lease_id=lease_id,
@@ -164,8 +165,14 @@ class JudgePoolClient:
         if lease is None or lease.unavailable or lease.reentrant:
             return False
         cfg = load_config()
-        detail = {"lease_id": lease.lease_id, "engine": lease.engine.value,
-                  "last_renew_at": _now_ms()}
+        # RENEW_SCRIPT 用 HSET 整值覆盖详情：只写基础字段会把申请时写入的
+        # 任务/行号/主机/pid/meta 抹掉，所以必须把完整详情重新写回
+        detail = dict(lease.detail or {})
+        if not lease.detail:
+            detail = self._read_lease_detail(lease) or {}
+        detail["lease_id"] = lease.lease_id
+        detail["engine"] = lease.engine.value
+        detail["last_renew_at"] = _now_ms()
         try:
             renewed = bool(self._lua_renew(lease.engine, lease.lease_id, json.dumps(detail, ensure_ascii=False), cfg))
         except Exception as e:  # noqa: BLE001
@@ -176,6 +183,21 @@ class JudgePoolClient:
             # 否则持有线程下一次 acquire 会命中重入判定，不申请额度就放行（绕过池限额）
             clear_current_lease(lease.engine, lease)
         return renewed
+
+    def _read_lease_detail(self, lease: Lease) -> Optional[Dict[str, Any]]:
+        """旧路径构造的 Lease 没带 detail：续约时从 Redis 读回当前详情再合并"""
+        try:
+            raw = self._client().hget(lease_data_key(lease.engine), lease.lease_id)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[judge_pool] 读取租约详情失败，续约只写基础字段: {e}")
+            return None
+        if not raw:
+            return None
+        try:
+            value = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        return value if isinstance(value, dict) else None
 
     def force_release(self, engine, lease_id: str, strict: bool = False) -> bool:
         """strict=True 时 Redis 异常原样上抛，让调用方能区分「租约不存在」与「Redis 不可用」"""
