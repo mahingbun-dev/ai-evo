@@ -8,6 +8,10 @@
 - app/services/platform_llm_wrapper.py::_generate（generate/batch/a_generate 汇入点）
 - app/services/response_parser.py 阶段4 LLM 兜底解析
 - judge 线程池（langgraph / claude code / plugin evaluator）的任务上下文继承
+
+覆盖（Task 9）：
+- app/services/harness_adapter.py::HarnessAdapter.run_prompt（CC → claude_agent、DS → harness）
+- app/services/plugin_evaluator.py::PluginEvaluator.evaluate / evaluate_trace（plugin）
 """
 import asyncio
 from types import SimpleNamespace
@@ -331,3 +335,53 @@ def test_plugin_evaluator_judge_layer_inherits_context(monkeypatch):
     assert len(seen) == 4
     assert set(seen) == {"task-3"}
     assert outcome["layer_result"]["layer"] == "judge"
+
+
+# ------------------------------------------- Harness 适配层与插件评测接入（Task 9）
+
+def test_harness_adapter_engine_mapping(monkeypatch):
+    from app.services import harness_adapter as mod
+
+    calls = []
+
+    class Ctx:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(mod, "judge_pool_slot", lambda engine, meta=None: (calls.append(engine), Ctx())[1])
+
+    class CC(mod.ClaudeCodeAdapter):
+        def _execute_raw(self, system_prompt, prompt, timeout):
+            return '{"score": 1}', "completed"
+
+    CC(config={"timeout_seconds": 5}).run_prompt("sys", "user", timeout=5)
+    assert calls == ["claude_agent"]
+
+    class DS(mod.HarnessAdapter):
+        def _execute_raw(self, system_prompt, prompt, timeout):
+            return '{"score": 1}', "completed"
+
+    DS(config={"timeout_seconds": 5}).run_prompt("sys", "user", timeout=5)
+    assert calls == ["claude_agent", "harness"]
+
+
+def test_plugin_evaluator_uses_plugin_engine(monkeypatch):
+    from app.services import plugin_evaluator as mod
+
+    calls = []
+
+    class Ctx:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(mod, "judge_pool_slot", lambda engine, meta=None: (calls.append(engine), Ctx())[1])
+    evaluator = mod.PluginEvaluator(engine="legacy")
+    monkeypatch.setattr(evaluator, "_evaluate_legacy", lambda *a, **k: {"success": True})
+    evaluator.evaluate(plugin_path="/tmp/x")
+    assert calls == ["plugin"]
