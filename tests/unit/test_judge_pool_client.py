@@ -281,3 +281,64 @@ def test_release_does_not_clear_other_threads_lease():
     assert current_lease(Engine.GRAPH) is lease
     c.release(lease)
     assert current_lease(Engine.GRAPH) is None
+
+
+def test_lost_lease_is_not_treated_as_reentrant():
+    """心跳在别的线程把租约标记 lost 后，持有线程必须重新申请额度"""
+    c = StubClient([AcquireResult(True, 1, [], -1), AcquireResult(True, 2, [], -1)])
+    first = c.acquire(Engine.GRAPH)
+    first.lost = True  # 心跳线程置位，持有线程只读
+
+    second = c.acquire(Engine.GRAPH)
+
+    assert second.reentrant is False
+    assert second.lost is False
+    assert second.lease_id != first.lease_id
+    assert len(c.calls) == 2
+    assert current_lease(Engine.GRAPH) is second
+    c.release(second)
+
+
+class _FakeHeartbeatClient:
+    def __init__(self, renew_ok):
+        self.renew_ok = renew_ok
+
+    def renew(self, lease):
+        return self.renew_ok
+
+    def release(self, lease):
+        return True
+
+
+def _heartbeat(monkeypatch, renew_ok):
+    from app.services.judge_pool.heartbeat import JudgePoolHeartbeat
+
+    events = []
+    hb = JudgePoolHeartbeat(
+        client=_FakeHeartbeatClient(renew_ok=renew_ok),
+        event_sink=lambda event, lease, **kwargs: events.append(event),
+    )
+    monkeypatch.setattr(hb, "_ensure_started", lambda: None)  # 不起后台线程
+    return hb, events
+
+
+def test_heartbeat_marks_lease_lost_on_renew_failure(monkeypatch):
+    hb, events = _heartbeat(monkeypatch, renew_ok=False)
+    lease = Lease(Engine.GRAPH, "l-lost", 0)
+    hb.register(lease, threading.current_thread())
+
+    hb.run_once()
+
+    assert lease.lost is True
+    assert events == ["lease_lost"]
+
+
+def test_heartbeat_keeps_lease_when_renew_succeeds(monkeypatch):
+    hb, events = _heartbeat(monkeypatch, renew_ok=True)
+    lease = Lease(Engine.GRAPH, "l-alive", 0)
+    hb.register(lease, threading.current_thread())
+
+    hb.run_once()
+
+    assert lease.lost is False
+    assert events == []

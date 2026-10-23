@@ -30,6 +30,7 @@ class Lease:
     meta: Dict[str, Any] = None
     reentrant: bool = False
     unavailable: bool = False
+    lost: bool = False
 
 
 @dataclass
@@ -71,7 +72,11 @@ class JudgePoolClient:
         ctx = current_judge_context()
         stop_checker = stop_checker or ctx.stop_checker
         existing = current_lease(engine)
-        if existing is not None:
+        if existing is not None and existing.lost:
+            # 心跳已把该租约标记失效（扫描回收/强释放）：不能再按重入放行，
+            # 清掉本线程登记后按正常流程重新申请额度
+            clear_current_lease(engine, existing)
+        elif existing is not None:
             return replace(existing, reentrant=True)
 
         cfg = load_config()

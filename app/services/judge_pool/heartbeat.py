@@ -60,6 +60,8 @@ class JudgePoolHeartbeat:
                 self._emit("owner_thread_dead", lease)
                 continue
             if not client.renew(lease):
+                # 标记失效：持有线程下一次 acquire 看到 lost 就不会误判为重入放行
+                lease.lost = True
                 self.unregister(lease_id)
                 self._emit("lease_lost", lease)
 
