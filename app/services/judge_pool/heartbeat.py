@@ -21,6 +21,7 @@ class JudgePoolHeartbeat:
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
+        self._atexit_registered = False
 
     def _client_or_default(self):
         if self._client is None:
@@ -78,7 +79,10 @@ class JudgePoolHeartbeat:
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="judge-pool-heartbeat", daemon=True)
         self._thread.start()
-        atexit.register(self.stop)
+        # 退出钩子只注册一次（心跳线程可能因异常退出后被重新拉起）
+        if not self._atexit_registered:
+            atexit.register(self.shutdown)
+            self._atexit_registered = True
 
     def _run(self) -> None:
         while not self._stop.is_set():
@@ -92,6 +96,40 @@ class JudgePoolHeartbeat:
 
     def stop(self) -> None:
         self._stop.set()
+
+    def shutdown(self) -> None:
+        """进程退出：置位停止 + 批量释放本进程登记的全部租约
+
+        只置位不释放的话，每次发布/优雅重启都会留下最长 lease_ttl（默认 180s）
+        的幽灵占用 —— 额度要等 TTL 过期才被回收，期间新任务白等。
+        逐条释放，单条异常吞掉（TTL 兜底），不能挡住其余租约。
+        """
+        self.stop()
+        with self._lock:
+            items = list(self._entries.items())
+            self._entries.clear()
+        if not items:
+            return
+        try:
+            client = self._client_or_default()
+        except Exception as e:  # noqa: BLE001 - 退出路径不抛，额度由 TTL 兜底回收
+            logger.warning(f"[judge_pool] 退出时无法获取池客户端，租约等待 TTL 回收: {e}")
+            return
+        for lease_id, (lease, _owner_thread) in items:
+            try:
+                client.release(lease)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[judge_pool] 退出释放租约 {lease_id} 失败（等待 TTL 回收）: {e}")
+        # 这批 release 事件要落库：audit 的 flush_audit 可能比本钩子先跑
+        # （atexit 是 LIFO，谁后注册谁先跑），不主动 flush 就会随进程丢掉。
+        # 只在写线程已起时 flush，避免测试/无审计场景白等超时
+        try:
+            from . import audit
+
+            if audit._writer_started:
+                audit.flush_audit(timeout=1.0)
+        except Exception:  # noqa: BLE001 - 审计缺失不影响释放本身
+            pass
 
 
 _heartbeat: Optional[JudgePoolHeartbeat] = None

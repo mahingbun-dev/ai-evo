@@ -229,3 +229,119 @@ def test_get_heartbeat_returns_singleton(monkeypatch):
     monkeypatch.setattr(hb_mod, "_heartbeat", None)
 
     assert get_heartbeat() is get_heartbeat()
+
+
+# ---------- 5. 进程退出：批量释放本进程租约（I3） ----------
+
+
+def test_shutdown_releases_every_registered_lease():
+    """只置位不释放会让每次发布留下最长 lease_ttl 的幽灵占用"""
+    client = FakeClient()
+    hb, events = _heartbeat(client)
+    hb.register(Lease(Engine.GRAPH, "l1", 0), threading.current_thread())
+    hb.register(Lease(Engine.PLUGIN, "l2", 0), threading.current_thread())
+
+    hb.shutdown()
+
+    assert sorted(client.released) == ["l1", "l2"]
+    assert hb._entries == {}
+    assert hb._stop.is_set()
+
+
+def test_shutdown_stops_later_renewal():
+    """退出后再驱动 run_once 不得继续续约（条目已清空）"""
+    client = FakeClient()
+    hb, _ = _heartbeat(client)
+    hb.register(Lease(Engine.GRAPH, "l1", 0), threading.current_thread())
+
+    hb.shutdown()
+    client.renewed.clear()
+    hb.run_once()
+
+    assert client.renewed == []
+    assert client.released == ["l1"], "释放只应发生一次"
+
+
+def test_shutdown_releases_remaining_leases_when_one_fails():
+    class FlakyClient(FakeClient):
+        def release(self, lease):
+            if lease.lease_id == "l1":
+                raise ConnectionError("redis down")
+            return super().release(lease)
+
+    client = FlakyClient()
+    hb, _ = _heartbeat(client)
+    hb.register(Lease(Engine.GRAPH, "l1", 0), threading.current_thread())
+    hb.register(Lease(Engine.GRAPH, "l2", 0), threading.current_thread())
+
+    hb.shutdown()  # 不抛
+
+    assert client.released == ["l2"], "单条释放失败不能挡住其余租约"
+    assert hb._entries == {}
+
+
+def test_shutdown_without_entries_is_noop():
+    client = FakeClient()
+    hb, _ = _heartbeat(client)
+
+    hb.shutdown()
+
+    assert client.released == []
+    assert client.renewed == []
+    assert hb._stop.is_set()
+
+
+def test_shutdown_tolerates_unavailable_client():
+    """退出时 Redis/客户端不可用不得抛异常（TTL 兜底回收）"""
+
+    class BoomClient:
+        def release(self, lease):
+            raise ConnectionError("redis down")
+
+    hb, _ = _heartbeat(BoomClient())
+    hb.register(Lease(Engine.GRAPH, "l1", 0), threading.current_thread())
+
+    hb.shutdown()  # 不抛
+
+    assert hb._entries == {}
+
+
+def test_ensure_started_registers_shutdown_hook_once(monkeypatch):
+    """atexit 挂的必须是 shutdown（不是只置位的 stop），且重复启动不重复注册"""
+    import threading as real_threading
+    from types import SimpleNamespace
+
+    # 本用例要跑真实的 _ensure_started：撤销 autouse fixture 打的 no-op 补丁
+    monkeypatch.undo()
+
+    created = []
+
+    class _FakeThread:
+        def __init__(self, target=None, name=None, daemon=None):
+            self.name = name
+            self.alive = True
+            created.append(self)
+
+        def start(self):
+            pass
+
+        def is_alive(self):
+            return self.alive
+
+    monkeypatch.setattr(
+        hb_mod, "threading",
+        SimpleNamespace(Event=real_threading.Event, Lock=real_threading.Lock, Thread=_FakeThread),
+    )
+    registered = []
+    monkeypatch.setattr(hb_mod, "atexit", SimpleNamespace(register=registered.append))
+
+    hb = hb_mod.JudgePoolHeartbeat(client=FakeClient())
+    hb._ensure_started()
+    assert len(created) == 1
+    assert registered == [hb.shutdown], "退出钩子必须是 shutdown（只置位的 stop 不释放租约）"
+
+    created[0].alive = False  # 模拟心跳线程意外退出后被重新拉起
+    hb._ensure_started()
+
+    assert len(created) == 2, "线程退出后应重新拉起"
+    assert registered == [hb.shutdown], "重复启动不得重复注册 atexit"
