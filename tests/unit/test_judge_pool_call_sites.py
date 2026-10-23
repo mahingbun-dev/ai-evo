@@ -207,6 +207,57 @@ def test_pool_disabled_call_site_is_unchanged(monkeypatch):
     assert mod._call_llm("hi", {"judge_model_config": {"provider": "openai"}}) == "plain"
 
 
+# ------------------------------------------------ 池异常必须透传（不被兜底吞掉）
+
+def _must_not_be_called(*args, **kwargs):
+    raise AssertionError("池异常已抛出，模型调用不应该发生")
+
+
+def _pool_raising(monkeypatch, module, exc):
+    def slot(engine, meta=None):
+        raise exc
+
+    monkeypatch.setattr(module, "judge_pool_slot", slot)
+
+
+def test_pool_timeout_propagates_from_fallback_sites(monkeypatch):
+    """池满等待超时不能被 "LLM 调用异常" 兜底吞成 None（否则上游给中性分）"""
+    import app.services.model_caller as mc
+
+    from app.services import rag_evaluator as rag_mod
+    from app.services import response_parser as parser_mod
+    from app.services.judge_pool import JudgePoolTimeout
+
+    monkeypatch.setattr(mc.ModelCallerSync, "call", staticmethod(_must_not_be_called))
+
+    _pool_raising(monkeypatch, rag_mod, JudgePoolTimeout("池满等待超时"))
+    with pytest.raises(JudgePoolTimeout):
+        rag_mod.LLMRagEvaluator(llm_config={"provider": "openai"})._call_llm("prompt")
+
+    _pool_raising(monkeypatch, parser_mod, JudgePoolTimeout("池满等待超时"))
+    with pytest.raises(JudgePoolTimeout):
+        parser_mod.JudgeResponseParser(judge_config={"provider": "openai"})._stage4_ai_correction("raw")
+
+
+def test_pool_aborted_propagates_from_fallback_sites(monkeypatch):
+    """任务停止（JudgePoolAborted）不能被兜底吞掉，行必须按停止标记"""
+    import app.services.model_caller as mc
+
+    from app.services import rag_evaluator as rag_mod
+    from app.services import response_parser as parser_mod
+    from app.services.judge_pool import JudgePoolAborted
+
+    monkeypatch.setattr(mc.ModelCallerSync, "call", staticmethod(_must_not_be_called))
+
+    _pool_raising(monkeypatch, rag_mod, JudgePoolAborted("并发池等待被中止"))
+    with pytest.raises(JudgePoolAborted):
+        rag_mod.LLMRagEvaluator(llm_config={"provider": "openai"})._call_llm("prompt")
+
+    _pool_raising(monkeypatch, parser_mod, JudgePoolAborted("并发池等待被中止"))
+    with pytest.raises(JudgePoolAborted):
+        parser_mod.JudgeResponseParser(judge_config={"provider": "openai"})._stage4_ai_correction("raw")
+
+
 # ---------------------------------------------------------- 线程池上下文继承
 
 def test_langgraph_run_parallel_inherits_context(monkeypatch):

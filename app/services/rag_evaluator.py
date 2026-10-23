@@ -11,7 +11,7 @@ import logging
 import re
 from typing import Dict, List, Any, Optional
 
-from app.services.judge_pool import judge_pool_slot
+from app.services.judge_pool import JudgePoolAborted, JudgePoolTimeout, judge_pool_slot
 
 logger = logging.getLogger(__name__)
 
@@ -475,6 +475,10 @@ class LLMRagEvaluator:
             else:
                 logger.warning(f"LLM 调用失败: {result.get('error')}")
                 return None
+        except (JudgePoolTimeout, JudgePoolAborted):
+            # 并发池等待超时/任务停止不能被当作「LLM 调用异常」吞成 None：
+            # 否则超时会被上游伪造成「LLM 无响应」的中性分，停止信号也无法按设计标记该行
+            raise
         except Exception as e:
             logger.error(f"LLM 调用异常: {e}")
             return None
