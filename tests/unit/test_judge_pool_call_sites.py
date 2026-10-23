@@ -410,3 +410,119 @@ def test_plugin_evaluator_trace_uses_plugin_engine(monkeypatch):
     result = evaluator.evaluate_trace("/tmp/x")
     assert result["success"] is True
     assert calls == ["plugin"]
+
+
+# ------------------------------------------- RAGAS 链路入池与池异常穿透（C2）
+
+def _ordering_slot(monkeypatch, module, events):
+    """记录型 slot：把 enter/exit 与被测代码里的真实模型调用写进同一条时间线
+
+    只断言「slot 被调用过」挡不住「把模型调用移出 with 块」这类回归，
+    所以这里断言调用发生在 enter 之后、exit 之前。
+    """
+
+    class _Ctx:
+        def __init__(self, engine, meta):
+            self.engine = engine
+            self.meta = meta
+
+        def __enter__(self):
+            events.append(("enter", self.engine, self.meta))
+            return None
+
+        def __exit__(self, *exc):
+            events.append(("exit", self.engine, self.meta))
+            return False
+
+    monkeypatch.setattr(module, "judge_pool_slot", lambda engine, meta=None: _Ctx(engine, meta))
+    return events
+
+
+def test_ragas_evaluate_runs_both_ascore_inside_slot(monkeypatch):
+    """ragas 新旧 API 的两次 single_turn_ascore 都必须在 slot 的 enter/exit 之间"""
+    import ragas.metrics as ragas_metrics
+
+    from app.services import rag_evaluator as mod
+
+    events = []
+    _ordering_slot(monkeypatch, mod, events)
+
+    class _FakeMetric:
+        def __init__(self, name):
+            self.name = name
+
+        async def single_turn_ascore(self, sample):
+            events.append(("ascore", self.name))
+            return 0.5
+
+    monkeypatch.setattr(mod.RagasEvaluator, "_build_ragas_llm", lambda self: object())
+    monkeypatch.setattr(
+        ragas_metrics, "LLMContextPrecisionWithReference",
+        lambda **kwargs: _FakeMetric("precision"),
+    )
+    monkeypatch.setattr(
+        ragas_metrics, "LLMContextRecall", lambda **kwargs: _FakeMetric("recall")
+    )
+
+    scores = mod.RagasEvaluator(llm_config={"api_key": "k"})._ragas_evaluate("q", "gt", ["ctx"])
+
+    assert scores == {"context_precision": 0.5, "context_recall": 0.5}
+    assert [e[0] for e in events] == ["enter", "ascore", "ascore", "exit"], events
+    assert events[0][1:] == ("graph", {"call_site": "rag_evaluator_ragas"})
+    assert events[-1][1:] == ("graph", {"call_site": "rag_evaluator_ragas"})
+
+
+def test_ragas_slot_released_when_body_raises(monkeypatch):
+    """slot 内抛异常也必须退出（否则额度要等 TTL 才回收）"""
+    from app.services import rag_evaluator as mod
+
+    events = []
+    _ordering_slot(monkeypatch, mod, events)
+
+    def _boom(self):
+        events.append(("build_llm",))
+        raise RuntimeError("裁判模型配置缺失")
+
+    monkeypatch.setattr(mod.RagasEvaluator, "_build_ragas_llm", _boom)
+
+    with pytest.raises(RuntimeError):
+        mod.RagasEvaluator(llm_config={"api_key": "k"})._ragas_evaluate("q", "gt", ["ctx"])
+
+    assert [e[0] for e in events] == ["enter", "build_llm", "exit"], events
+
+
+def test_pool_errors_propagate_out_of_rag_evaluate(monkeypatch):
+    """池超时/停止必须穿透 RAG 评测的三层兜底，不能被洗成缺指标或关键词降级分"""
+    from app.services import rag_evaluator as mod
+    from app.services.judge_pool import JudgePoolAborted, JudgePoolTimeout
+
+    def _raiser(exc):
+        def _inner(*args, **kwargs):
+            raise exc
+
+        return _inner
+
+    cases = [
+        (mod.RagasEvaluator, "_ragas_evaluate", ["context_precision"], JudgePoolTimeout("池满等待超时")),
+        (mod.RagasEvaluator, "_ragas_evaluate", ["context_recall"], JudgePoolAborted("并发池等待被中止")),
+        (mod.LLMRagEvaluator, "noise_sensitivity", ["noise_sensitivity"], JudgePoolTimeout("池满等待超时")),
+        (mod.LLMRagEvaluator, "negative_rejection", ["negative_rejection"], JudgePoolAborted("并发池等待被中止")),
+    ]
+    for cls, name, metrics, exc in cases:
+        monkeypatch.setattr(cls, name, _raiser(exc))
+        fallback_calls = []
+        monkeypatch.setattr(
+            mod.RagasEvaluator, "_fallback_precision",
+            lambda *a, **k: fallback_calls.append(a) or 0.0,
+        )
+        monkeypatch.setattr(
+            mod.RagasEvaluator, "_fallback_recall",
+            lambda *a, **k: fallback_calls.append(a) or 0.0,
+        )
+
+        evaluator = mod.RAGEvaluator(llm_config={"api_key": "k"})
+        with pytest.raises(type(exc)):
+            evaluator.evaluate("q", "gt", ["ctx"], metrics_list=metrics)
+        assert fallback_calls == [], f"{name} 的池异常被降级成关键词算法"
+
+        monkeypatch.undo()
