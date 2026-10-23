@@ -17,6 +17,8 @@ _INT_FIELDS = (
     "lease_ttl_seconds", "heartbeat_interval_seconds",
     "wait_timeout_seconds", "scan_interval_seconds", "audit_retention_days",
 )
+_TRUE_VALUES = {"1", "true", "yes", "on"}
+_FALSE_VALUES = {"0", "false", "no", "off"}
 
 
 @dataclass(frozen=True)
@@ -57,6 +59,24 @@ def _redis():
     return get_redis_client()
 
 
+def _parse_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in _TRUE_VALUES:
+        return True
+    if text in _FALSE_VALUES:
+        return False
+    raise ValueError(f"无法解析为布尔值: {value!r}")
+
+
+def _parse_int(field: str, value) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"{field} 必须是整数: {value!r}") from e
+
+
 def _from_mapping(raw: dict) -> JudgePoolConfig:
     values = DEFAULTS.to_dict()
     for field in _INT_FIELDS:
@@ -66,8 +86,22 @@ def _from_mapping(raw: dict) -> JudgePoolConfig:
             except (TypeError, ValueError):
                 pass
     if raw.get("fail_open") not in (None, ""):
-        values["fail_open"] = str(raw["fail_open"]).lower() in ("1", "true", "yes")
+        try:
+            values["fail_open"] = _parse_bool(raw["fail_open"])
+        except ValueError:
+            pass
     return JudgePoolConfig(**values)
+
+
+def _normalize_payload(payload: dict) -> dict:
+    """写侧归一化：非法值显式抛 ValueError，未知字段忽略。"""
+    normalized = {}
+    for key, value in payload.items():
+        if key in _INT_FIELDS:
+            normalized[key] = _parse_int(key, value)
+        elif key == "fail_open":
+            normalized[key] = _parse_bool(value)
+    return normalized
 
 
 def _mapping_from_config(cfg: JudgePoolConfig) -> dict:
@@ -94,8 +128,8 @@ def load_config(force: bool = False) -> JudgePoolConfig:
             client.hset(conf_key(), mapping=raw)
         cfg = _from_mapping(raw)
     except Exception as e:  # noqa: BLE001 - 配置读取失败不能阻断评测
-        logger.warning(f"[judge_pool] 读取配置失败，沿用上次值或默认值: {e}")
-        cfg = _cached or DEFAULTS
+        logger.warning(f"[judge_pool] 读取配置失败，回退持久化配置/上次值/默认值: {e}")
+        cfg = _load_from_db() or _cached or DEFAULTS
     with _lock:
         _cached = cfg
         _cached_at = now
@@ -148,8 +182,11 @@ def _save_to_db(payload: dict, updated_by: str = "") -> None:
 
 
 def save_config(payload: dict, updated_by: str = "") -> JudgePoolConfig:
-    current = load_config(force=True).to_dict()
-    current.update({k: v for k, v in payload.items() if k in current})
+    # 先校验，非法输入在任何副作用（DB/Redis）之前失败
+    normalized = _normalize_payload(payload)
+    # DB 是持久化源：以其当前值为底，避免用故障态的默认值覆盖运维配置
+    current = (_load_from_db() or load_config(force=True)).to_dict()
+    current.update(normalized)
     cfg = JudgePoolConfig(**current)
     _save_to_db(current, updated_by)
     try:
