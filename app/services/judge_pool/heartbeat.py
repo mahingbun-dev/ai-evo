@@ -59,7 +59,14 @@ class JudgePoolHeartbeat:
                 self.unregister(lease_id)
                 self._emit("owner_thread_dead", lease)
                 continue
-            if not client.renew(lease):
+            renewed = client.renew(lease)
+            if renewed is None:
+                # 传输异常（Redis 抖动）不等于租约失效：保持登记、下轮重试。
+                # 这里判失效会让一次抖动跨过一个心跳周期就停掉本进程全部在飞
+                # 租约的续约，TTL 后额度被回收而调用仍在跑 → 反向超发
+                logger.debug("[judge_pool] 续约传输失败，保留登记下轮重试: %s", lease_id)
+                continue
+            if not renewed:
                 # 标记失效：持有线程下一次 acquire 看到 lost 就不会误判为重入放行
                 lease.lost = True
                 self.unregister(lease_id)

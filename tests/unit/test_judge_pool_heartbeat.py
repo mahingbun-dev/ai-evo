@@ -133,6 +133,58 @@ def test_lost_lease_marked_unregistered_and_audited():
     assert events == ["lease_lost"]
 
 
+# ---------- 3b. renew 返回 None（传输异常）→ 保持登记，下轮重试 ----------
+
+
+def test_transport_error_keeps_lease_registered_and_retries():
+    """Redis 抖动跨过一个心跳周期不得停掉续约
+
+    判失效会让本进程所有在飞租约停止续约，TTL 后额度被回收而调用仍在跑
+    （plugin/CC 合法占用 30–120 分钟），池再放 limit 个进来 → 反向超发。
+    """
+    client = FakeClient(renew_ok=None)
+    hb, events = _heartbeat(client)
+    lease = Lease(Engine.GRAPH, "l1", 0)
+
+    hb.register(lease, threading.current_thread())
+    hb.run_once()
+    hb.run_once()
+
+    assert lease.lost is False
+    assert events == []
+    assert client.released == []
+    assert client.renewed == ["l1", "l1"], "None 时必须保持登记并在下一轮继续重试"
+
+
+def test_transport_error_then_success_recovers():
+    """抖动恢复后续约成功：租约全程不被标记失效"""
+    client = FakeClient(renew_ok=None)
+    hb, events = _heartbeat(client)
+    lease = Lease(Engine.GRAPH, "l1", 0)
+
+    hb.register(lease, threading.current_thread())
+    hb.run_once()
+    client.renew_ok = True
+    hb.run_once()
+
+    assert lease.lost is False
+    assert events == []
+    assert client.renewed == ["l1", "l1"]
+
+
+def test_script_zero_still_marks_lost():
+    """与 None 区分开：脚本明确返回 0（租约已被回收）才判失效"""
+    client = FakeClient(renew_ok=False)
+    hb, events = _heartbeat(client)
+    lease = Lease(Engine.GRAPH, "l1", 0)
+
+    hb.register(lease, threading.current_thread())
+    hb.run_once()
+
+    assert lease.lost is True
+    assert events == ["lease_lost"]
+
+
 # ---------- 4. unregister 后不再续约 ----------
 
 

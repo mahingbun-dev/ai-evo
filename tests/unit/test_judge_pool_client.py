@@ -398,13 +398,42 @@ def test_renew_failure_clears_thread_local_lease():
     c.release(again)
 
 
-def test_renew_exception_clears_thread_local_lease():
+def test_renew_transport_error_returns_none_and_keeps_lease():
+    """传输异常 ≠ 租约失效：返回 None，且不清线程本地登记（下轮重试）
+
+    清掉登记会让持有线程下一次 acquire 变成「首次申请」再占一个额度，
+    而它手里那次调用仍在跑 —— 一次 Redis 抖动就能把占用翻倍。
+    """
+
     class BoomRenew(StubClient):
         def _lua_renew(self, engine, lease_id, detail, cfg):
             raise ConnectionError("redis down")
 
     c = BoomRenew([AcquireResult(True, 1, [], -1)])
     lease = c.acquire(Engine.GRAPH)
+
+    assert c.renew(lease) is None
+    assert current_lease(Engine.GRAPH) is lease
+    assert lease.lost is False
+
+    # 仍按重入放行，不再申请第二个额度
+    again = c.acquire(Engine.GRAPH)
+    assert again.reentrant is True
+    assert len(c.calls) == 1
+    c.release(lease)
+    assert current_lease(Engine.GRAPH) is None
+
+
+def test_renew_script_zero_returns_false_not_none():
+    """脚本返回 0 = 租约真的没了：必须是 False（不是 None），并清掉登记"""
+
+    class ZeroRenew(StubClient):
+        def _lua_renew(self, engine, lease_id, detail, cfg):
+            return 0
+
+    c = ZeroRenew([AcquireResult(True, 1, [], -1)])
+    lease = c.acquire(Engine.GRAPH)
+
     assert c.renew(lease) is False
     assert current_lease(Engine.GRAPH) is None
 

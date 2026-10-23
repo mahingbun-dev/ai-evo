@@ -175,7 +175,16 @@ class JudgePoolClient:
                      hold_ms=_now_ms() - lease.acquired_at_ms)
         return bool(removed)
 
-    def renew(self, lease: Lease) -> bool:
+    def renew(self, lease: Lease) -> Optional[bool]:
+        """续约，三态返回：
+
+        - True：续上了；
+        - False：租约确实已失效（被扫描回收/管理员强释放），调用方应停止记账；
+        - None：传输异常，租约状态未知 —— 调用方必须保持登记、下轮重试。
+          把 None 混成 False 会让一次 Redis 抖动跨过一个心跳周期就停掉本进程
+          全部在飞租约的续约：TTL 后额度被回收而调用仍在跑（plugin/CC 合法
+          占用 30–120 分钟），池会再放 limit 个进来，形成反向超发。
+        """
         if lease is None or lease.unavailable or lease.reentrant:
             return False
         cfg = load_config()
@@ -190,8 +199,8 @@ class JudgePoolClient:
         try:
             renewed = bool(self._lua_renew(lease.engine, lease.lease_id, json.dumps(detail, ensure_ascii=False), cfg))
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"[judge_pool] 续约失败: {e}")
-            renewed = False
+            logger.warning(f"[judge_pool] 续约传输失败（保持登记，下轮重试）: {e}")
+            return None
         if not renewed:
             # 租约已被扫描回收/管理员强制释放：清掉线程本地登记，
             # 否则持有线程下一次 acquire 会命中重入判定，不申请额度就放行（绕过池限额）
