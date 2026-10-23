@@ -102,6 +102,9 @@ class JudgePoolClient:
                 result = self._try_acquire(engine, lease_id, detail, cfg)
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"[judge_pool] Redis 不可用，放行调用: {e}")
+                # 之前某一轮可能已把自己 ZADD 进 wait zset；不出队会占住 FIFO 队首
+                # 直到 stale 清扫，期间 am_head 判定会挡住所有后来的申请
+                self._drop_waiter(engine, lease_id)
                 record_event("redis_unavailable", engine=engine.value, lease_id=lease_id,
                              eval_task_id=ctx.eval_task_id, row_idx=ctx.row_idx,
                              detail={"error": str(e)[:500]})
@@ -159,10 +162,15 @@ class JudgePoolClient:
         detail = {"lease_id": lease.lease_id, "engine": lease.engine.value,
                   "last_renew_at": _now_ms()}
         try:
-            return bool(self._lua_renew(lease.engine, lease.lease_id, json.dumps(detail, ensure_ascii=False), cfg))
+            renewed = bool(self._lua_renew(lease.engine, lease.lease_id, json.dumps(detail, ensure_ascii=False), cfg))
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[judge_pool] 续约失败: {e}")
-            return False
+            renewed = False
+        if not renewed:
+            # 租约已被扫描回收/管理员强制释放：清掉线程本地登记，
+            # 否则持有线程下一次 acquire 会命中重入判定，不申请额度就放行（绕过池限额）
+            clear_current_lease(lease.engine, lease)
+        return renewed
 
     def force_release(self, engine, lease_id: str) -> bool:
         engine = coerce_engine(engine)
