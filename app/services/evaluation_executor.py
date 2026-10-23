@@ -10,6 +10,7 @@ import logging
 import threading
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
@@ -65,6 +66,41 @@ class EvaluationExecutor:
         self.execution_number = execution_number
         self.progress_offset = progress_offset
 
+    def _signal_stop(self) -> None:
+        """置停止信号（幂等），失败只告警不抛
+
+        生产 stop_event 是 RedisStopSignalChecker，set() 是一次裸 Redis 写；
+        软超时收尾路径上若这里再抛 ConnectionError，会**替换掉正在传播的**
+        SoftTimeLimitExceeded，任务失败标签从「软超时」变成「Redis 异常」，
+        运维据此判断不出是评测跑太久还是中间件抖动。所以吞掉并继续收尾。
+        """
+        try:
+            self.stop_event.set()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"置停止信号失败（继续按软超时收尾）: {e}")
+
+    @contextmanager
+    def _soft_timeout_stops_pool(self):
+        """线程池块的软超时守卫：退出前一定先置停止信号
+
+        Celery 软超时是在主线程**任意字节码处**抛出的，不只落在行内 try 里：
+        `for future in as_completed(...)` 自身阻塞时会中，行内 try 之外的
+        `_persist_row_result`（落库）也会中。这些位置逃逸的异常不会进内层
+        `except SoftTimeLimitExceeded`，于是 stop_event 未置位，with 的
+        __exit__ 仍走 shutdown(wait=True)，排队行还卡在 judge_pool.acquire 里
+        最长等 wait_timeout（900s）；软超时 6600s / 硬超时 7200s 只剩 600s
+        余量，等不完就撞硬 SIGKILL，留下幽灵等待者扩散到其他任务。
+
+        contextmanager 的 __exit__ 后进先出：它先于 executor 的 __exit__ 执行，
+        因此置位发生在 shutdown(wait=True) 之前，池等待 ≤2s 内以
+        JudgePoolAborted 退出。
+        """
+        try:
+            yield
+        except SoftTimeLimitExceeded:
+            self._signal_stop()
+            raise
+
     def execute_batch(
         self,
         payloads: List[Dict[str, Any]],
@@ -83,8 +119,10 @@ class EvaluationExecutor:
         results = []
         total = len(payloads)
 
-        # 创建线程池
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+        # 创建线程池（_soft_timeout_stops_pool：软超时逃逸点不止行内 try，
+        # as_completed 与 _persist_row_result 也会中，守卫保证退出前先置停止信号）
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor, \
+                self._soft_timeout_stops_pool():
             # 提交所有任务（future -> (列表序号, payload)；payload 携带任务链路
             # 标注的 _orig_idx 数据项原始序号，作为行级落库键）
             future_to_payload = {
@@ -119,8 +157,12 @@ class EvaluationExecutor:
                     # 里最长等 wait_timeout（900s）；软超时 6600s / 硬超时
                     # 7200s 只剩 600s 余量，等不完就撞硬 SIGKILL，留下幽灵
                     # 等待者扩散到其他任务。置位后池等待 ≤2s 内以
-                    # JudgePoolAborted 退出
-                    self.stop_event.set()
+                    # JudgePoolAborted 退出。
+                    # 这里与外层 _soft_timeout_stops_pool 守卫重复置位（幂等）：
+                    # 守卫兜住 as_completed / _persist_row_result 等行内 try
+                    # 之外的逃逸点，统一走 _signal_stop 以免 set() 自身抛异常
+                    # 把 SoftTimeLimitExceeded 换成 Redis 异常
+                    self._signal_stop()
                     raise
                 except JudgePoolAborted:
                     # 池等待期间任务被停止：按停止落行，不能被下面的宽 except
@@ -999,7 +1041,8 @@ class EvaluationExecutor:
         results = []
         total = len(payloads)
 
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor, \
+                self._soft_timeout_stops_pool():
             future_to_idx = {
                 executor.submit(self._evaluate_single_rag, payload, task): (pos, payload)
                 for pos, payload in enumerate(payloads)
@@ -1016,7 +1059,7 @@ class EvaluationExecutor:
                     # 先置停止信号，否则 with 块 __exit__ 的 shutdown(wait=True)
                     # 会等排队行在 judge_pool.acquire 里耗到 wait_timeout，
                     # 撞硬超时 SIGKILL 后留下幽灵等待者（详见 execute_batch）
-                    self.stop_event.set()
+                    self._signal_stop()
                     raise
                 except JudgePoolAborted:
                     # 池等待期间任务被停止：按停止落行，不伪装成 RAG 评测失败
@@ -1082,7 +1125,8 @@ class EvaluationExecutor:
         results = []
         total = len(payloads)
 
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor, \
+                self._soft_timeout_stops_pool():
             future_to_idx = {
                 executor.submit(self._evaluate_single_latency, payload, task): (pos, payload)
                 for pos, payload in enumerate(payloads)
@@ -1099,7 +1143,7 @@ class EvaluationExecutor:
                     # 先置停止信号，否则 with 块 __exit__ 的 shutdown(wait=True)
                     # 会等排队行在 judge_pool.acquire 里耗到 wait_timeout，
                     # 撞硬超时 SIGKILL 后留下幽灵等待者（详见 execute_batch）
-                    self.stop_event.set()
+                    self._signal_stop()
                     raise
                 except Exception as e:
                     logger.exception(f"耗时评测执行失败 (idx={pos})")
