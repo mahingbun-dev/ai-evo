@@ -57,38 +57,58 @@ def _writer_loop() -> None:
     batch = []
     last_flush = time.monotonic()
     while True:
-        timeout = max(0.05, _FLUSH_INTERVAL_SECONDS - (time.monotonic() - last_flush))
+        # 单批失败（含建会话失败）不能让写线程死掉：吞掉异常、丢弃该批后继续
         try:
-            item = _QUEUE.get(timeout=timeout)
-        except queue.Empty:
-            item = None
-        if item is not None and item.get("__flush__"):
-            if batch:
+            timeout = max(0.05, _FLUSH_INTERVAL_SECONDS - (time.monotonic() - last_flush))
+            try:
+                item = _QUEUE.get(timeout=timeout)
+            except queue.Empty:
+                item = None
+            if item is not None and item.get("__flush__"):
+                try:
+                    if batch:
+                        _write_batch(batch)
+                        last_flush = time.monotonic()
+                finally:
+                    # 落库失败也必须放开屏障，否则 flush_audit 会白等到超时
+                    item["__flush_event__"].set()
+                continue
+            if item is not None:
+                batch.append({k: v for k, v in item.items() if not k.startswith("__")})
+            if batch and (len(batch) >= _BATCH_SIZE or time.monotonic() - last_flush >= _FLUSH_INTERVAL_SECONDS):
                 _write_batch(batch)
                 last_flush = time.monotonic()
-            item["__flush_event__"].set()
-            continue
-        if item is not None:
-            batch.append({k: v for k, v in item.items() if not k.startswith("__")})
-        if batch and (len(batch) >= _BATCH_SIZE or time.monotonic() - last_flush >= _FLUSH_INTERVAL_SECONDS):
-            _write_batch(batch)
-            last_flush = time.monotonic()
+        except Exception as e:  # noqa: BLE001 - 写线程必须长活
+            logger.warning(f"[judge_pool] 审计写线程异常，丢弃当前批次: {e}")
+            batch.clear()
 
 
 def _write_batch(batch: list) -> None:
-    from app.models.judge_pool_models import JudgePoolAuditLog
+    try:
+        from app.models.judge_pool_models import JudgePoolAuditLog
 
-    db = SessionLocal()
+        db = SessionLocal()
+    except Exception as e:  # noqa: BLE001 - 建会话/导入失败只丢这一批
+        logger.warning(f"[judge_pool] 审计落库初始化失败，丢弃 {len(batch)} 条: {e}")
+        batch.clear()
+        return
+
     try:
         for item in batch:
             db.add(JudgePoolAuditLog(**item))
         db.commit()
     except Exception as e:  # noqa: BLE001
         logger.warning(f"[judge_pool] 审计落库失败，丢弃 {len(batch)} 条: {e}")
-        db.rollback()
+        try:
+            db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
     finally:
-        db.close()
-    batch.clear()
+        try:
+            db.close()
+        except Exception:  # noqa: BLE001
+            pass
+        batch.clear()
 
 
 def flush_audit(timeout: float = 2.0) -> None:
