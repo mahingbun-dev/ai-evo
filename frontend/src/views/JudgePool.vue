@@ -59,7 +59,7 @@
           <el-switch v-model="form.fail_open" />
         </el-form-item>
         <el-form-item>
-          <el-button type="primary" :loading="saving" @click="save">保存</el-button>
+          <el-button type="primary" :loading="saving" :disabled="!configLoaded" @click="save">保存</el-button>
           <el-button :disabled="saving" @click="loadConfig">重置</el-button>
         </el-form-item>
       </el-form>
@@ -185,6 +185,9 @@ const status = reactive({ redis_available: true, degraded: false, engines: {}, l
 const form = reactive({})
 const saving = ref(false)
 const configLoading = ref(false)
+// 配置是否成功加载过：加载失败时 form 为空，不能拿空表单去 PUT（后端会合并现值返回 200，
+// 页面却弹出「已保存」，实际什么都没改）
+const configLoaded = ref(false)
 const releasingAll = ref(false)
 const audit = reactive({ total: 0, items: [] })
 const auditQuery = reactive({ engine: '', event: '', page: 1, page_size: 20 })
@@ -249,7 +252,10 @@ async function loadConfig() {
     const data = await judgePoolApi.getConfig()
     Object.keys(form).forEach((k) => delete form[k])
     Object.assign(form, data)
+    configLoaded.value = true
   } catch (e) {
+    // 之前成功加载过时 form 仍持有真实值，保持可保存；只有空表单才判定为「未加载」
+    if (!Object.keys(form).length) configLoaded.value = false
     ElMessage.error(errorText(e, '加载并发配置失败'))
   } finally {
     configLoading.value = false
@@ -257,6 +263,10 @@ async function loadConfig() {
 }
 
 async function save() {
+  if (!configLoaded.value) {
+    ElMessage.warning('配置未加载，请先刷新')
+    return
+  }
   const error = validatePoolConfig(form)
   if (error) {
     ElMessage.error(error)
@@ -349,15 +359,23 @@ function handleAuditSearch() {
   loadAudit()
 }
 
+// 后台标签页里定时器会被浏览器节流（切回来可能要等 1 分钟），监控页不能显示过期数据：
+// 回到前台立即补一次拉取
+function handleVisibilityChange() {
+  if (document.visibilityState === 'visible') loadStatus()
+}
+
 onMounted(async () => {
   // 三个加载函数内部都消化了异常，Promise.all 不会因单个失败整体 reject
   await Promise.all([loadStatus(), loadConfig(), loadAudit()])
   timer = setInterval(loadStatus, POLL_INTERVAL_MS)
+  document.addEventListener('visibilitychange', handleVisibilityChange)
 })
 
 onUnmounted(() => {
   if (timer) clearInterval(timer)
   timer = null
+  document.removeEventListener('visibilitychange', handleVisibilityChange)
 })
 </script>
 
