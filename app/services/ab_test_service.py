@@ -68,8 +68,12 @@ class ABTestService:
 
         W19 归属：created_by=None 表示超管/不过滤（看全部）；传 user_code
         时只看本人创建 + 历史无主行（created_by IS NULL）。
+        M5 QE5-2：只列手工会话式（model 模式）——template 模式走
+        ABTemplateSessionService（旧入口行为不变）。
         """
-        query = self.db.query(ABTestSession)
+        query = self.db.query(ABTestSession).filter(
+            (ABTestSession.mode == "model") | (ABTestSession.mode.is_(None))
+        )
         if keyword:
             query = query.filter(ABTestSession.name.ilike(f"%{keyword}%"))
         if created_by is not None:

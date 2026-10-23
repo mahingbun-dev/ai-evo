@@ -49,11 +49,13 @@
             {{ formatTime(row.created_at) }}
           </template>
         </el-table-column>
-        <el-table-column label="操作" min-width="250" fixed="right">
+        <el-table-column label="操作" min-width="290" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" @click="runTask(row)" :disabled="row.status === 'running' || rowOpLoading" :loading="runningId === row.id">执行</el-button>
             <el-button link type="warning" @click="stopTask(row)" :disabled="!['running', 'failed'].includes(row.status) || rowOpLoading" :loading="stoppingId === row.id">停止</el-button>
             <el-button link type="info" @click="openExecutionHistory(row)" :disabled="rowOpLoading">历史</el-button>
+            <!-- M5 QE5-3：任务定时（cron 编辑器 + 下次运行 + 运行历史） -->
+            <el-button link type="primary" @click="openSchedule(row)" :disabled="rowOpLoading">定时</el-button>
             <el-button link type="primary" @click="openDialog(row)" :disabled="rowOpLoading">编辑</el-button>
             <el-button link type="danger" @click="deleteTask(row)" :disabled="rowOpLoading" :loading="deletingId === row.id">删除</el-button>
           </template>
@@ -105,6 +107,35 @@
           <el-select v-model="form.dataset_id" placeholder="请选择数据集" style="width: 100%">
             <el-option v-for="ds in datasets" :key="ds.id" :label="ds.name" :value="ds.id" />
           </el-select>
+        </el-form-item>
+        <!-- 数据集版本绑定（M5 QE5-1）：跟随最新（每次执行用当前数据）/ 锁定版本（执行用版本快照） -->
+        <el-form-item label="版本绑定" v-if="form.dataset_id && !(form.evaluation_type === 'safety' && form.safety_config?.sample_source === 'pack')">
+          <div style="width: 100%; display: flex; align-items: center; gap: 16px; flex-wrap: wrap;">
+            <el-radio-group v-model="datasetVersionMode">
+              <el-radio value="latest">跟随最新</el-radio>
+              <el-radio value="locked">锁定版本</el-radio>
+            </el-radio-group>
+            <el-select
+              v-if="datasetVersionMode === 'locked'"
+              v-model="form.dataset_version_no"
+              placeholder="选择要锁定的版本"
+              style="max-width: 360px"
+              :loading="datasetVersionsLoading"
+            >
+              <el-option
+                v-for="v in datasetVersions"
+                :key="v.version_no"
+                :label="`v${v.version_no}（${v.row_count} 行${v.changelog ? ' · ' + v.changelog : ''}）`"
+                :value="v.version_no"
+              />
+            </el-select>
+            <span v-if="datasetVersionMode === 'locked' && datasetVersions.length === 0 && !datasetVersionsLoading" style="color: #e6a23c; font-size: 12px;">
+              该数据集还没有版本，请先到数据集管理页打版，或改用「跟随最新」
+            </span>
+            <span v-else style="color: #909399; font-size: 12px;">
+              {{ datasetVersionMode === 'locked' ? '锁定后每次执行都用该版本快照数据（口径可复现）' : '每次执行用数据集当前数据' }}
+            </span>
+          </div>
         </el-form-item>
         <!-- 待评测内容来源：仅 AI 裁判员评测可配置；使用数据集字段/不使用模型输出时执行阶段不调用被测模型 -->
         <el-form-item label="待评测内容来源" v-if="form.evaluation_type === 'judge'">
@@ -1523,6 +1554,67 @@
       </template>
     </el-dialog>
 
+    <!-- 任务定时（M5 QE5-3）：cron 编辑器 + 下次运行时间 + 运行历史（一任务一定时） -->
+    <el-drawer v-model="scheduleVisible" :title="`定时评测 · ${scheduleTask?.name || ''}`" size="580px">
+      <div v-loading="scheduleLoading">
+        <el-form label-width="90px">
+          <el-form-item label="启用">
+            <el-switch v-model="scheduleForm.enabled" :disabled="readonlyRole" />
+            <span class="cron-tip" style="margin-left: 12px;">停用后不再扫描触发，配置保留</span>
+          </el-form-item>
+          <el-form-item label="常用预设">
+            <el-select v-model="schedulePreset" style="width: 200px" @change="applySchedulePreset">
+              <el-option v-for="p in SCHEDULE_PRESETS" :key="p.label" :label="p.label" :value="p.label" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="cron 表达式">
+            <div class="cron-row">
+              <div v-for="(f, i) in CRON_FIELDS" :key="f" class="cron-field">
+                <el-input v-model="scheduleForm.cron[i]" size="small" :disabled="readonlyRole" />
+                <span class="cron-field-label">{{ f }}</span>
+              </div>
+            </div>
+            <div class="cron-tip">5 段标准 cron（分 时 日 月 周，北京时间），支持 * / , - 与 */n 步进</div>
+          </el-form-item>
+          <el-form-item label="时段限制">
+            <el-time-select v-model="scheduleForm.window_start" start="00:00" step="00:30" end="23:30" placeholder="不限" style="width: 120px" :disabled="readonlyRole" />
+            <span style="margin: 0 8px;">至</span>
+            <el-time-select v-model="scheduleForm.window_end" start="00:00" step="00:30" end="23:30" placeholder="不限" style="width: 120px" :disabled="readonlyRole" />
+            <div class="cron-tip">触发时刻须落在时段内（支持跨零点）；留空=不限</div>
+          </el-form-item>
+          <el-form-item v-if="scheduleInfo?.next_run_at" label="下次运行">
+            <span>{{ formatTime(scheduleInfo.next_run_at) }}</span>
+          </el-form-item>
+          <el-form-item v-if="scheduleInfo?.last_status" label="最近结果">
+            <el-tag :type="scheduleStatusTagType(scheduleInfo.last_status)" size="small">
+              {{ scheduleStatusLabel(scheduleInfo.last_status) }}
+            </el-tag>
+            <span v-if="scheduleInfo?.last_message" class="cron-tip" style="margin-left: 8px;">{{ scheduleInfo.last_message }}</span>
+          </el-form-item>
+        </el-form>
+
+        <el-divider content-position="left">运行历史（最近 20 次）</el-divider>
+        <el-table :data="scheduleInfo?.history || []" size="small">
+          <el-table-column label="时间" width="165">
+            <template #default="{ row }">{{ formatTime(row.at) }}</template>
+          </el-table-column>
+          <el-table-column label="结果" width="110">
+            <template #default="{ row }">
+              <el-tag :type="scheduleStatusTagType(row.status)" size="small">
+                {{ scheduleStatusLabel(row.status) }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column prop="message" label="说明" min-width="140" show-overflow-tooltip />
+        </el-table>
+        <el-empty v-if="!(scheduleInfo?.history || []).length" description="暂无触发记录" :image-size="60" />
+      </div>
+      <template #footer>
+        <el-button v-if="scheduleInfo" type="danger" :loading="scheduleRemoving" :disabled="readonlyRole || scheduleSaving" @click="removeSchedule">删除定时</el-button>
+        <el-button type="primary" :loading="scheduleSaving" :disabled="readonlyRole" @click="saveSchedule">保存</el-button>
+      </template>
+    </el-drawer>
+
     <!-- hub_file 输入映射「选择文件」弹窗（阶段B/F4）：样本树点选/手填 glob + 即时匹配预览 + required -->
     <HubFilePatternPicker
       v-model:visible="hubPickerVisible"
@@ -1586,6 +1678,7 @@
 
 <script setup>
 import { ref, reactive, computed, inject, onMounted, onUnmounted, watch, nextTick } from 'vue'
+import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, View, Delete, ArrowDown, Warning, Rank, UploadFilled } from '@element-plus/icons-vue'
 import { taskApi, datasetApi, modelApi, batchApi, instructionApi, efficiencyApi, preJudgeScriptApi, pluginMarketplaceApi } from '@/api'
@@ -1622,6 +1715,34 @@ const DEFAULT_RAG_JUDGE_VARIABLE_CONFIG = [
 const tasks = ref([])
 const datasets = ref([])
 const models = ref([])
+
+// ==================== 数据集版本绑定（M5 QE5-1） ====================
+const route = useRoute()
+const datasetVersions = ref([])           // 当前所选数据集的版本列表（新→旧）
+const datasetVersionsLoading = ref(false)
+// 绑定模式：latest=跟随最新（默认，存量口径）/ locked=锁定版本（执行用版本快照）
+const datasetVersionMode = ref('latest')
+// 编辑回显抑制标记：openDialog 回填表单触发 dataset_id watcher 时，
+// 不按「用户换数据集」做版本绑定/字段重置（回显后由 taskDetail 值接管）
+const hydratingForm = ref(false)
+
+const fetchDatasetVersions = async (datasetId) => {
+  if (!datasetId) {
+    datasetVersions.value = []
+    return
+  }
+  datasetVersionsLoading.value = true
+  try {
+    const res = await datasetApi.listVersions(datasetId)
+    datasetVersions.value = res || []
+  } catch (e) {
+    console.error('获取数据集版本列表失败:', e)
+    datasetVersions.value = []
+  } finally {
+    datasetVersionsLoading.value = false
+  }
+}
+
 
 // 评测前脚本（Pre-Judge Script）相关状态：脚本以「待评测数据行 source=script_output」编排，
 // 任务级 pre_scripts 旧结构不再提供编辑入口（编辑回显时自动转为 script_output 目标行）
@@ -2253,8 +2374,9 @@ watch(() => form.value?.model_provider, () => {
 // 监听数据集选择变化
 watch(() => form.value.dataset_id, async (newDatasetId, oldDatasetId) => {
   if (newDatasetId !== oldDatasetId) {
-    // 只有当 oldDatasetId 有值时才清空（避免初始化时清空已有的配置）
-    if (oldDatasetId) {
+    // 只有当 oldDatasetId 有值时才清空（避免初始化时清空已有的配置）；
+    // 编辑回显（hydratingForm）由 taskDetail 的绑定值接管，不走重置
+    if (oldDatasetId && !hydratingForm.value) {
       datasetFields.value = []
       // 清空所有已选的 field 值
       form.value?.judge_variable_config?.forEach(item => {
@@ -2267,8 +2389,12 @@ watch(() => form.value.dataset_id, async (newDatasetId, oldDatasetId) => {
           target.source_config.field = ''
         }
       })
+      // 换数据集后旧版本号必然失效：重置为跟随最新
+      form.value.dataset_version_no = null
+      datasetVersionMode.value = 'latest'
     }
     await fetchDatasetFields(newDatasetId)
+    await fetchDatasetVersions(newDatasetId)
     // 已选的模型输出字段若不在新数据集中，清空
     if (form.value.model_output_field) {
       const availableFields = modelOutputFieldOptions.value.map(opt => opt.value)
@@ -2276,6 +2402,15 @@ watch(() => form.value.dataset_id, async (newDatasetId, oldDatasetId) => {
         form.value.model_output_field = ''
       }
     }
+  }
+})
+
+// 版本绑定模式切换（M5 QE5-1）：跟随最新清空锁定号；锁定时未选则默认取最新版
+watch(datasetVersionMode, (mode) => {
+  if (mode === 'latest') {
+    form.value.dataset_version_no = null
+  } else if (form.value.dataset_version_no == null && datasetVersions.value.length > 0) {
+    form.value.dataset_version_no = datasetVersions.value[0].version_no
   }
 })
 
@@ -2978,6 +3113,12 @@ const openDialog = async (row = null) => {
     // steps/pre_scripts 已废弃：不进入表单状态（展示归一化已分别并入 score_details / evaluation_targets）
     delete form.value.steps
     delete form.value.pre_scripts
+    // M5 QE5-1 版本绑定回显：dataset_version_no 有值=锁定该版本，空=跟随最新。
+    // 回显期间挂抑制标记——dataset_id watcher 识别编辑回填不做「换数据集」重置
+    hydratingForm.value = true
+    form.value.dataset_version_no = taskDetail.dataset_version_no ?? null
+    datasetVersionMode.value = taskDetail.dataset_version_no ? 'locked' : 'latest'
+    nextTick(() => { hydratingForm.value = false })
     // M1 门禁配置回填表单态
     applyGateConfig(taskDetail.gate_config)
     // M2 终态校验器回填表单态
@@ -3008,6 +3149,8 @@ const openDialog = async (row = null) => {
       name: '',
       evaluation_type: 'judge',
       dataset_id: '',
+      // M5 QE5-1 数据集版本绑定：null=跟随最新；锁定时为 dataset_versions.version_no
+      dataset_version_no: null,
       model_provider: '',
       model_output_source: 'model_call',
       model_output_field: '',
@@ -3055,6 +3198,9 @@ const openDialog = async (row = null) => {
     }
     // 新建任务无旧版结构
     legacyConfigDetected.value = false
+    // M5 QE5-1 新建默认跟随最新（清空锁定号与版本列表残留）
+    datasetVersionMode.value = 'latest'
+    datasetVersions.value = []
     // M1 门禁配置默认关闭
     applyGateConfig(null)
     // M2 终态校验器默认为空
@@ -4413,6 +4559,11 @@ const submitForm = async () => {
     if (!submitData.dataset_id) {
       submitData.dataset_id = null
     }
+    // M5 QE5-1 版本绑定提交：跟随最新显式发 null（服务端 None=跟随最新）；
+    // 无数据集（如安全评测 pack 直跑）时锁定号一并清空
+    submitData.dataset_version_no = submitData.dataset_id && datasetVersionMode.value === 'locked'
+      ? (submitData.dataset_version_no ?? null)
+      : null
     // M1 门禁配置：表单态收集为落库形状（null=未启用）
     submitData.gate_config = collectGateConfig()
     // M2 终态校验器：表单态收集为落库形状（null=未配置）
@@ -4527,6 +4678,115 @@ const openExecutionHistory = async (row) => {
   }
 }
 
+// ==================== 任务定时（M5 QE5-3） ====================
+const scheduleVisible = ref(false)
+const scheduleLoading = ref(false)
+const scheduleSaving = ref(false)
+const scheduleRemoving = ref(false)
+const scheduleTask = ref(null)
+// 服务端返回的完整定时信息（next_run_at/last_*/history）
+const scheduleInfo = ref(null)
+// cron 五段表单（分 时 日 月 周）+ 启用开关 + 时段限制（空=不限）
+const scheduleForm = reactive({ cron: ['*', '*', '*', '*', '*'], enabled: true, window_start: '', window_end: '' })
+const schedulePreset = ref('')
+const CRON_FIELDS = ['分', '时', '日', '月', '周']
+const SCHEDULE_PRESETS = [
+  { label: '每天 08:00', cron: ['0', '8', '*', '*', '*'] },
+  { label: '工作日 09:00', cron: ['0', '9', '*', '*', '1-5'] },
+  { label: '每周一 08:00', cron: ['0', '8', '*', '*', '1'] },
+  { label: '每小时', cron: ['0', '*', '*', '*', '*'] },
+]
+
+const SCHEDULE_STATUS = {
+  dispatched: { label: '已投递', type: 'success' },
+  skipped_running: { label: '互斥跳过', type: 'warning' },
+  skipped_window: { label: '窗口外跳过', type: 'info' },
+  submit_rejected: { label: '提交被拒', type: 'danger' },
+  task_unavailable: { label: '任务不可用', type: 'danger' },
+}
+const scheduleStatusLabel = (s) => SCHEDULE_STATUS[s]?.label || s
+const scheduleStatusTagType = (s) => SCHEDULE_STATUS[s]?.type || 'info'
+
+const applySchedulePreset = (label) => {
+  const preset = SCHEDULE_PRESETS.find(p => p.label === label)
+  if (preset) scheduleForm.cron = [...preset.cron]
+}
+
+const openSchedule = async (row) => {
+  scheduleTask.value = row
+  scheduleVisible.value = true
+  scheduleLoading.value = true
+  scheduleInfo.value = null
+  schedulePreset.value = ''
+  scheduleForm.cron = ['*', '*', '*', '*', '*']
+  scheduleForm.enabled = true
+  scheduleForm.window_start = ''
+  scheduleForm.window_end = ''
+  try {
+    const res = await taskApi.getSchedule(row.id)
+    scheduleInfo.value = res
+    const parts = String(res.cron || '').trim().split(/\s+/)
+    scheduleForm.cron = parts.length === 5 ? parts : ['*', '*', '*', '*', '*']
+    scheduleForm.enabled = !!res.enabled
+    scheduleForm.window_start = res.window_start || ''
+    scheduleForm.window_end = res.window_end || ''
+  } catch (e) {
+    // 404=任务未配置定时：展示空表单供新建；其余错误才提示
+    if (e?.response?.status !== 404) ElMessage.error('获取定时配置失败')
+  } finally {
+    scheduleLoading.value = false
+  }
+}
+
+const saveSchedule = async () => {
+  const cron = scheduleForm.cron.map(s => String(s || '').trim()).join(' ')
+  if (cron.split(/\s+/).length !== 5) {
+    ElMessage.warning('cron 表达式须为 5 段（分 时 日 月 周）')
+    return
+  }
+  if ((scheduleForm.window_start ? 1 : 0) !== (scheduleForm.window_end ? 1 : 0)) {
+    ElMessage.warning('时段限制须同时配置开始与结束（或都留空）')
+    return
+  }
+  scheduleSaving.value = true
+  try {
+    const res = await taskApi.saveSchedule(scheduleTask.value.id, {
+      cron,
+      enabled: scheduleForm.enabled,
+      window_start: scheduleForm.window_start || null,
+      window_end: scheduleForm.window_end || null,
+    })
+    scheduleInfo.value = res
+    ElMessage.success('定时配置已保存')
+  } catch (e) {
+    ElMessage.error(e?.message || '保存定时配置失败')
+  } finally {
+    scheduleSaving.value = false
+  }
+}
+
+const removeSchedule = async () => {
+  try {
+    await ElMessageBox.confirm('删除后任务将不再定时触发，确定删除？', '删除定时', { type: 'warning' })
+  } catch {
+    return
+  }
+  scheduleRemoving.value = true
+  try {
+    await taskApi.deleteSchedule(scheduleTask.value.id)
+    scheduleInfo.value = null
+    scheduleForm.cron = ['*', '*', '*', '*', '*']
+    scheduleForm.enabled = true
+    scheduleForm.window_start = ''
+    scheduleForm.window_end = ''
+    ElMessage.success('定时配置已删除')
+  } catch (e) {
+    ElMessage.error('删除定时配置失败')
+  } finally {
+    scheduleRemoving.value = false
+  }
+}
+
 const handleManualHoursChange = async (row) => {
   if (!row.id) {
     ElMessage.warning('执行记录ID缺失')
@@ -4625,9 +4885,21 @@ const batchDelete = async () => {
   }
 }
 
-onMounted(() => {
+onMounted(async () => {
   loadTasks()
-  loadOptions()
+  await loadOptions()
+  // M5 QE5-1：数据集版本抽屉「从此版本建任务」跳转——query 携带 dataset_id
+  // （+dataset_version_no）时预选数据集并锁定该版本，直接打开新建弹窗
+  const qDatasetId = route.query.dataset_id
+  if (qDatasetId && datasets.value.some(ds => ds.id === String(qDatasetId))) {
+    await openDialog(null)
+    form.value.dataset_id = String(qDatasetId)
+    const qVersion = Number(route.query.dataset_version_no)
+    if (Number.isInteger(qVersion) && qVersion > 0) {
+      form.value.dataset_version_no = qVersion
+      datasetVersionMode.value = 'locked'
+    }
+  }
 })
 
 onUnmounted(() => {
@@ -5253,6 +5525,30 @@ const removeDependency = (metric, index) => {
 
 .gate-add-btn {
   margin: 8px 0;
+}
+
+/* M5 QE5-3 任务定时 cron 编辑器 */
+.cron-row {
+  display: flex;
+  gap: 8px;
+  width: 100%;
+}
+.cron-field {
+  flex: 1;
+  text-align: center;
+}
+.cron-field-label {
+  display: block;
+  font-size: 12px;
+  color: #909399;
+  margin-top: 2px;
+}
+.cron-tip {
+  width: 100%;
+  font-size: 12px;
+  color: #909399;
+  line-height: 1.5;
+  margin-top: 4px;
 }
 
 /* M2 终态校验器配置区 */

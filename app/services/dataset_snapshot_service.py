@@ -26,6 +26,21 @@ class DatasetSnapshotService:
         Returns:
             snapshot_id: 快照ID
         """
+        return self._create_snapshot(task_id=task_id, dataset_id=dataset_id)
+
+    def create_dataset_snapshot(self, dataset_id: str) -> str:
+        """为数据集本身创建快照（M5 QE5-1 打版用，无任务归属）
+
+        Args:
+            dataset_id: 数据集ID
+
+        Returns:
+            snapshot_id: 快照ID
+        """
+        return self._create_snapshot(task_id=None, dataset_id=dataset_id)
+
+    def _create_snapshot(self, task_id: Optional[str], dataset_id: str) -> str:
+        """创建快照的公共实现（task_id 可空——数据集打版的版本快照无任务归属）"""
         from app.models.dataset_models import DatasetSnapshot, EvaluationDataV2, DatasetFieldMetadata
         from app.services.dataset_service import DatasetService, DatasetDataService
 
@@ -68,7 +83,7 @@ class DatasetSnapshotService:
                 "data": item.data,
             })
 
-        # 创建快照记录
+        # 创建快照记录（task_id 可空：版本快照无任务归属）
         snapshot_id = f"dss_{uuid.uuid4().hex[:12]}"
         snapshot = DatasetSnapshot(
             id=snapshot_id,
@@ -81,7 +96,9 @@ class DatasetSnapshotService:
         self.db.add(snapshot)
         self.db.commit()
 
-        logger.info(f"创建数据集快照成功: snapshot_id={snapshot_id}, task_id={task_id}, dataset_id={dataset_id}")
+        logger.info(
+            f"创建数据集快照成功: snapshot_id={snapshot_id}, task_id={task_id}, dataset_id={dataset_id}"
+        )
 
         return snapshot_id
 

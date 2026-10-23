@@ -59,6 +59,15 @@ class SignificanceRequest(BaseModel):
     )
 
 
+class CreateTemplateSessionRequest(BaseModel):
+    """A/B 模板版本对照实验创建请求（M5 QE5-2，任务化实验）"""
+    source_task_id: str = Field(..., description="源评测任务ID（变体任务由此复制）")
+    template_id: str = Field(..., description="评测模板ID")
+    version_a: int = Field(..., description="A 侧模板版本号")
+    version_b: int = Field(..., description="B 侧模板版本号")
+    name: Optional[str] = Field(None, max_length=60, description="对照实验备注名（可选）")
+
+
 # ==================== 工具函数 ====================
 
 def _process_runtime_vars(runtime_vars: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -476,6 +485,53 @@ async def save_session(request: Request, body: SaveSessionRequest, db: Session =
     return _session_to_dict(session)
 
 
+@router.post("/template-sessions", summary="创建模板版本对照实验（任务化）",
+             dependencies=[Depends(audited("CREATE", "ab_session"))])
+async def create_template_session(
+    request: Request,
+    body: CreateTemplateSessionRequest,
+    db: Session = Depends(get_db),
+):
+    """A/B 模板版本对照（M5 QE5-2）：源任务 × 两模板版本 → 两个变体评测任务
+
+    变体任务是普通评测任务（除模板派生字段外与源任务一致），运行走既有
+    任务 run 入口（RBAC/配额/互斥全口径），执行历史天然留存可比——逐步
+    替代手工会话式双模型对比（旧入口保留）。
+    """
+    from app.services.access_control import ensure_task_access, ensure_permission
+
+    ensure_permission(request.state.user, "tasks")  # 变体任务是任务写操作
+    ensure_task_access(db, request.state.user, body.source_task_id)
+
+    from app.services.ab_template_service import (
+        ABTemplateSessionError, ABTemplateSessionService,
+    )
+
+    user = request.state.user or {}
+    service = ABTemplateSessionService(db)
+    try:
+        session = service.create_session(
+            source_task_id=body.source_task_id,
+            template_id=body.template_id,
+            version_a=body.version_a,
+            version_b=body.version_b,
+            name=body.name,
+            created_by=user.get("user_code"),
+        )
+    except ABTemplateSessionError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    request.state.audit_resource = {
+        "id": session.id,
+        "name": body.name or f"模板对照 v{body.version_a} vs v{body.version_b}",
+        "detail": {"source_task_id": body.source_task_id, "template_id": body.template_id,
+                   "version_a": body.version_a, "version_b": body.version_b},
+    }
+    payload = _session_to_dict(session, include_results=False)
+    payload["comparison"] = service.comparison_payload(session)
+    return payload
+
+
 @router.post("/significance", summary="计算 A/B 多轮显著性统计")
 async def compute_significance(body: SignificanceRequest):
     """对逐轮同输入配对记录计算显著性（M2 QE2-3）
@@ -495,11 +551,29 @@ async def list_sessions(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     keyword: str = Query("", description="按备注名模糊搜索"),
+    mode: str = Query("model", description="会话模式：model-双模型对比（默认）/template-模板版本对照（M5）"),
     db: Session = Depends(get_db),
 ):
-    """获取历史 A/B 测试记录列表（分页，按创建时间降序；W19：超管看全部，普通用户看本人+历史无主行）"""
+    """获取历史 A/B 测试记录列表（分页，按创建时间降序；W19：超管看全部，普通用户看本人+历史无主行）
+
+    M5 QE5-2：mode=template 返回模板版本对照（任务化实验）记录，归属口径一致。
+    """
     user = request.state.user or {}
     viewer = None if is_super_admin(user) else user.get("user_code")
+
+    if mode == "template":
+        from app.services.ab_template_service import ABTemplateSessionService
+
+        result = ABTemplateSessionService(db).list_sessions(
+            page=page, page_size=page_size, keyword=keyword, created_by=viewer
+        )
+        return {
+            "total": result["total"],
+            "page": result["page"],
+            "page_size": result["page_size"],
+            "items": [_session_to_dict(s, include_results=False) for s in result["items"]],
+        }
+
     service = ABTestService(db)
     result = service.list_sessions(page=page, page_size=page_size, keyword=keyword, created_by=viewer)
     return {
@@ -512,7 +586,10 @@ async def list_sessions(
 
 @router.get("/sessions/{session_id}", summary="获取 A/B 测试记录详情")
 async def get_session(session_id: str, request: Request, db: Session = Depends(get_db)):
-    """获取单条 A/B 测试记录（含完整结果；W19：归属校验 404/403）"""
+    """获取单条 A/B 测试记录（含完整结果；W19：归属校验 404/403）
+
+    M5 QE5-2：模板对照会话附带 comparison 载荷（两侧变体任务状态 + 最新执行摘要）。
+    """
     user = request.state.user or {}
     service = ABTestService(db)
     session = service.get_session(session_id)
@@ -520,7 +597,12 @@ async def get_session(session_id: str, request: Request, db: Session = Depends(g
         raise HTTPException(status_code=404, detail="记录不存在")
     if not _session_readable(session, user):
         raise HTTPException(status_code=403, detail="无权访问该 A/B 测试记录（跨用户操作被拒绝）")
-    return _session_to_dict(session, include_results=True)
+    payload = _session_to_dict(session, include_results=True)
+    if (getattr(session, "mode", None) or "model") == "template":
+        from app.services.ab_template_service import ABTemplateSessionService
+
+        payload["comparison"] = ABTemplateSessionService(db).comparison_payload(session)
+    return payload
 
 
 @router.delete("/sessions/{session_id}", summary="删除 A/B 测试记录",
@@ -547,6 +629,8 @@ def _session_to_dict(session, include_results: bool = True) -> Dict[str, Any]:
         "id": session.id,
         "name": session.name,
         "created_by": getattr(session, "created_by", None),
+        # M5 QE5-2：会话模式（model=手工会话式双模型对比；template=模板版本对照）
+        "mode": getattr(session, "mode", None) or "model",
         "model_a_id": session.model_a_id,
         "model_b_id": session.model_b_id,
         "model_a_name": session.model_a_name,
@@ -559,6 +643,16 @@ def _session_to_dict(session, include_results: bool = True) -> Dict[str, Any]:
         "significance": getattr(session, "significance", None),
         "created_at": session.created_at.isoformat() if session.created_at else None,
     }
+    # M5 QE5-2：模板对照模式附加字段（model 模式为 None）
+    if (getattr(session, "mode", None) or "model") == "template":
+        d.update({
+            "source_task_id": getattr(session, "source_task_id", None),
+            "template_id": getattr(session, "template_id", None),
+            "template_version_a": getattr(session, "template_version_a", None),
+            "template_version_b": getattr(session, "template_version_b", None),
+            "task_a_id": getattr(session, "task_a_id", None),
+            "task_b_id": getattr(session, "task_b_id", None),
+        })
     if include_results:
         d["result_a"] = session.result_a
         d["result_b"] = session.result_b

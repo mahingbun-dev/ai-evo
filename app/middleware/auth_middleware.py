@@ -35,12 +35,16 @@ middleware_logger.setLevel(logging.INFO)
 # M4 QE4-1：OIDC SSO 匿名三端点——methods（登录页渲染依据）/login
 # （302 到 IdP）/callback（IdP 回跳换 token）。注意 /auth/oidc/config、
 # /auth/oidc/test 等超管配置面**不在**白名单（前缀精确到叶子路径）
+# M5 QE5-4：/api/v1/share/{token}/report 免登录只读报告——凭证即 token
+# 本身（sha256 比对 + 吊销/过期无差别 404），端点内另有 Redis IP 限流
+# （10 req/min）与访问审计；share 域没有其他匿名子路径
 WHITELIST_PREFIXES = [
     "/health", "/docs", "/api-docs", "/openapi.json", "/assets",
     "/api/v1/health",
     "/api/v1/auth/login", "/api/v1/auth/register", "/api/v1/auth/logout",
     "/api/v1/auth/status", "/api/v1/auth/methods",
     "/api/v1/auth/oidc/login", "/api/v1/auth/oidc/callback",
+    "/api/v1/share/",
 ]
 
 

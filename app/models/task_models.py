@@ -134,6 +134,14 @@ class EvaluationTask(Base):
     # 数据集快照ID（V2 新增）
     dataset_snapshot_id = Column(String, nullable=True, comment="数据集快照ID")
 
+    # 数据集版本绑定（M5 QE5-1）：NULL=跟随最新（每次执行用数据集当前数据，
+    # 存量行为不变）；整数=锁定该版本号，执行时经 dataset_versions 的快照
+    # 数据加载（dataset_id 变更时版本号必须同批切换，服务端校验归属）
+    dataset_version_no = Column(
+        Integer, nullable=True,
+        comment="数据集版本绑定（M5）：NULL=跟随最新，整数=锁定 dataset_versions.version_no",
+    )
+
     # 字段映射配置（V2 新增，支持自由数据集字段）
     input_field = Column(String, nullable=True, server_default="user_input", comment="指向 data 中的用户输入字段名")
     reference_field = Column(String, nullable=True, server_default="answer", comment="指向 data 中的参考答案字段名")

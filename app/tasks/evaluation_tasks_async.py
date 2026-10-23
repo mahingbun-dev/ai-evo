@@ -412,6 +412,22 @@ def _load_dataset(task, db) -> List[Dict[str, Any]]:
                 ]
         return []
 
+    # M5 QE5-1：锁定版本运行——经 dataset_versions 的版本快照加载（与任务执行
+    # 快照同构，data.items=[{id,index,data}]，后续媒体处理/行级落库零改动）。
+    # 版本不可变且不可删（无删除面），缺失属数据异常，显式报错而不是静默
+    # 退回活数据（退回会让「锁定版本」语义失效且口径漂移）
+    version_no = getattr(task, "dataset_version_no", None)
+    if version_no:
+        from app.services.dataset_version_service import DatasetVersionService
+
+        version_service = DatasetVersionService(db)
+        version = version_service.get_version_snapshot_id(task.dataset_id, version_no)
+        if version is None:
+            raise ValueError(
+                f"任务锁定的数据集版本不存在: dataset={task.dataset_id}, version={version_no}"
+            )
+        return version_service.load_snapshot_items(version)
+
     # 优先从快照加载数据
     if task.dataset_snapshot_id:
         snapshot_service = DatasetSnapshotService(db)

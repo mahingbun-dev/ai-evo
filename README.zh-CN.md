@@ -17,11 +17,11 @@
 | 模块 | 能力 |
 |---|---|
 | 模型配置 | OpenAI / Anthropic 兼容接口、自定义 HTTP（curl 导入）、运行时变量注入、连通性流式测试 |
-| 数据集管理 | Excel 导入（动态字段）、Agent 会话文件导入、媒体字段、字段级校验 |
+| 数据集管理 | Excel 导入（动态字段）、Agent 会话文件导入、媒体字段、字段级校验、数据集版本化（打版快照、版本间行级 diff、恢复、任务跟随最新/锁定版本运行） |
 | 脚本库 | 评测前处理脚本（zip / 文件夹包）、`model.py` 契约声明、在线文件树编辑、脚手架模板 |
-| 评测任务 | AI 裁判员 / Agent 长会话 / 一致性 / 成功率 / RAG 检索 / 二分分类等类型，批量运行、实时进度（WebSocket） |
+| 评测任务 | AI 裁判员 / Agent 长会话 / 一致性 / 成功率 / RAG 检索 / 二分分类等类型，批量运行、实时进度（WebSocket）；评测模板版本化（打版、字段级 diff、恢复，M5 起）；任务级 cron 定时（5 段表达式、北京时间、可选时段限制——经既有运行入口投递，团队配额与任务互斥照常生效；扫描循环在 api 进程内，Redis 锁 + `next_run_at` CAS 认领保证多 api 单写，不引 Celery beat，M5 起） |
 | 裁判引擎 | Claude Code 裁判（默认）与通用 LLM 裁判图可用；DeepSeek Harness 裁判适配就绪、任务流 M8 接通；评测维度动态配置 |
-| 结果与分析 | 评分明细、历史对比、Excel/JSON/CSV 导出、趋势统计、双模型 A/B 并排对比 |
+| 结果与分析 | 评分明细、历史对比、Excel/JSON/CSV 导出、趋势统计、双模型 A/B 并排对比；A/B 模板版本对照（同任务两模板版本的任务化实验，M5 起）；周报（每周一 08:00 北京时间聚合上周覆盖度/提效/门禁通过率生成 markdown，Statistics 归档可回看，推送订阅 `weekly.report.ready` 事件的 webhook，SMTP 邮件可选，M5 起）；免登录只读报告分享（M5 起：token 链接带有效期/行级范围/可吊销，`/share/:token` 只读页） |
 | 管理 | 团队与成员启停/角色管理（三角色 owner/engineer/viewer——写操作 owner+engineer，viewer 全站只读；超管保留全局）、审计日志（全部写端点由声明式 `audited` 依赖统一留痕，注册表静态断言把关覆盖面；csv/xlsx 导出挂 `AUDIT_EXPORT_ENABLED` 企业功能位，默认关）、内置使用文档 |
 
 本地账号密码登录：首个注册用户自动成为超级管理员；密码 PBKDF2-HMAC-SHA256 哈希存储，会话为 HS256 JWT（`Authorization: Bearer`）。企业统一身份：`AUTH_METHODS`（`local,oidc,ldap` 任意组合，单选 `oidc`/`ldap` 即纯企业身份部署——关闭本地登录注册）开启 OIDC SSO（授权码 + PKCE S256）与 LDAP/AD 只读认证（search+bind，滤值 RFC 4515 转义、空密码直拒）；超管在「开发者设置」配置 IdP / 目录（含连通性自检）；首次企业登录自动开户（JIT）或按邮箱映射既有账号，目录组与 SSO 组共用 groups→团队映射。
@@ -105,6 +105,10 @@ docker compose up -d --build
 - `AUTH_JWT_SECRET` 必须显式配置强随机值（`openssl rand -hex 32`）：缺失时服务启动
   直接失败（fail-fast）；「由 DATABASE_URL 派生」的回退需显式设
   `AUTH_JWT_ALLOW_DERIVED=true`，仅限本地开发机，企业部署严禁开启
+- 分享链接（M5）token 为 192bit 随机、库内只存 sha256 哈希（明文仅创建时返回
+  一次）；公开报告端点免登录但有 Redis 限流（10 req/min/IP），过期/吊销/不存在的
+  token 响应完全一致（404 同体，不可枚举）——专项测试见
+  `tests/security/test_share_links.py`
 - `SCRIPT_EXEC_MODE=local`（前处理脚本直跑）仅限开发机，企业部署禁止；合规通道为
   `container` 沙箱模式，见 [docs/build-pipeline.md](docs/build-pipeline.md) 第九节
 - anc-hub 端点默认严格校验 TLS 证书；自签名内网端点可显式设 `AIEVO_HUB_TLS_INSECURE=1` 跳过

@@ -274,7 +274,63 @@
           </el-table>
         </el-card>
       </el-tab-pane>
+
+      <!-- 周报归档 Tab（M5 QE5-3）：每周一 08:00 聚合上周覆盖度/提效/门禁通过率 -->
+      <el-tab-pane label="周报归档" name="weeklyReports">
+        <el-card class="filter-card">
+          <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+            <span style="font-size:12px; color:#909399;">
+              每周一 08:00（北京时间）自动聚合上周覆盖度 / 提效 / 门禁通过率生成 markdown 周报，
+              推送订阅了「周报生成」事件的 webhook（邮件可选配置）；错过时点后首拍补生成
+            </span>
+            <el-button size="small" @click="loadWeeklyReports">刷新</el-button>
+          </div>
+        </el-card>
+
+        <el-card class="table-card">
+          <el-table :data="weeklyReports" stripe>
+            <el-table-column label="报告周" min-width="200">
+              <template #default="{ row }">{{ row.week_start }} ~ {{ row.week_end }}</template>
+            </el-table-column>
+            <el-table-column prop="pushed_webhooks" label="webhook 推送" min-width="110" align="right">
+              <template #default="{ row }">{{ row.pushed_webhooks }} 端</template>
+            </el-table-column>
+            <el-table-column label="邮件" min-width="90">
+              <template #default="{ row }">
+                <el-tag :type="row.email_status === 'sent' ? 'success' : row.email_status === 'failed' ? 'danger' : 'info'" size="small">
+                  {{ { sent: '已发送', skipped: '未配置', failed: '发送失败' }[row.email_status] || '-' }}
+                </el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="生成时间" min-width="170">
+              <template #default="{ row }">{{ formatDateTime(row.created_at) }}</template>
+            </el-table-column>
+            <el-table-column label="操作" min-width="90" align="center">
+              <template #default="{ row }">
+                <el-button link type="primary" size="small" @click="viewWeeklyReport(row)">查看</el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+          <el-empty v-if="!weeklyReports.length" description="暂无周报归档" :image-size="60" />
+          <el-pagination
+            v-model:current-page="weeklyPagination.page"
+            v-model:page-size="weeklyPagination.pageSize"
+            :total="weeklyPagination.total"
+            :page-sizes="[10, 20, 50]"
+            layout="total, prev, pager, next"
+            @current-change="loadWeeklyReports"
+          />
+        </el-card>
+      </el-tab-pane>
     </el-tabs>
+
+    <!-- 周报正文查看（markdown 原文，只读展示） -->
+    <el-dialog v-model="weeklyReportVisible" :title="`评测周报 ${weeklyReportDetail?.week_start || ''} ~ ${weeklyReportDetail?.week_end || ''}`" width="760px">
+      <div v-loading="weeklyReportLoading" class="report-md">{{ weeklyReportDetail?.content || '' }}</div>
+      <template #footer>
+        <el-button @click="weeklyReportVisible = false">关闭</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -319,6 +375,13 @@ const planSubmitting = ref(false)
 const efficiencyDateRange = ref([])
 const totalEfficiency = ref({})
 const efficiencyItems = ref([])
+
+// Weekly reports state（M5 QE5-3 周报归档）
+const weeklyReports = ref([])
+const weeklyPagination = reactive({ page: 1, pageSize: 20, total: 0 })
+const weeklyReportVisible = ref(false)
+const weeklyReportLoading = ref(false)
+const weeklyReportDetail = ref(null)
 
 const getParams = () => ({
   start_date: dateRange.value?.[0] || null,
@@ -562,6 +625,35 @@ const handleTabChange = (tabName) => {
     })
   } else if (tabName === 'efficiency') {
     nextTick(() => loadEfficiencySummary())
+  } else if (tabName === 'weeklyReports') {
+    nextTick(() => loadWeeklyReports())
+  }
+}
+
+// Weekly reports methods（M5 QE5-3）
+const loadWeeklyReports = async () => {
+  try {
+    const res = await statsApi.listWeeklyReports({
+      page: weeklyPagination.page,
+      page_size: weeklyPagination.pageSize,
+    })
+    weeklyReports.value = res.items || []
+    weeklyPagination.total = res.total || 0
+  } catch (e) {
+    ElMessage.error('加载周报归档失败')
+  }
+}
+
+const viewWeeklyReport = async (row) => {
+  weeklyReportVisible.value = true
+  weeklyReportLoading.value = true
+  weeklyReportDetail.value = null
+  try {
+    weeklyReportDetail.value = await statsApi.getWeeklyReport(row.id)
+  } catch (e) {
+    ElMessage.error('加载周报内容失败')
+  } finally {
+    weeklyReportLoading.value = false
   }
 }
 
@@ -600,4 +692,15 @@ onUnmounted(() => {
 .filters { display: flex; gap: 10px; align-items: center; }
 .filters .el-select { width: 120px; flex-shrink: 0; }
 .chart-card, .table-card { margin-bottom: 20px; }
+/* M5 QE5-3 周报正文（markdown 原文只读展示，等宽排版） */
+.report-md {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: Menlo, Monaco, Consolas, 'Courier New', monospace;
+  font-size: 13px;
+  line-height: 1.7;
+  color: #303133;
+  max-height: 60vh;
+  overflow-y: auto;
+}
 </style>

@@ -2,7 +2,7 @@
 评测数据集数据模型
 """
 import sqlalchemy as sa
-from sqlalchemy import Column, Integer, String, DateTime, JSON, Boolean, ForeignKey, Index
+from sqlalchemy import Column, Integer, String, DateTime, JSON, Boolean, ForeignKey, Index, UniqueConstraint
 from sqlalchemy.sql import func
 from app.db.session import Base
 
@@ -88,10 +88,35 @@ class DatasetSnapshot(Base):
 
     id = Column(String, primary_key=True, index=True)
     dataset_id = Column(String, ForeignKey("evaluation_datasets.id", ondelete="CASCADE"), nullable=False, index=True)
-    task_id = Column(String, ForeignKey("evaluation_tasks.id", ondelete="CASCADE"), nullable=False, index=True)
+    # M5 QE5-1：task_id 可空——数据集打版（dataset_versions）复用本表存快照，
+    # 版本快照无任务归属；任务执行快照仍带 task_id（存量行为不变）
+    task_id = Column(String, ForeignKey("evaluation_tasks.id", ondelete="CASCADE"), nullable=True, index=True)
     data = Column(JSON, nullable=False, comment="快照数据完整拷贝")
     fields = Column(JSON, nullable=False, comment="快照时的字段结构")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class DatasetVersion(Base):
+    """数据集版本表（M5 QE5-1）- 打版历史，行级 diff 与恢复的事实源
+
+    每次打版把数据集当前数据+字段结构完整快照进 dataset_snapshot（复用既有
+    快照机制，任务锁定版本执行时与执行快照同一条加载链路），本表只登记
+    版本号与快照指针。
+    """
+    __tablename__ = "dataset_versions"
+
+    id = Column(String, primary_key=True, index=True)
+    dataset_id = Column(String, ForeignKey("evaluation_datasets.id", ondelete="CASCADE"), nullable=False, index=True)
+    version_no = Column(Integer, nullable=False, comment="版本号（同一数据集内单调递增，从1开始）")
+    snapshot_id = Column(String, nullable=False, comment="打版时的 dataset_snapshot 快照ID")
+    changelog = Column(String, nullable=True, comment="版本变更说明")
+    row_count = Column(Integer, nullable=True, comment="版本行数（冗余登记，列表展示免解包快照）")
+    created_by = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("dataset_id", "version_no", name="uq_dataset_versions_dataset_no"),
+    )
 
 
 class ImportTempFile(Base):

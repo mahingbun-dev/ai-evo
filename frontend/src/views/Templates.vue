@@ -29,9 +29,10 @@
             {{ formatTime(row.created_at) }}
           </template>
         </el-table-column>
-        <el-table-column label="操作" min-width="180" fixed="right">
+        <el-table-column label="操作" min-width="220" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" :loading="previewingId === row.id" :disabled="rowOpLoading" @click="previewTemplate(row)">预览</el-button>
+            <el-button link type="primary" :disabled="rowOpLoading" @click="openVersions(row)">版本</el-button>
             <el-button link type="primary" :disabled="rowOpLoading" @click="openDialog(row)">编辑</el-button>
             <el-button link type="primary" :loading="copyingId === row.id" :disabled="rowOpLoading" @click="copyTemplate(row)">复制</el-button>
             <el-button link type="danger" :loading="deletingId === row.id" :disabled="rowOpLoading" @click="deleteTemplate(row)">删除</el-button>
@@ -215,6 +216,15 @@
             </el-button>
           </div>
         </el-form-item>
+
+        <!-- 编辑留档（M5 QE5-2）：填写即先把改前内容打版进版本链再保存 -->
+        <el-form-item v-if="isEdit" label="版本说明">
+          <el-input
+            v-model="versionChangelog"
+            placeholder="选填：填写后保存时自动把当前内容打版（改前状态进版本链，可 diff/恢复）"
+            maxlength="500"
+          />
+        </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false" :disabled="saving">取消</el-button>
@@ -229,6 +239,79 @@
         <el-button @click="previewVisible = false">关闭</el-button>
       </template>
     </el-dialog>
+
+    <!-- 版本抽屉（M5 QE5-2）：打版历史 + 字段级 diff 双栏 + 恢复 -->
+    <el-drawer v-model="versionDrawerVisible" :title="`版本管理 - ${versionTemplate?.name || ''}`" size="66%" :close-on-click-modal="false">
+      <div v-loading="versionsLoading" class="version-drawer-body">
+        <!-- 打版区 -->
+        <div class="version-actions">
+          <el-input
+            v-model="newVersionChangelog"
+            placeholder="版本变更说明（可选，如：收紧评分标准）"
+            style="max-width: 380px"
+            maxlength="500"
+            @keyup.enter="createVersion"
+          />
+          <el-button type="primary" :loading="versionCreating" @click="createVersion">
+            以当前内容打版
+          </el-button>
+          <span class="version-hint">版本不可变：可 diff / 恢复 / 在 A/B 测试做两版本对照实验</span>
+        </div>
+
+        <!-- 版本列表 -->
+        <el-table :data="templateVersions" size="small" border>
+          <el-table-column prop="version_no" label="版本号" width="80" align="center">
+            <template #default="{ row }">
+              <el-tag size="small">v{{ row.version_no }}</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column prop="changelog" label="变更说明" min-width="220" show-overflow-tooltip>
+            <template #default="{ row }">{{ row.changelog || '-' }}</template>
+          </el-table-column>
+          <el-table-column prop="created_by" label="创建人" width="110" show-overflow-tooltip>
+            <template #default="{ row }">{{ row.created_by || '-' }}</template>
+          </el-table-column>
+          <el-table-column label="创建时间" width="160">
+            <template #default="{ row }">{{ formatTime(row.created_at) }}</template>
+          </el-table-column>
+          <el-table-column label="操作" width="180" fixed="right">
+            <template #default="{ row }">
+              <el-button link type="primary" size="small" @click="diffWithLatest(row)">与最新版对比</el-button>
+              <el-button link type="primary" size="small" @click="restoreVersion(row)">恢复到此版本</el-button>
+            </template>
+          </el-table-column>
+        </el-table>
+        <el-empty v-if="!versionsLoading && templateVersions.length === 0" description="暂无版本，点「以当前内容打版」创建第一个版本" :image-size="60" />
+
+        <!-- 字段级 diff 双栏 -->
+        <div v-if="versionDiff" class="version-diff">
+          <el-divider content-position="left">
+            版本对比 v{{ versionDiff.from.version_no }} → v{{ versionDiff.to.version_no }}
+          </el-divider>
+          <div class="diff-summary">
+            <el-tag type="warning">变更字段 {{ versionDiff.summary.changed }}</el-tag>
+            <el-tag type="info">未变字段 {{ versionDiff.summary.unchanged }}</el-tag>
+          </div>
+          <div class="diff-table">
+            <div class="diff-row diff-head">
+              <div class="diff-cell diff-meta">字段</div>
+              <div class="diff-cell">v{{ versionDiff.from.version_no }}（{{ formatTime(versionDiff.from.created_at) || '-' }}）</div>
+              <div class="diff-cell">v{{ versionDiff.to.version_no }}（{{ formatTime(versionDiff.to.created_at) || '-' }}）</div>
+            </div>
+            <div v-for="f in versionDiff.fields" :key="f.field" class="diff-row diff-changed">
+              <div class="diff-cell diff-meta">{{ fieldLabel(f.field) }}</div>
+              <div class="diff-cell">{{ renderDiffValue(f.from) }}</div>
+              <div class="diff-cell">{{ renderDiffValue(f.to) }}</div>
+            </div>
+            <el-empty
+              v-if="versionDiff.fields.length === 0"
+              description="两版本内容完全一致"
+              :image-size="60"
+            />
+          </div>
+        </div>
+      </div>
+    </el-drawer>
   </div>
 </template>
 
@@ -294,6 +377,108 @@ const rules = {
   scene: [{ required: true, message: '请选择场景', trigger: 'change' }]
 }
 
+// ==================== 模板版本（M5 QE5-2：打版/diff/恢复） ====================
+const versionChangelog = ref('')       // 编辑留档说明（填写即改前自动打版）
+const versionDrawerVisible = ref(false)
+const versionTemplate = ref(null)      // 当前抽屉对应模板行
+const templateVersions = ref([])       // 版本列表（新→旧）
+const versionsLoading = ref(false)
+const versionCreating = ref(false)     // 打版进行中
+const newVersionChangelog = ref('')    // 打版变更说明输入
+const versionDiff = ref(null)          // 字段级 diff 结果
+
+const openVersions = async (row) => {
+  versionTemplate.value = row
+  versionDrawerVisible.value = true
+  versionDiff.value = null
+  newVersionChangelog.value = ''
+  await loadVersions(row.id)
+}
+
+const loadVersions = async (templateId) => {
+  if (!templateId) return
+  versionsLoading.value = true
+  try {
+    const res = await instructionApi.listTemplateVersions(templateId)
+    templateVersions.value = res || []
+  } catch (e) {
+    console.error('获取模板版本列表失败:', e)
+    templateVersions.value = []
+  } finally {
+    versionsLoading.value = false
+  }
+}
+
+const createVersion = async () => {
+  if (!versionTemplate.value || versionCreating.value) return
+  versionCreating.value = true
+  try {
+    const version = await instructionApi.createTemplateVersion(versionTemplate.value.id, {
+      changelog: newVersionChangelog.value?.trim() || null
+    })
+    ElMessage.success(`打版成功：v${version.version_no}`)
+    newVersionChangelog.value = ''
+    await loadVersions(versionTemplate.value.id)
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || '打版失败')
+  } finally {
+    versionCreating.value = false
+  }
+}
+
+const diffWithLatest = async (row) => {
+  const latest = templateVersions.value[0]
+  if (!latest) return
+  if (latest.version_no === row.version_no) {
+    ElMessage.info('该版本已是最新版，无对比意义')
+    return
+  }
+  try {
+    versionDiff.value = await instructionApi.diffTemplateVersions(
+      versionTemplate.value.id, row.version_no, latest.version_no)
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || '获取版本 diff 失败')
+  }
+}
+
+const restoreVersion = async (row) => {
+  try {
+    await ElMessageBox.confirm(
+      `恢复将把模板内容整体替换为 v${row.version_no}（恢复前的当前内容会自动留存为新版本，不会丢失）。确定恢复？`,
+      '恢复模板版本',
+      { type: 'warning', confirmButtonText: '恢复', cancelButtonText: '取消' }
+    )
+  } catch { return }
+  try {
+    await instructionApi.restoreTemplateVersion(versionTemplate.value.id, row.version_no)
+    ElMessage.success(`已恢复到 v${row.version_no}`)
+    await loadTemplates()
+    // 抽屉对应行已变，重新挂最新行数据
+    versionTemplate.value = templates.value.find(t => t.id === versionTemplate.value.id) || versionTemplate.value
+    await loadVersions(versionTemplate.value.id)
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || '恢复失败')
+  }
+}
+
+// diff 字段中文名
+const FIELD_LABELS = {
+  name: '模板名称', scene: '评测场景', scene_description: '场景描述',
+  judge_prompt: '评测指令', evaluation_metrics: '评测维度', score_details: '分值标准',
+  max_score: '最高分', steps: '评分步骤（旧）', judge_variable_config: '裁判变量配置',
+  instruction_template: '完整指令模板'
+}
+const fieldLabel = (field) => FIELD_LABELS[field] || field
+
+// diff 单元格渲染：结构字段 JSON 化、多行文本保留换行
+const renderDiffValue = (value) => {
+  if (value == null) return '（空）'
+  if (typeof value === 'object') {
+    try { return JSON.stringify(value, null, 0) } catch { return String(value) }
+  }
+  return String(value)
+}
+
 const loadTemplates = async () => {
   try {
     const res = await instructionApi.list({ limit: 100 })
@@ -342,6 +527,8 @@ const migrateLegacyTemplates = async () => {
 }
 
 const openDialog = (row = null) => {
+  // 编辑留档（M5 QE5-2）：每次打开重置版本说明输入
+  versionChangelog.value = ''
   if (row) {
     isEdit.value = true
     form.value = {
@@ -474,6 +661,10 @@ const submitForm = async () => {
     await formRef.value.validate()
     const data = { ...form.value }
     if (isEdit.value) {
+      // M5 QE5-2 编辑留档：填写版本说明即先为改前内容打版（后端先打版再应用编辑）
+      if (versionChangelog.value?.trim()) {
+        data.version_changelog = versionChangelog.value.trim()
+      }
       await instructionApi.update(form.value.id, data)
       ElMessage.success('更新成功')
     } else {
@@ -569,6 +760,75 @@ onMounted(() => {
 .templates-page {
   max-width: 1400px;
   margin: 0 auto;
+}
+
+/* ==================== 版本抽屉（M5 QE5-2） ==================== */
+.version-drawer-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.version-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.version-hint {
+  color: #909399;
+  font-size: 12px;
+}
+
+.diff-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+/* diff 双栏：左=from 版本 / 右=to 版本，字段值多行展示 */
+.diff-table {
+  border: 1px solid #ebeef5;
+  border-radius: 4px;
+  max-height: 460px;
+  overflow: auto;
+}
+
+.diff-row {
+  display: flex;
+  border-bottom: 1px solid #ebeef5;
+}
+
+.diff-row:last-child {
+  border-bottom: none;
+}
+
+.diff-head {
+  background: #f5f7fa;
+  font-weight: 600;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+.diff-cell {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 10px;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  border-left: 1px solid #ebeef5;
+}
+
+.diff-meta {
+  flex: 0 0 110px;
+}
+
+.diff-changed {
+  background: #fdf6ec;
 }
 
 .card-header {

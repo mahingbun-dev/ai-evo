@@ -51,6 +51,11 @@
                 </el-dropdown-menu>
               </template>
             </el-dropdown>
+            <!-- M5 QE5-4：免登录只读报告分享（viewer 只读隐藏入口） -->
+            <el-button
+              v-if="selectedTaskId && !readonlyRole"
+              @click="openShareDialog"
+            >分享</el-button>
           </div>
         </div>
       </template>
@@ -2931,17 +2936,87 @@
         <el-button type="primary" @click="reasonDialog.visible = false">关闭</el-button>
       </template>
     </el-dialog>
+
+    <!-- 报告分享弹窗（M5 QE5-4）：创建链接（明文 token 仅一次）+ 吊销管理 -->
+    <el-dialog v-model="shareDialog.visible" title="分享评测报告" width="640px">
+      <!-- 新建区 -->
+      <el-form label-width="90px">
+        <el-form-item label="报告版本">
+          <el-radio-group v-model="shareDialog.form.executionMode">
+            <el-radio value="latest">跟随最新执行</el-radio>
+            <el-radio value="locked" :disabled="!selectedExecutionNumber">锁定当前版本（第 {{ selectedExecutionNumber || '-' }} 次）</el-radio>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item label="有效期">
+          <el-select v-model="shareDialog.form.expiresDays" style="width: 200px">
+            <el-option label="1 天" :value="1" />
+            <el-option label="7 天" :value="7" />
+            <el-option label="30 天" :value="30" />
+            <el-option label="永久" :value="null" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="可见范围">
+          <el-radio-group v-model="shareDialog.form.rowScope">
+            <el-radio value="all">全部（含明细行）</el-radio>
+            <el-radio value="summary">仅汇总</el-radio>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item>
+          <el-button type="primary" :loading="shareDialog.creating" @click="createShareLink">创建链接</el-button>
+          <span class="share-tip">免登录只读打开；明文链接仅创建时展示一次，请及时复制保存</span>
+        </el-form-item>
+      </el-form>
+
+      <!-- 一次性明文链接展示 -->
+      <el-alert v-if="shareDialog.createdUrl" type="success" :closable="false" class="share-url-alert">
+        <div class="share-url-row">
+          <span class="share-url-text">{{ shareDialog.createdUrl }}</span>
+          <el-button size="small" @click="copyShareUrl">复制链接</el-button>
+        </div>
+      </el-alert>
+
+      <!-- 链接管理列表 -->
+      <el-divider content-position="left">已创建链接（{{ shareDialog.links.length }}）</el-divider>
+      <el-table :data="shareDialog.links" size="small">
+        <el-table-column label="版本" width="110">
+          <template #default="{ row }">{{ row.execution_number == null ? '跟随最新' : `第 ${row.execution_number} 次` }}</template>
+        </el-table-column>
+        <el-table-column label="范围" width="90">
+          <template #default="{ row }">{{ row.row_scope === 'summary' ? '仅汇总' : '全部' }}</template>
+        </el-table-column>
+        <el-table-column label="有效期" min-width="150">
+          <template #default="{ row }">{{ row.expires_at ? formatTime(row.expires_at) : '永久' }}</template>
+        </el-table-column>
+        <el-table-column label="状态" width="90">
+          <template #default="{ row }">
+            <el-tag size="small" :type="row.active ? 'success' : 'info'">{{ row.active ? '有效' : '已失效' }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="90" align="center">
+          <template #default="{ row }">
+            <el-button
+              v-if="row.active"
+              link type="danger" size="small" :loading="shareDialog.revokingId === row.id"
+              @click="revokeShareLink(row)"
+            >吊销</el-button>
+            <span v-else class="share-tip">—</span>
+          </template>
+        </el-table-column>
+      </el-table>
+      <el-empty v-if="!shareDialog.links.length" description="暂无分享链接" :image-size="60" />
+    </el-dialog>
   </div>
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted, onUnmounted, nextTick } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ref, reactive, computed, inject, onMounted, onUnmounted, nextTick } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { InfoFilled, ArrowDown, Timer, CircleCheck, CircleCheckFilled, CircleClose, CircleCloseFilled, Warning, WarningFilled, Link, User } from '@element-plus/icons-vue'
-import { taskApi, resultApi } from '@/api'
+import { taskApi, resultApi, shareApi } from '@/api'
 import { useTaskPolling } from '@/composables/useTaskPolling'
 import { formatTime } from '@/utils/time'
 import { canUseIdxAsSeqNo, detailSeqNo } from '@/utils/seqno'
+import { canWrite } from '@/utils/permissions'
 import * as echarts from 'echarts'
 
 const tasks = ref([])
@@ -3228,6 +3303,92 @@ const handleExport = async (format) => {
     ElMessage.error('导出失败: ' + (e.message || '未知错误'))
   } finally {
     exporting.value = false
+  }
+}
+
+// ==================== 报告分享（M5 QE5-4，免登录只读） ====================
+const currentUser = inject('currentUser', null)
+const readonlyRole = computed(() => !canWrite(currentUser.value))
+
+const shareDialog = reactive({
+  visible: false,
+  creating: false,
+  revokingId: null,
+  createdUrl: '',   // 明文链接仅创建时展示一次
+  links: [],
+  form: {
+    executionMode: 'latest',   // latest=跟随最新执行 / locked=锁定当前选中版本
+    expiresDays: 7,
+    rowScope: 'all',
+  },
+})
+
+const openShareDialog = async () => {
+  shareDialog.visible = true
+  shareDialog.createdUrl = ''
+  shareDialog.form = { executionMode: 'latest', expiresDays: 7, rowScope: 'all' }
+  await loadShareLinks()
+}
+
+const loadShareLinks = async () => {
+  try {
+    const res = await shareApi.listLinks(selectedTaskId.value)
+    shareDialog.links = Array.isArray(res) ? res : []
+  } catch (e) {
+    ElMessage.error('获取分享链接列表失败')
+  }
+}
+
+const createShareLink = async () => {
+  if (shareDialog.creating) return
+  shareDialog.creating = true
+  try {
+    const res = await shareApi.createLink(selectedTaskId.value, {
+      execution_number: shareDialog.form.executionMode === 'locked' ? selectedExecutionNumber.value : null,
+      expires_days: shareDialog.form.expiresDays,
+      row_scope: shareDialog.form.rowScope,
+    })
+    shareDialog.createdUrl = `${window.location.origin}/share/${res.token}`
+    ElMessage.success('分享链接已创建（明文仅展示一次，请复制保存）')
+    await loadShareLinks()
+  } catch (e) {
+    ElMessage.error(e?.message || '创建分享链接失败')
+  } finally {
+    shareDialog.creating = false
+  }
+}
+
+const copyShareUrl = async () => {
+  try {
+    await navigator.clipboard.writeText(shareDialog.createdUrl)
+    ElMessage.success('链接已复制')
+  } catch {
+    // 剪贴板 API 不可用（非 https 等）：退回老 API
+    const input = document.createElement('textarea')
+    input.value = shareDialog.createdUrl
+    document.body.appendChild(input)
+    input.select()
+    document.execCommand('copy')
+    document.body.removeChild(input)
+    ElMessage.success('链接已复制')
+  }
+}
+
+const revokeShareLink = async (row) => {
+  try {
+    await ElMessageBox.confirm('吊销后该链接立即失效（免登录页将显示不存在），确定吊销？', '吊销分享链接', { type: 'warning' })
+  } catch {
+    return
+  }
+  shareDialog.revokingId = row.id
+  try {
+    await shareApi.revokeLink(selectedTaskId.value, row.id)
+    ElMessage.success('已吊销')
+    await loadShareLinks()
+  } catch (e) {
+    ElMessage.error('吊销失败')
+  } finally {
+    shareDialog.revokingId = null
   }
 }
 
@@ -5623,6 +5784,26 @@ const renderLatencyHistogram = (res) => {
 </script>
 
 <style scoped>
+/* M5 QE5-4 分享弹窗 */
+.share-tip {
+  margin-left: 10px;
+  font-size: 12px;
+  color: #909399;
+}
+.share-url-alert :deep(.el-alert__content) {
+  width: 100%;
+}
+.share-url-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.share-url-text {
+  flex: 1;
+  word-break: break-all;
+  font-size: 13px;
+}
+
 .results-page {
   max-width: 1400px;
   margin: 0 auto;

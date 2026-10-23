@@ -98,6 +98,11 @@ class ImportJsonRequest(BaseModel):
     data: List[Dict[str, Any]] = Field(..., description="评测数据列表")
 
 
+class CreateDatasetVersionRequest(BaseModel):
+    """数据集打版请求（M5 QE5-1）"""
+    changelog: Optional[str] = Field(None, max_length=500, description="版本变更说明")
+
+
 # ==================== Response Models ====================
 
 class DatasetResponse(BaseModel):
@@ -521,6 +526,123 @@ def update_dataset_fields(
     )
 
     return {"message": "更新成功"}
+
+
+# ==================== 数据集版本（M5 QE5-1） ====================
+
+@router.post("/{dataset_id}/versions", summary="数据集打版（以当前数据创建版本）",
+             dependencies=[Depends(audited("CREATE", "dataset", id_param="dataset_id"))])
+def create_dataset_version(
+    dataset_id: str,
+    body: CreateDatasetVersionRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """以数据集当前数据打版：完整快照（复用 dataset_snapshot 机制）+ 单调递增版本号
+
+    版本一经创建不可变（diff/恢复/锁定版本运行的事实源）。
+    """
+    ensure_permission(request.state.user, "datasets")  # RBAC（QE4-3）：viewer 只读
+    ensure_dataset_access(db, request.state.user, dataset_id)
+
+    from app.services.dataset_version_service import DatasetVersionService
+
+    user = request.state.user
+    created_by = user.get("user_code") if isinstance(user, dict) else getattr(user, "user_code", None)
+    try:
+        version = DatasetVersionService(db).create_version(
+            dataset_id, changelog=body.changelog, created_by=created_by
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    request.state.audit_resource = {
+        "id": dataset_id,
+        "detail": {"version_no": version["version_no"], "row_count": version["row_count"]},
+    }
+    return version
+
+
+@router.get("/{dataset_id}/versions", summary="数据集版本列表")
+def list_dataset_versions(
+    dataset_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """版本列表（新→旧；W9：对象级归属校验）"""
+    ensure_dataset_access(db, request.state.user, dataset_id)
+
+    from app.services.dataset_version_service import DatasetVersionService
+
+    return DatasetVersionService(db).list_versions(dataset_id)
+
+
+# 注意路由顺序：diff 是静态段，必须先于 /versions/{version_no} 注册
+@router.get("/{dataset_id}/versions/diff", summary="两版本行级 diff")
+def diff_dataset_versions(
+    dataset_id: str,
+    request: Request,
+    from_version: int = Query(..., alias="from", description="起始版本号"),
+    to_version: int = Query(..., alias="to", description="目标版本号"),
+    db: Session = Depends(get_db),
+):
+    """行级 diff：以稳定行键（打版时数据行 id）对齐，输出新增/删除/变更行与字段级差异
+
+    展示值超长截断、差异行超 500 条置 truncated（完整数据以版本快照为准）。
+    """
+    ensure_dataset_access(db, request.state.user, dataset_id)
+
+    from app.services.dataset_version_service import DatasetVersionNotFound, DatasetVersionService
+
+    try:
+        return DatasetVersionService(db).diff_versions(dataset_id, from_version, to_version)
+    except DatasetVersionNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.get("/{dataset_id}/versions/{version_no}", summary="数据集版本详情")
+def get_dataset_version(
+    dataset_id: str,
+    version_no: int,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """单版本详情（版本元信息 + 快照字段结构）"""
+    ensure_dataset_access(db, request.state.user, dataset_id)
+
+    from app.services.dataset_version_service import DatasetVersionNotFound, DatasetVersionService
+
+    try:
+        return DatasetVersionService(db).get_version(dataset_id, version_no)
+    except DatasetVersionNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.post("/{dataset_id}/versions/{version_no}/restore", summary="恢复数据集到指定版本",
+             dependencies=[Depends(audited("UPDATE", "dataset", id_param="dataset_id"))])
+def restore_dataset_version(
+    dataset_id: str,
+    version_no: int,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """把数据集活数据恢复到指定版本（软删当前行，按版本快照重写；字段结构同步恢复）
+
+    恢复是破坏性写操作：如需留存恢复前状态，请先打版。
+    """
+    ensure_permission(request.state.user, "datasets")  # RBAC（QE4-3）：viewer 只读
+    ensure_dataset_access(db, request.state.user, dataset_id)
+
+    from app.services.dataset_version_service import DatasetVersionNotFound, DatasetVersionService
+
+    try:
+        result = DatasetVersionService(db).restore_version(dataset_id, version_no)
+    except DatasetVersionNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    request.state.audit_resource = {
+        "id": dataset_id,
+        "detail": {"restored_version": version_no, "restored_count": result["restored_count"]},
+    }
+    return result
 
 
 @router.post("/cleanup-duplicates", summary="清理重复数据集",

@@ -384,7 +384,9 @@ const SCOPE_OPTIONS = [
 const EVENT_OPTIONS = [
   { value: 'task.execution.completed', label: '执行完成', desc: '任务评测完成时推送' },
   { value: 'task.execution.failed', label: '执行失败', desc: '任务评测失败收尾时推送' },
-  { value: 'gate.failed', label: '门禁失败', desc: '门禁判定为 failed 时额外推送' }
+  { value: 'gate.failed', label: '门禁失败', desc: '门禁判定为 failed 时额外推送' },
+  // M5 QE5-3：周报生成完成（每周一 08:00 聚合上周覆盖度/提效/门禁通过率）
+  { value: 'weekly.report.ready', label: '周报生成', desc: '每周一 08:00 周报生成完成时推送' }
 ]
 
 const scopeLabel = (value) => SCOPE_OPTIONS.find(o => o.value === value)?.label || value

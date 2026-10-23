@@ -160,6 +160,7 @@ class EvaluationTaskService:
         trials: Optional[int] = None,
         judge_guard_disabled: Optional[bool] = False,
         judge_canary: Optional[bool] = False,
+        dataset_version_no: Optional[int] = None,
     ) -> EvaluationTask:
         """创建评测任务"""
         # 验证评测类型
@@ -269,6 +270,18 @@ class EvaluationTaskService:
         )
         judge_model_config_snapshot = build_model_config_snapshot(self.db, judge_model)
 
+        # 数据集版本绑定校验（M5 QE5-1）：锁定版本必须属于所选数据集；
+        # 锁定时题目总数以版本行数为准（跟随最新=活数据行数，存量口径）
+        dataset_version_no = self._validate_dataset_version(dataset_id, dataset_version_no)
+        if dataset_id and dataset_version_no:
+            from app.services.dataset_version_service import DatasetVersionService
+
+            version_row_count = DatasetVersionService(self.db).get_version_row_count(
+                dataset_id, dataset_version_no
+            )
+            if version_row_count is not None:
+                total_questions = version_row_count
+
         task = EvaluationTask(
             id=task_id,
             name=name,
@@ -332,6 +345,8 @@ class EvaluationTaskService:
             judge_guard_disabled=bool(judge_guard_disabled),
             # M2 QE2-4：裁判金丝雀自检（默认关闭）
             judge_canary=bool(judge_canary),
+            # M5 QE5-1：数据集版本绑定（None=跟随最新；整数=锁定版本运行）
+            dataset_version_no=dataset_version_no,
         )
 
         self.db.add(task)
@@ -490,6 +505,21 @@ class EvaluationTaskService:
                 model_provider=effective_provider,
             )
 
+        # 数据集版本绑定校验（M5 QE5-1）：kwargs 与任务既有值合并成最终态——
+        # 只换数据集不改版本号（旧版本不属于新数据集）、或数据集清空仍锁定
+        # 版本，均按 400 拒绝；payload 显式携带时以校验后的值落库
+        effective_version_no = (
+            kwargs["dataset_version_no"] if "dataset_version_no" in kwargs
+            else getattr(task, "dataset_version_no", None)
+        )
+        validated_version_no = self._validate_dataset_version(
+            effective_dataset_id, effective_version_no
+        )
+        if "dataset_version_no" in kwargs:
+            kwargs["dataset_version_no"] = validated_version_no
+        else:
+            task.dataset_version_no = validated_version_no
+
         # 契约 v3 §五（保守语义）：pre_scripts 与 steps 仅在 payload 显式携带时置 None
         # （targets 为唯一事实源、维度顺序即步骤）；未携带时保留存量值，
         # 避免非前端通道的局部更新误清未迁移任务的 legacy 数据
@@ -637,6 +667,28 @@ class EvaluationTaskService:
                 f"裁判治理配置（输入消毒/金丝雀自检）仅支持 judge/agent 类型任务"
                 f"（当前 {evaluation_type!r}）——其余类型无裁判参与计分"
             )
+
+    def _validate_dataset_version(
+        self,
+        dataset_id: Optional[str],
+        dataset_version_no: Optional[int],
+    ) -> Optional[int]:
+        """数据集版本绑定校验（M5 QE5-1），失败抛 ValueError（API 层转 400）
+
+        锁定版本必须属于所选数据集（换数据集必须同批切换/清空版本号）；
+        None=跟随最新（存量行为），直接放行。
+        """
+        if dataset_version_no is None:
+            return None
+        if not dataset_id:
+            raise ValueError("锁定数据集版本需要先选择数据集")
+        from app.services.dataset_version_service import DatasetVersionService
+
+        if not DatasetVersionService(self.db).version_exists(dataset_id, dataset_version_no):
+            raise ValueError(
+                f"数据集不存在版本 {dataset_version_no}，请重新选择版本或改为跟随最新"
+            )
+        return dataset_version_no
 
     def _validate_targets_required(
         self,
@@ -1712,12 +1764,34 @@ class EvaluationTaskService:
         return task
 
     def refresh_dataset_count(self, task_id: str) -> Optional[EvaluationTask]:
-        """从数据集刷新题目数"""
+        """从数据集刷新题目数
+
+        M5 QE5-1：锁定版本时以版本行数为准（版本不可变，行数即执行基数）；
+        跟随最新（版本号为空）沿用活数据行数（存量口径）。
+        """
         task = self.get_task(task_id)
         if not task:
             return None
 
         if task.dataset_id:
+            version_no = getattr(task, "dataset_version_no", None)
+            if version_no:
+                from app.services.dataset_version_service import DatasetVersionService
+
+                row_count = DatasetVersionService(self.db).get_version_row_count(
+                    task.dataset_id, version_no
+                )
+                if row_count is not None:
+                    task.total_questions = row_count
+                    self.db.commit()
+                    self.db.refresh(task)
+                    return task
+                # 版本缺失（异常态：版本不可删，正常不会发生）——退回活数据
+                # 口径并告警，不阻断保存
+                logger.warning(
+                    "任务 %s 锁定的数据集版本 %s 缺失，题目数退回活数据口径",
+                    task_id, version_no,
+                )
             from app.services.dataset_service import DatasetDataService
             data_service = DatasetDataService(self.db)
             items = data_service.get_data_list_v2(task.dataset_id, skip=0, limit=10000)

@@ -40,6 +40,7 @@ from app.api.api_key_api import router as api_key_router
 from app.api.sso_api import router as sso_router
 from app.api.plugin_marketplace_api import router as plugin_marketplace_router
 from app.api.redteam_api import router as redteam_router
+from app.api.share_api import manage_router as share_manage_router, public_router as share_public_router
 from app.middleware.auth_middleware import AuthMiddleware
 from app.db.session import engine, Base
 from app.core.config import get_settings, validate_runtime_settings
@@ -100,6 +101,10 @@ settings = get_settings()
 # （设计 §2.3 D7「队列深度」指标；gauge 由 api 进程单写，见下方循环注释）
 QUEUE_DEPTH_REFRESH_SECONDS = 15
 
+# M5 QE5-3：定时评测扫描间隔（秒）——60s 扫 task_schedules due 调度 +
+# 周一 08:00 周报生成检查（不引 celery beat，api 进程承担）
+TASK_SCHEDULE_SCAN_SECONDS = 60
+
 
 async def _queue_depth_refresh_loop():
     """周期把 Redis llen 队列深度刷进 aievo_celery_queue_depth gauge（ARCH-2-3）
@@ -116,6 +121,28 @@ async def _queue_depth_refresh_loop():
         except Exception as e:
             logger.warning(f"队列深度指标刷新失败（保留上次值，下一拍重试）: {e}")
         await asyncio.sleep(QUEUE_DEPTH_REFRESH_SECONDS)
+
+
+async def _task_schedule_scan_loop():
+    """定时评测扫描与周报生成循环（M5 QE5-3）
+
+    每 60s 扫一次 task_schedules due 调度（Redis 锁单写 + next_run_at CAS
+    认领，多 api 部署不重复派发，见 task_schedule_service.scan_due），并
+    检查周报是否到点（每周一 08:00，幂等补生成）。投递走既有 run 入口
+    语义（团队配额 + 任务互斥 + priority=NORMAL），本循环不做业务判定；
+    DB/Redis 抖动时本轮放弃、下一拍重试，to_thread 挪出事件循环。
+    """
+    from app.db.session import SessionLocal
+    from app.services.task_schedule_service import TaskScheduleService
+    from app.services.weekly_report_service import generate_if_due
+    while True:
+        try:
+            with SessionLocal() as db:
+                TaskScheduleService(db).scan_due()
+                generate_if_due(db)
+        except Exception as e:
+            logger.warning(f"定时评测扫描失败（本轮放弃，下一拍重试）: {e}")
+        await asyncio.sleep(TASK_SCHEDULE_SCAN_SECONDS)
 
 
 @asynccontextmanager
@@ -158,6 +185,8 @@ async def lifespan(app: FastAPI):
 
     # ARCH-2-3：队列深度 gauge 周期刷新（Redis llen）——随应用启停
     queue_depth_task = asyncio.create_task(_queue_depth_refresh_loop())
+    # M5 QE5-3：定时评测扫描 + 周报生成循环——随应用启停（同款收尾口径）
+    task_schedule_scan_task = asyncio.create_task(_task_schedule_scan_loop())
 
     yield
 
@@ -165,10 +194,13 @@ async def lifespan(app: FastAPI):
     # Celery 由独立进程管理，API 进程关闭时无需特殊处理
     # ARCH-2-3：收掉队列深度刷新任务（await 收割取消，避免残挂 warning）
     queue_depth_task.cancel()
-    try:
-        await queue_depth_task
-    except asyncio.CancelledError:
-        pass
+    # M5 QE5-3：同款收掉定时扫描任务
+    task_schedule_scan_task.cancel()
+    for bg_task in (queue_depth_task, task_schedule_scan_task):
+        try:
+            await bg_task
+        except asyncio.CancelledError:
+            pass
     logger.info("API 进程关闭")
 
 # OpenAPI 标签说明，用于 /docs 分组展示
@@ -267,6 +299,10 @@ app.include_router(plugin_marketplace_router, prefix=settings.API_V1_STR + "/eva
 app.include_router(redteam_router, prefix=settings.API_V1_STR + "/evaluation")
 # M1 QE1-3：webhook 端点 CRUD 与送达历史（/api/v1/webhooks）
 app.include_router(webhook_router, prefix=settings.API_V1_STR)
+# M5 QE5-4：报告分享链接——鉴权面（创建/列表/吊销）+ 免登录公开报告
+# （/api/v1/share/{token}/report 走中间件白名单，端点内限流+无差别 404）
+app.include_router(share_manage_router, prefix=settings.API_V1_STR)
+app.include_router(share_public_router, prefix=settings.API_V1_STR)
 # M1 QE1-4：API Key 管理（/api/v1/api-keys，登录态专用——不进 scope 注册表）
 app.include_router(api_key_router, prefix=settings.API_V1_STR)
 # M4 QE4-1：OIDC SSO（/api/v1/auth/oidc/* + /api/v1/auth/methods；配置面

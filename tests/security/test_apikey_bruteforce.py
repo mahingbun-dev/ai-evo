@@ -68,7 +68,11 @@ class FakeRedis:
         self._data[key] = value
         return value
 
-    def set(self, key, value, ex=None):
+    def set(self, key, value, ex=None, nx=False):
+        # nx：仅当 key 不存在时写入（SET NX EX 语义，定时调度锁
+        # app/services/task_schedule_service.py 用；缺省 False 保持旧行为）
+        if nx and self._alive(key) is not None:
+            return None
         self._data[key] = value
         if ex is not None:
             self._ttl[key] = self.now + ex

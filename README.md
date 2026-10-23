@@ -19,11 +19,11 @@ Preparation → Evaluation → Analysis, in one platform:
 | Module | Capabilities |
 |---|---|
 | Model configs | OpenAI / Anthropic compatible endpoints, custom HTTP (import from curl), runtime variable injection, streaming connectivity test |
-| Datasets | Excel import (dynamic fields), Agent session file import, media fields, field-level validation |
+| Datasets | Excel import (dynamic fields), Agent session file import, media fields, field-level validation, dataset versioning (immutable snapshots, row-level diff between versions, restore, and follow-latest / lock-a-version binding on evaluation tasks) |
 | Script library | Pre-evaluation scripts (zip / folder packages), `model.py` contract declaration, online file-tree editing, scaffold templates |
-| Evaluation tasks | AI judge / Agent long-session / consistency / success-rate / RAG retrieval / binary classification / latency / plugin, batch runs, real-time progress over WebSocket |
+| Evaluation tasks | AI judge / Agent long-session / consistency / success-rate / RAG retrieval / binary classification / latency / plugin, batch runs, real-time progress over WebSocket; evaluation-template versioning (immutable snapshots, field-level diff, restore, M5); per-task cron scheduling (5-field cron, Beijing time, optional time window; dispatched through the regular run path — team quota and per-task mutex apply; scan loop lives in the API process with a Redis lock + `next_run_at` CAS claim, no Celery beat, M5) |
 | Judge engines | Claude Code judge (default) and the generic LLM judge graph are live; the DeepSeek harness judge is adapter-ready with task-flow wiring landing at M8; per-task evaluation dimensions |
-| Results & analytics | Score details, run-to-run history, Excel/JSON/CSV export, trend statistics, side-by-side A/B comparison |
+| Results & analytics | Score details, run-to-run history, Excel/JSON/CSV export, trend statistics, side-by-side A/B comparison, A/B template-version comparison (task-based experiments: same task across two template versions, M5); weekly report (every Monday 08:00 Beijing time: last week's coverage / efficiency / gate pass rate as markdown, archived in Statistics, pushed to webhooks subscribed to the `weekly.report.ready` event, optional SMTP email, M5); login-free read-only report sharing (M5: token links with expiry / row scope / revocation, `/share/:token` page) |
 | Administration | Teams, member enable/disable and role management (three roles: owner / engineer / viewer — writes are owner+engineer, viewer is read-only platform-wide; super admin keeps global rights), audit log (all write endpoints covered by a declarative `audited` dependency with a registry-scan static test; csv/xlsx export behind the `AUDIT_EXPORT_ENABLED` enterprise flag, off by default), built-in user guide |
 
 First registered user automatically becomes the super admin; sessions are JWT (`Authorization: Bearer`), passwords stored as PBKDF2-HMAC-SHA256 hashes. Enterprise identity: OIDC SSO (authorization code + PKCE S256) and LDAP/AD read-only auth (search + bind, with RFC 4515 filter-value escaping and empty-password rejection) can be enabled with `AUTH_METHODS=local,oidc,ldap` in any combination (a single `oidc` or `ldap` value disables local login/registration) — the super admin configures the IdP or directory (with connectivity self-check) in developer settings; first enterprise login JIT-provisions the account (or maps an existing one by email), and directory groups map to platform teams via a shared mapping table.
@@ -119,6 +119,11 @@ Dialogue evaluation is not a separate type — multi-turn scenarios are covered 
   empty passwords before any bind (anonymous-bind quirk), and reports directory
   failures uniformly as "wrong username or password" without leaking directory
   state (covered by `tests/security/test_ldap_attack_surface.py`)
+- Share links (M5) carry 192-bit tokens stored as sha256 hashes only (the
+  plaintext is returned exactly once at creation); the public report endpoint
+  is anonymous but rate-limited (Redis, 10 req/min/IP) and answers expired,
+  revoked and unknown tokens with an identical 404 so tokens cannot be
+  enumerated (covered by `tests/security/test_share_links.py`)
 - `SCRIPT_EXEC_MODE=local` (pre-evaluation scripts run as plain subprocesses) is for
   development machines only and forbidden in enterprise deployments; the compliant
   path is `container` sandbox mode — see section 9 of [docs/build-pipeline.md](docs/build-pipeline.md)

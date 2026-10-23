@@ -179,7 +179,20 @@ export const instructionApi = {
   preview: (data) => request.post('/instruction/preview', data),
   scenes: () => request.get('/instruction/scenes'),
   // 批量迁移旧版评测模板（steps 合并进 score_details，幂等；返回 {total, migrated, skipped, errors}）
-  migrateAllLegacy: () => request.post('/instruction/configs/migrate-legacy-all')
+  migrateAllLegacy: () => request.post('/instruction/configs/migrate-legacy-all'),
+  // ==================== 模板版本（M5 QE5-2） ====================
+  // 版本列表（新→旧，不含 content）：[{version_no, changelog, created_by, created_at}]
+  listTemplateVersions: (id) => request.get(`/instruction/config/${id}/versions`),
+  // 打版（以当前内容创建不可变版本，body: {changelog}）→ 版本信息
+  createTemplateVersion: (id, data) => request.post(`/instruction/config/${id}/versions`, data),
+  // 两版本字段级 diff（params from/to 为版本号）→ {summary, fields}
+  diffTemplateVersions: (id, fromVersion, toVersion) => request.get(`/instruction/config/${id}/versions/diff`, {
+    params: { from: fromVersion, to: toVersion }
+  }),
+  // 单版本详情（含完整 content 快照）
+  getTemplateVersion: (id, versionNo) => request.get(`/instruction/config/${id}/versions/${versionNo}`),
+  // 恢复模板到指定版本（恢复前活内容自动留存进版本链）
+  restoreTemplateVersion: (id, versionNo) => request.post(`/instruction/config/${id}/versions/${versionNo}/restore`)
 }
 
 // 数据集API
@@ -228,7 +241,20 @@ export const datasetApi = {
   updateData: (datasetId, dataId, data) => request.put(`/evaluation/datasets/${datasetId}/data/${dataId}`, data),
   deleteData: (dataId) => request.delete(`/evaluation/datasets/data/${dataId}`),
   getDataFiles: (datasetId, dataId, field) => request.get(`/evaluation/datasets/${datasetId}/data/${dataId}/files`, { params: { field } }),
-  deleteDataFile: (datasetId, dataId, fileId, field = 'answer') => request.delete(`/evaluation/datasets/${datasetId}/data/${dataId}/files/${fileId}?field=${field}`)
+  deleteDataFile: (datasetId, dataId, fileId, field = 'answer') => request.delete(`/evaluation/datasets/${datasetId}/data/${dataId}/files/${fileId}?field=${field}`),
+  // ==================== 数据集版本（M5 QE5-1） ====================
+  // 版本列表（新→旧）：[{version_no, changelog, row_count, snapshot_id, created_by, created_at}]
+  listVersions: (id) => request.get(`/evaluation/datasets/${id}/versions`),
+  // 打版（以当前数据创建版本，body: {changelog}）→ 版本信息
+  createVersion: (id, data) => request.post(`/evaluation/datasets/${id}/versions`, data),
+  // 两版本行级 diff（params from/to 为版本号）→ {summary, rows, truncated}
+  diffVersions: (id, fromVersion, toVersion) => request.get(`/evaluation/datasets/${id}/versions/diff`, {
+    params: { from: fromVersion, to: toVersion }
+  }),
+  // 单版本详情（含快照字段结构）
+  getVersion: (id, versionNo) => request.get(`/evaluation/datasets/${id}/versions/${versionNo}`),
+  // 恢复数据集到指定版本（破坏性：当前活行软删后按版本快照重写）
+  restoreVersion: (id, versionNo) => request.post(`/evaluation/datasets/${id}/versions/${versionNo}/restore`)
 }
 
 // anc-hub 文件API（file_query 透传，驱动「从 anc-hub 导入」页签远端浏览；阶段D 扩展文件树/预览/下载/匹配预览）
@@ -294,10 +320,23 @@ export const taskApi = {
   // 门禁状态轻量查询（M1：{verdict, gate_enabled, gate_result, ...}，可带 execution_number 查指定版本）
   gate: (id, params) => request.get(`/evaluation/tasks/${id}/gate`, { params }),
   // 校验器试跑（M2 QE2-1：单条样例试跑，script 类型复用脚本试跑通道；仅超管）
-  debugVerifier: (data) => request.post('/evaluation/tasks/verifiers/debug', data)
+  debugVerifier: (data) => request.post('/evaluation/tasks/verifiers/debug', data),
+  // 任务定时配置（M5 QE5-3：cron 5 段 + 时段限制 + 运行历史；未配置 get 返回 404）
+  getSchedule: (id) => request.get(`/evaluation/tasks/${id}/schedule`),
+  saveSchedule: (id, data) => request.put(`/evaluation/tasks/${id}/schedule`, data),
+  deleteSchedule: (id) => request.delete(`/evaluation/tasks/${id}/schedule`)
 }
 
 // 评测结果API
+// 报告分享链接API（M5 QE5-4：免登录只读报告；明文 token 仅创建响应返回一次）
+export const shareApi = {
+  createLink: (taskId, data) => request.post(`/evaluation/tasks/${taskId}/share-links`, data),
+  listLinks: (taskId) => request.get(`/evaluation/tasks/${taskId}/share-links`),
+  revokeLink: (taskId, linkId) => request.delete(`/evaluation/tasks/${taskId}/share-links/${linkId}`),
+  // 公开端点：分享页无登录态调用（无本地 token 时 Authorization 头自然为空）
+  getReport: (token) => request.get(`/share/${token}/report`)
+}
+
 export const resultApi = {
   get: (id) => request.get(`/evaluation/results/${id}`),
   // history 传 include_result=false 走轻量版本列表（不带 result 大列）
@@ -342,7 +381,11 @@ export const abTestApi = {
   saveSession: (data) => request.post('/ab-test/sessions', data),
   deleteSession: (id) => request.delete(`/ab-test/sessions/${id}`),
   // M2 QE2-3：多轮配对记录的显著性复算（历史详情回放共用）
-  computeSignificance: (rounds) => request.post('/ab-test/significance', { rounds })
+  computeSignificance: (rounds) => request.post('/ab-test/significance', { rounds }),
+  // ==================== 模板版本对照（M5 QE5-2，任务化实验） ====================
+  // 创建对照实验：{source_task_id, template_id, version_a, version_b, name?} →
+  // 两个变体评测任务 + 对照记录（含 comparison 初始载荷）
+  createTemplateSession: (data) => request.post('/ab-test/template-sessions', data)
 }
 
 // API Key 管理（M1 开发者设置）：明文 token 仅创建响应返回一次

@@ -20,6 +20,8 @@ from app.models.plugin_marketplace_models import PluginMarketplace
 from app.models.api_key_models import ApiKey
 from app.models.webhook_models import WebhookEndpoint, WebhookDelivery
 from app.models.sso_models import SsoOidcConfig, SsoTeamMapping, LdapConfig
+from app.models.schedule_models import TaskSchedule, WeeklyReport
+from app.models.share_models import ShareLink
 
 __all__ = [
     # 原有模型
@@ -76,4 +78,9 @@ __all__ = [
     # OIDC SSO（M4 QE4-1，企业身份）
     "SsoOidcConfig",
     "SsoTeamMapping",
+    # 定时评测与周报（M5 QE5-3）
+    "TaskSchedule",
+    "WeeklyReport",
+    # 报告分享链接（M5 QE5-4）
+    "ShareLink",
 ]

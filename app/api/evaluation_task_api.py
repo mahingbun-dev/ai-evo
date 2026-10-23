@@ -111,6 +111,9 @@ class CreateTaskRequest(BaseModel):
     # M2 QE2-4 裁判治理：金丝雀自检（true 时混入约 2% 空/乱码探针行，
     # 裁判高分→结果页风险徽标；探针行不计入均分）
     judge_canary: Optional[bool] = Field(False, description="裁判金丝雀自检（M2，默认false=关闭）")
+    # M5 QE5-1 数据集版本绑定：None=跟随最新（存量行为），整数=锁定
+    # dataset_versions.version_no 运行（执行用版本快照数据）
+    dataset_version_no: Optional[int] = Field(None, description="数据集版本绑定（M5）：空=跟随最新，整数=锁定版本")
 
 
 class UpdateTaskRequest(BaseModel):
@@ -174,8 +177,10 @@ class UpdateTaskRequest(BaseModel):
     # M2 QE2-3 行级多 trial 次数（局部更新语义：携带即覆盖，None/1=关闭多 trial）
     trials: Optional[int] = Field(None, description="行级多 trial 次数（judge 类型，2-5，None/1=关闭）")
     # M2 QE2-4 裁判治理（局部更新语义：携带即覆盖）
-    judge_guard_disabled: Optional[bool] = Field(None, description="裁判输入消毒显式关闭（true=关闭定界+免责指令）")
+    judge_guard_disabled: Optional[bool] = Field(None, description="裁判输入消毒显式关闭（true=关闭）")
     judge_canary: Optional[bool] = Field(None, description="裁判金丝雀自检开关（true=混入空/乱码探针行）")
+    # M5 QE5-1 数据集版本绑定（局部更新语义：携带即覆盖，None=跟随最新）
+    dataset_version_no: Optional[int] = Field(None, description="数据集版本绑定（M5）：空=跟随最新，整数=锁定版本")
 
 
 # ==================== Response Models ====================
@@ -189,6 +194,8 @@ class TaskResponse(BaseModel):
     evaluation_type: str
     status: str
     dataset_id: Optional[str]
+    # M5 QE5-1 数据集版本绑定（编辑回显/列表展示；None=跟随最新）
+    dataset_version_no: Optional[int] = None
     model_provider: Optional[str] = None  # 被评测模型ID
     model_endpoint: Optional[str] = None
     model_output_source: Optional[str] = None
@@ -261,6 +268,8 @@ class TaskConfigResponse(BaseModel):
     evaluation_type: str
     status: str
     dataset_id: Optional[str]
+    # M5 QE5-1 数据集版本绑定（编辑回显；None=跟随最新）
+    dataset_version_no: Optional[int] = None
     model_provider: Optional[str] = None
     model_endpoint: Optional[str] = None
     model_output_source: Optional[str] = None
@@ -547,6 +556,7 @@ def create_task(
         trials=body.trials,
         judge_guard_disabled=body.judge_guard_disabled,
         judge_canary=body.judge_canary,
+        dataset_version_no=body.dataset_version_no,
     )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -946,6 +956,80 @@ def run_task(
         raise HTTPException(status_code=400, detail="任务提交失败，请重试")
 
     return task
+
+
+# ==================== 定时评测（M5 QE5-3） ====================
+
+class UpsertScheduleRequest(BaseModel):
+    """任务定时配置（一任务一条，PUT 幂等 upsert）"""
+    cron: str = Field(..., description="cron 表达式（5 段：分 时 日 月 周，北京时间）")
+    enabled: bool = Field(True, description="是否启用")
+    window_start: Optional[str] = Field(None, description="允许触发窗口开始 HH:MM（空=不限）")
+    window_end: Optional[str] = Field(None, description="允许触发窗口结束 HH:MM（空=不限）")
+
+
+@router.get("/{task_id}/schedule", summary="查询任务定时配置")
+def get_schedule(
+    task_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """查询任务定时配置（未配置返回 404；M5 QE5-3）"""
+    ensure_permission(request.state.user, "tasks")  # RBAC（QE4-3）
+    ensure_task_access(db, request.state.user, task_id)
+    from app.services.task_schedule_service import TaskScheduleService
+    schedule = TaskScheduleService(db).get_schedule(task_id)
+    if schedule is None:
+        raise HTTPException(status_code=404, detail="任务未配置定时")
+    return TaskScheduleService(db).schedule_payload(schedule)
+
+
+@router.put("/{task_id}/schedule", summary="创建/更新任务定时配置",
+            dependencies=[Depends(audited("UPDATE", "task_schedule", id_param="task_id"))])
+def upsert_schedule(
+    task_id: str,
+    body: UpsertScheduleRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """创建/更新任务定时（cron 校验 + 重算下次运行时间；M5 QE5-3）
+
+    调度由 api 进程周期扫描承担（不引 celery beat）：每 60s 扫描 due，
+    经既有 run 入口语义投递（团队配额 + 任务互斥，priority=NORMAL）。
+    """
+    ensure_permission(request.state.user, "tasks")  # RBAC（QE4-3）
+    task = ensure_task_access(db, request.state.user, task_id)
+    from app.services.task_schedule_service import TaskScheduleService
+    user = request.state.user
+    user_code = user.get("user_code") if isinstance(user, dict) else getattr(user, "user_code", None)
+    try:
+        schedule = TaskScheduleService(db).upsert_schedule(
+            task.id,
+            cron=body.cron,
+            enabled=body.enabled,
+            window_start=body.window_start,
+            window_end=body.window_end,
+            user_code=user_code,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return TaskScheduleService(db).schedule_payload(schedule)
+
+
+@router.delete("/{task_id}/schedule", summary="删除任务定时配置",
+               dependencies=[Depends(audited("DELETE", "task_schedule", id_param="task_id"))])
+def delete_schedule(
+    task_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """删除任务定时配置（M5 QE5-3）"""
+    ensure_permission(request.state.user, "tasks")  # RBAC（QE4-3）
+    ensure_task_access(db, request.state.user, task_id)
+    from app.services.task_schedule_service import TaskScheduleService
+    if not TaskScheduleService(db).delete_schedule(task_id):
+        raise HTTPException(status_code=404, detail="任务未配置定时")
+    return {"message": "删除成功"}
 
 
 @router.post("/{task_id}/stop", response_model=TaskResponse, summary="停止评测",

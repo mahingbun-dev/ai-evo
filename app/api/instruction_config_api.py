@@ -49,6 +49,15 @@ class UpdateInstructionConfigRequest(BaseModel):
     max_score: Optional[int] = None
     steps: Optional[List[str]] = None
     judge_variable_config: Optional[List[Dict[str, Any]]] = None
+    # M5 QE5-2 编辑自动打版：携带（非 None）即先为改前内容打版再应用编辑
+    version_changelog: Optional[str] = Field(
+        None, max_length=500, description="编辑留档：携带即先把当前内容打版（改前状态进版本链）"
+    )
+
+
+class CreateTemplateVersionRequest(BaseModel):
+    """模板打版请求（M5 QE5-2）"""
+    changelog: Optional[str] = Field(None, max_length=500, description="版本变更说明")
 
 
 class PreviewRequest(BaseModel):
@@ -230,8 +239,22 @@ def update_instruction_config(
     if not template:
         raise HTTPException(status_code=404, detail="配置不存在")
 
+    # M5 QE5-2 编辑自动打版：携带 version_changelog（非 None）即先把改前内容
+    # 留存进版本链，再应用编辑——显式版本化编辑覆盖的状态都可回溯
+    if body.version_changelog is not None:
+        from app.services.template_version_service import TemplateVersionService
+
+        user = request.state.user or {}
+        TemplateVersionService(db).auto_version_before_update(
+            template,
+            changelog=body.version_changelog,
+            created_by=user.get("user_code"),
+        )
+
     # 更新字段
     update_data = body.model_dump(exclude_unset=True)
+    # 打版指令字段不进模板本体
+    update_data.pop("version_changelog", None)
 
     if "evaluation_metrics" in update_data:
         update_data["evaluation_metrics"] = _parse_metrics(update_data["evaluation_metrics"])
@@ -257,6 +280,127 @@ def update_instruction_config(
     db.commit()
     db.refresh(template)
     return template
+
+
+# ==================== 模板版本（M5 QE5-2：打版/列表/diff/恢复） ====================
+
+def _get_template_or_404(db: Session, config_id: str) -> EvaluationTemplate:
+    template = db.query(EvaluationTemplate).filter(EvaluationTemplate.id == config_id).first()
+    if not template:
+        raise HTTPException(status_code=404, detail="配置不存在")
+    return template
+
+
+@router.post("/config/{config_id}/versions", summary="模板打版（以当前内容创建版本）",
+             dependencies=[Depends(audited("CREATE", "template", id_param="config_id"))])
+def create_template_version(
+    config_id: str,
+    body: CreateTemplateVersionRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """以模板当前完整内容打版（content 全量快照，版本不可变，可 diff/恢复/对照）"""
+    ensure_permission(request.state.user, "templates")  # RBAC（QE4-3）：viewer 只读
+    template = _get_template_or_404(db, config_id)
+
+    from app.services.template_version_service import TemplateVersionService
+
+    user = request.state.user or {}
+    version = TemplateVersionService(db).create_version(
+        template, changelog=body.changelog, created_by=user.get("user_code")
+    )
+    request.state.audit_resource = {
+        "id": config_id,
+        "detail": {"version_no": version["version_no"]},
+    }
+    return version
+
+
+@router.get("/config/{config_id}/versions", summary="模板版本列表")
+def list_template_versions(
+    config_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """版本列表（新→旧，不含 content 大字段）"""
+    _get_template_or_404(db, config_id)
+
+    from app.services.template_version_service import TemplateVersionService
+
+    return TemplateVersionService(db).list_versions(config_id)
+
+
+# 注意路由顺序：diff 是静态段，必须先于 /versions/{version_no} 注册
+@router.get("/config/{config_id}/versions/diff", summary="两模板版本字段级 diff")
+def diff_template_versions(
+    config_id: str,
+    request: Request,
+    from_version: int = Query(..., alias="from", description="起始版本号"),
+    to_version: int = Query(..., alias="to", description="目标版本号"),
+    db: Session = Depends(get_db),
+):
+    """字段级 diff：逐内容字段输出 from/to 对照（展示值超长截断，完整内容以版本为准）"""
+    _get_template_or_404(db, config_id)
+
+    from app.services.template_version_service import (
+        TemplateVersionNotFound, TemplateVersionService,
+    )
+
+    try:
+        return TemplateVersionService(db).diff_versions(config_id, from_version, to_version)
+    except TemplateVersionNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.get("/config/{config_id}/versions/{version_no}", summary="模板版本详情")
+def get_template_version(
+    config_id: str,
+    version_no: int,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """单版本详情（含完整 content 快照）"""
+    _get_template_or_404(db, config_id)
+
+    from app.services.template_version_service import (
+        TemplateVersionNotFound, TemplateVersionService,
+    )
+
+    try:
+        return TemplateVersionService(db).get_version(config_id, version_no)
+    except TemplateVersionNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.post("/config/{config_id}/versions/{version_no}/restore", summary="恢复模板到指定版本",
+             dependencies=[Depends(audited("UPDATE", "template", id_param="config_id"))])
+def restore_template_version(
+    config_id: str,
+    version_no: int,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """把模板活内容恢复到指定版本（恢复前活内容自动留存进版本链，改前状态不丢）"""
+    ensure_permission(request.state.user, "templates")  # RBAC（QE4-3）：viewer 只读
+    template = _get_template_or_404(db, config_id)
+
+    from app.services.template_version_service import (
+        TemplateVersionNotFound, TemplateVersionService,
+    )
+
+    user = request.state.user or {}
+    try:
+        result = TemplateVersionService(db).restore_version(
+            template, version_no, created_by=user.get("user_code")
+        )
+    except TemplateVersionNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    request.state.audit_resource = {
+        "id": config_id,
+        "detail": {"restored_version": version_no,
+                   "pre_restore_version": result["pre_restore_version"]},
+    }
+    return result
 
 
 @router.delete("/config/{config_id}", summary="删除配置",

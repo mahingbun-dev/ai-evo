@@ -4,14 +4,21 @@
     <div class="ab-test-header">
       <div class="header-title">
         <el-icon :size="20"><Switch /></el-icon>
-        <span>A/B 模型对比测试</span>
-        <span class="subtitle">选择两个模型，输入变量，对比实时输出结果</span>
+        <span>A/B 对比测试</span>
+        <!-- M5 QE5-2 模式切换：模型对比（手工会话式，保留） / 模板版本对照（任务化实验） -->
+        <el-radio-group v-model="pageMode" size="small" style="margin-left: 16px">
+          <el-radio-button value="model">模型对比</el-radio-button>
+          <el-radio-button value="template">模板版本对照</el-radio-button>
+        </el-radio-group>
+        <span class="subtitle" v-if="pageMode === 'model'">选择两个模型，输入变量，对比实时输出结果</span>
+        <span class="subtitle" v-else>同一评测任务 × 两个模板版本，生成对照实验任务（执行历史留存可比）</span>
       </div>
-      <el-button :icon="Clock" @click="openHistory">历史记录</el-button>
+      <el-button v-if="pageMode === 'model'" :icon="Clock" @click="openHistory">历史记录</el-button>
+      <el-button v-else :icon="Clock" @click="openTemplateHistory">对照实验记录</el-button>
     </div>
 
-    <!-- 模型选择区域 -->
-    <el-card class="config-card" shadow="never">
+    <!-- 模型选择区域（手工会话式模式，保留旧入口） -->
+    <el-card v-if="pageMode === 'model'" class="config-card" shadow="never">
       <el-row :gutter="24">
         <!-- 模型 A -->
         <el-col :span="12">
@@ -108,8 +115,56 @@
       </div>
     </el-card>
 
+    <!-- 模板版本对照面板（M5 QE5-2，任务化实验）：源任务 × 两模板版本 → 两个变体任务 -->
+    <el-card v-if="pageMode === 'template'" class="config-card" shadow="never">
+      <el-form label-width="110px">
+        <el-form-item label="源评测任务">
+          <el-select v-model="tplSourceTaskId" placeholder="选择要对照的评测任务（变体任务由此复制）" filterable style="width: 100%" :loading="tplTasksLoading">
+            <el-option v-for="t in tplTasks" :key="t.id" :label="`${t.name}（${t.evaluation_type}）`" :value="t.id" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="评测模板">
+          <el-select v-model="tplTemplateId" placeholder="选择模板（需已打版）" filterable style="width: 100%" @change="onTplTemplateChange">
+            <el-option v-for="t in tplTemplates" :key="t.id" :label="t.name" :value="t.id" />
+          </el-select>
+        </el-form-item>
+        <el-row :gutter="16">
+          <el-col :span="12">
+            <el-form-item label="A 侧版本">
+              <el-select v-model="tplVersionA" placeholder="版本 A" style="width: 100%" :disabled="tplVersions.length === 0">
+                <el-option v-for="v in tplVersions" :key="v.version_no"
+                           :label="`v${v.version_no}${v.changelog ? ' · ' + v.changelog : ''}`" :value="v.version_no" />
+              </el-select>
+            </el-form-item>
+          </el-col>
+          <el-col :span="12">
+            <el-form-item label="B 侧版本">
+              <el-select v-model="tplVersionB" placeholder="版本 B" style="width: 100%" :disabled="tplVersions.length === 0">
+                <el-option v-for="v in tplVersions" :key="v.version_no"
+                           :label="`v${v.version_no}${v.changelog ? ' · ' + v.changelog : ''}`" :value="v.version_no" />
+              </el-select>
+            </el-form-item>
+          </el-col>
+        </el-row>
+        <el-form-item label="实验备注名">
+          <el-input v-model="tplSessionName" placeholder="选填，便于后续查找" maxlength="60" style="max-width: 360px" />
+        </el-form-item>
+      </el-form>
+      <div class="action-row">
+        <el-button
+          type="primary"
+          size="large"
+          :loading="tplCreating"
+          :disabled="!tplSourceTaskId || !tplTemplateId || !tplVersionA || !tplVersionB || tplVersionA === tplVersionB"
+          @click="createTemplateSession"
+        >创建对照实验</el-button>
+        <span v-if="tplVersionA && tplVersionA === tplVersionB" class="hint-text">对照两版本不能相同</span>
+        <span v-else class="hint-text">创建后生成两个变体任务（仅模板派生配置不同），在记录里逐个运行并对比均分</span>
+      </div>
+    </el-card>
+
     <!-- 显著性面板（M2 QE2-3）：多轮跑完/历史详情有统计才显示 -->
-    <el-card v-if="significance" class="significance-card" shadow="never">
+    <el-card v-if="pageMode === 'model' && significance" class="significance-card" shadow="never">
       <template #header>
         <div class="significance-header">
           <span>显著性统计</span>
@@ -165,7 +220,7 @@
     </el-card>
 
     <!-- 对比结果区域 -->
-    <el-row :gutter="16" class="result-row" v-if="testStarted">
+    <el-row :gutter="16" class="result-row" v-if="pageMode === 'model' && testStarted">
       <!-- 模型 A 结果 -->
       <el-col :span="12">
         <el-card shadow="never" class="result-card result-card-a">
@@ -208,7 +263,7 @@
     </el-row>
 
     <!-- 保存记录按钮 -->
-    <div class="save-row" v-if="testDone">
+    <div class="save-row" v-if="pageMode === 'model' && testDone">
       <el-button type="success" :icon="DocumentAdd" :disabled="isRunning" @click="startSave">
         保存本次对比记录
       </el-button>
@@ -354,6 +409,77 @@
         </el-row>
       </div>
     </el-dialog>
+    <!-- 模板版本对照实验记录（M5 QE5-2）：两侧变体任务状态/均分 + 运行/删除 -->
+    <el-dialog v-model="tplHistoryVisible" title="模板版本对照实验记录" width="1060px" top="6vh">
+      <div class="history-toolbar">
+        <el-button :icon="Refresh" size="small" @click="loadTemplateHistory">刷新</el-button>
+        <span class="tpl-history-tip">「运行」走任务执行全口径（配额/互斥），跑完刷新即见均分对照</span>
+      </div>
+      <el-table :data="tplHistoryList" v-loading="tplHistoryLoading" size="small" style="width: 100%">
+        <el-table-column label="备注名" min-width="120">
+          <template #default="{ row }">{{ row.name || '-' }}</template>
+        </el-table-column>
+        <el-table-column label="源任务" min-width="150">
+          <template #default="{ row }">{{ tplTaskName(row.source_task_id) }}</template>
+        </el-table-column>
+        <el-table-column label="对照版本" width="130" align="center">
+          <template #default="{ row }">
+            <el-tag size="small" type="primary">v{{ row.template_version_a }}</el-tag>
+            vs
+            <el-tag size="small" type="warning">v{{ row.template_version_b }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="A 均分 / 状态" width="150">
+          <template #default="{ row }">
+            <span v-if="comparisonOf(row)?.side_a?.latest_execution">
+              {{ comparisonOf(row).side_a.latest_execution.average_score ?? '-' }}
+              <el-tag size="small" :type="comparisonOf(row).side_a.latest_execution.status === 'completed' ? 'success' : 'info'">
+                {{ comparisonOf(row).side_a.latest_execution.status }}
+              </el-tag>
+            </span>
+            <span v-else>未运行</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="B 均分 / 状态" width="150">
+          <template #default="{ row }">
+            <span v-if="comparisonOf(row)?.side_b?.latest_execution">
+              {{ comparisonOf(row).side_b.latest_execution.average_score ?? '-' }}
+              <el-tag size="small" :type="comparisonOf(row).side_b.latest_execution.status === 'completed' ? 'success' : 'info'">
+                {{ comparisonOf(row).side_b.latest_execution.status }}
+              </el-tag>
+            </span>
+            <span v-else>未运行</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="实验状态" width="90" align="center">
+          <template #default="{ row }">
+            <el-tag size="small" :type="{ completed: 'success', failed: 'danger', pending: 'info' }[comparisonOf(row)?.state || 'pending']">
+              {{ { completed: '已完成', failed: '失败', pending: '进行中/未跑' }[comparisonOf(row)?.state || 'pending'] }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="创建时间" width="150">
+          <template #default="{ row }">{{ formatTime(row.created_at) }}</template>
+        </el-table-column>
+        <el-table-column label="操作" width="240" fixed="right">
+          <template #default="{ row }">
+            <el-button type="primary" link size="small" :disabled="tplRunningKey === `${row.id}-a`" :loading="tplRunningKey === `${row.id}-a`" @click="runTplSide(row, 'a')">运行 A</el-button>
+            <el-button type="primary" link size="small" :disabled="tplRunningKey === `${row.id}-b`" :loading="tplRunningKey === `${row.id}-b`" @click="runTplSide(row, 'b')">运行 B</el-button>
+            <el-button type="danger" link size="small" :loading="tplDeletingId === row.id" :disabled="tplDeletingId !== null" @click="deleteTplSession(row)">删除</el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+      <div class="history-pagination">
+        <el-pagination
+          v-model:current-page="tplHistoryPage"
+          :page-size="20"
+          :total="tplHistoryTotal"
+          layout="total, prev, pager, next"
+          @current-change="loadTemplateHistory"
+          small
+        />
+      </div>
+    </el-dialog>
   </div>
 </template>
 
@@ -364,11 +490,162 @@ import {
   Switch, Clock, Setting, VideoPlay, VideoPause, Loading,
   DocumentAdd, RefreshRight, Refresh, Search
 } from '@element-plus/icons-vue'
-import { modelApi, abTestApi } from '@/api'
+import { modelApi, abTestApi, taskApi, instructionApi } from '@/api'
 import appConfig from '@/config'
 import VariableInjector from '@/components/VariableInjector.vue'
 import { formatTime } from '@/utils/time'
 import ModelTestLog from '@/components/ModelTestLog.vue'
+
+// ==================== 页面模式（M5 QE5-2）：model=手工会话式双模型对比（保留），
+// template=模板版本对照（任务化实验：源任务 × 两模板版本 → 两个变体任务） ====================
+const pageMode = ref('model')
+
+// ==================== 模板版本对照 ====================
+const tplTasks = ref([])              // 可选源任务列表
+const tplTasksLoading = ref(false)
+const tplTemplates = ref([])          // 模板列表
+const tplVersions = ref([])           // 所选模板的版本列表
+const tplSourceTaskId = ref('')
+const tplTemplateId = ref('')
+const tplVersionA = ref(null)
+const tplVersionB = ref(null)
+const tplSessionName = ref('')
+const tplCreating = ref(false)
+
+const tplHistoryVisible = ref(false)
+const tplHistoryList = ref([])
+const tplHistoryLoading = ref(false)
+const tplHistoryTotal = ref(0)
+const tplHistoryPage = ref(1)
+const tplDeletingId = ref(null)
+const tplRunningKey = ref('')         // `${sessionId}-${side}` 运行中标识
+const tplComparisons = ref({})        // sessionId → comparison 载荷缓存
+
+const loadTplOptions = async () => {
+  tplTasksLoading.value = true
+  try {
+    const [tasksRes, tplRes] = await Promise.all([
+      taskApi.list({ limit: 200 }),
+      instructionApi.list({ limit: 200 })
+    ])
+    tplTasks.value = tasksRes || []
+    tplTemplates.value = tplRes || []
+  } catch (e) {
+    console.error('加载模板对照选项失败', e)
+  } finally {
+    tplTasksLoading.value = false
+  }
+}
+
+const onTplTemplateChange = async () => {
+  tplVersionA.value = null
+  tplVersionB.value = null
+  tplVersions.value = []
+  if (!tplTemplateId.value) return
+  try {
+    const res = await instructionApi.listTemplateVersions(tplTemplateId.value)
+    tplVersions.value = res || []
+    if (tplVersions.value.length === 0) {
+      ElMessage.warning('该模板还没有版本，请先到「评测模板」页打版')
+    }
+  } catch (e) {
+    console.error('获取模板版本失败', e)
+  }
+}
+
+const createTemplateSession = async () => {
+  if (tplCreating.value) return
+  if (!tplSourceTaskId.value || !tplTemplateId.value || !tplVersionA.value || !tplVersionB.value) return
+  if (tplVersionA.value === tplVersionB.value) {
+    ElMessage.error('对照两版本不能相同')
+    return
+  }
+  tplCreating.value = true
+  try {
+    const res = await abTestApi.createTemplateSession({
+      source_task_id: tplSourceTaskId.value,
+      template_id: tplTemplateId.value,
+      version_a: tplVersionA.value,
+      version_b: tplVersionB.value,
+      name: tplSessionName.value?.trim() || null
+    })
+    ElMessage.success(`对照实验已创建：${res.task_a_id ? 'A/B 两个变体任务就绪' : ''}，到「对照实验记录」运行`)
+    tplSessionName.value = ''
+    if (res.comparison) tplComparisons.value[res.id] = res.comparison
+    openTemplateHistory()
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || '创建对照实验失败')
+  } finally {
+    tplCreating.value = false
+  }
+}
+
+const openTemplateHistory = () => {
+  tplHistoryVisible.value = true
+  loadTemplateHistory()
+}
+
+const loadTemplateHistory = async () => {
+  tplHistoryLoading.value = true
+  try {
+    const res = await abTestApi.listSessions({
+      mode: 'template', page: tplHistoryPage.value, page_size: 20
+    })
+    tplHistoryList.value = res?.items || []
+    tplHistoryTotal.value = res?.total || 0
+    // 逐条拉对照载荷（任务状态/均分），缓存供表格渲染
+    await Promise.all(tplHistoryList.value.map(async (row) => {
+      if (!tplComparisons.value[row.id]) {
+        try {
+          const detail = await abTestApi.getSession(row.id)
+          if (detail?.comparison) tplComparisons.value[row.id] = detail.comparison
+        } catch (e) { /* 单条失败不阻断列表 */ }
+      }
+    }))
+  } catch (e) {
+    console.error('加载对照实验记录失败', e)
+  } finally {
+    tplHistoryLoading.value = false
+  }
+}
+
+const comparisonOf = (row) => tplComparisons.value[row.id] || null
+const tplTaskName = (taskId) => tplTasks.value.find(t => t.id === taskId)?.name || taskId || '-'
+
+// 运行单侧变体任务：走既有任务 run 入口（RBAC/配额/互斥全口径）
+const runTplSide = async (row, side) => {
+  const taskId = side === 'a' ? row.task_a_id : row.task_b_id
+  if (!taskId) return
+  tplRunningKey.value = `${row.id}-${side}`
+  try {
+    await taskApi.run(taskId)
+    ElMessage.success(`变体任务${side.toUpperCase()} 已开始执行，稍后点「刷新」查看均分`)
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || '任务启动失败')
+  } finally {
+    tplRunningKey.value = ''
+  }
+}
+
+const deleteTplSession = async (row) => {
+  try {
+    await ElMessageBox.confirm(
+      '删除对照实验记录不会删除已生成的变体任务（任务可在「评测任务」页自行管理）。确定删除？',
+      '删除对照记录',
+      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' }
+    )
+  } catch { return }
+  tplDeletingId.value = row.id
+  try {
+    await abTestApi.deleteSession(row.id)
+    ElMessage.success('已删除')
+    await loadTemplateHistory()
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || '删除失败')
+  } finally {
+    tplDeletingId.value = null
+  }
+}
 
 // ==================== 模型列表 ====================
 const modelList = ref([])
@@ -706,6 +983,8 @@ const buildLogsFromResult = (result) => {
 // ==================== 初始化 ====================
 onMounted(() => {
   loadModels()
+  // M5 QE5-2：模板对照模式的选项（任务/模板列表）随页预载，切模式零等待
+  loadTplOptions()
 })
 </script>
 
@@ -898,6 +1177,13 @@ onMounted(() => {
   align-items: center;
   gap: 8px;
   justify-content: flex-end;
+}
+
+/* 模板对照记录工具栏提示（M5 QE5-2） */
+.tpl-history-tip {
+  color: #909399;
+  font-size: 12px;
+  margin-right: auto;
 }
 
 .history-pagination {

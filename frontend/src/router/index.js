@@ -10,6 +10,13 @@ const routes = [
     meta: { title: '登录' }
   },
   {
+    // M5 QE5-4：免登录只读报告页（token 即凭证；过期/吊销后端 404，页面提示失效）
+    path: '/share/:token',
+    name: 'ShareReport',
+    component: () => import('@/views/ShareReport.vue'),
+    meta: { title: '评测报告（分享）' }
+  },
+  {
     path: '/',
     name: 'Home',
     component: () => import('@/views/Home.vue'),
@@ -97,8 +104,8 @@ const router = createRouter({
 
 // 全局路由守卫：在每次路由跳转前检查登录状态
 router.beforeEach(async (to, from, next) => {
-  // 登录页、根路径和文档路径不做登录检查
-  if (to.path === '/login' || to.path === '/' || to.path === '/docs') {
+  // 登录页、根路径和文档路径不做登录检查（/share/:token 免登录只读报告同口径）
+  if (to.path === '/login' || to.path === '/' || to.path === '/docs' || to.name === 'ShareReport') {
     return next()
   }
 

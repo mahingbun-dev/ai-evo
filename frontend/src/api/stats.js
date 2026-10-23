@@ -12,6 +12,15 @@ export const statsApi = {
   getTrends(params) {
     return request.get('/stats/trends', { params })
   },
+
+  // 周报归档（M5 QE5-3）：每周一 08:00 聚合上周覆盖度/提效/门禁通过率
+  listWeeklyReports(params) {
+    return request.get('/stats/weekly-reports', { params })
+  },
+
+  getWeeklyReport(id) {
+    return request.get(`/stats/weekly-reports/${id}`)
+  },
 }
 
 export const coverageApi = {

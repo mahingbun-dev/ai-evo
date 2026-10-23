@@ -256,6 +256,17 @@ class Settings(BaseSettings):
     AUDIT_EXPORT_ENABLED: bool = False
     AUDIT_EXPORT_MAX_ROWS: int = 10000
 
+    # M5 QE5-3 周报邮件推送（可选，默认未配置=跳过邮件只走 webhook）：SMTP
+    # 主机留空即整体跳过（email_status 落 skipped，不告警不阻断）；收件人
+    # 逗号分隔。纯标准库 smtplib，无新增依赖
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    SMTP_USER: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_USE_TLS: bool = True
+    SMTP_FROM: str = ""
+    WEEKLY_REPORT_EMAIL_TO: str = ""
+
     @property
     def auth_methods(self) -> set:
         """已启用认证方式集合（M4 QE4-1/QE4-2）：AUTH_METHODS 解析结果，

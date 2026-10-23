@@ -56,6 +56,33 @@ class TrendResponse(BaseModel):
     data: List[TrendItem]
 
 
+# 周报归档（M5 QE5-3）：每周一 08:00 聚合上周覆盖度/提效/门禁通过率的
+# markdown 报告，归档可回看（生成与推送在 api 进程周期任务内完成）
+class WeeklyReportItem(BaseModel):
+    id: str
+    week_start: str
+    week_end: str
+    pushed_webhooks: int
+    email_status: Optional[str] = None
+    created_at: Optional[datetime] = None
+
+
+class WeeklyReportListResponse(BaseModel):
+    total: int
+    page: int
+    page_size: int
+    items: List[WeeklyReportItem]
+
+
+class WeeklyReportDetailResponse(BaseModel):
+    id: str
+    week_start: str
+    week_end: str
+    content: str
+    payload: Optional[dict] = None
+    created_at: Optional[datetime] = None
+
+
 @router.get("/records", response_model=RecordListResponse)
 def get_records(
     start_date: Optional[str] = Query(None, description="开始日期 YYYY-MM-DD"),
@@ -115,3 +142,28 @@ def get_trends(
         granularity=granularity,
     )
     return result
+
+
+@router.get("/weekly-reports", response_model=WeeklyReportListResponse)
+def list_weekly_reports(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+):
+    """周报归档列表（M5 QE5-3，新在前）"""
+    from app.services.weekly_report_service import list_reports
+    return list_reports(db, page=page, page_size=page_size)
+
+
+@router.get("/weekly-reports/{report_id}", response_model=WeeklyReportDetailResponse)
+def get_weekly_report(
+    report_id: str,
+    db: Session = Depends(get_db),
+):
+    """单份周报正文（markdown 原文，前端查看弹窗渲染）"""
+    from app.services.weekly_report_service import get_report_content
+    report = get_report_content(db, report_id)
+    if report is None:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="周报不存在")
+    return report

@@ -35,8 +35,12 @@ logger = logging.getLogger(__name__)
 EVENT_TASK_COMPLETED = "task.execution.completed"
 EVENT_TASK_FAILED = "task.execution.failed"
 EVENT_GATE_FAILED = "gate.failed"
+# M5 QE5-3：周报生成完成（每周一 08:00 聚合后推送，报文含指标快照）
+EVENT_WEEKLY_REPORT = "weekly.report.ready"
 
-WEBHOOK_EVENTS: Tuple[str, ...] = (EVENT_TASK_COMPLETED, EVENT_TASK_FAILED, EVENT_GATE_FAILED)
+WEBHOOK_EVENTS: Tuple[str, ...] = (
+    EVENT_TASK_COMPLETED, EVENT_TASK_FAILED, EVENT_GATE_FAILED, EVENT_WEEKLY_REPORT,
+)
 
 # ---------------- 投递参数 ----------------
 

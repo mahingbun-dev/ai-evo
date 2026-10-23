@@ -32,10 +32,11 @@
             {{ formatTime(row.updated_at) || '-' }}
           </template>
         </el-table-column>
-        <el-table-column label="操作" min-width="240" fixed="right">
+        <el-table-column label="操作" min-width="300" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" :disabled="rowOpLoading" @click="viewData(row)">预览</el-button>
             <el-button link type="primary" :disabled="rowOpLoading" @click="openDialog(row)">编辑</el-button>
+            <el-button link type="primary" :disabled="rowOpLoading" @click="openVersions(row)">版本</el-button>
             <el-button
               link
               type="primary"
@@ -471,11 +472,95 @@
 
     <!-- 执行包「文件」抽屉（F3）：摘要卡 + 文件树 + 节点预览/下载 -->
     <HubFileDrawer v-model:visible="hubDrawerVisible" :file-id="hubDrawerFileId" :summary="hubDrawerSummary" />
+
+    <!-- 版本抽屉（M5 QE5-1）：打版历史 + 行级 diff 双栏 + 恢复 + 从此版本建任务 -->
+    <el-drawer v-model="versionDrawerVisible" :title="`版本管理 - ${versionDataset?.name || ''}`" size="72%" :close-on-click-modal="false">
+      <div v-loading="versionsLoading" class="version-drawer-body">
+        <!-- 打版区 -->
+        <div class="version-actions">
+          <el-input
+            v-model="newVersionChangelog"
+            placeholder="版本变更说明（可选，如：新增 20 条边界样本）"
+            style="max-width: 380px"
+            maxlength="500"
+            :disabled="versionCreating || readonlyRole"
+            @keyup.enter="createVersion"
+          />
+          <el-button type="primary" :loading="versionCreating" :disabled="readonlyRole" :title="readonlyRole ? '当前角色（viewer）只读' : ''" @click="createVersion">
+            以当前数据打版
+          </el-button>
+          <span class="version-hint">打版后版本不可变，可 diff / 恢复 / 锁定版本运行评测</span>
+        </div>
+
+        <!-- 版本列表 -->
+        <el-table :data="versions" size="small" border>
+          <el-table-column prop="version_no" label="版本号" width="80" align="center">
+            <template #default="{ row }">
+              <el-tag size="small">v{{ row.version_no }}</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column prop="row_count" label="行数" width="90" align="center" />
+          <el-table-column prop="changelog" label="变更说明" min-width="200" show-overflow-tooltip>
+            <template #default="{ row }">{{ row.changelog || '-' }}</template>
+          </el-table-column>
+          <el-table-column prop="created_by" label="创建人" width="120" show-overflow-tooltip>
+            <template #default="{ row }">{{ row.created_by || '-' }}</template>
+          </el-table-column>
+          <el-table-column label="创建时间" width="160">
+            <template #default="{ row }">{{ formatTime(row.created_at) }}</template>
+          </el-table-column>
+          <el-table-column label="操作" width="260" fixed="right">
+            <template #default="{ row }">
+              <el-button link type="primary" size="small" @click="diffWithLatest(row)">与最新版对比</el-button>
+              <el-button link type="primary" size="small" :disabled="readonlyRole" @click="restoreVersion(row)">恢复到此版本</el-button>
+              <el-button link type="primary" size="small" @click="createTaskFromVersion(row)">从此版本建任务</el-button>            </template>
+          </el-table-column>
+        </el-table>
+        <el-empty v-if="!versionsLoading && versions.length === 0" description="暂无版本，点「以当前数据打版」创建第一个版本" :image-size="60" />
+
+        <!-- 行级 diff 双栏 -->
+        <div v-if="diffResult" class="version-diff">
+          <el-divider content-position="left">
+            版本对比 v{{ diffResult.from.version_no }} → v{{ diffResult.to.version_no }}
+          </el-divider>
+          <div class="diff-summary">
+            <el-tag type="success">新增 {{ diffResult.summary.added }}</el-tag>
+            <el-tag type="danger">删除 {{ diffResult.summary.removed }}</el-tag>
+            <el-tag type="warning">变更 {{ diffResult.summary.changed }}</el-tag>
+            <el-tag type="info">未变 {{ diffResult.summary.unchanged }}</el-tag>
+            <span class="version-hint">行数 {{ diffResult.summary.from_count }} → {{ diffResult.summary.to_count }}</span>
+            <el-tag v-if="diffResult.truncated" type="warning">差异行超过 500 条，仅展示前 500 条</el-tag>
+          </div>
+          <!-- 双栏头（左=from 快照值 / 右=to 快照值，展示值超长已由后端截断） -->
+          <div class="diff-table">
+            <div class="diff-row diff-head">
+              <div class="diff-cell diff-meta">行</div>
+              <div class="diff-cell">v{{ diffResult.from.version_no }}（{{ formatTime(diffResult.from.created_at) || '-' }}）</div>
+              <div class="diff-cell">v{{ diffResult.to.version_no }}（{{ formatTime(diffResult.to.created_at) || '-' }}）</div>
+            </div>
+            <div v-for="row in diffResult.rows" :key="row.key" class="diff-row" :class="`diff-${row.status}`">
+              <div class="diff-cell diff-meta">
+                <el-tag :type="diffStatusTag(row.status)" size="small">{{ diffStatusText(row.status) }}</el-tag>
+                <div class="diff-index">{{ row.status === 'added' ? `#${row.to_index}` : `#${row.from_index}` }}</div>
+              </div>
+              <div class="diff-cell">{{ row.status === 'added' ? '（不存在）' : renderRowData(row.from_data) }}</div>
+              <div class="diff-cell">{{ row.status === 'removed' ? '（不存在）' : renderRowData(row.to_data, row.changed_fields) }}</div>
+            </div>
+            <el-empty
+              v-if="diffResult.rows.length === 0"
+              description="两版本行级数据完全一致"
+              :image-size="60"
+            />
+          </div>
+        </div>
+      </div>
+    </el-drawer>
   </div>
 </template>
 
 <script setup>
 import { ref, computed, inject, onMounted, onUnmounted, watch } from 'vue'
+import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { datasetApi, ossApi, hubApi, preJudgeScriptApi, hubImportApi } from '@/api'
 import { useTaskWebSocket } from '@/composables/useTaskWebSocket'
@@ -567,6 +652,123 @@ const HUB_JOB_WATCH_TIMEOUT_MS = 15 * 60 * 1000 // 关注时长上限（job 仍�
 const hubDrawerVisible = ref(false)
 const hubDrawerFileId = ref('')
 const hubDrawerSummary = ref(null)
+
+// ==================== 版本抽屉（M5 QE5-1：打版/diff/恢复/从此版本建任务） ====================
+const router = useRouter()
+const versionDrawerVisible = ref(false)
+const versionDataset = ref(null)      // 当前抽屉对应数据集行
+const versions = ref([])              // 版本列表（新→旧）
+const versionsLoading = ref(false)
+const versionCreating = ref(false)    // 打版进行中
+const newVersionChangelog = ref('')   // 打版变更说明输入
+const diffResult = ref(null)          // 行级 diff 结果（{from, to, summary, rows, truncated}）
+
+const openVersions = async (row) => {
+  versionDataset.value = row
+  versionDrawerVisible.value = true
+  diffResult.value = null
+  newVersionChangelog.value = ''
+  await loadVersions(row.id)
+}
+
+const loadVersions = async (datasetId) => {
+  if (!datasetId) return
+  versionsLoading.value = true
+  try {
+    const res = await datasetApi.listVersions(datasetId)
+    versions.value = res || []
+  } catch (e) {
+    console.error('获取版本列表失败:', e)
+    versions.value = []
+  } finally {
+    versionsLoading.value = false
+  }
+}
+
+// 打版：以数据集当前数据创建不可变版本
+const createVersion = async () => {
+  if (!versionDataset.value || versionCreating.value) return
+  versionCreating.value = true
+  try {
+    const version = await datasetApi.createVersion(versionDataset.value.id, {
+      changelog: newVersionChangelog.value?.trim() || null
+    })
+    ElMessage.success(`打版成功：v${version.version_no}（${version.row_count} 行）`)
+    newVersionChangelog.value = ''
+    await loadVersions(versionDataset.value.id)
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || '打版失败')
+  } finally {
+    versionCreating.value = false
+  }
+}
+
+// 与最新版对比（列表新→旧，最新版即 versions[0]）
+const diffWithLatest = async (row) => {
+  const latest = versions.value[0]
+  if (!latest) return
+  if (latest.version_no === row.version_no) {
+    ElMessage.info('该版本已是最新版，无对比意义')
+    return
+  }
+  await loadDiff(row.version_no, latest.version_no)
+}
+
+const loadDiff = async (fromVersion, toVersion) => {
+  if (!versionDataset.value) return
+  try {
+    const res = await datasetApi.diffVersions(versionDataset.value.id, fromVersion, toVersion)
+    diffResult.value = res
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || '获取版本 diff 失败')
+  }
+}
+
+// 恢复到指定版本：破坏性（当前活行软删后按版本快照重写），二次确认
+const restoreVersion = async (row) => {
+  try {
+    await ElMessageBox.confirm(
+      `恢复将用 v${row.version_no}（${row.row_count} 行）整体替换当前数据（含字段结构），当前未打版的数据变更将丢失。确定恢复？`,
+      '恢复数据集版本',
+      { type: 'warning', confirmButtonText: '恢复', cancelButtonText: '取消' }
+    )
+  } catch { return }
+  try {
+    const res = await datasetApi.restoreVersion(versionDataset.value.id, row.version_no)
+    ElMessage.success(`已恢复到 v${row.version_no}（重写 ${res.restored_count} 行）`)
+    await loadDatasets()
+    await loadVersions(versionDataset.value.id)
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || '恢复失败')
+  }
+}
+
+// 从此版本建任务：带 dataset_id + dataset_version_no 跳任务页（Tasks 读取 query 预选+锁定）
+const createTaskFromVersion = (row) => {
+  versionDrawerVisible.value = false
+  router.push({
+    path: '/tasks',
+    query: { dataset_id: versionDataset.value.id, dataset_version_no: row.version_no }
+  })
+}
+
+// diff 行状态 → 标签
+const diffStatusTag = (status) => ({ added: 'success', removed: 'danger', changed: 'warning' }[status] || 'info')
+const diffStatusText = (status) => ({ added: '新增', removed: '删除', changed: '变更' }[status] || status)
+
+// diff 单元格渲染：字段名: 值 逐行拼接；变更行高亮变更字段
+const renderRowData = (data, changedFields) => {
+  if (data == null) return ''
+  if (typeof data !== 'object') return String(data)
+  const changed = new Set(changedFields || [])
+  return Object.entries(data)
+    .map(([key, value]) => {
+      const text = typeof value === 'object' ? JSON.stringify(value) : String(value)
+      return changed.has(key) ? `【${key}: ${text}】` : `${key}: ${text}`
+    })
+    .join('\n')
+}
+
 
 // 打开文件抽屉：file_id 取 hub_file 字段值，摘要取同行 hub_summary（存在时）
 const openHubFileDrawer = (row, fieldName) => {
@@ -2350,6 +2552,90 @@ onMounted(() => {
 .datasets-page {
   max-width: 1400px;
   margin: 0 auto;
+}
+
+/* ==================== 版本抽屉（M5 QE5-1） ==================== */
+.version-drawer-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.version-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.version-hint {
+  color: #909399;
+  font-size: 12px;
+}
+
+.diff-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+/* diff 双栏：左=from 快照 / 右=to 快照，行内字段值多行展示 */
+.diff-table {
+  border: 1px solid #ebeef5;
+  border-radius: 4px;
+  max-height: 480px;
+  overflow: auto;
+}
+
+.diff-row {
+  display: flex;
+  border-bottom: 1px solid #ebeef5;
+}
+
+.diff-row:last-child {
+  border-bottom: none;
+}
+
+.diff-head {
+  background: #f5f7fa;
+  font-weight: 600;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+.diff-cell {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 10px;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  border-left: 1px solid #ebeef5;
+}
+
+.diff-meta {
+  flex: 0 0 72px;
+  text-align: center;
+}
+
+.diff-index {
+  color: #909399;
+  font-size: 11px;
+}
+
+.diff-added {
+  background: #f0f9eb;
+}
+
+.diff-removed {
+  background: #fef0f0;
+}
+
+.diff-changed {
+  background: #fdf6ec;
 }
 
 .card-header {
