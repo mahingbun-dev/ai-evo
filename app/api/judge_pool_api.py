@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
+from redis.exceptions import RedisError
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
@@ -13,10 +14,17 @@ from app.services.judge_pool.audit import query_audit, record_event
 from app.services.judge_pool.client import get_pool_client
 from app.services.judge_pool.config import load_config, save_config
 from app.services.judge_pool.engine import Engine, coerce_engine
+from app.services.judge_pool.errors import JudgePoolError, JudgePoolRedisSyncError
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/judge-pool", tags=["并发池"], dependencies=[Depends(ensure_super_admin)])
+
+# 审计事件白名单：与 record_event 的调用点保持一致
+_AUDIT_EVENTS = {
+    "acquire", "wait_timeout", "release", "lease_expired", "redis_unavailable",
+    "manual_release", "owner_thread_dead", "lease_lost",
+}
 
 
 class JudgePoolConfigPayload(BaseModel):
@@ -79,25 +87,32 @@ def get_config() -> Dict[str, Any]:
 @router.put("/config")
 def update_config(payload: JudgePoolConfigPayload, request: Request) -> Dict[str, Any]:
     values = {k: v for k, v in payload.model_dump().items() if v is not None}
-    current = load_config()
-    lease_ttl = values.get("lease_ttl_seconds", current.lease_ttl_seconds)
-    heartbeat = values.get("heartbeat_interval_seconds", current.heartbeat_interval_seconds)
-    # 心跳必须明显快于租约有效期，否则一次抖动就会让活租约被判死亡
-    if heartbeat * 2 >= lease_ttl:
-        raise HTTPException(
-            status_code=400,
-            detail="heartbeat_interval_seconds 必须小于 lease_ttl_seconds 的一半",
-        )
+    # 关系校验（心跳 < 租约一半）由 save_config 在 DB 现值合并之后做，
+    # 端点不再用 load_config() 预检，避免出现两套校验基准
     try:
-        return save_config(values, updated_by=_current_operator(request)).to_dict()
+        cfg = save_config(values, updated_by=_current_operator(request), strict=True)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+    except JudgePoolRedisSyncError as e:
+        # DB 已是可靠来源，允许 200 但如实告知未同步
+        return {**e.config.to_dict(), "redis_synced": False}
+    except JudgePoolError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    return {**cfg.to_dict(), "redis_synced": True}
+
+
+def _redis_unavailable(e: Exception) -> HTTPException:
+    logger.error(f"[judge_pool] 强制释放时 Redis 不可用: {e}")
+    return HTTPException(status_code=503, detail="Redis 不可用，无法确认租约状态，请稍后重试")
 
 
 @router.post("/leases/{lease_id}/release")
 def force_release(lease_id: str, request: Request, engine: str = Query(...)) -> Dict[str, Any]:
     eng = _coerce_engine_or_400(engine)
-    released = get_pool_client().force_release(eng, lease_id)
+    try:
+        released = get_pool_client().force_release(eng, lease_id, strict=True)
+    except RedisError as e:
+        raise _redis_unavailable(e) from e
     # 租约已不存在时不能留一条「释放过」的审计，否则审计与事实不符
     if released:
         record_event(
@@ -114,7 +129,10 @@ def release_all(request: Request, engine: Optional[str] = Query(None)) -> Dict[s
     operator = _current_operator(request)
     if engine:
         eng = _coerce_engine_or_400(engine)
-        count = get_pool_client().force_release_engine(eng)
+        try:
+            count = get_pool_client().force_release_engine(eng, strict=True)
+        except RedisError as e:
+            raise _redis_unavailable(e) from e
         if count:
             record_event(
                 "manual_release",
@@ -125,7 +143,10 @@ def release_all(request: Request, engine: Optional[str] = Query(None)) -> Dict[s
 
     total = 0
     for eng in Engine:
-        count = get_pool_client().force_release_engine(eng)
+        try:
+            count = get_pool_client().force_release_engine(eng, strict=True)
+        except RedisError as e:
+            raise _redis_unavailable(e) from e
         total += count
         if count:
             record_event(
@@ -146,6 +167,10 @@ def list_audit(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
 ) -> Dict[str, Any]:
+    if engine:
+        engine = _coerce_engine_or_400(engine).value
+    if event and event not in _AUDIT_EVENTS:
+        raise HTTPException(status_code=400, detail=f"未知审计事件: {event!r}")
     rows, total = query_audit(db, engine=engine, event=event, start=start, end=end,
                               skip=(page - 1) * page_size, limit=page_size)
     return {

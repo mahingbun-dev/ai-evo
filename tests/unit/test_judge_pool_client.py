@@ -1,4 +1,5 @@
 """客户端申请/释放/重入/fail-open 测试（脚本结果用桩替换）"""
+import json
 import threading
 import time
 import uuid
@@ -10,7 +11,7 @@ from app.services.judge_pool.client import AcquireResult, JudgePoolClient, Lease
 from app.services.judge_pool.context import bind_judge_context, clear_current_lease, current_lease
 from app.services.judge_pool.engine import Engine
 from app.services.judge_pool.errors import JudgePoolAborted, JudgePoolTimeout
-from app.services.judge_pool.redis_keys import wait_key
+from app.services.judge_pool.redis_keys import lease_data_key, leases_key, peak_key, wait_key
 
 pytestmark = pytest.mark.unit
 
@@ -342,3 +343,71 @@ def test_heartbeat_keeps_lease_when_renew_succeeds(monkeypatch):
 
     assert lease.lost is False
     assert events == []
+
+
+# ---------------------------------------------------------------------------
+# snapshot 契约形状与报错脱敏（/status 端点的数据源）
+# ---------------------------------------------------------------------------
+
+
+class _SnapshotRedis:
+    """只实现 snapshot 用到的 5 个命令"""
+
+    def __init__(self, lease=None):
+        self.lease = lease
+
+    def zcard(self, key):
+        return 1 if self.lease and key == leases_key(Engine.GRAPH) else 0
+
+    def zrange(self, key, start, end):
+        if self.lease and key == leases_key(Engine.GRAPH):
+            return [self.lease["lease_id"]]
+        return []
+
+    def hmget(self, key, ids):
+        if self.lease and key == lease_data_key(Engine.GRAPH):
+            return [json.dumps(self.lease)]
+        return []
+
+    def zscore(self, key, member):
+        return time.time() * 1000 + 60_000
+
+    def get(self, key):
+        return "5" if key == peak_key(Engine.GRAPH) else "0"
+
+
+class _BrokenRedis:
+    def zcard(self, key):
+        raise RuntimeError(
+            "redis://user:secret@redis-host:6379/0 连接被拒绝 " + "x" * 500
+        )
+
+
+def test_snapshot_contract_shape():
+    """引擎五项指标与租约关键字段由真实 client 产出，改错键名即红"""
+    lease = {"lease_id": "l-1", "engine": "graph", "host": "h1", "pid": 42,
+             "row_idx": 7, "acquired_at": 0, "last_renew_at": 0}
+    snap = JudgePoolClient(redis_client=_SnapshotRedis(lease=lease)).snapshot()
+
+    assert snap["redis_available"] is True
+    assert snap["degraded"] is False
+    assert set(snap["engines"]) == {e.value for e in Engine}
+    for engine_value, info in snap["engines"].items():
+        assert set(info) == {"limit", "active", "available", "waiting", "peak_1m"}
+    assert snap["engines"]["graph"]["limit"] == _cfg().graph_limit
+    assert snap["engines"]["graph"]["peak_1m"] == 5
+
+    item = snap["leases"][0]
+    for key in ("lease_id", "engine", "host", "pid", "row_idx", "ttl_remaining_seconds"):
+        assert key in item, f"租约项缺少 {key}"
+    assert item["ttl_remaining_seconds"] >= 0
+
+
+def test_snapshot_error_masked_with_type_and_truncated():
+    snap = JudgePoolClient(redis_client=_BrokenRedis()).snapshot()
+
+    assert snap["redis_available"] is False
+    assert snap["degraded"] is True
+    assert snap["error"].startswith("RuntimeError: ")
+    message = snap["error"].split(": ", 1)[1]
+    assert len(message) <= 200

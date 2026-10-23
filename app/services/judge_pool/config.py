@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass
 from typing import Optional
 
 from .engine import Engine
+from .errors import JudgePoolError, JudgePoolRedisSyncError
 from .redis_keys import conf_key
 
 logger = logging.getLogger(__name__)
@@ -162,7 +163,8 @@ def _load_from_db() -> Optional[JudgePoolConfig]:
         return None
 
 
-def _save_to_db(payload: dict, updated_by: str = "") -> None:
+def _save_to_db(payload: dict, updated_by: str = "") -> bool:
+    """落库成功返回 True；失败只记日志并返回 False（strict 调用方据此报错）"""
     try:
         from app.db.session import SessionLocal
         from app.models.judge_pool_models import JudgePoolConfig as ConfigRow
@@ -177,25 +179,38 @@ def _save_to_db(payload: dict, updated_by: str = "") -> None:
                     setattr(row, key, value)
             row.updated_by = updated_by
             db.commit()
+        return True
     except Exception as e:  # noqa: BLE001
         logger.warning(f"[judge_pool] 配置持久化失败（仅内存/Redis 生效）: {e}")
+        return False
 
 
-def save_config(payload: dict, updated_by: str = "") -> JudgePoolConfig:
+def save_config(payload: dict, updated_by: str = "", strict: bool = False) -> JudgePoolConfig:
     # 先校验，非法输入在任何副作用（DB/Redis）之前失败
     normalized = _normalize_payload(payload)
     # DB 是持久化源：以其当前值为底，避免用故障态的默认值覆盖运维配置
     current = (_load_from_db() or load_config(force=True)).to_dict()
     current.update(normalized)
+    # 关系校验必须放在合并之后：写入基准是 DB 现值，用缓存/Redis 上的值预检会
+    # 放过「缓存 ttl=180、DB ttl=60」这类分叉组合
+    if current["heartbeat_interval_seconds"] * 2 >= current["lease_ttl_seconds"]:
+        raise ValueError("心跳间隔必须小于租约有效期的一半")
     cfg = JudgePoolConfig(**current)
-    _save_to_db(current, updated_by)
+    db_ok = _save_to_db(current, updated_by)
+    if strict and not db_ok:
+        raise JudgePoolError("配置持久化失败，请检查数据库")
+    redis_ok = True
     try:
         _redis().hset(conf_key(), mapping=_mapping_from_config(cfg))
     except Exception as e:  # noqa: BLE001
+        redis_ok = False
         logger.error(f"[judge_pool] 配置写入 Redis 失败: {e}")
     invalidate_config_cache()
     with _lock:
         global _cached, _cached_at
         _cached = cfg
         _cached_at = time.monotonic()
+    if strict and not redis_ok:
+        # 降级成功：DB 已是可靠来源，其他 worker 在 Redis 恢复后经空 Redis 回填
+        raise JudgePoolRedisSyncError("配置已落库，Redis 同步失败，恢复后生效", cfg)
     return cfg

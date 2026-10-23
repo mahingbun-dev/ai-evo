@@ -177,23 +177,28 @@ class JudgePoolClient:
             clear_current_lease(lease.engine, lease)
         return renewed
 
-    def force_release(self, engine, lease_id: str) -> bool:
+    def force_release(self, engine, lease_id: str, strict: bool = False) -> bool:
+        """strict=True 时 Redis 异常原样上抛，让调用方能区分「租约不存在」与「Redis 不可用」"""
         engine = coerce_engine(engine)
         try:
             removed = self._lua_release(engine, lease_id)
         except Exception as e:  # noqa: BLE001
+            if strict:
+                raise
             logger.error(f"[judge_pool] 强制释放失败: {e}")
             return False
         return bool(removed)
 
-    def force_release_engine(self, engine) -> int:
+    def force_release_engine(self, engine, strict: bool = False) -> int:
         engine = coerce_engine(engine)
         try:
             ids = self._client().zrange(leases_key(engine), 0, -1)
         except Exception as e:  # noqa: BLE001
+            if strict:
+                raise
             logger.error(f"[judge_pool] 读取租约失败: {e}")
             return 0
-        return sum(1 for lease_id in ids if self.force_release(engine, lease_id))
+        return sum(1 for lease_id in ids if self.force_release(engine, lease_id, strict=strict))
 
     def prune_expired(self, engine) -> List[str]:
         engine = coerce_engine(engine)
@@ -241,7 +246,8 @@ class JudgePoolClient:
         except Exception as e:  # noqa: BLE001
             out["redis_available"] = False
             out["degraded"] = True
-            out["error"] = str(e)[:500]
+            # 脱敏：只留异常类型 + 截断后的消息，避免把连接串等细节透到前端
+            out["error"] = f"{type(e).__name__}: {str(e)[:200]}"
         return out
 
     # ---------- 脚本调用（测试可覆盖） ----------

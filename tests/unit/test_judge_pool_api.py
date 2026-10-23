@@ -46,13 +46,50 @@ class _FakeClient:
             "leases": [],
         }
 
-    def force_release(self, engine, lease_id):
-        self.released_calls.append((Engine(engine), lease_id))
+    def force_release(self, engine, lease_id, strict=False):
+        self.released_calls.append((Engine(engine), lease_id, strict))
         return self.release_result
 
-    def force_release_engine(self, engine):
+    def force_release_engine(self, engine, strict=False):
         self.released_engines.append(Engine(engine))
         return self.engine_count
+
+
+class _RedisDownClient:
+    """Redis 全挂：strict 时按真实 client 语义原样上抛"""
+
+    def __init__(self):
+        from redis.exceptions import RedisError
+
+        self._err = RedisError("redis down")
+        self.strict_seen = []
+
+    def snapshot(self):
+        return _FakeClient().snapshot()
+
+    def force_release(self, engine, lease_id, strict=False):
+        self.strict_seen.append(strict)
+        raise self._err
+
+    def force_release_engine(self, engine, strict=False):
+        self.strict_seen.append(strict)
+        raise self._err
+
+
+class _FakeCfgRedis:
+    """配置模块的最小 Redis 假实现"""
+
+    def __init__(self):
+        self.hashes = {}
+        self.fail_hset = False
+
+    def hgetall(self, key):
+        return dict(self.hashes.get(key, {}))
+
+    def hset(self, key, mapping=None, **kwargs):
+        if self.fail_hset:
+            raise ConnectionError("redis down")
+        self.hashes.setdefault(key, {}).update(mapping or kwargs)
 
 
 class _FakeDb:
@@ -108,13 +145,29 @@ def audit_calls(monkeypatch):
 
 
 @pytest.fixture
+def real_config(monkeypatch):
+    """走真实的 config.save_config/load_config，只替 DB/Redis 边界"""
+    from app.services.judge_pool import config as cfg_mod
+
+    fake = _FakeCfgRedis()
+    monkeypatch.setattr(cfg_mod, "_redis", lambda: fake)
+    monkeypatch.setattr(cfg_mod, "_load_from_db", lambda: fake.db_config)
+    monkeypatch.setattr(cfg_mod, "_save_to_db", lambda payload, updated_by="": True)
+    fake.db_config = None
+    cfg_mod.invalidate_config_cache()
+    yield fake
+    cfg_mod.invalidate_config_cache()
+
+
+@pytest.fixture
 def make_client(monkeypatch, audit_events, audit_calls):
     """按需构造 TestClient；user 为写入 request.state.user 的登录上下文"""
 
-    def _make(user=None, db=None, config=None, client=None):
-        monkeypatch.setattr(api, "load_config", lambda force=False: config or DEFAULTS)
-        monkeypatch.setattr(api, "save_config",
-                            lambda payload, updated_by="": config or DEFAULTS)
+    def _make(user=None, db=None, config=None, client=None, real_config=False):
+        if not real_config:
+            monkeypatch.setattr(api, "load_config", lambda force=False: config or DEFAULTS)
+            monkeypatch.setattr(api, "save_config",
+                                lambda payload, updated_by="": config or DEFAULTS)
         fake = client or _FakeClient()
         monkeypatch.setattr(api, "get_pool_client", lambda: fake)
         app = FastAPI()
@@ -176,25 +229,39 @@ def test_get_config(make_client):
     assert body["lease_ttl_seconds"] == 180
 
 
-def test_put_config_heartbeat_not_less_than_half_ttl_400(make_client):
-    resp = make_client().put(
+def test_put_config_heartbeat_not_less_than_half_ttl_400(make_client, real_config):
+    resp = make_client(real_config=True).put(
         "/judge-pool/config",
         json={"heartbeat_interval_seconds": 200, "lease_ttl_seconds": 180},
     )
     assert resp.status_code == 400
-    assert "heartbeat_interval_seconds" in resp.json()["detail"]
+    assert "心跳" in resp.json()["detail"]
 
 
-def test_put_config_heartbeat_against_current_ttl_400(make_client):
-    """只改心跳时，要按当前 ttl 校验（默认 ttl=180 → 90 已越界）"""
-    resp = make_client().put("/judge-pool/config", json={"heartbeat_interval_seconds": 100})
+def test_put_config_heartbeat_against_current_ttl_400(make_client, real_config):
+    """只改心跳时，要按当前 ttl 校验（默认 ttl=180 → 100 已越界）"""
+    resp = make_client(real_config=True).put(
+        "/judge-pool/config", json={"heartbeat_interval_seconds": 100}
+    )
+    assert resp.status_code == 400
+
+
+def test_put_config_validation_uses_merged_db_basis(make_client, real_config):
+    """基准分叉：缓存/Redis 上 ttl=180，DB 现值 ttl=60；只提交心跳必须按 60 判"""
+    from app.services.judge_pool import config as cfg_mod
+
+    cfg_mod.load_config(force=True)  # 热源基准 180
+    real_config.db_config = cfg_mod.JudgePoolConfig(lease_ttl_seconds=60)
+    resp = make_client(real_config=True).put(
+        "/judge-pool/config", json={"heartbeat_interval_seconds": 30}
+    )
     assert resp.status_code == 400
 
 
 def test_put_config_value_error_from_save_is_400(make_client, monkeypatch, audit_events):
     client = make_client()  # 先建 client（它会装上默认替身），再覆盖 save_config
 
-    def _boom(payload, updated_by=""):
+    def _boom(payload, updated_by="", strict=False):
         raise ValueError("fail_open 无法解析为布尔值")
 
     monkeypatch.setattr(api, "save_config", _boom)
@@ -203,11 +270,39 @@ def test_put_config_value_error_from_save_is_400(make_client, monkeypatch, audit
     assert "fail_open" in resp.json()["detail"]
 
 
+def test_put_config_db_failure_503(make_client, real_config, monkeypatch):
+    """DB 未落库：其他 worker 永远读不到，不能谎报 200"""
+    from app.services.judge_pool import config as cfg_mod
+
+    monkeypatch.setattr(cfg_mod, "_save_to_db", lambda payload, updated_by="": False)
+    resp = make_client(real_config=True).put("/judge-pool/config", json={"graph_limit": 32})
+    assert resp.status_code == 503
+    assert "持久化" in resp.json()["detail"]
+
+
+def test_put_config_redis_sync_failure_200_with_flag(make_client, real_config):
+    """DB 已落库、Redis 写失败：允许 200，但要如实告知未同步"""
+    real_config.fail_hset = True
+    resp = make_client(real_config=True).put("/judge-pool/config", json={"graph_limit": 32})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["graph_limit"] == 32
+    assert body["redis_synced"] is False
+
+
+def test_put_config_ok_reports_redis_synced(make_client, real_config):
+    resp = make_client(real_config=True).put("/judge-pool/config", json={"graph_limit": 32})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["graph_limit"] == 32
+    assert body["redis_synced"] is True
+
+
 def test_put_config_ok_passes_updated_by(make_client, monkeypatch, audit_events):
     seen = {}
     from app.services.judge_pool.config import JudgePoolConfig
 
-    def _save(payload, updated_by=""):
+    def _save(payload, updated_by="", strict=False):
         seen.update(payload=payload, updated_by=updated_by)
         return JudgePoolConfig(**{**DEFAULTS.to_dict(), **payload})
 
@@ -223,8 +318,10 @@ def test_put_config_ok_passes_updated_by(make_client, monkeypatch, audit_events)
 def test_put_config_operator_falls_back_to_username(make_client, monkeypatch):
     seen = {}
     client = make_client(user={"username": "alice", "super_admin_flag": 1})
-    monkeypatch.setattr(api, "save_config",
-                        lambda payload, updated_by="": seen.update(updated_by=updated_by) or DEFAULTS)
+    monkeypatch.setattr(
+        api, "save_config",
+        lambda payload, updated_by="", strict=False: seen.update(updated_by=updated_by) or DEFAULTS,
+    )
     resp = client.put("/judge-pool/config", json={"graph_limit": 32})
     assert resp.status_code == 200
     assert seen["updated_by"] == "alice"
@@ -240,12 +337,30 @@ def test_force_release_success(make_client, audit_events):
     resp = make_client(client=fake_client).post("/judge-pool/leases/abc/release?engine=graph")
     assert resp.status_code == 200
     assert resp.json()["released"] is True
-    assert fake_client.released_calls == [(Engine.GRAPH, "abc")]
+    assert fake_client.released_calls == [(Engine.GRAPH, "abc", True)]
     assert len(audit_events) == 1
     event, kw = audit_events[0]
     assert event == "manual_release"
     assert kw["engine"] == "graph"
     assert kw["detail"] == {"scope": "single", "operator": "u-1"}
+
+
+def test_force_release_redis_down_503(make_client, audit_events):
+    """Redis 异常必须与「租约不存在」区分开"""
+    down = _RedisDownClient()
+    resp = make_client(client=down).post("/judge-pool/leases/abc/release?engine=graph")
+    assert resp.status_code == 503
+    assert "Redis" in resp.json()["detail"]
+    assert down.strict_seen == [True]
+    assert audit_events == []
+
+
+def test_release_all_redis_down_503(make_client, audit_events):
+    down = _RedisDownClient()
+    resp = make_client(client=down).post("/judge-pool/release-all?engine=graph")
+    assert resp.status_code == 503
+    assert down.strict_seen == [True]
+    assert audit_events == []
 
 
 def test_force_release_missing_lease_no_audit(make_client, audit_events):
@@ -322,3 +437,37 @@ def test_audit_pagination_shape(make_client, audit_calls):
 def test_audit_page_size_bounds(make_client):
     assert make_client().get("/judge-pool/audit?page_size=500").status_code == 422
     assert make_client().get("/judge-pool/audit?page=0").status_code == 422
+
+
+def test_audit_invalid_engine_400(make_client, audit_calls):
+    resp = make_client().get("/judge-pool/audit?engine=bogus")
+    assert resp.status_code == 400
+    assert "bogus" in resp.json()["detail"]
+    assert audit_calls == []
+
+
+def test_audit_invalid_event_400(make_client, audit_calls):
+    resp = make_client().get("/judge-pool/audit?event=bogus_event")
+    assert resp.status_code == 400
+    assert "bogus_event" in resp.json()["detail"]
+    assert audit_calls == []
+
+
+# ---------------------------------------------------------------------------
+# 门禁
+# ---------------------------------------------------------------------------
+
+
+def test_ordinary_user_forbidden_403():
+    """不 override ensure_super_admin：普通用户必须被路由依赖挡住"""
+    app = FastAPI()
+
+    @app.middleware("http")
+    async def _inject_user(request, call_next):
+        request.state.user = {"user_code": "u-2", "super_admin_flag": 0}
+        return await call_next(request)
+
+    app.include_router(api.router)
+    app.dependency_overrides[api.get_db] = lambda: _FakeDb()
+    resp = TestClient(app).get("/judge-pool/status")
+    assert resp.status_code == 403
