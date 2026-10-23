@@ -33,6 +33,7 @@ pytestmark = [pytest.mark.integration]
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ENGINE = Engine.GRAPH
+_TEST_LEASE_SOURCE = "integration-test"
 
 
 # ---------------------------------------------------------------- fixtures
@@ -67,7 +68,11 @@ def restore_pool_config(redis_client):
 
 
 def _detail_json(lease_id: str, *, pid: int = -1) -> str:
-    """租约明细的最小合法形状（client.acquire 写进 lease_data 的字段子集）"""
+    """租约明细的最小合法形状（client.acquire 写进 lease_data 的字段子集）
+
+    meta.source 是本文件创建租约的标记：注入租约的 pid 不可靠（-1 会被
+    os.kill(-1, 0) 判成「存活」），清理一律认标记、不认 pid。
+    """
     now = int(time.time() * 1000)
     return json.dumps(
         {
@@ -81,10 +86,35 @@ def _detail_json(lease_id: str, *, pid: int = -1) -> str:
             "row_idx": None,
             "acquired_at": now,
             "last_renew_at": now,
-            "meta": {"source": "integration-test"},
+            "meta": {"source": _TEST_LEASE_SOURCE},
         },
         ensure_ascii=False,
     )
+
+
+def _purge_test_leases(client) -> int:
+    """删除本文件创建的租约（认 meta.source 标记，进入/退出两侧都调用）。
+
+    不能只靠 pid 判活：注入租约的 pid=-1 调 os.kill(-1, 0) 不抛
+    ProcessLookupError，会被当成活进程而漏清；漏清又会让下一个用例因
+    「池非空闲」skip —— CI 会把 skip 当成没跑而放过。
+    """
+    removed = 0
+    for raw in client.hvals(lease_data_key(ENGINE)):
+        try:
+            item = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        if (item.get("meta") or {}).get("source") != _TEST_LEASE_SOURCE:
+            continue
+        lease_id = item.get("lease_id")
+        if not lease_id:
+            continue
+        client.zrem(leases_key(ENGINE), lease_id)
+        client.hdel(lease_data_key(ENGINE), lease_id)
+        client.zrem(wait_key(ENGINE), lease_id)  # 排队者 id 与租约 id 同值
+        removed += 1
+    return removed
 
 
 def _inject_expired_lease(client, lease_id: str | None = None) -> str:
@@ -107,7 +137,9 @@ def _release_dead_leftovers(client) -> None:
         except (TypeError, ValueError):
             continue
         pid = item.get("pid")
-        if item.get("host") != socket.gethostname() or not isinstance(pid, int):
+        # pid<=1 绝不能 os.kill：-1 表示「所有进程」，探测不报错会被误判为存活；
+        # 这类注入租约由 _purge_test_leases 按标记清理
+        if item.get("host") != socket.gethostname() or not isinstance(pid, int) or pid <= 1:
             continue
         try:
             os.kill(pid, 0)
@@ -121,9 +153,16 @@ def _release_dead_leftovers(client) -> None:
 
 @pytest.fixture()
 def idle_pool(redis_client):
-    """确保 graph 引擎此刻没有别的进程在用；用完只清本进程的遗留"""
+    """确保 graph 引擎此刻没有别的进程在用；进入/退出两侧都清本文件创建的租约"""
+    client = JudgePoolClient(redis_client=redis_client)
+    # 进入侧三道清理缺一不可：先按标记清本文件的历史残留（含 pid 不可判活的
+    # 注入租约），再走扫描回收真实过期租约，最后清本机死进程遗留
+    _purge_test_leases(redis_client)
+    client.prune_expired(ENGINE)
     _release_dead_leftovers(redis_client)
-    snap = JudgePoolClient(redis_client=redis_client).snapshot()
+    _purge_test_leases(redis_client)
+
+    snap = client.snapshot()
     active = snap["engines"][ENGINE.value]["active"]
     if active:
         pytest.skip(
@@ -133,9 +172,12 @@ def idle_pool(redis_client):
     # 空闲时排队者不可能合法存在（有额度会立刻被拿掉），清掉上轮崩溃残留的
     # 队首会让后续所有申请被 am_head 判定挡住，直到 wait_timeout 过期
     redis_client.delete(wait_key(ENGINE))
+
     yield
+
+    _purge_test_leases(redis_client)
     _release_dead_leftovers(redis_client)
-    # 本进程继承的租约兜底清理：只删明细里 pid 是自己的
+    # 本进程内已释放但 Redis 调用失败的租约兜底：只删明细里 pid 是自己的
     for raw in redis_client.hvals(lease_data_key(ENGINE)):
         try:
             item = json.loads(raw)
@@ -144,6 +186,12 @@ def idle_pool(redis_client):
         if item.get("pid") == os.getpid():
             redis_client.zrem(leases_key(ENGINE), item["lease_id"])
             redis_client.hdel(lease_data_key(ENGINE), item["lease_id"])
+            redis_client.zrem(wait_key(ENGINE), item["lease_id"])
+    # 清理必须彻底：残留会让下一个用例静默 skip，而 skip 在 CI 里等于没跑
+    assert redis_client.zcard(leases_key(ENGINE)) == 0, (
+        f"用例结束后仍有活跃租约: {redis_client.hvals(lease_data_key(ENGINE))}"
+    )
+    assert redis_client.zcard(wait_key(ENGINE)) == 0, "用例结束后等待队列仍有成员"
 
 
 def _apply(**overrides) -> None:
@@ -159,8 +207,14 @@ def test_global_limit_holds_across_threads(redis_client, idle_pool):
     limit = 3
     _apply(graph_limit=limit, wait_timeout_seconds=30)
 
-    state = {"now": 0, "peak": 0, "redis_peak": 0, "redis_available_min": limit}
-    cond = threading.Condition()
+    # 用 Barrier 而不是「加一/减一计数」制造同时持有：计数无论先减还是先
+    # release，都有一侧窗口（先减=Redis 仍持有但不计入，先 release=计数虚高），
+    # 判断超限时会误判。Barrier 只放行真正同时持有额度的线程，峰值一律以
+    # Redis snapshot（唯一权威）为准。线程数必须是 limit 的整数倍，否则最后一
+    # 组凑不齐会在超时后 BrokenBarrierError。
+    barrier = threading.Barrier(limit, timeout=20)
+    snapshots: list[tuple[int, int]] = []  # (active, available)，每个持有者各一条
+    snap_lock = threading.Lock()
     errors: list[str] = []
     acquired = [0]
 
@@ -171,25 +225,15 @@ def test_global_limit_holds_across_threads(redis_client, idle_pool):
             try:
                 if lease.unavailable or lease.reentrant:
                     raise AssertionError(f"意外租约状态: {lease}")
-                with cond:
-                    state["now"] += 1
-                    state["peak"] = max(state["peak"], state["now"])
-                    cond.notify_all()
-                    # 等三个额度同时到手再放：把「上限确实被打满」变成确定性
-                    # 断言，否则线程错开时峰值可能只有 1，测试会空转通过
-                    cond.wait_for(lambda: state["now"] >= limit, timeout=10)
                 snap = client.snapshot()["engines"][ENGINE.value]
-                with cond:
-                    state["redis_peak"] = max(state["redis_peak"], snap["active"])
-                    state["redis_available_min"] = min(
-                        state["redis_available_min"], snap["available"]
-                    )
+                with snap_lock:
+                    snapshots.append((snap["active"], snap["available"]))
+                # 三个持有者到齐才放行；到齐那一刻 Redis 里必然同时有 3 个租约
+                barrier.wait()
                 time.sleep(0.05)
-                with cond:
+                with snap_lock:
                     acquired[0] += 1
             finally:
-                with cond:
-                    state["now"] -= 1
                 client.release(lease)
         except BaseException as e:  # noqa: BLE001 - 线程内异常要带回主线程断言
             errors.append(f"{type(e).__name__}: {e}")
@@ -205,11 +249,14 @@ def test_global_limit_holds_across_threads(redis_client, idle_pool):
 
     assert errors == [], f"工作线程异常: {errors}"
     assert all(not t.is_alive() for t in threads), "工作线程未在 40s 内结束"
-    assert acquired[0] == 9, f"只有 {acquired[0]}/9 个线程最终拿到额度"
+    assert len(snapshots) == 9, f"只有 {len(snapshots)}/9 个线程拿到额度"
+    assert acquired[0] == 9, f"只有 {acquired[0]}/9 个线程走完持有流程"
+
+    peak = max(active for active, _ in snapshots)
+    free_min = min(available for _, available in snapshots)
     # 上界 + 下界：既没超限，也证明限流真的生效（否则峰值会是 9）
-    assert state["peak"] == limit, f"进程内并发峰值 {state['peak']} != {limit}"
-    assert state["redis_peak"] == limit, f"Redis 侧并发峰值 {state['redis_peak']} != {limit}"
-    assert state["redis_available_min"] == 0, "打满时 snapshot 仍显示有空闲额度"
+    assert peak == limit, f"Redis 侧并发峰值 {peak} != {limit}（各持有者观测: {snapshots}）"
+    assert free_min == 0, f"打满时 snapshot 仍显示有空闲额度: {snapshots}"
 
     after = JudgePoolClient(redis_client=redis_client).snapshot()["engines"][ENGINE.value]
     assert after["active"] == 0, f"用例结束后额度未归还干净: {after}"
