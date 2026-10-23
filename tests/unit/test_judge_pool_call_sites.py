@@ -22,22 +22,37 @@ pytestmark = pytest.mark.unit
 
 
 class _Ctx:
-    """judge_pool_slot 的最小替身（__enter__/__exit__ 协议）"""
+    """judge_pool_slot 的最小替身（__enter__/__exit__ 协议），进出各留一道痕"""
+
+    def __init__(self, calls, events, engine, meta):
+        self.calls = calls
+        self.events = events
+        self.engine = engine
+        self.meta = meta
 
     def __enter__(self):
+        self.calls.append((self.engine, self.meta))
+        self.events.append(("enter", self.engine, self.meta))
         return None
 
     def __exit__(self, *exc):
+        self.events.append(("exit", self.engine, self.meta))
         return False
 
 
-def _recording_slot(monkeypatch, module, calls=None):
-    """把 module 命名空间里的 judge_pool_slot 换成记录器"""
+def _recording_slot(monkeypatch, module, calls=None, events=None):
+    """把 module 命名空间里的 judge_pool_slot 换成记录器
+
+    - calls：在 `__enter__` 时追加（不是构造时），只断言它证明不了模型调用
+      发生在额度窗口内 —— 把调用移出 with 块同样会留下记录；
+    - events：enter/exit 时间线，被测代码把真实调用也 append 进来，
+      据此断言调用确实夹在 enter 与 exit 之间。
+    """
     calls = [] if calls is None else calls
+    events = [] if events is None else events
 
     def slot(engine, meta=None):
-        calls.append((engine, meta))
-        return _Ctx()
+        return _Ctx(calls, events, engine, meta)
 
     monkeypatch.setattr(module, "judge_pool_slot", slot)
     return calls
@@ -414,30 +429,6 @@ def test_plugin_evaluator_trace_uses_plugin_engine(monkeypatch):
 
 # ------------------------------------------- RAGAS 链路入池与池异常穿透（C2）
 
-def _ordering_slot(monkeypatch, module, events):
-    """记录型 slot：把 enter/exit 与被测代码里的真实模型调用写进同一条时间线
-
-    只断言「slot 被调用过」挡不住「把模型调用移出 with 块」这类回归，
-    所以这里断言调用发生在 enter 之后、exit 之前。
-    """
-
-    class _Ctx:
-        def __init__(self, engine, meta):
-            self.engine = engine
-            self.meta = meta
-
-        def __enter__(self):
-            events.append(("enter", self.engine, self.meta))
-            return None
-
-        def __exit__(self, *exc):
-            events.append(("exit", self.engine, self.meta))
-            return False
-
-    monkeypatch.setattr(module, "judge_pool_slot", lambda engine, meta=None: _Ctx(engine, meta))
-    return events
-
-
 def test_ragas_evaluate_runs_both_ascore_inside_slot(monkeypatch):
     """ragas 新旧 API 的两次 single_turn_ascore 都必须在 slot 的 enter/exit 之间"""
     import ragas.metrics as ragas_metrics
@@ -445,7 +436,7 @@ def test_ragas_evaluate_runs_both_ascore_inside_slot(monkeypatch):
     from app.services import rag_evaluator as mod
 
     events = []
-    _ordering_slot(monkeypatch, mod, events)
+    _recording_slot(monkeypatch, mod, events=events)
 
     class _FakeMetric:
         def __init__(self, name):
@@ -477,7 +468,7 @@ def test_ragas_slot_released_when_body_raises(monkeypatch):
     from app.services import rag_evaluator as mod
 
     events = []
-    _ordering_slot(monkeypatch, mod, events)
+    _recording_slot(monkeypatch, mod, events=events)
 
     def _boom(self):
         events.append(("build_llm",))
@@ -526,3 +517,65 @@ def test_pool_errors_propagate_out_of_rag_evaluate(monkeypatch):
         assert fallback_calls == [], f"{name} 的池异常被降级成关键词算法"
 
         monkeypatch.undo()
+
+
+# ------------------------------------- 调用点真实性：调用必须落在额度窗口内
+
+def test_graph_model_call_happens_inside_slot_window(monkeypatch):
+    """graph：把模型调用移出 with 块，本用例必须变红
+
+    只断言「slot 被调用过」挡不住这种回归 —— 额度窗口和真实调用脱开后，
+    池统计与限流全都失真，而行级结果看起来完全正常。
+    """
+    from app.services import judge_graph_nodes as mod
+
+    events = []
+    calls = _recording_slot(monkeypatch, mod, events=events)
+
+    def fake_call(*args, **kwargs):
+        events.append(("call",))
+        return {"success": True, "content": "{}"}
+
+    monkeypatch.setattr(mod, "ModelCallerSync", lambda: SimpleNamespace(call=fake_call))
+
+    assert mod._call_llm("hi", {"judge_model_config": {"provider": "openai"}}) == "{}"
+    assert [e[0] for e in events] == ["enter", "call", "exit"], events
+    assert calls == [("graph", {"call_site": "judge_graph_nodes"})]
+
+
+def test_plugin_evaluation_happens_inside_slot_window(monkeypatch):
+    """plugin：整个插件评测（可达数十分钟）必须在额度窗口内跑完"""
+    from app.services import plugin_evaluator as mod
+
+    events = []
+    calls = _recording_slot(monkeypatch, mod, events=events)
+    evaluator = mod.PluginEvaluator(engine="legacy")
+
+    def fake_evaluate_legacy(*args, **kwargs):
+        events.append(("call",))
+        return {"success": True}
+
+    monkeypatch.setattr(evaluator, "_evaluate_legacy", fake_evaluate_legacy)
+
+    assert evaluator.evaluate(plugin_path="/tmp/x") == {"success": True}
+    assert [e[0] for e in events] == ["enter", "call", "exit"], events
+    assert calls == [("plugin", {"call_site": "plugin_evaluator:legacy"})]
+
+
+def test_rag_llm_judge_call_happens_inside_slot_window(monkeypatch):
+    """graph（RAG LLM 裁判）：_call_llm 的模型调用同样必须在窗口内"""
+    import app.services.model_caller as mc
+
+    from app.services import rag_evaluator as mod
+
+    events = []
+    _recording_slot(monkeypatch, mod, events=events)
+
+    def fake_call(*args, **kwargs):
+        events.append(("call",))
+        return {"success": True, "content": "x"}
+
+    monkeypatch.setattr(mc.ModelCallerSync, "call", staticmethod(fake_call))
+
+    assert mod.LLMRagEvaluator(llm_config={"provider": "openai"})._call_llm("prompt") == "x"
+    assert [e[0] for e in events] == ["enter", "call", "exit"], events

@@ -26,8 +26,15 @@ pytestmark = pytest.mark.unit
 @pytest.fixture(autouse=True)
 def no_side_effects(monkeypatch):
     monkeypatch.setattr(client_mod, "record_event", lambda *a, **k: None)
-    monkeypatch.setattr(client_mod, "get_heartbeat", lambda: _NoopHeartbeat())
     monkeypatch.setattr(client_mod, "load_config", lambda force=False: _cfg())
+
+
+@pytest.fixture(autouse=True)
+def heartbeat(monkeypatch):
+    """记录型心跳桩（共享实例，用例可直接断言登记/注销）"""
+    hb = _RecordingHeartbeat()
+    monkeypatch.setattr(client_mod, "get_heartbeat", lambda: hb)
+    return hb
 
 
 @pytest.fixture(autouse=True)
@@ -44,12 +51,23 @@ def _clean_thread_leases():
     _drain()
 
 
-class _NoopHeartbeat:
+class _RecordingHeartbeat:
+    """记录型心跳桩
+
+    原先是 `register: pass` 的空桩：把 client.acquire 里的 register 调用整行
+    删掉，全套用例照样全绿 —— 而漏登记的后果是没人续约，租约 TTL 后被回收
+    而调用仍在跑。所以这里必须留下可调用的证据。
+    """
+
+    def __init__(self):
+        self.registered = []
+        self.unregistered = []
+
     def register(self, lease, thread):
-        pass
+        self.registered.append((lease, thread))
 
     def unregister(self, lease_id):
-        pass
+        self.unregistered.append(lease_id)
 
 
 def _cfg():
@@ -85,6 +103,67 @@ def test_acquire_success_and_release():
     assert c.release(lease) is True
     assert current_lease(Engine.GRAPH) is None
     assert c.released == [lease.lease_id]
+
+
+def test_acquire_registers_same_lease_and_current_thread_with_heartbeat(heartbeat):
+    """登记的是「同一条 lease + 当前线程」：漏登记就没人续约，租约 TTL 后被
+    扫描回收而调用仍在跑（额度凭空多出一份）；登记错线程则会被判为死线程提前释放"""
+    c = StubClient([AcquireResult(True, 1, [], -1)])
+
+    lease = c.acquire(Engine.GRAPH, meta={"call_site": "t"})
+
+    assert heartbeat.registered == [(lease, threading.current_thread())]
+    assert heartbeat.registered[0][0] is lease, "登记的必须是 acquire 返回的同一条租约"
+
+    c.release(lease)
+    assert heartbeat.unregistered == [lease.lease_id]
+
+
+def test_reentrant_acquire_does_not_register_again(heartbeat):
+    c = StubClient([AcquireResult(True, 1, [], -1)])
+
+    first = c.acquire(Engine.GRAPH)
+    second = c.acquire(Engine.GRAPH)
+
+    assert second.reentrant is True
+    assert heartbeat.registered == [(first, threading.current_thread())]
+    c.release(first)
+
+
+def test_wait_then_acquire_registers_once(heartbeat):
+    """排队若干轮后拿到额度：只登记最终那条租约"""
+    c = StubClient([AcquireResult(False, 1, [], 0), AcquireResult(True, 2, [], -1)])
+    c._sleep = lambda seconds: None
+
+    lease = c.acquire(Engine.GRAPH, wait_timeout=30)
+
+    assert heartbeat.registered == [(lease, threading.current_thread())]
+    c.release(lease)
+
+
+def test_fail_open_lease_is_not_registered(heartbeat):
+    """Redis 不可用放行的租约不在池里，登记续约没有意义（还会误判失效）"""
+
+    class Boom(JudgePoolClient):
+        def _try_acquire(self, *a, **k):
+            raise ConnectionError("redis down")
+
+    c = Boom(redis_client=object())
+
+    lease = c.acquire(Engine.GRAPH)
+
+    assert lease.unavailable is True
+    assert heartbeat.registered == []
+
+
+def test_wait_timeout_does_not_register(heartbeat):
+    c = StubClient([AcquireResult(False, 1, [], 0)])
+    c._sleep = lambda seconds: None
+
+    with pytest.raises(JudgePoolTimeout):
+        c.acquire(Engine.GRAPH, wait_timeout=0)
+
+    assert heartbeat.registered == []
 
 
 def test_reentrant_acquire_does_not_consume_second_slot():
