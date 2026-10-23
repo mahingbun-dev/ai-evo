@@ -59,6 +59,13 @@ const routes = [
     meta: { title: '结果展示' }
   },
   {
+    // M7 QE7-5：仿真评测（第 9 种类型：场景构建器 + 运行列表 + 逐 trial 对话回放）
+    path: '/simulation',
+    name: 'Simulation',
+    component: () => import('@/views/Simulation.vue'),
+    meta: { title: '仿真评测' }
+  },
+  {
     path: '/statistics',
     name: 'Statistics',
     component: () => import('@/views/Statistics.vue'),

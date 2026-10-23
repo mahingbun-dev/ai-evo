@@ -166,9 +166,17 @@ class EvaluationTaskService:
         # 验证评测类型
         # W12-2：latency 白名单激活（执行/聚合/导出链早已就绪，此前仅因白名单缺席被拒）
         # M3 QE3-1：safety 白名单放行（双通道红队引擎就绪，见 app/services/redteam/）
-        valid_evaluation_types = ["judge", "consistency", "success_rate", "rag", "binary_classification", "agent", "latency", "plugin", "safety"]
+        # M7 QE7-4：simulation 入白名单（第 9 种类型，进平台类型口径与统计口径）；
+        # 其执行不走任务执行器（evaluator 分发无该类型适配器），运行单元是
+        # 仿真场景（simulation_scenarios → simulation_runs，/api/v1/simulation），
+        # 直建该类型任务在下方显式拒绝并指向仿真入口
+        valid_evaluation_types = ["judge", "consistency", "success_rate", "rag", "binary_classification", "agent", "latency", "plugin", "safety", "simulation"]
         if evaluation_type not in valid_evaluation_types:
             raise ValueError(f"不支持的评测类型: {evaluation_type}，可选值: {valid_evaluation_types}")
+        if evaluation_type == "simulation":
+            raise ValueError(
+                "simulation 类型经仿真场景运行（POST /api/v1/simulation/scenarios/"
+                "{id}/run，见仿真评测页），不支持直接创建评测任务")
 
         # 插件评测配置校验：深度白名单 + 评测对象来源（数据集 / 任务级路径或内联 SKILL.md 至少其一）
         if evaluation_type == "plugin":

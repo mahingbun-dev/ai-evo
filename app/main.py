@@ -45,6 +45,7 @@ from app.api.share_api import manage_router as share_manage_router, public_route
 from app.api.license_api import router as license_router
 # M6 QE6-3：用量计量汇总（超管续约对账）
 from app.api.usage_api import router as usage_router
+from app.api.simulation_api import router as simulation_router
 from app.middleware.auth_middleware import AuthMiddleware
 from app.db.session import engine, Base
 from app.core.config import get_settings, validate_runtime_settings
@@ -327,6 +328,8 @@ app.include_router(sso_router, prefix=settings.API_V1_STR)
 app.include_router(license_router, prefix=settings.API_V1_STR)
 # M6 QE6-3：用量计量（/api/v1/admin/usage/summary，超管专用）
 app.include_router(usage_router, prefix=settings.API_V1_STR)
+# M7 QE7-4：仿真评测（/api/v1/simulation——场景 CRUD + 运行，第 9 种类型）
+app.include_router(simulation_router, prefix=settings.API_V1_STR)
 
 # WebSocket 路由（不需要 API_V1_STR 前缀）
 app.include_router(task_status_router)

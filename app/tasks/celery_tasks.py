@@ -207,6 +207,64 @@ def run_evaluation_with_stop_checker(task_id: str, stop_checker: RedisStopSignal
     return run_evaluation_async(task_id, stop_event)
 
 
+@celery_app.task(bind=True, name="app.tasks.celery_tasks.run_simulation_run")
+def run_simulation_run(self, run_id: str) -> Dict[str, Any]:
+    """仿真运行入口（M7 QE7-4）
+
+    与 run_evaluation_task 同口径：运行级互斥锁（acks_late 重投防护，
+    key 前缀 simrun_lock）+ Redis 停止信号（回合间生效）+ SIGTERM 优雅停。
+    执行体在 SimulationService.execute_run（逐 trial 进度发布 + 配额释放）。
+    """
+    from app.services.simulation.service import SIM_RUN_LOCK_PREFIX, SimulationService
+    from app.tasks.evaluation_tasks_async import get_db_session
+
+    run_lock = EvalTaskLock(run_id, key_prefix=SIM_RUN_LOCK_PREFIX)
+    lock_acquired = True
+    try:
+        lock_acquired = run_lock.acquire()
+    except Exception as e:  # noqa: BLE001 - redis 抖动不阻断（fail-open），互斥为防御性措施
+        logger.warning(f"仿真 run {run_id} 互斥锁获取异常（redis 不可用？），放行执行: {e}")
+    if not lock_acquired:
+        holder = None
+        try:
+            holder = run_lock.holder()
+        except Exception:  # noqa: BLE001 - 持锁者查询失败不影响拒绝结论
+            pass
+        logger.error(
+            f"仿真 run {run_id} 已有其它 worker 在执行（simrun_lock 冲突，持锁: {holder}），"
+            "拒绝本次孤儿消息重投执行"
+        )
+        return {"status": "duplicate_rejected", "run_id": run_id, "lock_holder": holder}
+    try:
+        run_lock.renew()
+    except Exception as e:  # noqa: BLE001 - redis 抖动不阻断评测
+        logger.warning(f"仿真 run {run_id} 互斥锁续期失败（不影响执行）: {e}")
+
+    stop_checker = RedisStopSignalChecker(run_id)
+    sigterm_handler = SigtermHandler(stop_checker)
+    sigterm_handler._original_handler = signal.signal(signal.SIGTERM, sigterm_handler)
+
+    db = get_db_session()
+    try:
+        service = SimulationService(db)
+        result = service.execute_run(run_id, stop_checker)
+        stop_checker.cleanup()
+        return result
+    except Exception as e:
+        logger.exception(f"仿真 run 执行失败: {run_id}")
+        stop_checker.cleanup()
+        raise
+    finally:
+        db.close()
+        if lock_acquired:
+            try:
+                run_lock.release()
+            except Exception as e:  # noqa: BLE001 - 释放失败靠 TTL 过期兜底
+                logger.warning(f"仿真 run {run_id} 互斥锁释放失败（将由 TTL 过期）: {e}")
+        if sigterm_handler._original_handler:
+            signal.signal(signal.SIGTERM, sigterm_handler._original_handler)
+
+
 @celery_app.task(name="app.tasks.celery_tasks.run_hub_import_job")
 def run_hub_import_job(
     job_id: str,

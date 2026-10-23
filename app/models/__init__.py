@@ -23,6 +23,7 @@ from app.models.sso_models import SsoOidcConfig, SsoTeamMapping, LdapConfig
 from app.models.schedule_models import TaskSchedule, WeeklyReport
 from app.models.share_models import ShareLink
 from app.models.license_models import PlatformLicense
+from app.models.simulation_models import SimulationScenario, SimulationRun
 
 __all__ = [
     # 原有模型
@@ -86,4 +87,7 @@ __all__ = [
     "ShareLink",
     # 平台 License（M6 QE6-1，企业授权）
     "PlatformLicense",
+    # 仿真评测（M7 QE7-4，第 9 种评测类型的运行单元）
+    "SimulationScenario",
+    "SimulationRun",
 ]

@@ -295,6 +295,32 @@ def ensure_model_access(db: Session, user: Any, model_id: str):
     return _check_record_access(user, model, "模型不存在")
 
 
+def ensure_simulation_scenario_access(db: Session, user: Any, scenario_id: str):
+    """仿真场景归属校验（M7 QE7-4 复审补收口）：查出 + 校验一步完成。
+
+    场景 config 含 db_assert SQL 与 persona 细节，跨团队读同样是数据
+    暴露面——读端点（详情/运行历史）与写端点（更新/删除/发起 run）统一
+    挂本闸；列表过滤用 filter_team_code（与任务/数据集列表同口径）。
+    """
+    from app.models.simulation_models import SimulationScenario
+
+    scenario = (
+        db.query(SimulationScenario)
+        .filter(SimulationScenario.id == scenario_id)
+        .first()
+    )
+    return _check_record_access(user, scenario, f"仿真场景不存在: {scenario_id}")
+
+
+def ensure_simulation_run_access(db: Session, user: Any, run_id: str):
+    """仿真运行归属校验（M7 QE7-4 复审补收口）：run 行自带 team_code
+    （创建时随场景冻结），按行直判；详情/停止统一挂本闸。"""
+    from app.models.simulation_models import SimulationRun
+
+    run = db.query(SimulationRun).filter(SimulationRun.id == run_id).first()
+    return _check_record_access(user, run, f"仿真运行不存在: {run_id}")
+
+
 def ensure_super_admin(request: Request) -> None:
     """超管门禁依赖（W19 补收口）：供 router 级 dependencies 与单端点使用。
 
