@@ -167,3 +167,22 @@ def get_weekly_report(
         from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="周报不存在")
     return report
+
+
+# 裁判-人工一致性报告（M8 QE8-1）：人工金分标注（Results 标注模式）与裁判
+# 聚合分的相关性度量——Pearson/Spearman（scipy）+ 分带 Cohen's kappa
+# （得分率 <60%/80% 分低/中/高带，按各任务 max_score 归一），作为裁判
+# 可信度证据（销售物料）。task_id 为空=全任务聚合（附 by_task 摘要）。
+@router.get("/judge-agreement", summary="裁判-人工一致性报告")
+def get_judge_agreement(
+    task_id: Optional[str] = Query(None, description="任务ID（空=全任务聚合）"),
+    execution_number: Optional[int] = Query(None, description="执行序号（指定任务时可选锁定单次执行）"),
+    db: Session = Depends(get_db),
+):
+    """裁判-人工一致性报告（M8 QE8-1）
+
+    样本口径：status=completed 且金分非空的标注 × 行裁判聚合分；裁判分缺失
+    行（judge_failed）单独计数（excluded_no_judge）不计入样本。
+    """
+    from app.services.annotation_service import judge_agreement_report
+    return judge_agreement_report(db, task_id=task_id, execution_number=execution_number)

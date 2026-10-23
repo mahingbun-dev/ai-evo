@@ -60,8 +60,9 @@ ARCH-3-4（设计 §3 Phase 3 表 3-4 行「gVisor 可选运行时档」）：�
 ``SANDBOX_RUNTIME``（app/core/config.py，默认 runc）配置，由 ``sandbox_runtime``
 读取后经 SandboxRunSpec.runtime 透传到驱动；白名单（runc|runsc）与旗标构造的
 单一事实源在 executor/sandbox_params（两侧一致，缺省 runc 不拼旗标——默认
-行为不变）。HTTP executor 驱动的客户端透传（请求体带 runtime 字段）属后续
-批次接线（executor 侧字段与校验本批已开，见 executor/app.py.SandboxRunRequest）。
+行为不变）。HTTP executor 驱动的客户端透传（请求体 runtime 字段）已于 M8
+QE8-3 接线收口（executor_client.HttpExecutorDriver.run，CLI/HTTP 两通道同档
+生效）。
 
 bind 源宿主根映射（SANDBOX_WORKSPACE_HOST_ROOT，命名卷部署缺陷修复）：
 docker daemon 按**宿主路径**解析 ``-v`` 挂载源，而 ``SandboxRunSpec.

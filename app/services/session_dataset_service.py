@@ -184,14 +184,6 @@ def import_sessions(
          （逐行多重、行内去重，供导入方 acquire_ref 与释放端粒度对齐）}
     """
     from app.services.session_file_parser import detect_and_parse
-    from app.services.dataset_service import DatasetService, DatasetDataService
-    from app.services.dataset_field_service import (
-        DatasetFieldService,
-        derive_fields_from_row,
-        reindex_field_positions,
-    )
-    from app.models.dataset_models import EvaluationDataV2, EvaluationDataset
-    from sqlalchemy import func
 
     # 先解析全部会话（任一文件解析失败即中止导入，避免部分成功）
     # 记录 (entry_key, file_name, record) 关联，供 file_extra 按条目唯一键附加
@@ -206,6 +198,40 @@ def import_sessions(
             raise ValueError(f"文件 {file_name} 未解析出有效会话")
         for record in records:
             all_records.append((entry_key, file_name, record))
+
+    return _import_parsed_sessions(
+        db, all_records,
+        name=name, description=description, real_dataset_id=real_dataset_id,
+        created_by=created_by, file_extra=file_extra, team_code=team_code,
+    )
+
+
+def _import_parsed_sessions(
+    db,
+    all_records: List[Tuple[str, str, Dict[str, Any]]],
+    *,
+    name: str = "",
+    description: str = "",
+    real_dataset_id: Optional[str] = None,
+    created_by: Optional[str] = None,
+    file_extra: Optional[Dict[str, Dict[str, Any]]] = None,
+    team_code: Optional[str] = None,
+) -> Dict[str, Any]:
+    """内存态 SessionRecord 列表落库为（或追加进）会话数据集
+
+    import_sessions（文件通道）与 /ingest/otel-traces（M8 QE8-4，API 推送
+    通道）共用的落库核心：新建/追加数据集、逐条 build_session_data 落
+    EvaluationDataV2、字段元数据合并保存、question_count 刷新；失败补偿
+    清理半成品数据集（仅新建模式）。入参与返回结构同 import_sessions。
+    """
+    from app.services.dataset_service import DatasetService, DatasetDataService
+    from app.services.dataset_field_service import (
+        DatasetFieldService,
+        derive_fields_from_row,
+        reindex_field_positions,
+    )
+    from app.models.dataset_models import EvaluationDataV2, EvaluationDataset
+    from sqlalchemy import func
 
     dataset_service = DatasetService(db)
     is_new_dataset = not real_dataset_id

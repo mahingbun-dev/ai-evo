@@ -322,6 +322,116 @@
           />
         </el-card>
       </el-tab-pane>
+      <!-- 裁判一致性 Tab（M8 QE8-1）：人工金分标注 vs 裁判分的一致性报告 -->
+      <el-tab-pane label="裁判一致性" name="judgeAgreement">
+        <el-card class="filter-card">
+          <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+            <el-select v-model="agreementForm.taskId" placeholder="选择任务（空=全任务聚合）" clearable style="width: 280px;" @change="loadAgreement">
+              <el-option v-for="t in agreementTasks" :key="t.id" :label="t.name" :value="t.id" />
+            </el-select>
+            <el-select
+              v-model="agreementForm.executionNumber"
+              placeholder="执行版本（空=全部）"
+              clearable
+              style="width: 180px;"
+              :disabled="!agreementForm.taskId"
+              @change="loadAgreement"
+            >
+              <el-option v-for="n in taskExecutionNumbers" :key="n" :label="`第 ${n} 次`" :value="n" />
+            </el-select>
+            <el-button type="primary" size="default" :loading="agreementLoading" @click="loadAgreement">查询</el-button>
+            <span style="font-size:12px; color:#909399;">
+              样本来源：结果页「标注模式」的人工金分；Pearson/Spearman 为连续分相关性，κ 为分带（低/中/高）一致性
+            </span>
+          </div>
+        </el-card>
+
+        <template v-if="agreementReport">
+          <!-- 指标卡 -->
+          <el-row :gutter="20" class="overview-cards">
+            <el-col :span="5">
+              <el-card shadow="hover"><div class="card-content">
+                <div class="card-label">Pearson r</div>
+                <div class="card-value">{{ fmtMetric(agreementReport.pearson?.r) }}</div>
+              </div></el-card>
+            </el-col>
+            <el-col :span="5">
+              <el-card shadow="hover"><div class="card-content">
+                <div class="card-label">Spearman ρ</div>
+                <div class="card-value">{{ fmtMetric(agreementReport.spearman?.rho) }}</div>
+              </div></el-card>
+            </el-col>
+            <el-col :span="5">
+              <el-card shadow="hover"><div class="card-content">
+                <div class="card-label">Cohen's κ（分带）</div>
+                <div class="card-value">{{ fmtMetric(agreementReport.cohen_kappa) }}</div>
+              </div></el-card>
+            </el-col>
+            <el-col :span="4">
+              <el-card shadow="hover"><div class="card-content">
+                <div class="card-label">分带一致率</div>
+                <div class="card-value">{{ agreementReport.band_agreement_rate != null ? (agreementReport.band_agreement_rate * 100).toFixed(1) + '%' : '—' }}</div>
+              </div></el-card>
+            </el-col>
+            <el-col :span="5">
+              <el-card shadow="hover"><div class="card-content">
+                <div class="card-label">样本数（跳过 / 无裁判分）</div>
+                <div class="card-value">{{ agreementReport.sample_count }}（{{ agreementReport.skipped_count }} / {{ agreementReport.excluded_no_judge }}）</div>
+              </div></el-card>
+            </el-col>
+          </el-row>
+
+          <!-- 分带混淆矩阵：行=裁判带，列=人工带 -->
+          <el-card class="table-card">
+            <template #header>
+              <span style="font-size:14px;">分带混淆矩阵（行 = 裁判带，列 = 人工带；对角线 = 一致）</span>
+            </template>
+            <el-table :data="confusionRows" stripe style="max-width: 420px;">
+              <el-table-column label="裁判 \\ 人工" prop="label" width="110" />
+              <el-table-column
+                v-for="(band, bi) in agreementReport.confusion.bands"
+                :key="band"
+                :label="agreementReport.confusion.band_labels[band]"
+                align="center"
+              >
+                <template #default="{ row }">
+                  <span :style="row.cells[bi] > 0 && row.bandIndex === bi ? 'color:#67c23a; font-weight:600;' : ''">{{ row.cells[bi] }}</span>
+                </template>
+              </el-table-column>
+            </el-table>
+            <div style="font-size:12px; color:#909399; margin-top:8px;">
+              分带口径：得分率 = 分数 / 任务最大分值，&lt;60% 低 · 60%~80% 中 · ≥80% 高；平均绝对误差 MAE = {{ agreementReport.mae != null ? agreementReport.mae : '—' }}
+            </div>
+          </el-card>
+
+          <!-- 全任务聚合时的逐任务摘要 -->
+          <el-card v-if="agreementReport.by_task?.length" class="table-card">
+            <template #header><span style="font-size:14px;">逐任务摘要</span></template>
+            <el-table :data="agreementReport.by_task" stripe>
+              <el-table-column prop="task_name" label="任务" min-width="220" show-overflow-tooltip />
+              <el-table-column prop="max_score" label="满分" width="70" align="right" />
+              <el-table-column prop="sample_count" label="样本数" width="80" align="right" />
+              <el-table-column label="Pearson r" width="100" align="right">
+                <template #default="{ row }">{{ fmtMetric(row.pearson?.r) }}</template>
+              </el-table-column>
+              <el-table-column label="Spearman ρ" width="100" align="right">
+                <template #default="{ row }">{{ fmtMetric(row.spearman?.rho) }}</template>
+              </el-table-column>
+              <el-table-column label="κ" width="90" align="right">
+                <template #default="{ row }">{{ fmtMetric(row.cohen_kappa) }}</template>
+              </el-table-column>
+              <el-table-column label="分带一致率" width="110" align="right">
+                <template #default="{ row }">{{ row.band_agreement_rate != null ? (row.band_agreement_rate * 100).toFixed(1) + '%' : '—' }}</template>
+              </el-table-column>
+            </el-table>
+          </el-card>
+        </template>
+
+        <el-empty
+          v-else-if="!agreementLoading"
+          description="暂无标注样本 — 到「评测结果 → 标注模式」完成人工打分后，这里生成裁判-人工一致性报告（裁判可信度证据）"
+        />
+      </el-tab-pane>
     </el-tabs>
 
     <!-- 周报正文查看（markdown 原文，只读展示） -->
@@ -335,9 +445,9 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted, onUnmounted, nextTick } from 'vue'
+import { ref, reactive, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import { ElMessage } from 'element-plus'
-import { statsApi, coverageApi, efficiencyApi } from '@/api'
+import { statsApi, coverageApi, efficiencyApi, taskApi, resultApi } from '@/api'
 import * as echarts from 'echarts'
 
 const activeTab = ref('overview')
@@ -382,6 +492,62 @@ const weeklyPagination = reactive({ page: 1, pageSize: 20, total: 0 })
 const weeklyReportVisible = ref(false)
 const weeklyReportLoading = ref(false)
 const weeklyReportDetail = ref(null)
+
+// 裁判-人工一致性 state（M8 QE8-1 标注闭环）
+const agreementTasks = ref([])               // 已完成任务选项（标注锚定行级结果）
+const taskExecutionNumbers = ref([])          // 选中任务的执行版本号选项
+const agreementForm = reactive({ taskId: '', executionNumber: null })
+const agreementLoading = ref(false)
+const agreementReport = ref(null)
+
+const confusionRows = computed(() => {
+  const report = agreementReport.value
+  if (!report?.confusion) return []
+  return report.confusion.bands.map((band, i) => ({
+    bandIndex: i,
+    label: report.confusion.band_labels[band],
+    cells: report.confusion.matrix[i] || [],
+  }))
+})
+
+const fmtMetric = (v) => (v !== null && v !== undefined && !Number.isNaN(v) ? v.toFixed(3) : '—')
+
+const loadAgreementTasks = async () => {
+  try {
+    const res = await taskApi.list({ limit: 200 })
+    agreementTasks.value = (res || []).filter(t => t.status === 'completed')
+  } catch (e) {
+    console.error(e)
+  }
+}
+
+const loadTaskVersions = async (taskId) => {
+  taskExecutionNumbers.value = []
+  if (!taskId) return
+  try {
+    const versions = await resultApi.history(taskId, { limit: 50, include_result: false })
+    taskExecutionNumbers.value = (Array.isArray(versions) ? versions : []).map(v => v.execution_number)
+  } catch (e) {
+    console.error(e)
+  }
+}
+
+const loadAgreement = async () => {
+  if (agreementForm.taskId) await loadTaskVersions(agreementForm.taskId)
+  agreementLoading.value = true
+  try {
+    const params = {}
+    if (agreementForm.taskId) params.task_id = agreementForm.taskId
+    if (agreementForm.taskId && agreementForm.executionNumber) {
+      params.execution_number = agreementForm.executionNumber
+    }
+    agreementReport.value = await statsApi.judgeAgreement(params)
+  } catch (e) {
+    ElMessage.error('加载一致性报告失败')
+  } finally {
+    agreementLoading.value = false
+  }
+}
 
 const getParams = () => ({
   start_date: dateRange.value?.[0] || null,
@@ -627,6 +793,11 @@ const handleTabChange = (tabName) => {
     nextTick(() => loadEfficiencySummary())
   } else if (tabName === 'weeklyReports') {
     nextTick(() => loadWeeklyReports())
+  } else if (tabName === 'judgeAgreement') {
+    nextTick(() => {
+      loadAgreementTasks()
+      loadAgreement()
+    })
   }
 }
 

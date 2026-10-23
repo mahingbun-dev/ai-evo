@@ -303,15 +303,17 @@ class TestHttpDriverRequests:
         # 鉴权与地址（compose 内网 + token，设计 D1/D6）
         assert post["url"] == f"{EXECUTOR_URL}/sandbox/run"
         assert post["auth"] == f"Bearer {TOKEN}"
-        # 字段集恰为白名单面（无 privileged/volumes 等可表达位）
+        # 字段集恰为白名单面（无 privileged/volumes 等可表达位；runtime 为
+        # M8 QE8-3 收口的运行时档透传字段，mount_source 未配置形态不携带）
         body = post["body"]
         assert sorted(body) == ["entrypoint", "image", "net_profile",
-                                "timeout", "workdir", "workspace"]
+                                "runtime", "timeout", "workdir", "workspace"]
         assert body["image"] == spec.image
         assert body["workspace"] == str(run_dir)
         # 容器内工作目录透传 per-script cwd（不是挂载根）
         assert body["workdir"] == spec.workdir_container == "/workspace/s1"
         assert body["net_profile"] == "none"
+        assert body["runtime"] == "runc"  # spec 缺省档原样透传（executor 同值缺省）
         assert body["timeout"] == 120.0
         # entrypoint = sh -c「原 argv 逐段引号包裹 + stdin 文件重定向」
         assert body["entrypoint"][0:2] == ["sh", "-c"]
@@ -356,6 +358,23 @@ class TestHttpDriverRequests:
         mock_executor.post_responses.append(urllib.error.URLError("connection refused"))
         with pytest.raises(SandboxDriverError, match="不可达"):
             HttpExecutorDriver().run(_spec(tmp_path))
+
+    def test_runtime_runsc_passes_through_to_request(self, tmp_path, mock_executor):
+        """运行时档透传（M8 QE8-3，ARCH-3-4 收口）：spec.runtime=runsc →
+        请求体 runtime=runsc——加固档走 executor 通道不再静默降回 runc"""
+        spec = _spec(tmp_path)
+        spec.runtime = "runsc"
+        HttpExecutorDriver().run(spec)
+        assert mock_executor.posts()[0]["body"]["runtime"] == "runsc"
+
+    def test_orchestration_runsc_env_reaches_request_runtime(
+            self, tmp_path, mock_executor, monkeypatch):
+        """全链：SANDBOX_RUNTIME=runsc → 编排层 sandbox_runtime() 进 spec →
+        HTTP 请求体 runtime=runsc（与 docker-CLI 通道同档生效）"""
+        monkeypatch.setenv("SANDBOX_RUNTIME", "runsc")
+        result, _ = _run_in_container(tmp_path)
+        assert result["status"] == "ok"
+        assert mock_executor.posts()[0]["body"]["runtime"] == "runsc"
 
 
 # ---------------- bind 源宿主根映射（SANDBOX_WORKSPACE_HOST_ROOT，命名卷部署） ----------------

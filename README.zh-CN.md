@@ -1,6 +1,6 @@
 # AgentEvo — 私有化部署的 Agent 质量工程平台
 
-私有化部署的 Agent 质量工程平台，定位「评测即门禁」——模型 / Agent 的变更先过评测、再进发布。当前已可用：模型配置、数据集管理、评测前处理脚本、8 种评测类型、终态校验器（脚本 / 数据库 / 文件 / 回调断言，确定性校验优先，M2 起）、轨迹匹配（agent 会话工具序列断言：严格 / 乱序 / 子序列 / 禁止多余四模式 + 期望 / 禁用调用，聚合出轨迹匹配率门禁指标，M2 起）、pass^k 统计（裁判类任务行级多 Trial 2-5 + 一致性/成功率重复次数，τ-bench 口径的 pass@1 / pass^k / 分数标准误，M2 起）、A/B 显著性检验（多轮同输入配对：Wilcoxon 符号秩 + 配对 t + Cliff's delta + McNemar 精确检验，M2 起）、结果聚合与统计分析、A/B 对比测试；门禁闭环已随 M1 落地：任务级阈值门禁（结果页判定横幅 + 执行历史门禁列）、按 scope 授权的 API Key、Webhook 通知、开发者设置控制台、CI 命令行 `aievo-cli`（退出码 0=通过 / 1=门禁失败 / 2=错误，GitHub/GitLab/Jenkins 模板见 `ci-templates/`）。FastAPI + Vue 3 + Celery，一个 Docker Compose 栈即可部署。
+私有化部署的 Agent 质量工程平台，定位「评测即门禁」——模型 / Agent 的变更先过评测、再进发布。当前已可用：模型配置、数据集管理、评测前处理脚本、9 种评测任务类型（AI 裁判员 / Agent 长会话 / 一致性 / 成功率 / RAG 检索 / 二分分类 / 响应耗时 / 插件 / 安全红队）+ persona 用户模拟的仿真评测（经仿真场景运行）、终态校验器（脚本 / 数据库 / 文件 / 回调断言，确定性校验优先，M2 起）、轨迹匹配（agent 会话工具序列断言：严格 / 乱序 / 子序列 / 禁止多余四模式 + 期望 / 禁用调用，聚合出轨迹匹配率门禁指标，M2 起）、pass^k 统计（裁判类任务行级多 Trial 2-5 + 一致性/成功率重复次数，τ-bench 口径的 pass@1 / pass^k / 分数标准误，M2 起）、A/B 显著性检验（多轮同输入配对：Wilcoxon 符号秩 + 配对 t + Cliff's delta + McNemar 精确检验，M2 起）、人工金分标注与裁判-人工一致性报告（M8 起）、结果聚合与统计分析、A/B 对比测试；门禁闭环已随 M1 落地：任务级阈值门禁（结果页判定横幅 + 执行历史门禁列）、按 scope 授权的 API Key、Webhook 通知、开发者设置控制台、CI 命令行 `aievo-cli`（退出码 0=通过 / 1=门禁失败 / 2=错误，GitHub/GitLab/Jenkins 模板见 `ci-templates/`）。FastAPI + Vue 3 + Celery，一个 Docker Compose 栈即可部署。
 
 ![首页](docs/assets/00-home.png)
 
@@ -17,11 +17,11 @@
 | 模块 | 能力 |
 |---|---|
 | 模型配置 | OpenAI / Anthropic 兼容接口、自定义 HTTP（curl 导入）、运行时变量注入、连通性流式测试 |
-| 数据集管理 | Excel 导入（动态字段）、Agent 会话文件导入、媒体字段、字段级校验、数据集版本化（打版快照、版本间行级 diff、恢复、任务跟随最新/锁定版本运行） |
+| 数据集管理 | Excel 导入（动态字段）、Agent 会话文件导入、媒体字段、字段级校验、数据集版本化（打版快照、版本间行级 diff、恢复、任务跟随最新/锁定版本运行）；OTel 兼容 trace 导入（M8 起：`POST /ingest/otel-traces` 收 OTLP/HTTP JSON / Phoenix 导出 / Langfuse 导出，一 trace 一行会话数据进既有 trace 评测链路——平台与既有 tracing 平台共存，不是 tracing 后端） |
 | 脚本库 | 评测前处理脚本（zip / 文件夹包）、`model.py` 契约声明、在线文件树编辑、脚手架模板 |
-| 评测任务 | AI 裁判员 / Agent 长会话 / 一致性 / 成功率 / RAG 检索 / 二分分类等类型，批量运行、实时进度（WebSocket）；评测模板版本化（打版、字段级 diff、恢复，M5 起）；任务级 cron 定时（5 段表达式、北京时间、可选时段限制——经既有运行入口投递，团队配额与任务互斥照常生效；扫描循环在 api 进程内，Redis 锁 + `next_run_at` CAS 认领保证多 api 单写，不引 Celery beat，M5 起） |
-| 裁判引擎 | Claude Code 裁判（默认）与通用 LLM 裁判图可用；DeepSeek Harness 裁判适配就绪、任务流 M8 接通；评测维度动态配置 |
-| 结果与分析 | 评分明细、历史对比、Excel/JSON/CSV 导出、趋势统计、双模型 A/B 并排对比；A/B 模板版本对照（同任务两模板版本的任务化实验，M5 起）；周报（每周一 08:00 北京时间聚合上周覆盖度/提效/门禁通过率生成 markdown，Statistics 归档可回看，推送订阅 `weekly.report.ready` 事件的 webhook，SMTP 邮件可选，M5 起）；免登录只读报告分享（M5 起：token 链接带有效期/行级范围/可吊销，`/share/:token` 只读页） |
+| 评测任务 | AI 裁判员 / Agent 长会话 / 一致性 / 成功率 / RAG 检索 / 二分分类 / 响应耗时 / 插件 / 安全红队（双通道：内置攻击样本库+变异增强，确定性检测器+裁判 rubric，M3 起）9 种任务类型，批量运行、实时进度（WebSocket）；仿真评测（M7 起，经仿真场景运行、不建任务）——persona 用户模拟器、故障注入（工具超时/错误响应/污染数据/矛盾指令/上下文超长）、终态校验出 pass^k、trial 回放与失败转数据集；评测模板版本化（打版、字段级 diff、恢复，M5 起）；任务级 cron 定时（5 段表达式、北京时间、可选时段限制——经既有运行入口投递，团队配额与任务互斥照常生效；扫描循环在 api 进程内，Redis 锁 + `next_run_at` CAS 认领保证多 api 单写，不引 Celery beat，M5 起） |
+| 裁判引擎 | Claude Code 裁判（默认）、通用 LLM 裁判图与 DeepSeek Agent 裁判（deepseek-harness-sdk，M8 接通）三种可用；「与 Claude Code 对拍」出双引擎裁判一致性报告（同批既有输出逐行分数差/容差内一致率，M8）；评测维度动态配置 |
+| 结果与分析 | 评分明细、历史对比、Excel/JSON/CSV 导出、趋势统计、双模型 A/B 并排对比；A/B 模板版本对照（同任务两模板版本的任务化实验，M5 起）；周报（每周一 08:00 北京时间聚合上周覆盖度/提效/门禁通过率生成 markdown，Statistics 归档可回看，推送订阅 `weekly.report.ready` 事件的 webhook，SMTP 邮件可选，M5 起）；免登录只读报告分享（M5 起：token 链接带有效期/行级范围/可吊销，`/share/:token` 只读页）；人工标注闭环（M8 起：结果页标注模式——待标队列失败行/低分行优先、快捷键打金分，一行结果一条标注；Statistics 裁判-人工一致性报告——Pearson/Spearman 相关性 + 分带 Cohen's κ 与分带混淆矩阵） |
 | 管理 | 团队与成员启停/角色管理（三角色 owner/engineer/viewer——写操作 owner+engineer，viewer 全站只读；超管保留全局）、审计日志（全部写端点由声明式 `audited` 依赖统一留痕，注册表静态断言把关覆盖面；csv/xlsx 导出为企业功能位 audit_export——license 授权后可用，未授权 403+upgrade_required 且前端按钮锁定，另有企业端点旁路静态断言看守）、离线 License 管理（M6：超管上传 Ed25519 签名 license 开通企业档位与功能位——审计导出/报告白标水印；验签失败/过期只降级开源版并醒目告警，不阻断核心评测；生成工具 `tools/license/gen.py`）、用量计量（M6：每次执行的模型 token 用量——被测与裁判调用统一计量——按月度运行数与团队 token 聚合，`GET /admin/usage/summary` 供 license 续约对账；超额只告警不阻断）、内置使用文档 |
 
 本地账号密码登录：首个注册用户自动成为超级管理员；密码 PBKDF2-HMAC-SHA256 哈希存储，会话为 HS256 JWT（`Authorization: Bearer`）。企业统一身份：`AUTH_METHODS`（`local,oidc,ldap` 任意组合，单选 `oidc`/`ldap` 即纯企业身份部署——关闭本地登录注册）开启 OIDC SSO（授权码 + PKCE S256）与 LDAP/AD 只读认证（search+bind，滤值 RFC 4515 转义、空密码直拒）；超管在「开发者设置」配置 IdP / 目录（含连通性自检）；首次企业登录自动开户（JIT）或按邮箱映射既有账号，目录组与 SSO 组共用 groups→团队映射。

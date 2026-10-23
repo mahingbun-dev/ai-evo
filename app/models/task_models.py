@@ -40,7 +40,7 @@ class EvaluationTask(Base):
 
     # AI裁判员评测配置
     judge_model = Column(String, nullable=True, comment="裁判员模型（软退场：历史字段，新任务不再写入）")
-    judge_engine = Column(String, default="claude_agent", server_default="claude_agent", comment="裁判引擎：claude_agent(Claude Code Agent)/graph(裁判图 HTTP 直调)，历史任务空值按 graph 处理")
+    judge_engine = Column(String, default="claude_agent", server_default="claude_agent", comment="裁判引擎：claude_agent(Claude Code Agent)/deepseek_agent(DeepSeek Agent，M8)/graph(裁判图 HTTP 直调)，历史任务空值按 graph 处理")
     judge_prompt = Column(Text, nullable=True, comment="评测prompt模板")
 
     # 评测指令配置

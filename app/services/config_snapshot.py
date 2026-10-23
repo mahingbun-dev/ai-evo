@@ -297,12 +297,41 @@ def summarize_call_config(config: Optional[Dict[str, Any]], source: str) -> Opti
     }
 
 
+def _dsh_judge_model_summary() -> Optional[Dict[str, Any]]:
+    """DeepSeek Agent 引擎的裁判模型摘要（M8 QE8-2，掩码凭据）
+
+    与 CC 全局配置同口径：judge_engine=deepseek_agent 不消费任务级裁判
+    快照，归因锚点是 DeepSeek Harness 全局配置（provider/model/协议/
+    base_url + 掩码 key）；未配置时返回 config_missing 标记。
+    """
+    try:
+        from app.services.deepseek_harness_config_service import (
+            DeepSeekHarnessConfigService,
+        )
+
+        config = DeepSeekHarnessConfigService.get_active_config()
+    except Exception as e:  # 配置服务异常不阻断执行记录写入
+        logger.warning(f"裁判快照加载 DeepSeek Harness 全局配置失败: {e}")
+        config = None
+    if not config:
+        return {"source": "deepseek_harness_global", "config_missing": True}
+    return {
+        "source": "deepseek_harness_global",
+        "provider": config.get("provider"),
+        "model_type": config.get("model"),
+        "endpoint": config.get("base_url"),
+        "protocol": config.get("protocol") or "deepseek",
+        MASKED_KEY_FIELD: mask_api_key(config.get("api_key")),
+    }
+
+
 def build_used_config_summary(task, db=None) -> Dict[str, Any]:
     """执行结束写入：该次实际使用的配置摘要（「实然」面）
 
     与执行链路共用同一解析器，摘要即可回答「这次 X 分当时用的什么模型/温度」。
-    裁判侧按 judge_engine 归因：claude_agent 引擎走 CC 全局配置（不消费任务级
-    裁判快照），graph 引擎走快照优先链。
+    裁判侧按 judge_engine 归因：claude_agent 引擎走 CC 全局配置、deepseek_agent
+    引擎走 DeepSeek Harness 全局配置（均不消费任务级裁判快照），graph 引擎走
+    快照优先链。
     """
     summary: Dict[str, Any] = {"model": None, "judge": None}
 
@@ -332,6 +361,9 @@ def build_used_config_summary(task, db=None) -> Dict[str, Any]:
                 summarize_call_config(cc_config, "claude_code_global")
                 or {"source": "claude_code_global", "config_missing": True}
             )
+        elif judge_engine == "deepseek_agent":
+            # M8 QE8-2：DeepSeek Agent 引擎走 DSH 全局配置（掩码凭据）
+            summary["judge"] = _dsh_judge_model_summary()
         else:
             judge_config, judge_source = resolve_judge_call_config(task, db)
             summary["judge"] = (
@@ -381,6 +413,9 @@ def build_judge_config_snapshot(task, db=None) -> Optional[Dict[str, Any]]:
             summarize_call_config(cc_config, "claude_code_global")
             or {"source": "claude_code_global", "config_missing": True}
         )
+    elif judge_engine == "deepseek_agent":
+        # M8 QE8-2：DeepSeek Agent 引擎走 DSH 全局配置（掩码凭据）
+        judge_model = _dsh_judge_model_summary()
     else:
         judge_config, judge_source = resolve_judge_call_config(task, db)
         judge_model = (

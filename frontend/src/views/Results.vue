@@ -56,6 +56,11 @@
               v-if="selectedTaskId && !readonlyRole"
               @click="openShareDialog"
             >分享</el-button>
+            <!-- M8 QE8-1：人工标注模式（待标队列=失败行/低分行优先，快捷键打分；viewer 隐藏） -->
+            <el-button
+              v-if="selectedTaskId && !readonlyRole"
+              @click="openAnnotationMode"
+            >标注模式</el-button>
           </div>
         </div>
       </template>
@@ -2937,6 +2942,13 @@
       </template>
     </el-dialog>
 
+    <!-- 人工标注模式弹窗（M8 QE8-1）：待标队列（失败/低分优先）+ 快捷键打分 -->
+    <AnnotationModeDialog
+      v-model="annotationMode.visible"
+      :task-id="selectedTaskId"
+      :execution-number="selectedExecutionNumber"
+    />
+
     <!-- 报告分享弹窗（M5 QE5-4）：创建链接（明文 token 仅一次）+ 吊销管理 -->
     <el-dialog v-model="shareDialog.visible" title="分享评测报告" width="640px">
       <!-- 新建区 -->
@@ -3013,6 +3025,7 @@ import { ref, reactive, computed, inject, onMounted, onUnmounted, nextTick } fro
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { InfoFilled, ArrowDown, Timer, CircleCheck, CircleCheckFilled, CircleClose, CircleCloseFilled, Warning, WarningFilled, Link, User } from '@element-plus/icons-vue'
 import { taskApi, resultApi, shareApi } from '@/api'
+import AnnotationModeDialog from '@/components/AnnotationModeDialog.vue'
 import { useTaskPolling } from '@/composables/useTaskPolling'
 import { formatTime } from '@/utils/time'
 import { canUseIdxAsSeqNo, detailSeqNo } from '@/utils/seqno'
@@ -3309,6 +3322,16 @@ const handleExport = async (format) => {
 // ==================== 报告分享（M5 QE5-4，免登录只读） ====================
 const currentUser = inject('currentUser', null)
 const readonlyRole = computed(() => !canWrite(currentUser.value))
+
+// ==================== 人工标注模式（M8 QE8-1，标注闭环） ====================
+// 队列排序（失败行/低分行优先）与快捷键打分在 AnnotationModeDialog 内实现；
+// 这里只管入口开关——锚定当前选中的执行版本（未选=最新一次执行）
+const annotationMode = reactive({ visible: false })
+
+const openAnnotationMode = () => {
+  if (!selectedTaskId.value) return
+  annotationMode.visible = true
+}
 
 const shareDialog = reactive({
   visible: false,

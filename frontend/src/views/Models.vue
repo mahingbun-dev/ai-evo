@@ -211,6 +211,8 @@
             <el-form-item>
               <el-button type="primary" :disabled="dshSaving || dshTesting" :loading="dshSaving" @click="saveDshConfig">保存配置</el-button>
               <el-button :disabled="dshSaving || dshTesting" :loading="dshTesting" @click="testDshConfig">测试连接</el-button>
+              <!-- M8 QE8-2：双引擎裁判对拍（同批既有输出交 CC × DSH 评分出一致性报告） -->
+              <el-button :disabled="readonlyRole" @click="openJudgeComparison">与 Claude Code 对拍</el-button>
             </el-form-item>
           </el-form>
 
@@ -784,14 +786,80 @@
         <el-button v-else type="primary" @click="startTest" :disabled="testingLoading" :loading="testingLoading">重新测试</el-button>
       </template>
     </el-dialog>
+
+    <!-- 双引擎裁判对拍弹窗（M8 QE8-2）：同批既有输出交 CC × DSH 两引擎评分 -->
+    <el-dialog v-model="compareDialog.visible" title="双引擎裁判对拍（Claude Code × DeepSeek）" width="860px" :close-on-click-modal="!compareDialog.loading">
+      <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-bottom: 12px;">
+        <el-select v-model="compareDialog.taskId" placeholder="选择使用裁判的已完成任务" style="width: 320px;" filterable>
+          <el-option v-for="t in compareTasks" :key="t.id" :label="t.name" :value="t.id" />
+        </el-select>
+        <el-input-number v-model="compareDialog.sampleCount" :min="1" :max="10" />
+        <span style="font-size:12px; color:#909399;">样本数（取该任务最新执行的行级结果）</span>
+        <el-button type="primary" :loading="compareDialog.loading" :disabled="!compareDialog.taskId" @click="runJudgeComparison">开始对拍</el-button>
+      </div>
+
+      <div v-if="compareDialog.report" v-loading="compareDialog.loading">
+        <!-- 汇总卡 -->
+        <el-row :gutter="12" style="margin-bottom: 12px;">
+          <el-col :span="6"><el-statistic title="对拍样本" :value="compareDialog.report.summary.sample_count" /></el-col>
+          <el-col :span="6"><el-statistic title="平均绝对分差" :value="compareDialog.report.summary.mean_abs_diff ?? '—'" /></el-col>
+          <el-col :span="6">
+            <el-statistic title="容差内一致率（≤1分）" :value="compareDialog.report.summary.within_tolerance_rate != null ? (compareDialog.report.summary.within_tolerance_rate * 100).toFixed(1) + '%' : '—'" />
+          </el-col>
+          <el-col :span="6">
+            <el-statistic title="失败（CC / DSH）" :value="`${compareDialog.report.summary.claude_failed} / ${compareDialog.report.summary.deepseek_failed}`" />
+          </el-col>
+        </el-row>
+        <!-- 引擎配置摘要 -->
+        <div style="font-size:12px; color:#909399; margin-bottom: 8px;">
+          Claude Code：{{ compareDialog.report.engines.claude_agent?.model || '—' }} ·
+          DeepSeek：{{ compareDialog.report.engines.deepseek_agent?.model || '—' }}（{{ compareDialog.report.engines.deepseek_agent?.protocol || 'deepseek' }} 协议）
+        </div>
+        <!-- 逐行对照 -->
+        <el-table :data="compareDialog.report.rows" stripe size="small" max-height="320">
+          <el-table-column label="行" width="60">
+            <template #default="{ row }">{{ row.data_index + 1 }}</template>
+          </el-table-column>
+          <el-table-column prop="user_input" label="输入（截断）" min-width="200" show-overflow-tooltip />
+          <el-table-column label="Claude Code" width="110" align="right">
+            <template #default="{ row }">
+              <span v-if="row.claude_agent.score != null">{{ row.claude_agent.score }}</span>
+              <el-tag v-else size="small" type="danger">失败</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="DeepSeek" width="110" align="right">
+            <template #default="{ row }">
+              <span v-if="row.deepseek_agent.score != null">{{ row.deepseek_agent.score }}</span>
+              <el-tag v-else size="small" type="danger">失败</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="分差 (CC−DSH)" width="120" align="right">
+            <template #default="{ row }">
+              <span v-if="row.score_diff != null" :style="{ color: Math.abs(row.score_diff) > 1 ? '#e6a23c' : '#67c23a', fontWeight: 600 }">
+                {{ row.score_diff > 0 ? '+' : '' }}{{ row.score_diff }}
+              </span>
+              <span v-else style="color:#c0c4cc;">—</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="原执行均分" width="100" align="right">
+            <template #default="{ row }">{{ row.existing_average_score ?? '—' }}</template>
+          </el-table-column>
+        </el-table>
+      </div>
+      <el-empty
+        v-else-if="!compareDialog.loading"
+        description="选任务后开始对拍：同一批既有模型输出分别交两引擎评分，产出分数差与一致率报告（DeepSeek 裁判接通的回归验收）"
+        :image-size="70"
+      />
+    </el-dialog>
   </div>
 </template>
 
 <script setup>
-import { ref, computed, inject, onMounted, watch } from 'vue'
+import { ref, reactive, computed, inject, onMounted, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Loading, CircleCheck, CircleClose, Finished, Delete, Rank, InfoFilled, Upload } from '@element-plus/icons-vue'
-import { modelApi, claudeCodeApi, deepSeekHarnessApi } from '@/api'
+import { modelApi, claudeCodeApi, deepSeekHarnessApi, taskApi } from '@/api'
 import { formatTime } from '@/utils/time'
 import JsonFieldEditor from '@/components/JsonFieldEditor.vue'
 import ChainVariablePanel from '@/components/ChainVariablePanel.vue'
@@ -1178,6 +1246,45 @@ const testDshConfig = async () => {
     ElMessage.error(e.message || '测试连接失败')
   } finally {
     dshTesting.value = false
+  }
+}
+
+// ==================== 双引擎裁判对拍（M8 QE8-2） ====================
+const compareDialog = reactive({
+  visible: false,
+  taskId: '',
+  sampleCount: 5,
+  loading: false,
+  report: null,
+})
+const compareTasks = ref([])
+
+const openJudgeComparison = async () => {
+  compareDialog.visible = true
+  compareDialog.report = null
+  if (!compareTasks.value.length) {
+    try {
+      const res = await taskApi.list({ limit: 200 })
+      // 只列使用裁判的任务（judge/agent + 启用裁判的一致性），且有执行历史可锚定
+      compareTasks.value = (res || []).filter(
+        t => t.status === 'completed' && ['judge', 'agent'].includes(t.evaluation_type))
+    } catch (e) {
+      console.error(e)
+    }
+  }
+}
+
+const runJudgeComparison = async () => {
+  if (!compareDialog.taskId || compareDialog.loading) return
+  compareDialog.loading = true
+  try {
+    compareDialog.report = await taskApi.judgeComparison(compareDialog.taskId, {
+      sample_count: compareDialog.sampleCount,
+    })
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || e.message || '对拍失败')
+  } finally {
+    compareDialog.loading = false
   }
 }
 

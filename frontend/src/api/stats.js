@@ -21,6 +21,12 @@ export const statsApi = {
   getWeeklyReport(id) {
     return request.get(`/stats/weekly-reports/${id}`)
   },
+
+  // 裁判-人工一致性报告（M8 QE8-1）：Pearson/Spearman + 分带 Cohen's kappa，
+  // task_id 为空=全任务聚合（附 by_task 摘要）
+  judgeAgreement(params) {
+    return request.get('/stats/judge-agreement', { params })
+  },
 }
 
 export const coverageApi = {

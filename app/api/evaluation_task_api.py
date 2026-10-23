@@ -53,7 +53,7 @@ class CreateTaskRequest(BaseModel):
     model_output_field: Optional[str] = Field(None, description="模型输出字段名（source=dataset_field 时生效）")
     dataset_id: Optional[str] = Field(None, description="数据集ID")
     judge_model: Optional[str] = Field(None, description="裁判模型")
-    judge_engine: Optional[str] = Field("claude_agent", description="裁判引擎：claude_agent(Claude Code Agent)/graph(裁判图 HTTP 直调)")
+    judge_engine: Optional[str] = Field("claude_agent", description="裁判引擎：claude_agent(Claude Code Agent)/deepseek_agent(DeepSeek Agent，M8)/graph(裁判图 HTTP 直调)")
     judge_prompt: Optional[str] = Field(None, description="评测prompt")
     consistency_config: Optional[Dict[str, Any]] = Field(None, description="一致性评测配置")
     success_rate_config: Optional[Dict[str, Any]] = Field(None, description="成功率评测配置")
@@ -958,6 +958,53 @@ def run_task(
     return task
 
 
+class JudgeComparisonRequest(BaseModel):
+    """双引擎裁判对拍请求（M8 QE8-2）：同一批既有输出交两引擎评分"""
+    sample_count: int = Field(5, ge=1, le=10, description="对拍样本数（1~10，取最新执行的行级结果）")
+
+
+@router.post(
+    "/{task_id}/judge-comparison",
+    summary="双引擎裁判对拍（Claude Code × DeepSeek）",
+    dependencies=[Depends(audited("RUN", "task", id_param="task_id"))],
+)
+def run_judge_comparison(
+    task_id: str,
+    body: JudgeComparisonRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """双引擎裁判对拍报告（M8 QE8-2，同步执行）
+
+    取任务最新一次执行的行级结果（既有模型输出），同一 prompt 分别交
+    Claude Code Agent 与 DeepSeek Agent 裁判各评 1 次，返回逐行分数差与
+    汇总（平均绝对分差 / 容差内一致率）——DeepSeek 裁判接通的回归对拍
+    验收物。需两套引擎全局配置齐备（模型配置页）。
+    """
+    ensure_permission(request.state.user, "tasks")  # RBAC（QE4-3）：viewer 403
+    task = ensure_task_access(db, request.state.user, task_id)
+
+    from app.core.config import get_settings
+    from app.services.judge_comparison_service import (
+        JudgeComparisonError,
+        generate_judge_comparison,
+    )
+
+    settings = get_settings()
+    langfuse_host = settings.LANGFUSE_HOST if settings.LANGFUSE_ENABLED else ""
+    try:
+        report = generate_judge_comparison(
+            db, task, sample_count=body.sample_count, langfuse_host=langfuse_host)
+    except JudgeComparisonError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    request.state.audit_resource = {
+        "id": task.id, "name": task.name,
+        "detail": {"sample_count": report["summary"]["sample_count"],
+                   "mean_abs_diff": report["summary"]["mean_abs_diff"]},
+    }
+    return report
+
+
 # ==================== 定时评测（M5 QE5-3） ====================
 
 class UpsertScheduleRequest(BaseModel):
@@ -1407,6 +1454,77 @@ def get_result_history_version(
         "gate_result": None,
         "judge_config_snapshot": None,
     }
+
+
+class SubmitAnnotationRequest(BaseModel):
+    """提交/修正一行人工标注（M8 QE8-1，标注闭环）
+
+    一行结果一条标注：重复提交幂等覆盖（标注修正场景）。
+    """
+    result_row_id: int = Field(..., description="锚定的行级结果 evaluation_results.id")
+    gold_score: Optional[float] = Field(None, description="人工金分（status=completed 必填，0~任务最大分值）")
+    status: str = Field("completed", description="标注状态：completed-已打分 / skipped-跳过（无法判定）")
+    notes: Optional[str] = Field(None, description="标注备注（争议点/判定依据）")
+
+
+@results_router.get(
+    "/{task_id}/annotations",
+    summary="获取标注队列（失败行/低分行优先）",
+    dependencies=[Depends(require_scope(scopes.RESULTS_READ))],
+)
+def get_annotation_queue(
+    task_id: str,
+    request: Request,
+    execution_number: Optional[int] = Query(None, description="执行序号（缺省=最新一次执行）"),
+    db: Session = Depends(get_db),
+):
+    """标注模式待标队列（M8 QE8-1）
+
+    排序口径：失败行（执行失败/裁判失败）最优先，其余按裁判分升序（低分
+    优先）——人工注意力先投给最可疑的行。返回全量行含已标注行（annotation
+    字段空=待标），前端据此跳转下一个待标行并支持回看/修正。
+    """
+    task = ensure_task_access(db, request.state.user, task_id)
+    from app.services.annotation_service import get_annotation_queue
+    resolved = execution_number or task.execution_count or 1
+    return get_annotation_queue(db, task, resolved)
+
+
+@results_router.post(
+    "/{task_id}/annotations",
+    summary="提交/修正一行人工标注",
+    dependencies=[Depends(audited("CREATE", "annotation", id_param="task_id"))],
+)
+def submit_annotation(
+    task_id: str,
+    body: SubmitAnnotationRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """提交人工金分标注（M8 QE8-1；一行结果一条标注，幂等覆盖）"""
+    ensure_permission(request.state.user, "tasks")  # RBAC（QE4-3）：viewer 403
+    task = ensure_task_access(db, request.state.user, task_id)
+
+    from app.services.annotation_service import AnnotationError, submit_annotation as do_submit
+    user = request.state.user
+    user_code = user.get("user_code") if isinstance(user, dict) else getattr(user, "user_code", None)
+    try:
+        payload = do_submit(
+            db, task,
+            result_row_id=body.result_row_id,
+            gold_score=body.gold_score,
+            status=body.status,
+            notes=body.notes,
+            annotator=user_code,
+        )
+    except AnnotationError as e:
+        raise HTTPException(status_code=getattr(e, "status_code", 400), detail=str(e))
+    request.state.audit_resource = {
+        "id": body.result_row_id, "name": task.name,
+        "detail": {"task_id": task.id, "gold_score": payload["gold_score"],
+                   "status": payload["status"]},
+    }
+    return payload
 
 
 class ExecutionExportRequest(BaseModel):

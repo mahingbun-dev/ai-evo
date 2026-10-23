@@ -1036,6 +1036,38 @@ class EvaluationExecutor:
                 result["success"] = True
                 return result
 
+            # ========== M8 QE8-2：DeepSeek Agent 裁判（judge_engine=deepseek_agent） ==========
+            # 与 CC 分支同收口：维度量程归一化重算 + 聚合 + success 置位。
+            # 差异在待评数据的传递方式——DSH 无 argv 上限问题（system 拼进
+            # prompt），也不走 CC 的落盘+Read 阅读（会话内容由裁判 agent 内联，
+            # 见 deepseek_judge_agent 模块 docstring 的边界说明）
+            if judge_engine == "deepseek_agent":
+                from app.services.deepseek_judge_agent import DeepSeekJudgeAgent
+                from app.services.claude_code_judge_agent import write_session_file
+
+                if session_file is None and session_markdown and len(session_markdown) > 30000:
+                    data_id = (payload.get("_dataset_item", {}) or {}).get("id", payload.get("idx", 0))
+                    session_file = write_session_file(str(task.id), data_id, session_markdown)
+
+                dsh_agent = DeepSeekJudgeAgent(
+                    task=task,
+                    langfuse_host=self.langfuse_host,
+                )
+                judge_results = dsh_agent.run_parallel(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    session_file=session_file,
+                    judge_count=task.judge_count or 1,
+                )
+                judge_results = self._renormalize_cc_judge_scores(
+                    judge_results, scoring_metrics, task.max_score
+                )
+                judge_scores = judge_results
+                result["judge_scores"] = judge_scores
+                result = self._aggregate_judge_scores(result, judge_scores)
+                result["success"] = True
+                return result
+
             from app.services.judge_langgraph_agent import JudgeLangGraphAgent
             from app.services.judge_graph_state import build_state_input
 

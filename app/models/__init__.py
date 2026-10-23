@@ -24,6 +24,7 @@ from app.models.schedule_models import TaskSchedule, WeeklyReport
 from app.models.share_models import ShareLink
 from app.models.license_models import PlatformLicense
 from app.models.simulation_models import SimulationScenario, SimulationRun
+from app.models.annotation_models import ResultAnnotation
 
 __all__ = [
     # 原有模型
@@ -90,4 +91,6 @@ __all__ = [
     # 仿真评测（M7 QE7-4，第 9 种评测类型的运行单元）
     "SimulationScenario",
     "SimulationRun",
+    # 行级人工标注/金分（M8 QE8-1，标注闭环）
+    "ResultAnnotation",
 ]

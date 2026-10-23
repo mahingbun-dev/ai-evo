@@ -324,7 +324,9 @@ export const taskApi = {
   // 任务定时配置（M5 QE5-3：cron 5 段 + 时段限制 + 运行历史；未配置 get 返回 404）
   getSchedule: (id) => request.get(`/evaluation/tasks/${id}/schedule`),
   saveSchedule: (id, data) => request.put(`/evaluation/tasks/${id}/schedule`, data),
-  deleteSchedule: (id) => request.delete(`/evaluation/tasks/${id}/schedule`)
+  deleteSchedule: (id) => request.delete(`/evaluation/tasks/${id}/schedule`),
+  // 双引擎裁判对拍（M8 QE8-2）：同一批既有输出交 Claude Code × DeepSeek 两引擎评分
+  judgeComparison: (id, data) => request.post(`/evaluation/tasks/${id}/judge-comparison`, data)
 }
 
 // 评测结果API
@@ -346,6 +348,9 @@ export const resultApi = {
   // 多次执行维度分数趋势（后端按 execution_number 倒序返回、最近一次在前，仅 completed 版本，
   // 前端使用前显式排序；limit 限制返回次数）
   dimensionTrend: (id, limit = 50) => request.get('/evaluation/results/' + id + '/dimension-trend', { params: { limit } }),
+  // 人工标注闭环（M8 QE8-1）：待标队列（失败行/低分行优先）+ 金分提交（一行一条幂等覆盖）
+  annotationQueue: (id, params) => request.get(`/evaluation/results/${id}/annotations`, { params }),
+  submitAnnotation: (id, data) => request.post(`/evaluation/results/${id}/annotations`, data),
   // 批量导出（Excel/CSV）：rawResponse 取完整响应以读 blob 与 content-type
   exportBatch: (data) => request.post('/evaluation/results/batch-export', data, { responseType: 'blob', rawResponse: true })
 }

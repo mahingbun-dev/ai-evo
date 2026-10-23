@@ -144,6 +144,10 @@ def pre_w3_db():
     conn.autocommit = True
     try:
         with conn.cursor() as cur:
+            # M8 QE8-1 的 annotations 表 FK 依赖 evaluation_results（create_all
+            # 建出）——先摘除该依赖表才能还原 pre-W3 态（本用例只升级到 W3
+            # revision c4e8f9a2b7d6，annotations 不在断言面内）
+            cur.execute("DROP TABLE IF EXISTS annotations")
             cur.execute("DROP TABLE IF EXISTS evaluation_results")
             cur.execute(
                 "ALTER TABLE task_execution_records "

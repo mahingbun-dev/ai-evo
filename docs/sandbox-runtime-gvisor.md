@@ -111,12 +111,12 @@ docker compose restart worker        # 评测机：docker compose -f docker-comp
 - worker docker-CLI 通道（`EXECUTOR_URL` 未配置的单机形态）：
   `sandbox_runtime()`（`app/services/script_container.py`）→
   `SandboxRunSpec.runtime` → `docker run ... --runtime runsc`；
-- executor 通道：请求字段 `runtime`（`executor/app.py.SandboxRunRequest`，
-  默认 `runc`）经白名单校验（`executor/sandbox_params.validate_container_runtime`）
-  后拼 `--runtime runsc`。**worker 侧 HTTP 客户端透传该字段属后续批次接线**
-  （`app/services/executor_client.py`），接线前 executor 通道按缺省 `runc`
-  执行——需要 runsc 生效的评测机在客户端接线落地前请走 docker-CLI 通道，
-  或由接线批次一并启用；
+- executor 通道：`SandboxRunSpec.runtime` → HTTP 请求字段 `runtime`
+  （`app/services/executor_client.py`，M8 QE8-3 接线收口）→
+  `executor/app.py.SandboxRunRequest`（默认 `runc`）经白名单校验
+  （`executor/sandbox_params.validate_container_runtime`）后拼
+  `--runtime runsc`——`SANDBOX_RUNTIME=runsc` 对 docker-CLI / executor
+  两通道同档生效，走 executor 通道不会静默降回 runc；
 - 非法值（非 `runc|runsc`）三层拒绝：Settings 启动即拒（`field_validator`）、
   worker 读取抛 `SandboxDriverError` 转脚本 fail 条目、executor 请求 400
   （拒绝即审计 WARNING，不触碰 docker CLI）。

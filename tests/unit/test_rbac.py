@@ -306,7 +306,7 @@ class TestWriteEndpointWiring:
     """静态断言：M4 QE4-3 点名的资源写端点已挂 ensure_permission（源码级）"""
 
     EXPECTED = {
-        "app/api/evaluation_task_api.py": 8,   # create/update/delete/run/stop+定时 get/upsert/delete（M5 QE5-3）
+        "app/api/evaluation_task_api.py": 10,  # create/update/delete/run/stop+定时 get/upsert/delete（M5 QE5-3）+标注提交（M8 QE8-1）+裁判对拍（M8 QE8-2）
         "app/api/dataset_api.py": 12,          # CRUD+fields+imports+data 行级+版本打版/恢复（M5 QE5-1）
         "app/api/model_config_api.py": 3,      # create/update/delete
         "app/api/media_api.py": 2,             # upload/delete
@@ -314,6 +314,7 @@ class TestWriteEndpointWiring:
         "app/api/webhook_api.py": 2,           # create/delete
         "app/api/api_key_api.py": 2,           # create/revoke
         "app/api/share_api.py": 2,             # 分享链接 create/revoke（M5 QE5-4）
+        "app/api/ingest_api.py": 1,            # OTel/Phoenix/Langfuse trace 导入（M8 QE8-4）
     }
 
     def test_write_endpoints_guarded(self):

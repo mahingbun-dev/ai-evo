@@ -197,9 +197,9 @@ class EvaluationTaskService:
                 safety_config, dataset_id=dataset_id, model_provider=model_provider
             )
 
-        # 验证裁判引擎
-        if judge_engine and judge_engine not in ("claude_agent", "graph"):
-            raise ValueError(f"不支持的裁判引擎: {judge_engine}，可选值: claude_agent, graph")
+        # 验证裁判引擎（M8 QE8-2：deepseek_agent 任务流接通，三引擎齐备）
+        if judge_engine and judge_engine not in ("claude_agent", "deepseek_agent", "graph"):
+            raise ValueError(f"不支持的裁判引擎: {judge_engine}，可选值: claude_agent, deepseek_agent, graph")
 
         task_id = f"task_{uuid.uuid4().hex[:12]}"
 

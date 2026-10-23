@@ -12,8 +12,9 @@ config 增 SANDBOX_RUNTIME（默认 runc，白名单仅 runc|runsc）；script_c
   逐字节一致）
 - 透传：runsc → docker run 参数含 ``--runtime runsc``——worker docker-CLI
   通道（SANDBOX_RUNTIME → sandbox_runtime → SandboxRunSpec.runtime →
-  DockerCliDriver Popen 参数）与 executor 通道（POST /sandbox/run 请求
-  runtime 字段 → daemon CLI 参数）两条链
+  DockerCliDriver Popen 参数）与 executor 通道（SANDBOX_RUNTIME → spec →
+  HTTP 请求 runtime 字段（M8 QE8-3 客户端接线收口）→ executor 白名单 →
+  daemon CLI 参数）两条链
 - 拒绝：非法值（kata/空/flag 样值/大写变形）四层闸——Settings 启动
   ValidationError、sandbox_params 构造 SandboxParamError、worker 读取
   SandboxDriverError（转脚本 fail 条目，不炸编排）、executor 400（不触碰
@@ -258,6 +259,54 @@ class TestWorkerOrchestrationPassThrough:
         assert result["status"] == "fail"
         assert result["finish_reason"] == "error"
         assert "SANDBOX_RUNTIME" in result["error"] and "kata" in result["error"]
+
+
+class TestHttpExecutorClientRuntime:
+    """HTTP executor 通道客户端环（M8 QE8-3 接线收口）：spec.runtime →
+    POST /sandbox/run 请求体 runtime 字段——SANDBOX_RUNTIME=runsc 对
+    docker-CLI / executor 两通道同档生效（复用 test_sandbox_driver 的
+    mock executor，替换唯一 I/O 出口 _http_open，不经真实网络）"""
+
+    @pytest.fixture
+    def mock_executor(self, monkeypatch):
+        from tests.unit.test_sandbox_driver import EXECUTOR_URL, MockExecutor
+
+        monkeypatch.setenv("EXECUTOR_URL", EXECUTOR_URL)
+        monkeypatch.setenv("EXECUTOR_TOKEN", "unit-test-executor-token")
+        mock = MockExecutor()
+        from app.services import executor_client
+        monkeypatch.setattr(executor_client, "_http_open", mock)
+        return mock
+
+    def test_runsc_spec_reaches_request_runtime_field(self, tmp_path, mock_executor):
+        """spec.runtime=runsc → 请求体 runtime=runsc（加固档不因走 executor
+        通道静默降回 runc）"""
+        from app.services.executor_client import HttpExecutorDriver
+
+        run_dir, _, cwd = _workspace(tmp_path)
+        spec = SandboxRunSpec(
+            image="ai-evo-script-runner:latest", user="10001:10001",
+            workspace_host=str(run_dir), workspace_container="/workspace",
+            workdir_container="/workspace/s1", cwd_host=str(cwd),
+            net_profile="none", container_name="aievo-script-s1-abc123",
+            entrypoint=["python"], stdin_payload=b"{}", timeout=30.0,
+            runtime="runsc")
+        HttpExecutorDriver().run(spec)
+        assert mock_executor.posts()[0]["body"]["runtime"] == "runsc"
+
+    def test_default_spec_sends_runc(self, tmp_path, mock_executor):
+        """spec 缺省 runc 同样显式携带（executor 同值缺省，行为等价不变）"""
+        from app.services.executor_client import HttpExecutorDriver
+
+        run_dir, _, cwd = _workspace(tmp_path)
+        spec = SandboxRunSpec(
+            image="ai-evo-script-runner:latest", user="10001:10001",
+            workspace_host=str(run_dir), workspace_container="/workspace",
+            workdir_container="/workspace/s1", cwd_host=str(cwd),
+            net_profile="none", container_name="aievo-script-s1-abc123",
+            entrypoint=["python"], stdin_payload=b"{}", timeout=30.0)
+        HttpExecutorDriver().run(spec)
+        assert mock_executor.posts()[0]["body"]["runtime"] == "runc"
 
 
 class _FakePopen:

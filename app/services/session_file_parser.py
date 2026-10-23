@@ -501,6 +501,16 @@ def parse_langfuse_trace(path: str) -> List[Dict[str, Any]]:
     return [_record_from_trace(trace) for trace in _normalize_traces(data)]
 
 
+def parse_langfuse_payload(data: Any) -> List[Dict[str, Any]]:
+    """内存态 Langfuse trace 载荷 → SessionRecord 列表（M8 QE8-4 OTel 兼容导入）
+
+    与 parse_langfuse_trace 同一归一化/转换路径（单 trace / 数组 /
+    ``{"traces": [...]}`` 包装），供 /ingest/otel-traces 直接吃 API 推送
+    的 JSON 体（不经临时文件）。
+    """
+    return [_record_from_trace(trace) for trace in _normalize_traces(data)]
+
+
 # ---------------------------------------------------------------------------
 # 分发入口
 # ---------------------------------------------------------------------------

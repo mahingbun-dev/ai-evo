@@ -26,7 +26,10 @@
 Settings，与 get_script_exec_mode 同语义；token 未配置即 fail-closed 不发起
 调用，与 executor 侧 503 语义对齐）。网络档位三档映射：档位值原样进请求
 net_profile 字段，白名单校验的单一事实源在 executor/sandbox_params.NET_PROFILES
-（none|egress；open 档未放开——请求即拒，错误透传）。
+（none|egress；open 档未放开——请求即拒，错误透传）。容器运行时档同口径
+透传（M8 QE8-3，ARCH-3-4 收口）：spec.runtime 原样进请求 runtime 字段，
+worker 侧 sandbox_runtime() 与 executor 侧 sandbox_params 白名单同源
+（runc|runsc，gVisor 加固档两通道同档生效）。
 
 单测替换点：``_http_open`` 是唯一网络 I/O 出口（tests/unit/test_sandbox_driver.py
 以 mock executor 替换，覆盖三档映射/错误传递/超时），不经真实网络。
@@ -183,6 +186,11 @@ class HttpExecutorDriver(SandboxDriver):
             # 校验（sandbox_params.resolve_container_workdir），越界 400 透传
             "workdir": spec.workdir_container,
             "net_profile": spec.net_profile,
+            # 容器运行时档透传（M8 QE8-3 收口 ARCH-3-4）：spec.runtime 已在编排层
+            # 经 sandbox_runtime() 白名单校验（runc|runsc），executor 侧同源白名单
+            # 二次校验后拼 --runtime 旗标——SANDBOX_RUNTIME=runsc 对 CLI/HTTP 两
+            # 通道同档生效，加固档不再因走 executor 通道静默降回 runc
+            "runtime": spec.runtime,
             "timeout": spec.timeout,
             "entrypoint": ["sh", "-c", shell_command],
         }

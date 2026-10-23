@@ -1,4 +1,4 @@
-"""工具清单：25 个 MCP 工具的单一事实源。
+"""工具清单：28 个 MCP 工具的单一事实源。
 
 每个工具的 route 声明 HTTP 方法、URL 模板、参数去向与 input schema，
 manifest 的 ToolDecl 与 handle 的分发共用这一张表，杜绝声明与实现漂移。
@@ -36,13 +36,16 @@ from .result_summary import (
 PLUGIN_NAME = "ai-evo"
 # 中台规则：同版本号契约不可变（VERSION_CONFLICT 拒绝注册）——凡动工具/描述/schema/消息契约必须升此号
 # 1.4.0（M1 QE1-2）：新增 run_task_with_gate / get_gate_status 两工具（评测即门禁）
-PLUGIN_VERSION = "1.4.0"
+# 1.5.0（M8 QE8-5）：新增 dataset_versions / simulation_run / simulation_run_status
+# 三工具（M5 版本查询与 M7 仿真触发）；task_create/task_list 的引擎与类型描述
+# 同步为平台白名单实际状态（3 裁判引擎 / 9 种评测类型）
+PLUGIN_VERSION = "1.5.0"
 PLUGIN_DESCRIPTION = (
-    "AI 评测平台（ai-evo）代理：数据集管理与导入（经 anc-hub file-store 的 file_id）、"
-    "评测任务的创建/修改/删除与执行、任务轻量状态轮询与执行历史、"
+    "AI 评测平台（ai-evo）代理：数据集管理与导入（经 anc-hub file-store 的 file_id）"
+    "与版本查询、评测任务的创建/修改/删除与执行、任务轻量状态轮询与执行历史、"
     "单次执行明细分页查询与结果文档导出（markdown/json 上传 file-store 返回 file_id）、"
     "评测结果摘要查询、任务日志与评测门禁（评测即门禁：触发执行后按门禁 verdict 轮询，"
-    "agent 可作为门禁调用方）。"
+    "agent 可作为门禁调用方）、仿真评测触发与运行查询（M7）。"
     "调用方需有平台登录态（经 anc-hub 登录后透传），所有操作以真实用户身份执行并落审计。"
 )
 
@@ -86,6 +89,39 @@ def _summarize_result(data: Any, ctx: Dict[str, Any]) -> Any:
             # 在下拉中选任务），保留该参数以便前端未来支持自动选中。
             data["result_url"] = f"{frontend_base.rstrip('/')}/results?task_id={task_id}"
             data["result_url_task_id"] = str(task_id)
+    return data
+
+
+def _summarize_simulation_run(data: Any, ctx: Dict[str, Any]) -> Any:
+    """simulation_run_status 的后处理：剥掉逐 trial 会话回放，只留指标与 trial 概要。
+
+    运行详情的 result.trials 含完整对话/工具轨迹（trial 回放是前端专属能力，
+    agent 轮询只需要终态与指标）；每个 trial 保留 序号/是否通过/终止原因/
+    回合数/工具浪费率/故障命中/耗时，对话 turns 整块替换为 turns_omitted 计数。
+    """
+    if not isinstance(data, dict) or not isinstance(data.get("result"), dict):
+        return data
+    result = data["result"]
+    trials = result.get("trials")
+    if isinstance(trials, list):
+        slim_trials = []
+        for trial in trials:
+            if not isinstance(trial, dict):
+                continue
+            turns = trial.get("turns") or {}
+            turn_list = turns.get("turns") if isinstance(turns, dict) else None
+            slim_trials.append({
+                "trial": trial.get("trial"),
+                "passed": trial.get("passed"),
+                "termination": trial.get("termination"),
+                "turn_count": len(turn_list) if isinstance(turn_list, list) else 0,
+                "tool_count": (trial.get("agent") or {}).get("tool_count"),
+                "tool_waste_rate": trial.get("tool_waste_rate"),
+                "faults_fired": trial.get("faults_fired"),
+                "duration_ms": trial.get("duration_ms"),
+            })
+        result["trials"] = slim_trials
+        result["note"] = "已省略逐 trial 对话回放与终态校验明细；回放/证据请在前端仿真页查看"
     return data
 
 
@@ -251,6 +287,24 @@ TOOL_ROUTES: Dict[str, _ROUTE_TYPE] = {
             "required": ["job_id"],
         },
     },
+    "dataset_versions": {
+        "method": "GET",
+        "path": "/api/v1/evaluation/datasets/{dataset_id}/versions",
+        "path_params": ["dataset_id"],
+        "body": False,
+        "desc": (
+            "列出数据集的版本历史（M5 版本化，新→旧）：每版含版本号、行数、变更说明、"
+            "打版时间与打版人。评测任务可锁定数据集版本（dataset_version_no）保证可复现——"
+            "用本工具确认可用版本号；任务配置的版本语义见 task_create/task_update 的数据集绑定说明"
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "dataset_id": {"type": "string", "description": "数据集 ID"},
+            },
+            "required": ["dataset_id"],
+        },
+    },
 
     # ── 评测任务 ─────────────────────────────────────────────────────
     "model_list": {
@@ -270,7 +324,7 @@ TOOL_ROUTES: Dict[str, _ROUTE_TYPE] = {
             "type": "object",
             "properties": {
                 "status": {"type": "string", "description": "状态过滤：pending/running/completed/failed/stopped（可选）"},
-                "evaluation_type": {"type": "string", "description": "评测类型过滤：judge/consistency/success_rate/rag/binary_classification（可选）"},
+                "evaluation_type": {"type": "string", "description": "评测类型过滤：judge/agent/consistency/success_rate/rag/binary_classification/latency/plugin/safety（可选；simulation 类型经仿真场景运行，见 simulation_run）"},
                 "name": {"type": "string", "description": "任务名称模糊过滤（不区分大小写的子串匹配，可选）"},
                 "skip": {"type": "integer", "description": "跳过条数（默认 0）"},
                 "limit": {"type": "integer", "description": "返回条数上限（默认 100，最大 1000）"},
@@ -301,11 +355,12 @@ TOOL_ROUTES: Dict[str, _ROUTE_TYPE] = {
         "path": "/api/v1/evaluation/tasks",
         "body": True,
         "desc": (
-            "创建评测任务。必填 name 与 evaluation_type（judge/consistency/success_rate/"
-            "rag/binary_classification）；judge 类型还需数据集（dataset_id）、待评测数据行"
+            "创建评测任务。必填 name 与 evaluation_type（judge/agent/consistency/"
+            "success_rate/rag/binary_classification/latency/plugin/safety；simulation 类型"
+            "经仿真场景运行，不支持直接创建）；judge 类型还需数据集（dataset_id）、待评测数据行"
             "（evaluation_targets，见该字段说明）、被评测模型（model_provider，见 model_list）"
             "与评测维度（evaluation_metrics，含 name/weight/description 的维度列表），"
-            "裁判可配 judge_model/judge_count/judge_prompt 等"
+            "裁判可配 judge_model/judge_engine/judge_count/judge_prompt 等"
         ),
         "schema": {
             "type": "object",
@@ -314,12 +369,13 @@ TOOL_ROUTES: Dict[str, _ROUTE_TYPE] = {
                 "description": {"type": "string", "description": "任务描述（可选）"},
                 "evaluation_type": {
                     "type": "string",
-                    "description": "评测类型：judge（裁判打分）/consistency/success_rate/rag/binary_classification",
+                    "description": "评测类型：judge（裁判打分）/agent（长会话）/consistency/success_rate/rag/binary_classification/latency/plugin/safety",
                 },
-                "dataset_id": {"type": "string", "description": "评测数据集 ID（见 dataset_list）"},
+                "dataset_id": {"type": "string", "description": "评测数据集 ID（见 dataset_list；可用 dataset_versions 查版本号）"},
+                "dataset_version_no": {"type": "integer", "description": "锁定数据集版本（M5，可选）：空=跟随最新，整数=dataset_versions 里的版本号（换 dataset_id 时必须同批切换）"},
                 "model_provider": {"type": "string", "description": "被评测模型配置 ID（见 model_list）"},
                 "judge_model": {"type": "string", "description": "裁判模型配置 ID（judge 类型，可选）"},
-                "judge_engine": {"type": "string", "description": "裁判引擎：claude_agent（默认）/graph"},
+                "judge_engine": {"type": "string", "description": "裁判引擎：claude_agent（默认，Claude Code Agent）/deepseek_agent（DeepSeek Agent，M8）/graph（传统裁判图）"},
                 "judge_count": {"type": "integer", "description": "裁判数量（默认 6）"},
                 "judge_prompt": {"type": "string", "description": "自定义评测 prompt（可选）"},
                 "evaluation_metrics": {
@@ -582,6 +638,45 @@ TOOL_ROUTES: Dict[str, _ROUTE_TYPE] = {
                 "limit": {"type": "integer", "description": "返回条数上限（默认 100，最大 500）"},
             },
             "required": ["task_id"],
+        },
+    },
+
+    # ── 仿真评测（M7 QE7-4，第 9 种评测类型） ────────────────────────
+    "simulation_run": {
+        "method": "POST",
+        "path": "/api/v1/simulation/scenarios/{scenario_id}/run",
+        "path_params": ["scenario_id"],
+        "body": False,
+        "desc": (
+            "触发仿真评测运行（M7）：对既有仿真场景跑 N 个 trial 的 persona 用户模拟"
+            "（含故障注入与终态校验），异步执行立即返回 run_id。用 simulation_run_status "
+            "轮询进度/终态（completed/failed/stopped 即终态）；团队并发配额满时返回 429，稍后重试"
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "scenario_id": {"type": "string", "description": "仿真场景 ID（在前端仿真页创建）"},
+            },
+            "required": ["scenario_id"],
+        },
+    },
+    "simulation_run_status": {
+        "method": "GET",
+        "path": "/api/v1/simulation/runs/{run_id}",
+        "path_params": ["run_id"],
+        "body": False,
+        "postprocess": _summarize_simulation_run,
+        "desc": (
+            "查询仿真运行状态与指标（轮询专用）：status/trials_done 与完成后指标"
+            "（pass^k/任务成功率/平均回合数/工具浪费率/故障恢复率 + 逐 trial 概要）。"
+            "逐 trial 对话回放与终态校验明细已省略（载荷过大），回放/证据请在前端仿真页查看"
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string", "description": "simulation_run 返回的 run_id"},
+            },
+            "required": ["run_id"],
         },
     },
 }
