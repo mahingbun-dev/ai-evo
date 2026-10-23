@@ -3,7 +3,7 @@ import logging
 import threading
 import time
 from dataclasses import asdict, dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 from .engine import Engine
 from .errors import JudgePoolError, JudgePoolRedisSyncError
@@ -125,9 +125,15 @@ def load_config(force: bool = False) -> JudgePoolConfig:
         client = _redis()
         raw = client.hgetall(conf_key())
         if not raw:
-            raw = _mapping_from_config(_load_from_db() or DEFAULTS)
-            client.hset(conf_key(), mapping=raw)
-        cfg = _from_mapping(raw)
+            # Redis 为空 → 以 DB 为准，且只有「DB 读成功并拿到配置行」才回填。
+            # DB 读失败时回填 DEFAULTS 会把故障期的默认值写进热源：Redis 从此非空，
+            # 再也不会回落 DB，运维配置被默认值永久压住
+            db_cfg, db_ok = _load_from_db_checked()
+            if db_ok and db_cfg is not None:
+                client.hset(conf_key(), mapping=_mapping_from_config(db_cfg))
+            cfg = db_cfg or _cached or DEFAULTS
+        else:
+            cfg = _from_mapping(raw)
     except Exception as e:  # noqa: BLE001 - 配置读取失败不能阻断评测
         logger.warning(f"[judge_pool] 读取配置失败，回退持久化配置/上次值/默认值: {e}")
         cfg = _load_from_db() or _cached or DEFAULTS
@@ -137,7 +143,47 @@ def load_config(force: bool = False) -> JudgePoolConfig:
     return cfg
 
 
-def _load_from_db() -> Optional[JudgePoolConfig]:
+def _as_text(value) -> str:
+    """Redis 客户端可能返回 bytes（decode_responses=False）：对账前统一成 str"""
+    return value.decode() if isinstance(value, bytes) else str(value)
+
+
+def reconcile_config_to_redis() -> bool:
+    """DB → Redis 对账：把持久化源的配置拉回热源（扫描周期调用）
+
+    save_config 的 Redis 写可能失败而 DB 已落库，此时 Redis hash 非空且装着旧值，
+    load_config 的「Redis 为空才回落 DB」永远不触发 → 分叉永久化、Redis 永远赢。
+    生产中唯一的写入方（judge_pool_api）用 strict=True，DB 失败不会写 Redis，
+    所以 DB 一定是较新的一侧，可以安全地按 DB 全量覆盖。
+
+    Returns:
+        是否发生了回写（读失败/无行/已一致/写失败都返回 False）
+    """
+    db_cfg, ok = _load_from_db_checked()
+    if not ok or db_cfg is None:
+        # DB 读失败或根本没有配置行：一律不写，用故障态的值覆盖热源等于打回默认
+        return False
+    desired = _mapping_from_config(db_cfg)
+    try:
+        client = _redis()
+        current = client.hgetall(conf_key()) or {}
+        if {_as_text(k): _as_text(v) for k, v in current.items()} == desired:
+            return False
+        client.hset(conf_key(), mapping=desired)
+    except Exception as e:  # noqa: BLE001 - 对账失败不影响其他清理，下轮重试
+        logger.warning(f"[judge_pool] 配置对账失败（下一轮扫描重试）: {e}")
+        return False
+    logger.info("[judge_pool] 配置对账：Redis 与 DB 不一致，已按 DB 全量回写")
+    invalidate_config_cache()
+    return True
+
+
+def _load_from_db_checked() -> Tuple[Optional[JudgePoolConfig], bool]:
+    """读 DB 配置，返回 (配置, 读取是否成功)
+
+    必须区分「没有配置行」与「DB 读失败」：后者若被当成前者，调用方会用
+    DEFAULTS 顶替运维配置（甚至回填进 Redis）。
+    """
     try:
         from app.db.session import SessionLocal
         from app.models.judge_pool_models import JudgePoolConfig as ConfigRow
@@ -145,7 +191,7 @@ def _load_from_db() -> Optional[JudgePoolConfig]:
         with SessionLocal() as db:
             row = db.query(ConfigRow).order_by(ConfigRow.id.asc()).first()
             if not row:
-                return None
+                return None, True
             return JudgePoolConfig(
                 graph_limit=row.graph_limit,
                 claude_agent_limit=row.claude_agent_limit,
@@ -157,10 +203,15 @@ def _load_from_db() -> Optional[JudgePoolConfig]:
                 scan_interval_seconds=row.scan_interval_seconds,
                 audit_retention_days=row.audit_retention_days,
                 fail_open=bool(row.fail_open),
-            )
+            ), True
     except Exception as e:  # noqa: BLE001
         logger.warning(f"[judge_pool] 读取配置表失败: {e}")
-        return None
+        return None, False
+
+
+def _load_from_db() -> Optional[JudgePoolConfig]:
+    cfg, _ok = _load_from_db_checked()
+    return cfg
 
 
 def _save_to_db(payload: dict, updated_by: str = "") -> bool:
@@ -211,6 +262,8 @@ def save_config(payload: dict, updated_by: str = "", strict: bool = False) -> Ju
         _cached = cfg
         _cached_at = time.monotonic()
     if strict and not redis_ok:
-        # 降级成功：DB 已是可靠来源，其他 worker 在 Redis 恢复后经空 Redis 回填
+        # 降级成功：DB 已是可靠来源。注意 Redis hash 此时仍装着旧值（不是空的），
+        # 所以不能指望「空 Redis 回落 DB」；由扫描器的 reconcile_config_to_redis
+        # 在下一个周期按 DB 全量回写，把热源拉回一致
         raise JudgePoolRedisSyncError("配置已落库，Redis 同步失败，恢复后生效", cfg)
     return cfg

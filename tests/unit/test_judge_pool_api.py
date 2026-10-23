@@ -82,6 +82,8 @@ class _FakeCfgRedis:
     def __init__(self):
         self.hashes = {}
         self.fail_hset = False
+        self.db_config = None
+        self.db_ok = True  # DB 读取是否成功（与「没有配置行」区分）
 
     def hgetall(self, key):
         return dict(self.hashes.get(key, {}))
@@ -152,6 +154,9 @@ def real_config(monkeypatch):
     fake = _FakeCfgRedis()
     monkeypatch.setattr(cfg_mod, "_redis", lambda: fake)
     monkeypatch.setattr(cfg_mod, "_load_from_db", lambda: fake.db_config)
+    monkeypatch.setattr(
+        cfg_mod, "_load_from_db_checked", lambda: (fake.db_config, fake.db_ok)
+    )
     monkeypatch.setattr(cfg_mod, "_save_to_db", lambda payload, updated_by="": True)
     fake.db_config = None
     cfg_mod.invalidate_config_cache()

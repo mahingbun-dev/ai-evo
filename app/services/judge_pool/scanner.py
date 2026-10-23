@@ -1,4 +1,4 @@
-"""僵尸扫描：清理过期租约、超时等待者、刷新峰值、清理旧审计"""
+"""僵尸扫描：清理过期租约、超时等待者、刷新峰值、清理旧审计、配置 DB→Redis 对账"""
 import logging
 import socket
 import threading
@@ -6,7 +6,7 @@ import time
 import uuid
 from typing import Optional
 
-from .config import load_config
+from .config import load_config, reconcile_config_to_redis
 from .engine import Engine
 from .redis_keys import leases_key, peak_key, scan_lock_key
 
@@ -59,6 +59,13 @@ class JudgePoolScanner:
         if token is None:
             return
         try:
+            # 先做配置对账（DB 是持久化源）：save_config 的 Redis 写失败会留下
+            # 「DB 新值 / Redis 旧值」的永久分叉，load_config 只在 Redis 为空时
+            # 才回落 DB，所以必须由这里把 Redis 拉回 DB 值
+            try:
+                reconcile_config_to_redis()
+            except Exception as e:  # noqa: BLE001 - 对账失败不影响僵尸清理
+                logger.warning(f"[judge_pool] 配置对账跳过: {e}")
             cfg = load_config()
             client = self._client_or_default()
             redis = self._redis()
