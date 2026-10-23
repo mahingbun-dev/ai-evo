@@ -11,7 +11,14 @@ from app.services.judge_pool.client import AcquireResult, JudgePoolClient, Lease
 from app.services.judge_pool.context import bind_judge_context, clear_current_lease, current_lease
 from app.services.judge_pool.engine import Engine
 from app.services.judge_pool.errors import JudgePoolAborted, JudgePoolTimeout
-from app.services.judge_pool.redis_keys import lease_data_key, leases_key, peak_key, wait_key
+from app.services.judge_pool.redis_keys import (
+    lease_data_key,
+    leases_key,
+    peak_key,
+    wait_alive_key,
+    wait_alive_prefix,
+    wait_key,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -165,7 +172,7 @@ def test_child_thread_does_not_inherit_lease():
 
 
 class _RecordingRedis:
-    """只记录 zrem 的假 redis：用来证明等待者确实被移出 wait zset
+    """只记录写命令的假 redis：用来证明等待者确实被移出 wait zset、存活凭证被删
 
     `object()` 假客户端下 `_drop_waiter` 抛的 AttributeError 会被吞掉，
     缺陷会静默通过，所以这里必须记录调用。
@@ -173,10 +180,35 @@ class _RecordingRedis:
 
     def __init__(self):
         self.zrem_calls = []
+        self.delete_calls = []
+        self.set_calls = []
 
     def zrem(self, key, member):
         self.zrem_calls.append((key, member))
         return 1
+
+    def delete(self, *keys):
+        self.delete_calls.extend(keys)
+        return len(keys)
+
+    def set(self, key, value, ex=None, nx=False):
+        self.set_calls.append((key, value, ex))
+        return True
+
+
+class _RecordingEvalRedis(_RecordingRedis):
+    """再记录 eval：用来断言 ACQUIRE_SCRIPT 的 KEYS/ARGV 契约"""
+
+    def __init__(self, acquired=True):
+        super().__init__()
+        self.eval_calls = []
+        self.acquired = acquired
+
+    def eval(self, script, numkeys, *args):
+        self.eval_calls.append((script, numkeys, args))
+        if script != client_mod.lua.ACQUIRE_SCRIPT:
+            raise AssertionError(f"未预期的脚本调用: {script[:60]!r}")
+        return [1 if self.acquired else 0, 1, [], -1]
 
 
 def test_stop_signal_removes_waiter_from_wait_zset():
@@ -194,6 +226,8 @@ def test_stop_signal_removes_waiter_from_wait_zset():
     key, waiter_id = fake.zrem_calls[0]
     assert key == wait_key(Engine.GRAPH)
     uuid.UUID(waiter_id)  # 出队的正是本次 acquire 生成的 waiter_id
+    # 存活凭证一并删除：残留会让下一个申请者在 Lua 里被误判为「队首仍存活」
+    assert fake.delete_calls == [wait_alive_key(Engine.GRAPH, waiter_id)]
 
 
 def test_wait_timeout_removes_waiter_from_wait_zset(monkeypatch):
@@ -208,6 +242,7 @@ def test_wait_timeout_removes_waiter_from_wait_zset(monkeypatch):
     key, waiter_id = fake.zrem_calls[0]
     assert key == wait_key(Engine.GRAPH)
     assert waiter_id == c.calls[0][1]
+    assert fake.delete_calls == [wait_alive_key(Engine.GRAPH, waiter_id)]
 
 
 def test_redis_error_drops_queued_waiter(monkeypatch):
@@ -236,6 +271,59 @@ def test_redis_error_drops_queued_waiter(monkeypatch):
     key, waiter_id = fake.zrem_calls[0]
     assert key == wait_key(Engine.GRAPH)
     assert waiter_id == c.queued_waiter_ids[0]
+    assert fake.delete_calls == [wait_alive_key(Engine.GRAPH, waiter_id)]
+
+
+def test_drop_waiter_deletes_alive_credential_even_if_zrem_fails():
+    """出队失败不能连带留下存活凭证：两步各自吞异常"""
+
+    class ZremBrokenRedis(_RecordingRedis):
+        def zrem(self, key, member):
+            raise ConnectionError("redis down")
+
+    fake = ZremBrokenRedis()
+    c = JudgePoolClient(redis_client=fake)
+
+    c._drop_waiter(Engine.GRAPH, "w-1")  # 不抛
+
+    assert fake.delete_calls == [wait_alive_key(Engine.GRAPH, "w-1")]
+
+
+def test_try_acquire_refreshes_alive_credential_before_eval():
+    """排队前必须先挂存活凭证，TTL 远大于轮询退避上限（2s），否则会被误判幽灵"""
+    fake = _RecordingEvalRedis()
+    c = JudgePoolClient(redis_client=fake)
+
+    result = c._try_acquire(Engine.GRAPH, "lease-1", {"lease_id": "lease-1"}, _cfg())
+
+    assert result.acquired is True
+    assert fake.set_calls == [
+        (wait_alive_key(Engine.GRAPH, "lease-1"), "1", client_mod.WAIT_ALIVE_TTL_SECONDS)
+    ]
+    assert client_mod.WAIT_ALIVE_TTL_SECONDS >= 10
+
+
+def test_try_acquire_eval_argv_contract():
+    """ARGV 契约：8 项，末项是存活凭证前缀（Lua 侧按 waiter_id 拼接判活）"""
+    fake = _RecordingEvalRedis()
+    c = JudgePoolClient(redis_client=fake)
+    cfg = _cfg()
+
+    c._try_acquire(Engine.GRAPH, "lease-1", {"lease_id": "lease-1"}, cfg)
+
+    script, numkeys, args = fake.eval_calls[0]
+    assert script == client_mod.lua.ACQUIRE_SCRIPT
+    assert numkeys == 3
+    keys, argv = list(args[:numkeys]), list(args[numkeys:])
+    assert keys == [leases_key(Engine.GRAPH), lease_data_key(Engine.GRAPH), wait_key(Engine.GRAPH)]
+    assert len(argv) == 8, f"ARGV 必须是 8 项（含存活凭证前缀）: {argv}"
+    assert argv[1] == cfg.lease_ttl_seconds * 1000
+    assert argv[2] == cfg.graph_limit
+    assert argv[3] == argv[4] == "lease-1"  # lease_id 与 waiter_id 同值
+    assert json.loads(argv[5]) == {"lease_id": "lease-1"}
+    assert argv[6] == int(argv[0]) - cfg.wait_timeout_seconds * 1000
+    assert argv[7] == wait_alive_prefix(Engine.GRAPH)
+    assert argv[7] + "lease-1" == wait_alive_key(Engine.GRAPH, "lease-1")
 
 
 def test_renew_failure_clears_thread_local_lease():

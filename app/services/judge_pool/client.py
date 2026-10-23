@@ -17,9 +17,13 @@ from .context import clear_current_lease, current_judge_context, current_lease, 
 from .engine import Engine, coerce_engine
 from .errors import JudgePoolAborted, JudgePoolTimeout
 from .heartbeat import get_heartbeat
-from .redis_keys import lease_data_key, leases_key, peak_key, wait_key
+from .redis_keys import lease_data_key, leases_key, peak_key, wait_alive_key, wait_alive_prefix, wait_key
 
 logger = logging.getLogger(__name__)
+
+# 等待者存活凭证有效期：必须远大于排队轮询的退避上限（_sleep 最大 2s），
+# 否则存活的等待者会被 Lua 误判为幽灵队首而被踢出队列（丢失 FIFO 位次）
+WAIT_ALIVE_TTL_SECONDS = 30
 
 
 @dataclass
@@ -276,12 +280,17 @@ class JudgePoolClient:
 
     def _try_acquire(self, engine, lease_id, detail, cfg) -> AcquireResult:
         now = _now_ms()
+        alive_key = wait_alive_key(engine, lease_id)
+        # 每轮排队都刷新存活凭证：Lua 侧凭「凭证是否存在」判定队首等待者是否已死。
+        # 凭证 SET 失败按 Redis 不可用处理，由 acquire 的 fail-open 分支接管
+        self._client().set(alive_key, "1", ex=WAIT_ALIVE_TTL_SECONDS)
         res = self._client().eval(
             lua.ACQUIRE_SCRIPT, 3,
             leases_key(engine), lease_data_key(engine), wait_key(engine),
             now, cfg.lease_ttl_seconds * 1000, cfg.limit_for(engine),
             lease_id, lease_id, json.dumps(detail, ensure_ascii=False),
             now - cfg.wait_timeout_seconds * 1000,
+            wait_alive_prefix(engine),
         )
         return AcquireResult(bool(res[0]), int(res[1]), list(res[2] or []), int(res[3]))
 
@@ -299,7 +308,17 @@ class JudgePoolClient:
 
     def _drop_waiter(self, engine, waiter_id) -> None:
         try:
-            self._client().zrem(wait_key(engine), waiter_id)
+            client = self._client()
+        except Exception:  # noqa: BLE001
+            return
+        # 两步各自吞异常：出队失败不能让存活凭证残留（幽灵队首要等 TTL 才可回收），
+        # 删凭证失败也不影响已完成的出队
+        try:
+            client.zrem(wait_key(engine), waiter_id)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            client.delete(wait_alive_key(engine, waiter_id))
         except Exception:  # noqa: BLE001
             pass
 

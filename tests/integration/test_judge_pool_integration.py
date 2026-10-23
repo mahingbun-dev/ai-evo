@@ -27,7 +27,8 @@ from app.services.judge_pool import client as client_mod
 from app.services.judge_pool.client import JudgePoolClient
 from app.services.judge_pool.config import invalidate_config_cache, load_config, save_config
 from app.services.judge_pool.engine import Engine
-from app.services.judge_pool.redis_keys import lease_data_key, leases_key, wait_key
+from app.services.judge_pool.errors import JudgePoolTimeout
+from app.services.judge_pool.redis_keys import lease_data_key, leases_key, wait_alive_key, wait_key
 
 pytestmark = [pytest.mark.integration]
 
@@ -396,7 +397,86 @@ def test_sigkill_process_lease_reclaimed_by_prune(redis_client, idle_pool):
         client.force_release(ENGINE, lease_id)  # 断言失败时的兜底清理
 
 
+# ---------------------------------------------------------------- 幽灵等待者
+
+
+def test_dead_waiter_head_does_not_block_acquire(redis_client, idle_pool):
+    """死亡等待者（无存活凭证）不得卡住 FIFO 队首。
+
+    等待者被 SIGKILL / 硬超时杀掉后无法 ZREM 自己；它占据队首时 am_head=false，
+    即使 active=0，所有后来者也会被拒到 wait_timeout（默认 900s）过期为止。
+    """
+    _apply(graph_limit=8, wait_timeout_seconds=30)
+    ghost = f"ghost-{uuid.uuid4()}"
+    # 入队分数必须严格早于本轮申请的 now：同毫秒时 ZRANGE 按字典序决定队首，
+    # 后来者可能排到注入等待者前面，用例就测不到「幽灵队首被回收」
+    redis_client.zadd(wait_key(ENGINE), {ghost: int(time.time() * 1000) - 5000})
+    client = JudgePoolClient()
+    try:
+        assert redis_client.zcard(leases_key(ENGINE)) == 0, "前置条件：池必须空闲"
+        assert redis_client.zcard(wait_key(ENGINE)) == 1, "前置条件：幽灵必须在队首"
+
+        started = time.monotonic()
+        lease = client.acquire(ENGINE, wait_timeout=30)
+        try:
+            # 修复前：这里会一直排到 wait_timeout 后抛 JudgePoolTimeout
+            assert lease.unavailable is False, "Redis 可用时不该走 fail-open"
+            assert time.monotonic() - started < 10, "被幽灵队首挡住（未在 10s 内拿到额度）"
+            assert redis_client.zscore(wait_key(ENGINE), ghost) is None, "幽灵队首未被回收"
+            assert redis_client.exists(wait_alive_key(ENGINE, lease.lease_id)) == 0, (
+                "拿到租约后自己的存活凭证必须删除"
+            )
+        finally:
+            client.release(lease)
+    finally:
+        redis_client.zrem(wait_key(ENGINE), ghost)
+        redis_client.delete(wait_alive_key(ENGINE, ghost))
+
+
+def test_live_waiter_head_still_blocks_latecomer(redis_client, idle_pool):
+    """存活队首（有存活凭证）仍须挡住后来者：幽灵回收不能破坏 FIFO 公平性。
+
+    wait_timeout_seconds 必须留足（30s）：它同时是等待队列的 stale 阈值，
+    设成 2s 会让存活队首在本用例等待期间被 ZREMRANGEBYSCORE 当成陈旧等待者
+    清掉，断言就退化成「池空 → 直接拿到额度」。本用例的等待预算由 acquire
+    的 wait_timeout 参数单独给（只影响 deadline，不影响 stale 阈值）。
+    """
+    _apply(graph_limit=8, wait_timeout_seconds=30)
+    live = f"live-{uuid.uuid4()}"
+    # 同毫秒入队会被字典序决定队首（"live-..." 排在十六进制 uuid 之后），
+    # 后来者就成了队首并直接拿到额度；提前 5s 入队保证它稳定占据队首，
+    # 且 5s < stale 阈值 30s，不会被 ZREMRANGEBYSCORE 当成陈旧等待者清掉
+    redis_client.zadd(wait_key(ENGINE), {live: int(time.time() * 1000) - 5000})
+    redis_client.set(wait_alive_key(ENGINE, live), "1", ex=60)
+    client = JudgePoolClient()
+    try:
+        assert redis_client.zcard(leases_key(ENGINE)) == 0, "前置条件：池必须空闲"
+
+        granted = None
+        try:
+            granted = client.acquire(ENGINE, wait_timeout=2)
+        except JudgePoolTimeout:
+            pass
+        if granted is not None:
+            pytest.fail(
+                "存活队首未挡住后来者："
+                f"reentrant={granted.reentrant} unavailable={granted.unavailable} "
+                f"wait_zset={redis_client.zrange(wait_key(ENGINE), 0, -1)} "
+                f"alive_key_exists={redis_client.exists(wait_alive_key(ENGINE, live))} "
+                f"active={redis_client.zcard(leases_key(ENGINE))}"
+            )
+
+        assert redis_client.zscore(wait_key(ENGINE), live) is not None, "存活队首被误删"
+        assert redis_client.exists(wait_alive_key(ENGINE, live)) == 1, "存活凭证被误删"
+        # 后来者自己的排队痕迹必须清干净（idle_pool teardown 也断言 wait 队列为空）
+        assert redis_client.zcard(wait_key(ENGINE)) == 1
+    finally:
+        redis_client.zrem(wait_key(ENGINE), live)
+        redis_client.delete(wait_alive_key(ENGINE, live))
+
+
 # ---------------------------------------------------------------- 跨进程上限
+
 
 _MP_WORKER_SCRIPT = """
 import json, sys, time
