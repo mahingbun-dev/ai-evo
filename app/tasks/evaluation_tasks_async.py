@@ -1120,6 +1120,10 @@ def _execute_plugin_evaluation(task, payloads: List[Dict], task_id: str, db, sto
     results = []
     total = len(rows)
 
+    # 行级 judge 上下文：插件评测的裁判调用会在池里排队，绑定任务/行/停止信号
+    # 才能归属租约并在排队期响应停止（否则停止要等满 wait_timeout）
+    from app.services.judge_pool import bind_judge_context
+
     for idx, payload in enumerate(rows):
         if stop_event and stop_event.is_set():
             logger.info(f"插件评测任务 {task_id} 收到停止信号，已完成 {len(results)}/{total} 行")
@@ -1145,7 +1149,12 @@ def _execute_plugin_evaluation(task, payloads: List[Dict], task_id: str, db, sto
             plugin_path = _row_field("plugin_path").strip()
             skill_content = _row_field("skill_content")
 
-            row = evaluator.evaluate(plugin_path=plugin_path, skill_content=skill_content)
+            with bind_judge_context(
+                eval_task_id=task_id,
+                row_idx=payload.get("_orig_idx", idx),
+                stop_checker=stop_event,
+            ):
+                row = evaluator.evaluate(plugin_path=plugin_path, skill_content=skill_content)
             row["idx"] = payload.get("_orig_idx", payload.get("idx", idx))
             row.update(input_variables)
             if market_info:
@@ -1252,6 +1261,10 @@ def _execute_plugin_trace_evaluation(task, payloads: List[Dict], task_id: str, d
         except Exception as e:  # 日志不可用不阻断评测
             logger.warning(f"[插件Trace评测] 写任务日志失败（忽略）: {e}")
 
+    # 行级 judge 上下文：trace 行的裁判调用会在池里排队，绑定任务/行/停止信号
+    # 才能归属租约并在排队期响应停止（否则停止要等满 wait_timeout）
+    from app.services.judge_pool import bind_judge_context
+
     for idx, payload in enumerate(payloads):
         if stop_event and stop_event.is_set():
             logger.info(f"插件 trace 评测任务 {task_id} 收到停止信号，已完成 {len(results)}/{total} 行")
@@ -1291,9 +1304,14 @@ def _execute_plugin_trace_evaluation(task, payloads: List[Dict], task_id: str, d
                 if elapsed % 600 < 60:
                     _add_log("info", f"[{row_no}/{total}] 评测动作执行中（已 {max(1, elapsed // 60)} 分钟）")
 
-            row = evaluator.evaluate_trace(
-                package_dir, on_tick=_on_tick, design_cache=design_cache
-            )
+            with bind_judge_context(
+                eval_task_id=task_id,
+                row_idx=payload.get("_orig_idx", idx),
+                stop_checker=stop_event,
+            ):
+                row = evaluator.evaluate_trace(
+                    package_dir, on_tick=_on_tick, design_cache=design_cache
+                )
             row["idx"] = payload.get("_orig_idx", payload.get("idx", idx))
             row.update(input_variables)
             results.append(row)

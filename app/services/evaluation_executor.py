@@ -55,9 +55,10 @@ class EvaluationExecutor:
             concurrency: 任务级行并发数（EvaluationTask.concurrency）；None 时
                 沿用 max_workers，钳制到 1~64
         """
-        self.concurrency = concurrency
         base = concurrency if concurrency is not None else max_workers
         self.max_workers = max(1, min(int(base or 1), 64))
+        # 公开属性与实际行为一致：存钳制后的值（入参 999 实际只跑 64）
+        self.concurrency = self.max_workers
         self.task_id = task_id
         self.stop_event = stop_event or threading.Event()
         self.langfuse_host = langfuse_host
@@ -931,6 +932,11 @@ class EvaluationExecutor:
 
             result["success"] = True
 
+        except JudgePoolAborted:
+            # 中止 = 任务已停止，不是本行评测失败。JudgePoolAborted 是 RuntimeError
+            # 子类，若被下面的宽 except 吞掉，execute_batch 的停止行分支永远走不到；
+            # 上抛后 finally 仍清理本条工作区。JudgePoolTimeout 保持失败行语义，不在此列。
+            raise
         except Exception as e:
             logger.exception("评测执行失败")
             result["error"] = str(e)
@@ -1476,6 +1482,10 @@ class EvaluationExecutor:
                 "reasons": eval_result.get("reasons", {}),
             })
 
+        except JudgePoolAborted:
+            # 中止 = 任务已停止，不是 RAG 行失败：上抛给 execute_batch_rag 的
+            # 停止行分支（同 _evaluate_single_inner 口径，超时仍按失败行处理）
+            raise
         except Exception as e:
             logger.exception("RAG 评测执行失败")
             result["error"] = str(e)

@@ -13,6 +13,7 @@ from typing import Dict, Any, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from langgraph.graph.state import CompiledStateGraph
 from app.services.judge_pool.context import capture_context, run_in_context
+from app.services.judge_pool.errors import JudgePoolAborted
 from .judge_graph_builder import compile_judge_graph
 from .judge_graph_state import JudgeAgentState
 import uuid
@@ -97,6 +98,10 @@ class JudgeLangGraphAgent:
 
         try:
             result_state = self.graph.invoke(state_input, config)
+        except JudgePoolAborted:
+            # 池等待期间任务被停止：停止不是裁判失败，上抛走停止收尾
+            # （不能被下面的宽 except 记成 judge_failed=True/llm_error）
+            raise
         except Exception as e:
             logger.exception(f"[JudgeAgent] 裁判 {judge_index} 执行失败")
             # W2-1 失败显式标记：score 置 None + judge_failed=True，
@@ -161,6 +166,9 @@ class JudgeLangGraphAgent:
             for future in as_completed(futures):
                 try:
                     results.append(future.result())
+                except JudgePoolAborted:
+                    # 停止信号导致的池中止不记裁判失败：上抛交给任务停止收尾
+                    raise
                 except Exception as e:
                     logger.error(f"[JudgeAgent] 并行执行中某个裁判失败: {e}")
                     # W2-1 失败显式标记（同 run 的异常分支口径）

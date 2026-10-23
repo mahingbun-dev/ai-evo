@@ -9,6 +9,12 @@
 4. 池等待超时（JudgePoolTimeout）在插件行循环不得按行失败慢速消耗——
    与软超时同等上抛，任务快速失败；
 5. API/Service 透传 concurrency。
+
+补充（评审修复，注入点均在真实链路）：
+6. 中止从裁判层（CC agent run_parallel / RAGEvaluator）注入后，execute_batch(_rag)
+   的行必须是「任务已停止」，而不是被 _evaluate_single_inner 的宽 except 吞成普通失败；
+7. 插件 evaluate / evaluate_trace 行内读到的是绑定的 stop_checker（停止可中止）；
+8. graph 引擎 run / run_parallel 原样上抛 JudgePoolAborted，不记 judge_failed。
 """
 from unittest.mock import MagicMock, patch
 
@@ -227,3 +233,235 @@ class TestApiAndServiceConcurrency:
 
         # None 不写回（避免把已有值清空）；模型属性保持原值
         assert existing.concurrency == 4
+
+
+# ==================== 评审修复：在真实链路注入中止 ====================
+
+
+class _StopAfterFirstCheck:
+    """第一次 is_set()（行首检查）为 False，之后为 True
+
+    模拟「行已开始执行后用户才点停止」：行首检查放行，等到池里排队时停止已置位。
+    """
+
+    def __init__(self):
+        self.calls = 0
+
+    def is_set(self):
+        self.calls += 1
+        return self.calls > 1
+
+
+def _mock_judge_task(judge_engine="claude_agent"):
+    return type("Task", (), {
+        "id": "task_real_chain",
+        "evaluation_type": "judge",
+        "judge_engine": judge_engine,
+        "judge_count": 1,
+        "model_config": {"provider": "openai"},
+        "model_provider": None,
+        "max_score": 10,
+        "evaluation_metrics": [{"name": "维度A"}],
+        "judge_variable_config": {},
+        "evaluation_targets": None,
+        "runtime_variables": {},
+    })()
+
+
+class TestPoolAbortThroughJudgeChain:
+    """中止注入点在裁判层，走真实 _evaluate_single_inner / RAG 内层
+
+    回归点：内层方法体自带宽 except Exception（RuntimeError 子类会被吞成
+    「评测执行失败」行），执行器的 except JudgePoolAborted 必须是活的。
+    """
+
+    def test_execute_batch_row_stopped_when_cc_judge_aborts(self):
+        task = _mock_judge_task("claude_agent")
+        executor = EvaluationExecutor(max_workers=1, task_id="task_real_chain")
+        with patch("app.services.prompt_builder.PromptBuilder") as mock_pb, \
+             patch("app.services.variable_injector.VariableInjector") as mock_vi, \
+             patch("app.services.claude_code_judge_agent.ClaudeCodeJudgeAgent") as mock_cc, \
+             patch("app.services.model_caller.ModelCallerSync") as mock_caller:
+            mock_pb.return_value.build_user_prompt_from_judge_vars.return_value = "user prompt"
+            mock_pb.return_value._build_system_prompt.return_value = "system prompt"
+            mock_vi.return_value.build_judge_payload.return_value = {"user_input": "x"}
+            mock_vi.return_value.script_output_missing = []
+            mock_caller.return_value.call.return_value = {
+                "success": True, "content": "模型输出", "chain_results": [],
+            }
+            mock_cc.return_value.run_parallel.side_effect = JudgePoolAborted(
+                "并发池等待被中止（引擎 graph）"
+            )
+
+            results = executor.execute_batch(
+                [{"idx": 0, "user_input": "问题", "_dataset_item": {}}], task
+            )
+
+        assert results[0]["success"] is False
+        assert results[0]["error"] == "任务已停止"
+
+    def test_execute_batch_graph_judge_timeout_stays_row_failure(self):
+        """池超时保持行失败语义（不像中止那样上抛）"""
+        task = _mock_judge_task("claude_agent")
+        executor = EvaluationExecutor(max_workers=1, task_id="task_real_chain")
+        with patch("app.services.prompt_builder.PromptBuilder") as mock_pb, \
+             patch("app.services.variable_injector.VariableInjector") as mock_vi, \
+             patch("app.services.claude_code_judge_agent.ClaudeCodeJudgeAgent") as mock_cc, \
+             patch("app.services.model_caller.ModelCallerSync") as mock_caller:
+            mock_pb.return_value.build_user_prompt_from_judge_vars.return_value = "user prompt"
+            mock_pb.return_value._build_system_prompt.return_value = "system prompt"
+            mock_vi.return_value.build_judge_payload.return_value = {"user_input": "x"}
+            mock_vi.return_value.script_output_missing = []
+            mock_caller.return_value.call.return_value = {
+                "success": True, "content": "模型输出", "chain_results": [],
+            }
+            mock_cc.return_value.run_parallel.side_effect = JudgePoolTimeout(
+                "并发池等待超时（引擎 graph，等待 900s）"
+            )
+
+            results = executor.execute_batch(
+                [{"idx": 0, "user_input": "问题", "_dataset_item": {}}], task
+            )
+
+        assert results[0]["success"] is False
+        assert "并发池等待超时" in results[0]["error"]
+
+    def test_execute_batch_rag_row_stopped_when_rag_judge_aborts(self):
+        task = MagicMock()
+        task.rag_config = {"metrics": ["answer_relevancy"]}
+        task.judge_variable_config = {}
+        task.judge_model = None
+        executor = EvaluationExecutor(max_workers=1, task_id="task_rag_chain")
+        with patch(
+            "app.services.config_snapshot.resolve_model_call_config",
+            return_value=({"provider": "openai"}, "test"),
+        ), patch("app.services.model_caller.ModelCallerSync") as mock_caller, \
+           patch("app.services.rag_evaluator.RAGEvaluator") as mock_rag:
+            mock_caller.return_value.call.return_value = {
+                "success": True, "content": "答案", "chain_results": [],
+            }
+            mock_rag.return_value.evaluate.side_effect = JudgePoolAborted(
+                "并发池等待被中止（引擎 graph）"
+            )
+
+            results = executor.execute_batch_rag([{"idx": 0, "user_input": "问题"}], task)
+
+        assert results[0]["success"] is False
+        assert results[0]["error"] == "任务已停止"
+
+
+class TestPluginRowBindsJudgeContext:
+    """插件两条行循环必须把任务/行/停止信号绑进池调用（否则停止要等 900s 超时）"""
+
+    def test_evaluate_row_binds_stop_checker(self, monkeypatch):
+        from app.tasks.evaluation_tasks_async import _execute_plugin_evaluation
+
+        stop_event = _StopAfterFirstCheck()
+        seen = {}
+
+        def fake_evaluate(self, **kwargs):
+            ctx = current_judge_context()
+            seen["stop_checker"] = ctx.stop_checker
+            seen["eval_task_id"] = ctx.eval_task_id
+            seen["row_idx"] = ctx.row_idx
+            # 真实 acquirer 的判定：停止已置位 → 池等待中止
+            if ctx.stop_checker is not None and ctx.stop_checker.is_set():
+                raise JudgePoolAborted("并发池等待被中止（引擎 plugin）")
+            return {"success": True, "average_score": 80.0}
+
+        monkeypatch.setattr(
+            "app.services.plugin_evaluator.PluginEvaluator.evaluate", fake_evaluate
+        )
+        task = MagicMock()
+        task.plugin_config = {"depth": "quick", "source": "manual"}
+        payloads = [{"idx": 0, "_orig_idx": 5, "plugin_path": "/p"}]
+
+        with patch("app.tasks.evaluation_tasks_async._persist_row"), \
+             patch("app.tasks.evaluation_tasks_async._update_progress"):
+            with pytest.raises(JudgePoolAborted):
+                _execute_plugin_evaluation(
+                    task, payloads, "task-plugin", None, stop_event, execution_number=1
+                )
+
+        assert seen["stop_checker"] is stop_event
+        assert seen["eval_task_id"] == "task-plugin"
+        assert seen["row_idx"] == 5
+
+    def test_trace_row_binds_stop_checker(self, monkeypatch):
+        from app.tasks.evaluation_tasks_async import _execute_plugin_trace_evaluation
+
+        stop_event = _StopAfterFirstCheck()
+        seen = {}
+
+        def fake_evaluate_trace(self, package_dir, on_tick=None, design_cache=None):
+            ctx = current_judge_context()
+            seen["stop_checker"] = ctx.stop_checker
+            seen["eval_task_id"] = ctx.eval_task_id
+            seen["row_idx"] = ctx.row_idx
+            if ctx.stop_checker is not None and ctx.stop_checker.is_set():
+                raise JudgePoolAborted("并发池等待被中止（引擎 plugin）")
+            return {"success": True, "evaluation_mode": "trace", "trace": {"mode": "trace"}}
+
+        monkeypatch.setattr(
+            "app.services.plugin_evaluator.PluginEvaluator.evaluate_trace",
+            fake_evaluate_trace,
+        )
+        monkeypatch.setattr(
+            "app.services.hub_file_service.get_hub_file_fields",
+            lambda db, ds: ["hub_file_id"],
+        )
+        task = MagicMock()
+        task.plugin_config = {"depth": "quick", "source": "trace"}
+        payloads = [{"_orig_idx": 7, "_dataset_item": {"data": {"hub_file_id": "/p"}}}]
+
+        with patch("app.tasks.evaluation_tasks_async._persist_row"), \
+             patch("app.tasks.evaluation_tasks_async._update_progress"):
+            with pytest.raises(JudgePoolAborted):
+                _execute_plugin_trace_evaluation(
+                    task, payloads, "task-trace", None, stop_event, execution_number=1
+                )
+
+        assert seen["stop_checker"] is stop_event
+        assert seen["eval_task_id"] == "task-trace"
+        assert seen["row_idx"] == 7
+
+
+class TestGraphAgentPoolAbort:
+    """graph 引擎（存量任务兜底）不得把中止记成裁判失败"""
+
+    def _make_agent(self):
+        from app.services.judge_langgraph_agent import JudgeLangGraphAgent
+
+        agent = JudgeLangGraphAgent.__new__(JudgeLangGraphAgent)
+        agent.task = MagicMock()
+        agent.langfuse_host = ""
+        agent.graph = MagicMock()
+        return agent
+
+    def test_run_reraises_pool_abort(self):
+        agent = self._make_agent()
+        agent.graph.invoke.side_effect = JudgePoolAborted("并发池等待被中止（引擎 graph）")
+
+        with pytest.raises(JudgePoolAborted):
+            agent.run({"task_id": "t"}, judge_index=0)
+
+    def test_run_parallel_reraises_pool_abort(self, monkeypatch):
+        agent = self._make_agent()
+
+        def aborting_run(state_input, judge_index=0):
+            raise JudgePoolAborted("并发池等待被中止（引擎 graph）")
+
+        monkeypatch.setattr(agent, "run", aborting_run)
+
+        with pytest.raises(JudgePoolAborted):
+            agent.run_parallel({"task_id": "t"}, judge_count=2)
+
+
+class TestClampedConcurrencyAttribute:
+    """公开属性与实际行为一致：concurrency 存夹取后的值"""
+
+    def test_concurrency_attribute_is_clamped(self):
+        executor = EvaluationExecutor(max_workers=4, concurrency=999)
+        assert executor.concurrency == 64
+        assert executor.max_workers == 64
+
