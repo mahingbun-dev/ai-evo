@@ -762,6 +762,11 @@ def _execute_consistency_evaluation(task, payloads: List[Dict], db, task_id: str
         except SoftTimeLimitExceeded:
             # W3-4：软超时不得按行失败吞掉（P0-E），上抛触发收尾
             raise
+        except JudgePoolTimeout:
+            # 池等待超时不能按行失败慢速消耗（每行都要再等满 wait_timeout）：
+            # 与软超时同等上抛，任务带着明确的超时信息快速失败
+            # （口径与插件评测 / trace 评测的行循环一致）
+            raise
         except JudgePoolAborted:
             # 池等待期间任务被停止：上抛走停止收尾，不记该行评测失败
             raise

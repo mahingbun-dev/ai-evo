@@ -13,7 +13,7 @@ from typing import Dict, Any, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from langgraph.graph.state import CompiledStateGraph
 from app.services.judge_pool.context import capture_context, run_in_context
-from app.services.judge_pool.errors import JudgePoolAborted
+from app.services.judge_pool.errors import JudgePoolAborted, JudgePoolTimeout
 from .judge_graph_builder import compile_judge_graph
 from .judge_graph_state import JudgeAgentState
 import uuid
@@ -102,6 +102,11 @@ class JudgeLangGraphAgent:
             # 池等待期间任务被停止：停止不是裁判失败，上抛走停止收尾
             # （不能被下面的宽 except 记成 judge_failed=True/llm_error）
             raise
+        except JudgePoolTimeout:
+            # 池满等待超时同样上抛：它要由行级逻辑落成「失败行」（携带额度耗尽的
+            # 真实原因），被这里吞掉就只剩一个语义错误的 judge_failed/llm_error，
+            # 运维据此判断不出是额度不够还是裁判模型报错
+            raise
         except Exception as e:
             logger.exception(f"[JudgeAgent] 裁判 {judge_index} 执行失败")
             # W2-1 失败显式标记：score 置 None + judge_failed=True，
@@ -168,6 +173,9 @@ class JudgeLangGraphAgent:
                     results.append(future.result())
                 except JudgePoolAborted:
                     # 停止信号导致的池中止不记裁判失败：上抛交给任务停止收尾
+                    raise
+                except JudgePoolTimeout:
+                    # 池满等待超时上抛，由行级逻辑落失败行（口径同 run）
                     raise
                 except Exception as e:
                     logger.error(f"[JudgeAgent] 并行执行中某个裁判失败: {e}")

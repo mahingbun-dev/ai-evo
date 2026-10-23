@@ -15,6 +15,11 @@
    的行必须是「任务已停止」，而不是被 _evaluate_single_inner 的宽 except 吞成普通失败；
 7. 插件 evaluate / evaluate_trace 行内读到的是绑定的 stop_checker（停止可中止）；
 8. graph 引擎 run / run_parallel 原样上抛 JudgePoolAborted，不记 judge_failed。
+
+补充（终审 I-QA1：池超时同样不得在 agent 层被洗成 judge_failed）：
+9. graph / claude_agent 两个引擎的 run(_single) 与 run_parallel 原样上抛
+   JudgePoolTimeout，由行级逻辑落「失败行」（携带额度耗尽的真实原因）；
+10. 一致性行循环与插件 / trace 行循环同口径上抛 JudgePoolTimeout。
 """
 from unittest.mock import MagicMock, patch
 
@@ -180,6 +185,71 @@ class TestPoolAbortInRowLoops:
              patch("app.tasks.evaluation_tasks_async._update_progress"):
             with pytest.raises(JudgePoolAborted):
                 _execute_plugin_trace_evaluation(task, payloads, "task-1", None, None, execution_number=1)
+
+    def test_consistency_loop_reraises_pool_timeout(self, monkeypatch):
+        """一致性行循环与插件/trace 同口径：池超时上抛，不按行失败慢速消耗
+
+        缺这一条时，每行都要各自排满 wait_timeout（900s）再落一行失败，
+        10 行的任务要卡 2.5 小时才结束，且结果里看不出是额度不够。
+        """
+        from app.tasks.evaluation_tasks_async import _execute_consistency_evaluation
+
+        monkeypatch.setattr(
+            "app.services.config_snapshot.resolve_model_call_config",
+            lambda task, db: ({"provider": "openai"}, "test"),
+        )
+        monkeypatch.setattr(
+            "app.services.config_snapshot.resolve_judge_call_config",
+            lambda task, db: ({"provider": "openai"}, "test"),
+        )
+
+        async def timeout(self, *args, **kwargs):
+            raise JudgePoolTimeout("并发池等待超时（引擎 graph，等待 900s）")
+
+        monkeypatch.setattr(
+            "app.services.consistency_evaluator.ConsistencyEvaluator.evaluate_single", timeout
+        )
+        task = MagicMock()
+        task.consistency_config = {"repeat_count": 2, "use_judge": True}
+        task.evaluation_metrics = [{"name": "维度A"}]
+        payloads = [{"idx": 0, "_orig_idx": 0, "user_input": "q"}]
+
+        with patch("app.tasks.evaluation_tasks_async._persist_row"), \
+             patch("app.tasks.evaluation_tasks_async._update_progress"):
+            with pytest.raises(JudgePoolTimeout):
+                _execute_consistency_evaluation(
+                    task, payloads, MagicMock(), "task-1", None, execution_number=1
+                )
+
+    def test_consistency_loop_reraises_pool_abort(self, monkeypatch):
+        from app.tasks.evaluation_tasks_async import _execute_consistency_evaluation
+
+        monkeypatch.setattr(
+            "app.services.config_snapshot.resolve_model_call_config",
+            lambda task, db: ({"provider": "openai"}, "test"),
+        )
+        monkeypatch.setattr(
+            "app.services.config_snapshot.resolve_judge_call_config",
+            lambda task, db: ({"provider": "openai"}, "test"),
+        )
+
+        async def aborted(self, *args, **kwargs):
+            raise JudgePoolAborted("并发池等待被中止（引擎 graph）")
+
+        monkeypatch.setattr(
+            "app.services.consistency_evaluator.ConsistencyEvaluator.evaluate_single", aborted
+        )
+        task = MagicMock()
+        task.consistency_config = {"repeat_count": 2, "use_judge": True}
+        task.evaluation_metrics = [{"name": "维度A"}]
+        payloads = [{"idx": 0, "_orig_idx": 0, "user_input": "q"}]
+
+        with patch("app.tasks.evaluation_tasks_async._persist_row"), \
+             patch("app.tasks.evaluation_tasks_async._update_progress"):
+            with pytest.raises(JudgePoolAborted):
+                _execute_consistency_evaluation(
+                    task, payloads, MagicMock(), "task-1", None, execution_number=1
+                )
 
 
 class TestApiAndServiceConcurrency:
@@ -455,6 +525,104 @@ class TestGraphAgentPoolAbort:
 
         with pytest.raises(JudgePoolAborted):
             agent.run_parallel({"task_id": "t"}, judge_count=2)
+
+    def test_run_reraises_pool_timeout(self):
+        """池等待超时不得被洗成 judge_failed/llm_error
+
+        被 run 的宽 except 吞掉后，上层拿到的是一个「裁判执行失败」结果，
+        行仍按普通失败落库：额度耗尽（900s 排队超时）与裁判模型报错在结果里
+        无法区分，运维判断不出该扩额度还是该查模型。
+        """
+        agent = self._make_agent()
+        agent.graph.invoke.side_effect = JudgePoolTimeout(
+            "并发池等待超时（引擎 graph，等待 900s）"
+        )
+
+        with pytest.raises(JudgePoolTimeout):
+            agent.run({"task_id": "t"}, judge_index=0)
+
+    def test_run_parallel_reraises_pool_timeout(self, monkeypatch):
+        agent = self._make_agent()
+
+        def timing_out_run(state_input, judge_index=0):
+            raise JudgePoolTimeout("并发池等待超时（引擎 graph，等待 900s）")
+
+        monkeypatch.setattr(agent, "run", timing_out_run)
+
+        with pytest.raises(JudgePoolTimeout):
+            agent.run_parallel({"task_id": "t"}, judge_count=2)
+
+
+class TestClaudeCodeAgentPoolErrors:
+    """claude_agent 引擎：池异常必须原样上抛，不记 judge_failed"""
+
+    def _make_agent(self, monkeypatch, query_raises):
+        from app.services.claude_code_judge_agent import ClaudeCodeJudgeAgent
+
+        agent = ClaudeCodeJudgeAgent.__new__(ClaudeCodeJudgeAgent)
+        agent.task = MagicMock()
+        agent.langfuse_host = ""
+        monkeypatch.setattr(agent, "_build_final_prompt", lambda user_prompt, session_file: "final")
+        monkeypatch.setattr(agent, "_query_agent", lambda config, system_prompt, prompt: query_raises())
+        return agent
+
+    def test_run_single_reraises_pool_abort(self, monkeypatch):
+        def aborted():
+            raise JudgePoolAborted("并发池等待被中止（引擎 claude_agent）")
+
+        agent = self._make_agent(monkeypatch, aborted)
+
+        with pytest.raises(JudgePoolAborted):
+            agent._run_single({"model": "m"}, "sys", "user", None, 0)
+
+    def test_run_single_reraises_pool_timeout(self, monkeypatch):
+        """同 graph 引擎口径：超时上抛，由执行器落「失败行」而非 judge_failed"""
+
+        def timed_out():
+            raise JudgePoolTimeout("并发池等待超时（引擎 claude_agent，等待 900s）")
+
+        agent = self._make_agent(monkeypatch, timed_out)
+
+        with pytest.raises(JudgePoolTimeout):
+            agent._run_single({"model": "m"}, "sys", "user", None, 0)
+
+    def test_run_parallel_reraises_pool_timeout(self, monkeypatch):
+        from app.services.claude_code_judge_agent import ClaudeCodeJudgeAgent
+
+        agent = ClaudeCodeJudgeAgent.__new__(ClaudeCodeJudgeAgent)
+        agent.task = MagicMock()
+        agent.langfuse_host = ""
+        monkeypatch.setattr(
+            "app.services.claude_code_config_service.ClaudeCodeConfigService.get_active_config",
+            staticmethod(lambda: {"model": "m"}),
+        )
+
+        def timing_out_single(config, system_prompt, user_prompt, session_file, judge_index):
+            raise JudgePoolTimeout("并发池等待超时（引擎 claude_agent，等待 900s）")
+
+        monkeypatch.setattr(agent, "_run_single", timing_out_single)
+
+        with pytest.raises(JudgePoolTimeout):
+            agent.run_parallel("sys", "user", None, 2)
+
+    def test_run_parallel_reraises_pool_abort(self, monkeypatch):
+        from app.services.claude_code_judge_agent import ClaudeCodeJudgeAgent
+
+        agent = ClaudeCodeJudgeAgent.__new__(ClaudeCodeJudgeAgent)
+        agent.task = MagicMock()
+        agent.langfuse_host = ""
+        monkeypatch.setattr(
+            "app.services.claude_code_config_service.ClaudeCodeConfigService.get_active_config",
+            staticmethod(lambda: {"model": "m"}),
+        )
+
+        def aborting_single(config, system_prompt, user_prompt, session_file, judge_index):
+            raise JudgePoolAborted("并发池等待被中止（引擎 claude_agent）")
+
+        monkeypatch.setattr(agent, "_run_single", aborting_single)
+
+        with pytest.raises(JudgePoolAborted):
+            agent.run_parallel("sys", "user", None, 2)
 
 
 class TestClampedConcurrencyAttribute:
