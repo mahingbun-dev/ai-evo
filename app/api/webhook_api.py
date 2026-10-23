@@ -18,9 +18,11 @@ from app.core import scopes
 from app.core.scopes import require_scope
 from app.db.session import get_db
 from app.services import webhook_service
+from app.services.audit_service import audited
 from app.services.access_control import (
     AccessDeniedError,
     check_team_access,
+    ensure_permission,
     resource_team_code,
     user_team_code,
 )
@@ -102,9 +104,11 @@ def _ensure_endpoint_access(db: Session, user, endpoint_id: int):
     "",
     response_model=WebhookCreateResponse,
     summary="创建 webhook 端点",
-    dependencies=[Depends(require_scope(scopes.WEBHOOKS_MANAGE))],
+    dependencies=[Depends(require_scope(scopes.WEBHOOKS_MANAGE)),
+                  Depends(audited("CREATE", "webhook"))],
 )
 def create_webhook(body: WebhookCreateRequest, request: Request, db: Session = Depends(get_db)):
+    ensure_permission(request.state.user, "webhooks")  # RBAC（QE4-3）：viewer 只读
     """创建团队级 webhook 端点。secret 仅本次响应明文返回，库内不再可查。
 
     URL 经 SSRF 守卫校验（默认拒绝 localhost/私网/链路本地；企业内网接收端
@@ -121,6 +125,10 @@ def create_webhook(body: WebhookCreateRequest, request: Request, db: Session = D
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    # QE4-4：URL/事件进审计 detail（secret 绝不落审计）
+    request.state.audit_resource = {
+        "id": endpoint.id, "name": body.name, "detail": {"url": body.url, "events": body.events},
+    }
     resp = WebhookCreateResponse.model_validate(endpoint)
     resp.secret = secret
     return resp
@@ -143,11 +151,14 @@ def list_webhooks(request: Request, db: Session = Depends(get_db)):
     "/{webhook_id}",
     response_model=WebhookResponse,
     summary="删除 webhook 端点",
-    dependencies=[Depends(require_scope(scopes.WEBHOOKS_MANAGE))],
+    dependencies=[Depends(require_scope(scopes.WEBHOOKS_MANAGE)),
+                  Depends(audited("DELETE", "webhook", id_param="webhook_id"))],
 )
 def delete_webhook(webhook_id: int, request: Request, db: Session = Depends(get_db)):
+    ensure_permission(request.state.user, "webhooks")  # RBAC（QE4-3）：viewer 只读
     """删除端点（物理删；投递留痕级联清理）"""
     endpoint = _ensure_endpoint_access(db, request.state.user, webhook_id)
+    request.state.audit_resource = {"id": webhook_id, "name": endpoint.name}
     webhook_service.delete_endpoint(db, webhook_id)
     return endpoint
 

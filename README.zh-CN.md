@@ -22,9 +22,9 @@
 | 评测任务 | AI 裁判员 / Agent 长会话 / 一致性 / 成功率 / RAG 检索 / 二分分类等类型，批量运行、实时进度（WebSocket） |
 | 裁判引擎 | Claude Code 裁判（默认）与通用 LLM 裁判图可用；DeepSeek Harness 裁判适配就绪、任务流 M8 接通；评测维度动态配置 |
 | 结果与分析 | 评分明细、历史对比、Excel/JSON/CSV 导出、趋势统计、双模型 A/B 并排对比 |
-| 管理 | 团队与用户启停（超级管理员）、审计日志、内置使用文档 |
+| 管理 | 团队与成员启停/角色管理（三角色 owner/engineer/viewer——写操作 owner+engineer，viewer 全站只读；超管保留全局）、审计日志（全部写端点由声明式 `audited` 依赖统一留痕，注册表静态断言把关覆盖面；csv/xlsx 导出挂 `AUDIT_EXPORT_ENABLED` 企业功能位，默认关）、内置使用文档 |
 
-本地账号密码登录：首个注册用户自动成为超级管理员；密码 PBKDF2-HMAC-SHA256 哈希存储，会话为 HS256 JWT（`Authorization: Bearer`）。
+本地账号密码登录：首个注册用户自动成为超级管理员；密码 PBKDF2-HMAC-SHA256 哈希存储，会话为 HS256 JWT（`Authorization: Bearer`）。企业统一身份：`AUTH_METHODS`（`local,oidc,ldap` 任意组合，单选 `oidc`/`ldap` 即纯企业身份部署——关闭本地登录注册）开启 OIDC SSO（授权码 + PKCE S256）与 LDAP/AD 只读认证（search+bind，滤值 RFC 4515 转义、空密码直拒）；超管在「开发者设置」配置 IdP / 目录（含连通性自检）；首次企业登录自动开户（JIT）或按邮箱映射既有账号，目录组与 SSO 组共用 groups→团队映射。
 
 ## 快速开始（本地开发）
 

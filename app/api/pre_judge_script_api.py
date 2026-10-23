@@ -45,6 +45,7 @@ from sqlalchemy.orm import Session
 
 from app.db.session import get_db
 from app.services import pre_judge_runner
+from app.services.audit_service import audited
 from app.services.pre_judge_script_service import (
     PreJudgeFileError,
     PreJudgeScriptService,
@@ -161,7 +162,8 @@ async def get_script(script_id: str, db: Session = Depends(get_db)):
     return script
 
 
-@router.post("", summary="创建脚本")
+@router.post("", summary="创建脚本",
+             dependencies=[Depends(audited("CREATE", "pre_judge_script"))])
 async def create_script(payload: PreJudgeScriptPayload, request: Request, db: Session = Depends(get_db)):
     _ensure_admin(request)
     user = getattr(request.state, "user", None) or {}
@@ -170,10 +172,13 @@ async def create_script(payload: PreJudgeScriptPayload, request: Request, db: Se
         script = _service(db).create_script(payload.model_dump(), created_by=created_by)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    # QE4-4：service 返回 dict（脚本库统一序列化口径），id/name 从 dict 取
+    request.state.audit_resource = {"id": script["id"], "name": payload.name}
     return script
 
 
-@router.put("/{script_id}", summary="更新脚本")
+@router.put("/{script_id}", summary="更新脚本",
+            dependencies=[Depends(audited("UPDATE", "pre_judge_script", id_param="script_id"))])
 async def update_script(script_id: str, payload: PreJudgeScriptPayload, request: Request, db: Session = Depends(get_db)):
     _ensure_admin(request)
     try:
@@ -183,7 +188,8 @@ async def update_script(script_id: str, payload: PreJudgeScriptPayload, request:
     return script
 
 
-@router.delete("/{script_id}", summary="删除脚本（物理删除）")
+@router.delete("/{script_id}", summary="删除脚本（物理删除）",
+               dependencies=[Depends(audited("DELETE", "pre_judge_script", id_param="script_id"))])
 async def delete_script(script_id: str, request: Request, db: Session = Depends(get_db)):
     """物理删除 DB 记录与落盘目录；停用（可再启用）请用更新接口置 is_active=False。
 
@@ -200,7 +206,8 @@ async def delete_script(script_id: str, request: Request, db: Session = Depends(
     return {"deleted": True, "script_id": script_id}
 
 
-@router.post("/{script_id}/upload", summary="上传脚本文件（exec_type=script）")
+@router.post("/{script_id}/upload", summary="上传脚本文件（exec_type=script）",
+             dependencies=[Depends(audited("UPDATE", "pre_judge_script", id_param="script_id"))])
 async def upload_script_file(
     script_id: str,
     request: Request,
@@ -232,7 +239,8 @@ async def upload_script_file(
     return saved
 
 
-@router.post("/{script_id}/upload-package", summary="上传 zip 脚本包（exec_type=script）")
+@router.post("/{script_id}/upload-package", summary="上传 zip 脚本包（exec_type=script）",
+             dependencies=[Depends(audited("UPDATE", "pre_judge_script", id_param="script_id"))])
 async def upload_script_package(
     script_id: str,
     request: Request,
@@ -343,7 +351,8 @@ async def export_script(script_id: str, db: Session = Depends(get_db)):
     )
 
 
-@router.post("/import-package", summary="导入脚本包（zip / 多文件列表）")
+@router.post("/import-package", summary="导入脚本包（zip / 多文件列表）",
+             dependencies=[Depends(audited("CREATE", "pre_judge_script"))])
 async def import_script_package(
     request: Request,
     files: List[UploadFile] = File(..., description="包文件（单 .zip / 多文件列表）"),
@@ -385,6 +394,11 @@ async def import_script_package(
     result = _service(db).import_package(files_map, source_name,
                                          overwrite=overwrite, created_by=created_by)
     logger.info(f"[PreJudgeScript] 导入脚本包 source={source_name} status={result['status']}")
+    # QE4-4：导入结果进审计 detail（status/script_id；覆盖导入同样留痕）
+    request.state.audit_resource = {
+        "id": result.get("script_id") or "", "name": source_name,
+        "detail": {"status": result.get("status"), "overwrite": overwrite},
+    }
     return {"results": [result]}
 
 
@@ -412,7 +426,8 @@ async def export_script_package(script_id: str, db: Session = Depends(get_db)):
     )
 
 
-@router.post("/from-template", summary="从脚手架模板生成脚本")
+@router.post("/from-template", summary="从脚手架模板生成脚本",
+             dependencies=[Depends(audited("CREATE", "pre_judge_script"))])
 async def create_script_from_template(
     payload: PreJudgeScriptTemplatePayload, request: Request, db: Session = Depends(get_db),
 ):
@@ -429,6 +444,8 @@ async def create_script_from_template(
             description=payload.description, created_by=created_by)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    request.state.audit_resource = {"id": script["id"], "name": payload.name,
+                                    "detail": {"template": payload.template}}
     return script
 
 
@@ -462,7 +479,8 @@ async def read_script_file(
         raise _map_file_error(e)
 
 
-@router.put("/{script_id}/file", summary="在线编辑保存（乐观锁）")
+@router.put("/{script_id}/file", summary="在线编辑保存（乐观锁）",
+            dependencies=[Depends(audited("UPDATE", "pre_judge_script", id_param="script_id"))])
 async def update_script_file(
     script_id: str, payload: PreJudgeScriptFileSavePayload,
     request: Request, db: Session = Depends(get_db),
@@ -477,7 +495,8 @@ async def update_script_file(
         raise _map_file_error(e)
 
 
-@router.post("/{script_id}/file", summary="新建脚本文本文件")
+@router.post("/{script_id}/file", summary="新建脚本文本文件",
+             dependencies=[Depends(audited("UPDATE", "pre_judge_script", id_param="script_id"))])
 async def create_script_file(
     script_id: str, payload: PreJudgeScriptFileCreatePayload,
     request: Request, db: Session = Depends(get_db),
@@ -490,7 +509,8 @@ async def create_script_file(
         raise _map_file_error(e)
 
 
-@router.delete("/{script_id}/file", summary="删除脚本文件")
+@router.delete("/{script_id}/file", summary="删除脚本文件",
+               dependencies=[Depends(audited("DELETE", "pre_judge_script", id_param="script_id"))])
 async def delete_script_file(
     script_id: str, request: Request,
     path: str = Query(..., description="脚本目录内相对路径"),
@@ -504,7 +524,8 @@ async def delete_script_file(
         raise _map_file_error(e)
 
 
-@router.post("/{script_id}/file/rename", summary="重命名/移动脚本文件")
+@router.post("/{script_id}/file/rename", summary="重命名/移动脚本文件",
+             dependencies=[Depends(audited("UPDATE", "pre_judge_script", id_param="script_id"))])
 async def rename_script_file(
     script_id: str, payload: PreJudgeScriptFileRenamePayload,
     request: Request, db: Session = Depends(get_db),

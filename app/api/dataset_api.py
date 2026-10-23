@@ -11,8 +11,10 @@ from app.db.session import get_db
 from app.core.config import get_settings
 from app.core import scopes
 from app.core.scopes import require_scope
+from app.services.audit_service import audited
 from app.services.access_control import (
     ensure_dataset_access,
+    ensure_permission,
     ensure_super_admin,
     filter_team_code,
     user_team_code,
@@ -392,13 +394,15 @@ def export_dataset_excel(
 
 
 @router.post("", response_model=DatasetResponse, summary="创建数据集",
-             dependencies=[Depends(require_scope(scopes.DATASETS_WRITE))])
+             dependencies=[Depends(require_scope(scopes.DATASETS_WRITE)),
+                           Depends(audited("CREATE", "dataset"))])
 def create_dataset(
     body: CreateDatasetRequest,
     request: Request,
     db: Session = Depends(get_db),
 ):
     """创建新的评测数据集（W9：team_code 随用户团队落库，列表过滤/归属校验的归属锚点）"""
+    ensure_permission(request.state.user, "datasets")  # RBAC（QE4-3）：viewer 只读
     service = DatasetService(db)
     try:
         dataset = service.create_dataset(
@@ -407,6 +411,7 @@ def create_dataset(
             created_by=body.created_by,
             team_code=user_team_code(request.state.user),
         )
+        request.state.audit_resource = {"id": dataset.id, "name": dataset.name}
         return dataset
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -439,7 +444,8 @@ def get_dataset(
     return dataset
 
 
-@router.put("/{dataset_id}", response_model=DatasetResponse, summary="更新数据集")
+@router.put("/{dataset_id}", response_model=DatasetResponse, summary="更新数据集",
+            dependencies=[Depends(audited("UPDATE", "dataset", id_param="dataset_id"))])
 def update_dataset(
     dataset_id: str,
     body: UpdateDatasetRequest,
@@ -447,6 +453,7 @@ def update_dataset(
     db: Session = Depends(get_db),
 ):
     """更新数据集信息（W9：对象级归属校验）"""
+    ensure_permission(request.state.user, "datasets")  # RBAC（QE4-3）：viewer 只读
     ensure_dataset_access(db, request.state.user, dataset_id)
     service = DatasetService(db)
     dataset = service.update_dataset(dataset_id, **body.model_dump(exclude_unset=True))
@@ -455,13 +462,15 @@ def update_dataset(
     return dataset
 
 
-@router.delete("/{dataset_id}", summary="删除数据集")
+@router.delete("/{dataset_id}", summary="删除数据集",
+               dependencies=[Depends(audited("DELETE", "dataset", id_param="dataset_id"))])
 def delete_dataset(
     dataset_id: str,
     request: Request,
     db: Session = Depends(get_db),
 ):
     """删除数据集（W9：对象级归属校验）"""
+    ensure_permission(request.state.user, "datasets")  # RBAC（QE4-3）：viewer 只读
     ensure_dataset_access(db, request.state.user, dataset_id)
     service = DatasetService(db)
     try:
@@ -491,7 +500,8 @@ def get_dataset_fields(
     return fields
 
 
-@router.put("/{dataset_id}/fields", summary="更新数据集字段元数据")
+@router.put("/{dataset_id}/fields", summary="更新数据集字段元数据",
+            dependencies=[Depends(audited("UPDATE", "dataset", id_param="dataset_id"))])
 def update_dataset_fields(
     dataset_id: str,
     fields: List[DatasetFieldResponse],
@@ -499,6 +509,7 @@ def update_dataset_fields(
     db: Session = Depends(get_db),
 ):
     """更新数据集的字段元数据（W9：对象级归属校验）"""
+    ensure_permission(request.state.user, "datasets")  # RBAC（QE4-3）：viewer 只读
     # 验证数据集存在 + 团队归属
     ensure_dataset_access(db, request.state.user, dataset_id)
 
@@ -512,7 +523,8 @@ def update_dataset_fields(
     return {"message": "更新成功"}
 
 
-@router.post("/cleanup-duplicates", summary="清理重复数据集")
+@router.post("/cleanup-duplicates", summary="清理重复数据集",
+             dependencies=[Depends(audited("DELETE", "dataset"))])
 def cleanup_duplicates(
     request: Request,
     db: Session = Depends(get_db),
@@ -559,6 +571,10 @@ def cleanup_duplicates(
             to_delete.extend(others)
 
     deleted_count = len(to_delete)
+    request.state.audit_resource = {
+        "name": "cleanup-duplicates",
+        "detail": {"deleted_count": deleted_count},
+    }
 
     # 软删除重复的数据集
     for dataset in to_delete:
@@ -581,7 +597,8 @@ def cleanup_duplicates(
 
 
 @router.post("/{dataset_id}/import/excel", response_model=ImportResponse, summary="从Excel导入数据",
-             dependencies=[Depends(require_scope(scopes.DATASETS_WRITE))])
+             dependencies=[Depends(require_scope(scopes.DATASETS_WRITE)),
+                           Depends(audited("UPDATE", "dataset", id_param="dataset_id"))])
 async def import_from_excel(
     dataset_id: str,
     request: Request,
@@ -589,6 +606,7 @@ async def import_from_excel(
     db: Session = Depends(get_db),
 ):
     """从Excel文件导入评测数据（W9：对象级归属校验）"""
+    ensure_permission(request.state.user, "datasets")  # RBAC（QE4-3）：viewer 只读
     # W9：数据集归属校验
     ensure_dataset_access(db, request.state.user, dataset_id)
     # 保存上传的文件
@@ -612,7 +630,8 @@ async def import_from_excel(
 
 
 @router.post("/{dataset_id}/import/json", response_model=ImportResponse, summary="从JSON导入数据",
-             dependencies=[Depends(require_scope(scopes.DATASETS_WRITE))])
+             dependencies=[Depends(require_scope(scopes.DATASETS_WRITE)),
+                           Depends(audited("UPDATE", "dataset", id_param="dataset_id"))])
 def import_from_json(
     dataset_id: str,
     body: ImportJsonRequest,
@@ -620,6 +639,7 @@ def import_from_json(
     db: Session = Depends(get_db),
 ):
     """从JSON导入评测数据（W9：对象级归属校验）"""
+    ensure_permission(request.state.user, "datasets")  # RBAC（QE4-3）：viewer 只读
     ensure_dataset_access(db, request.state.user, dataset_id)
     service = DatasetService(db)
     count = service.import_from_json(dataset_id, body.data)
@@ -627,7 +647,8 @@ def import_from_json(
 
 
 # 数据项文件相关路由 - 需要放在通用路由 /data 之前
-@router.post("/{dataset_id}/data/{data_id}/upload-file", response_model=FileResponse, summary="上传数据项关联文件")
+@router.post("/{dataset_id}/data/{data_id}/upload-file", response_model=FileResponse, summary="上传数据项关联文件",
+             dependencies=[Depends(audited("UPDATE", "dataset", id_param="data_id"))])
 async def upload_data_file(
     dataset_id: str,
     data_id: str,
@@ -674,7 +695,8 @@ def get_data_files(
     return files
 
 
-@router.delete("/{dataset_id}/data/{data_id}/files/{file_id}", summary="删除数据项关联文件")
+@router.delete("/{dataset_id}/data/{data_id}/files/{file_id}", summary="删除数据项关联文件",
+               dependencies=[Depends(audited("DELETE", "dataset", id_param="file_id"))])
 def delete_data_file(
     dataset_id: str,
     data_id: str,
@@ -773,7 +795,8 @@ def get_dataset_data_v2(
     }
 
 
-@router.post("/{dataset_id}/data", summary="添加评测数据")
+@router.post("/{dataset_id}/data", summary="添加评测数据",
+             dependencies=[Depends(audited("UPDATE", "dataset", id_param="dataset_id"))])
 def add_data(
     dataset_id: str,
     body: AddDataRequest,
@@ -781,6 +804,7 @@ def add_data(
     db: Session = Depends(get_db),
 ):
     """添加单条评测数据（W9：数据集归属校验）"""
+    ensure_permission(request.state.user, "datasets")  # RBAC（QE4-3）：viewer 只读
     # 验证数据集存在 + 团队归属
     ensure_dataset_access(db, request.state.user, dataset_id)
 
@@ -810,13 +834,15 @@ def add_data(
         return data
 
 
-@router.delete("/data/{data_id}", summary="删除评测数据")
+@router.delete("/data/{data_id}", summary="删除评测数据",
+               dependencies=[Depends(audited("DELETE", "dataset", id_param="data_id"))])
 def delete_data(
     data_id: str,
     request: Request,
     db: Session = Depends(get_db),
 ):
     """删除评测数据（W9：原实现按 data_id 直删无归属校验，现经所属数据集团队校验）"""
+    ensure_permission(request.state.user, "datasets")  # RBAC（QE4-3）：viewer 只读
     data_service = DatasetDataService(db)
     data_item = data_service.get_data(data_id)
     if not data_item:
@@ -829,7 +855,8 @@ def delete_data(
     return {"message": "删除成功"}
 
 
-@router.put("/{dataset_id}/data/{data_id}", summary="更新评测数据")
+@router.put("/{dataset_id}/data/{data_id}", summary="更新评测数据",
+            dependencies=[Depends(audited("UPDATE", "dataset", id_param="data_id"))])
 def update_data(
     dataset_id: str,
     data_id: str,
@@ -838,6 +865,7 @@ def update_data(
     db: Session = Depends(get_db),
 ):
     """更新单条评测数据（W9：数据集归属校验）"""
+    ensure_permission(request.state.user, "datasets")  # RBAC（QE4-3）：viewer 只读
     # 验证数据集存在 + 团队归属
     ensure_dataset_access(db, request.state.user, dataset_id)
 
@@ -1228,7 +1256,8 @@ async def preview_import_v2(
             os.remove(tmp_path)
 
 
-@router.post("/{dataset_id}/import/confirm", response_model=ImportResponse, summary="确认导入数据")
+@router.post("/{dataset_id}/import/confirm", response_model=ImportResponse, summary="确认导入数据",
+             dependencies=[Depends(audited("CREATE", "dataset"))])
 async def confirm_import(
     dataset_id: str,
     request: Request,
@@ -1241,6 +1270,7 @@ async def confirm_import(
     db: Session = Depends(get_db),
 ):
     """确认导入校验后的数据（W9：追加模式目标数据集归属校验；新建数据集随用户团队落库）"""
+    ensure_permission(request.state.user, "datasets")  # RBAC（QE4-3）：viewer 只读
     import tempfile
     import os
 
@@ -1484,6 +1514,10 @@ async def confirm_import(
         for key in keys_to_delete:
             del _temp_files[key]
 
+        # QE4-4：导入落库留痕（新建/追加模式均记目标数据集与条数）
+        request.state.audit_resource = {
+            "id": real_dataset_id, "detail": {"count": count, "mode": "confirm"},
+        }
         return {"count": count, "message": f"成功导入 {count} 条数据"}
     except Exception as e:
         db.rollback()
@@ -1767,6 +1801,7 @@ async def preview_session_import(
     "/import/sessions/confirm",
     response_model=SessionImportResponse,
     summary="确认导入会话数据",
+    dependencies=[Depends(audited("CREATE", "dataset"))],
 )
 async def confirm_session_import(
     name: str = Form('', description="新建数据集名称"),
@@ -1806,6 +1841,9 @@ async def confirm_session_import(
             created_by=user_code,
             team_code=user_team_code(user),
         )
+        request.state.audit_resource = {
+            "id": result["dataset_id"], "detail": {"count": result["count"], "mode": "sessions"},
+        }
         return SessionImportResponse(
             dataset_id=result["dataset_id"],
             count=result["count"],
@@ -1840,6 +1878,7 @@ def _discard_fresh_materializations(db, freshly_materialized, import_completed: 
     "/import/sessions/from-hub",
     response_model=SessionImportResponse,
     summary="从 anc-hub 拉取会话文件并导入",
+    dependencies=[Depends(audited("CREATE", "dataset"))],
 )
 async def import_sessions_from_hub(
     body: HubSessionImportRequest,
@@ -2004,6 +2043,9 @@ async def import_sessions_from_hub(
                 except Exception as re_err:
                     logger.warning(f"anc-hub 会话导入补偿释放引用失败: file_id={done_fid} 错误: {re_err}")
             raise RuntimeError(f"会话导入引用计数失败（已补偿释放 {len(acquired)} 个）: {e}") from e
+        request.state.audit_resource = {
+            "id": result["dataset_id"], "detail": {"count": result["count"], "mode": "from-hub"},
+        }
         return SessionImportResponse(
             dataset_id=result["dataset_id"],
             count=result["count"],

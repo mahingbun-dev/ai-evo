@@ -142,13 +142,14 @@ def _run_export(monkeypatch, *, task, record, fmt="markdown", request=None,
 
     if execution_number is None:
         execution_number = record.execution_number if record else 9
+    req_obj = request or _req()
     resp = export_result_history_version(
         "task_x", execution_number,
         ExecutionExportRequest(format=fmt),
-        request or _req(),
+        req_obj,
         db=db or _db_with_task(task),
     )
-    return resp, calls, logs
+    return resp, calls, logs, req_obj
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +160,7 @@ def _run_export(monkeypatch, *, task, record, fmt="markdown", request=None,
 class TestExportDirectSuccess:
     def test_markdown_export_success(self, monkeypatch):
         record = _record()
-        resp, calls, logs = _run_export(monkeypatch, task=_task(), record=record, fmt="markdown")
+        resp, calls, logs, req_obj = _run_export(monkeypatch, task=_task(), record=record, fmt="markdown")
 
         assert resp == {
             "task_id": "task_x", "execution_number": 2, "format": "markdown",
@@ -169,15 +170,18 @@ class TestExportDirectSuccess:
         # 渲染产物整体交给上传；以调用者凭证构造服务
         assert calls[0][1] == "# markdown 报告全文".encode("utf-8")
         assert calls[0][0] == "fake_report.md"
-        # 上传成功后登记 + EXPORT 审计
+        # 上传成功后登记 + 导出审计改走路由级 audited 依赖（QE4-4）：
+        # 直调断言 handler 暂存了审计标识（id/名称/format），真实落库由
+        # test_audit_dependency/test_audit_coverage 把关；散点手工审计应不存在
         assert record.exported_files["markdown"]["file_id"] == "file-1"
         assert "uploaded_at" in record.exported_files["markdown"]
-        assert logs[0]["action"] == "EXPORT"
-        assert logs[0]["resource_type"] == "execution_record"
-        assert logs[0]["resource_id"] == "exec_rec_1"
+        stash = getattr(req_obj.state, "audit_resource", None)
+        assert stash and stash["id"] == "exec_rec_1"
+        assert stash["detail"]["format"] == "markdown"
+        assert logs == []  # 不再散点手工 log_operation（路由依赖统一落库）
 
     def test_json_export_success(self, monkeypatch):
-        resp, calls, _ = _run_export(monkeypatch, task=_task(), record=_record(), fmt="json")
+        resp, calls, _unused, _req_json = _run_export(monkeypatch, task=_task(), record=_record(), fmt="json")
         assert resp["format"] == "json"
         assert resp["cached"] is False
         assert calls[0][1] == b'{"lossless": true}'
@@ -188,7 +192,7 @@ class TestExportDirectSuccess:
         record = _record(exported_files={
             "markdown": {"file_id": "file-cached", "filename": "old.md", "size": 9, "sha256": "aa"},
         })
-        resp, calls, logs = _run_export(monkeypatch, task=_task(), record=record, db=db)
+        resp, calls, logs, _req_cached = _run_export(monkeypatch, task=_task(), record=record, db=db)
         assert resp == {
             "task_id": "task_x", "execution_number": 2, "format": "markdown",
             "cached": True, "file_id": "file-cached", "filename": "old.md",
@@ -203,14 +207,14 @@ class TestExportDirectSuccess:
         record = _record(exported_files={
             "markdown": {"file_id": "file-md", "filename": "old.md", "size": 9, "sha256": "aa"},
         })
-        resp, calls, _ = _run_export(monkeypatch, task=_task(), record=record, fmt="json")
+        resp, calls, _, _ = _run_export(monkeypatch, task=_task(), record=record, fmt="json")
         assert resp["cached"] is False
         assert len(calls) == 1
 
     def test_non_db_exported_files_type_ignored(self, monkeypatch):
         """exported_files 非 dict（脏数据/历史行）：不上抛，走正常上传。"""
         record = _record(exported_files="not-a-dict")
-        resp, calls, _ = _run_export(monkeypatch, task=_task(), record=record)
+        resp, calls, _, _ = _run_export(monkeypatch, task=_task(), record=record)
         assert resp["cached"] is False
         assert len(calls) == 1
 
@@ -254,7 +258,7 @@ class TestExportDirectErrors:
             return b"# compat"
 
         task = _task(result={"total": 1}, execution_count=3, created_at=None, completed_at=None)
-        resp, calls, logs = _run_export(
+        resp, calls, logs, _req_compat = _run_export(
             monkeypatch, task=task, record=None, svc=_record_service(None), execution_number=3,
             markdown_builder=fake_render,
             hub_result={"file_id": "file-compat", "filename": "fake_report.md",
@@ -267,9 +271,12 @@ class TestExportDirectErrors:
         assert rec.result == {"total": 1}
         assert rec.config_snapshot is None
         assert rec.error_message is None
-        # 非 DB 记录不写登记，审计落在任务 id 上
+        # 非 DB 记录不写登记，审计改走路由级 audited 依赖（QE4-4）：
+        # 直调断言 handler 暂存审计标识落在任务 id 上（is_db_record=False 分支）
         assert not hasattr(captured["record"], "exported_files") or captured["record"].exported_files is None
-        assert logs[0]["resource_id"] == "task_x"
+        stash = getattr(_req_compat.state, "audit_resource", None)
+        assert stash and stash["id"] == "task_x"
+        assert logs == []
 
     def test_missing_cookie_401_before_upload(self, monkeypatch):
         """无 PLATFORM_SSO cookie：401，且不发生上传。"""

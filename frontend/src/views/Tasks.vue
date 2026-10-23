@@ -5,7 +5,7 @@
         <div class="card-header">
           <span>评测任务</span>
           <div>
-            <el-button type="primary" @click="openDialog()" :disabled="batchOpLoading">新建任务</el-button>
+            <el-button type="primary" @click="openDialog()" :disabled="batchOpLoading || readonlyRole" :title="readonlyRole ? '当前角色（viewer）只读' : ''">新建任务</el-button>
               <el-button type="success" @click="batchRun" :disabled="!selectedTasks.length" :loading="batchOpLoading">批量执行</el-button>
               <el-button type="warning" @click="batchStop" :disabled="!selectedTasks.length" :loading="batchOpLoading">批量停止</el-button>
               <el-button  type="danger" @click="batchDelete" :disabled="!selectedTasks.length" :loading="batchOpLoading">批量删除</el-button>
@@ -1585,7 +1585,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
+import { ref, reactive, computed, inject, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, View, Delete, ArrowDown, Warning, Rank, UploadFilled } from '@element-plus/icons-vue'
 import { taskApi, datasetApi, modelApi, batchApi, instructionApi, efficiencyApi, preJudgeScriptApi, pluginMarketplaceApi } from '@/api'
@@ -1598,6 +1598,11 @@ import HubFilePatternPicker from '@/components/HubFilePatternPicker.vue'
 import VariableInjector from '@/components/VariableInjector.vue'
 import AgentEvaluationConfig from '@/components/AgentEvaluationConfig.vue'
 import SafetyEvaluationConfig from '@/components/SafetyEvaluationConfig.vue'
+import { canWrite } from '@/utils/permissions'
+
+// M4 QE4-3：viewer 只读——写按钮禁用联动（canWrite 见 utils/permissions）
+const currentUser = inject('currentUser', null)
+const readonlyRole = computed(() => !canWrite(currentUser.value))
 import RefTextarea from '@/components/RefTextarea.vue'
 
 // 裁判变量默认配置（judge 类型）

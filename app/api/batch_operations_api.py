@@ -13,6 +13,7 @@ from datetime import datetime
 
 from app.db.session import get_db
 from app.services.access_control import ensure_task_access
+from app.services.audit_service import audited
 from app.services.evaluation_task_service import EvaluationTaskService
 from app.services.result_aggregator import ResultExporter
 
@@ -50,7 +51,8 @@ class BatchOperationResponse(BaseModel):
 router = APIRouter(prefix="/evaluation/tasks", tags=["批量操作"])
 
 
-@router.post("/batch-run", response_model=BatchOperationResponse, summary="批量执行任务")
+@router.post("/batch-run", response_model=BatchOperationResponse, summary="批量执行任务",
+             dependencies=[Depends(audited("RUN", "task"))])
 def batch_run_tasks(
     body: BatchRunRequest,
     request: Request,
@@ -101,6 +103,9 @@ def batch_run_tasks(
             results.append({"task_id": task_id, "status": "failed", "error": str(e)})
             failed_count += 1
 
+    request.state.audit_resource = {
+        "detail": {"task_ids": body.task_ids, "success": success_count, "failed": failed_count},
+    }
     return {
         "total": len(body.task_ids),
         "success": success_count,
@@ -109,7 +114,8 @@ def batch_run_tasks(
     }
 
 
-@router.post("/batch-delete", response_model=BatchOperationResponse, summary="批量删除任务")
+@router.post("/batch-delete", response_model=BatchOperationResponse, summary="批量删除任务",
+             dependencies=[Depends(audited("DELETE", "task"))])
 def batch_delete_tasks(
     body: BatchDeleteRequest,
     request: Request,
@@ -143,6 +149,9 @@ def batch_delete_tasks(
             results.append({"task_id": task_id, "status": "failed", "error": str(e)})
             failed_count += 1
 
+    request.state.audit_resource = {
+        "detail": {"task_ids": body.task_ids, "success": success_count, "failed": failed_count},
+    }
     return {
         "total": len(body.task_ids),
         "success": success_count,
@@ -151,7 +160,8 @@ def batch_delete_tasks(
     }
 
 
-@router.post("/batch-stop", response_model=BatchOperationResponse, summary="批量停止任务")
+@router.post("/batch-stop", response_model=BatchOperationResponse, summary="批量停止任务",
+             dependencies=[Depends(audited("STOP", "task"))])
 def batch_stop_tasks(
     body: BatchStopRequest,
     request: Request,
@@ -188,6 +198,9 @@ def batch_stop_tasks(
             results.append({"task_id": task_id, "status": "failed", "error": str(e)})
             failed_count += 1
 
+    request.state.audit_resource = {
+        "detail": {"task_ids": body.task_ids, "success": success_count, "failed": failed_count},
+    }
     return {
         "total": len(body.task_ids),
         "success": success_count,
@@ -201,7 +214,8 @@ def batch_stop_tasks(
 export_router = APIRouter(prefix="/evaluation/results", tags=["结果导出"])
 
 
-@export_router.post("/batch-export", summary="批量导出结果")
+@export_router.post("/batch-export", summary="批量导出结果",
+                    dependencies=[Depends(audited("EXPORT", "execution_record"))])
 def batch_export_results(
     body: BatchExportRequest,
     request: Request,
@@ -240,6 +254,12 @@ def batch_export_results(
         except Exception as e:
             results.append({"task_id": task_id, "status": "failed", "error": str(e)})
             failed_count += 1
+
+    # QE4-4：批量导出即数据外流，统一留痕（excel/csv/json 三种格式共用）
+    request.state.audit_resource = {
+        "detail": {"task_ids": body.task_ids, "format": body.format,
+                   "success": success_count, "failed": failed_count},
+    }
 
     # 导出
     if body.format == "excel":

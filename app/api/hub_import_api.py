@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from app.db.session import get_db
 from app.services.access_control import ensure_dataset_access, ensure_hub_import_job_access, user_team_code
+from app.services.audit_service import audited
 from app.services.hub_import_job_service import create_import_job, get_job, retry_job
 from app.services.hub_file_service import resolve_hub_bearer_token
 
@@ -77,6 +78,7 @@ def _get_user_code(request: Optional[Request]) -> Optional[str]:
     "/import/hub-files",
     response_model=HubImportJobResponse,
     summary="从 anc-hub 导入执行包（批量异步）",
+    dependencies=[Depends(audited("CREATE", "hub_import_job"))],
 )
 def import_hub_files(
     body: HubFilesImportRequest,
@@ -128,6 +130,13 @@ def import_hub_files(
         logger.error(f"[hub_import] 导入任务投递失败: job_id={job.id} 错误: {e}")
         raise HTTPException(status_code=500, detail=f"导入任务投递失败，请稍后重试: {e}")
 
+    # QE4-4：创建导入任务留痕（file_ids 进 detail，凭证绝不入审计；
+    # 直调测试 request 可为 None，此时跳过暂存——路由级依赖总有真实 Request）
+    if request is not None:
+        request.state.audit_resource = {
+            "id": job.id, "name": body.name or f"hub-import-{job.id}",
+            "detail": {"file_ids": body.file_ids, "real_dataset_id": body.real_dataset_id or ""},
+        }
     return HubImportJobResponse.model_validate(job)
 
 
@@ -147,7 +156,8 @@ def get_hub_import_job(job_id: str, request: Request, db: Session = Depends(get_
     return HubImportJobResponse.model_validate(job)
 
 
-@router.post("/{job_id}/retry", response_model=HubImportJobResponse, summary="重试导入任务的失败项")
+@router.post("/{job_id}/retry", response_model=HubImportJobResponse, summary="重试导入任务的失败项",
+             dependencies=[Depends(audited("RUN", "hub_import_job", id_param="job_id"))])
 def retry_hub_import_job(job_id: str, request: Request, db: Session = Depends(get_db)):
     """只重跑失败项：已成功的包不重复导入（succeeded_file_ids 幂等键；W9：归属校验）
 

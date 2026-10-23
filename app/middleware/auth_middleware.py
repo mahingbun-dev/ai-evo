@@ -32,11 +32,15 @@ middleware_logger.setLevel(logging.INFO)
 # 注意：不能放 "/" 作为前缀，因为它会匹配所有路径，应该精确匹配根路径
 # W13：/api/v1/health（深健康检查）入白名单——探活请求不带业务凭证，
 # build-service 部署校验与 compose healthcheck 都依赖匿名可达
+# M4 QE4-1：OIDC SSO 匿名三端点——methods（登录页渲染依据）/login
+# （302 到 IdP）/callback（IdP 回跳换 token）。注意 /auth/oidc/config、
+# /auth/oidc/test 等超管配置面**不在**白名单（前缀精确到叶子路径）
 WHITELIST_PREFIXES = [
     "/health", "/docs", "/api-docs", "/openapi.json", "/assets",
     "/api/v1/health",
     "/api/v1/auth/login", "/api/v1/auth/register", "/api/v1/auth/logout",
-    "/api/v1/auth/status",
+    "/api/v1/auth/status", "/api/v1/auth/methods",
+    "/api/v1/auth/oidc/login", "/api/v1/auth/oidc/callback",
 ]
 
 
@@ -51,6 +55,7 @@ def _build_user_dict(user: User) -> dict:
         "org_code": user.org_code,
         "org_name": user.org_name,
         "position_name": user.position_name,
+        "role": user.role,
         "user_type": user.user_type,
         "super_admin_flag": user.super_admin_flag,
         "application_admin": user.application_admin,

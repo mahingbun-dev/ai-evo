@@ -9,6 +9,14 @@ from datetime import datetime
 
 from app.db.session import get_db
 from app.models.user_models import User
+from app.services.access_control import (
+    TEAM_ROLES,
+    ROLE_OWNER,
+    is_super_admin,
+    user_role,
+    user_team_code,
+)
+from app.services.audit_service import audited
 from app.services.team_service import get_teams, get_team, get_team_members_all, get_team_stats, update_user_status
 
 
@@ -61,6 +69,7 @@ class TeamMemberResponse(BaseModel):
     org_code: Optional[str] = None
     org_name: Optional[str] = None
     position_name: Optional[str] = None
+    role: Optional[str] = None
     is_active: bool = True
     last_login_at: Optional[datetime] = None
 
@@ -187,7 +196,8 @@ def get_team_members_list(
     return TeamMembersListResponse(total=total, items=items)
 
 
-@router.patch("/{team_code}/members/{user_code}/status", summary="设置团队成员状态")
+@router.patch("/{team_code}/members/{user_code}/status", summary="设置团队成员状态",
+              dependencies=[Depends(audited("UPDATE", "team_member_status", id_param="user_code"))])
 def set_member_status(
     team_code: str,
     user_code: str,
@@ -213,9 +223,79 @@ def set_member_status(
     if not updated_user:
         raise HTTPException(status_code=404, detail="用户不存在")
 
+    # QE4-4：暂存审计标识（团队/新旧状态进 detail）
+    request.state.audit_resource = {
+        "id": user_code, "name": updated_user.username or user_code,
+        "detail": {"team_code": team_code, "is_active": body.is_active},
+    }
     return {
         "success": True,
         "message": f"成员已{'启用' if body.is_active else '禁用'}",
         "user_code": user_code,
         "is_active": body.is_active
+    }
+
+
+class SetMemberRoleRequest(BaseModel):
+    """设置团队成员角色请求（M4 QE4-3）"""
+    role: str = Field(..., description=f"目标角色，可选：{list(TEAM_ROLES)}")
+
+
+@router.patch("/{team_code}/members/{user_code}/role", summary="设置团队成员角色",
+              dependencies=[Depends(audited("UPDATE", "team_member_role", id_param="user_code"))])
+def set_member_role(
+    team_code: str,
+    user_code: str,
+    request: Request,
+    body: SetMemberRoleRequest,
+    db: Session = Depends(get_db),
+):
+    """设置团队成员角色（M4 QE4-3）：本团队 owner 或超管可改，落审计。
+
+    保护约束：
+    - 末位 owner 不可降级（团队必须始终保有至少一位 owner，否则无人能再
+      管理角色——只能靠超管兜底恢复）；
+    - 跨团队 owner 无权（owner 权限仅及本团队，跨团队仍 403）。
+    """
+    operator = request.state.user
+    if body.role not in TEAM_ROLES:
+        raise HTTPException(status_code=400, detail=f"非法角色，可选：{list(TEAM_ROLES)}")
+
+    target = db.get(User, user_code)
+    if not target or (target.org_code or "") != (team_code or ""):
+        raise HTTPException(status_code=404, detail="该团队中不存在此成员")
+
+    # 权限闸：超管放行；否则必须是本团队 owner
+    if not is_super_admin(operator):
+        if user_team_code(operator) != (team_code or ""):
+            raise HTTPException(status_code=403, detail="无权管理其他团队的成员角色")
+        if user_role(operator) != ROLE_OWNER:
+            raise HTTPException(status_code=403, detail="仅团队 owner 可调整成员角色")
+
+    old_role = user_role(target)
+    # 末位 owner 保护：目标当前是 owner 且要降级时，团队必须还有其他 owner
+    if old_role == ROLE_OWNER and body.role != ROLE_OWNER:
+        other_owners = (
+            db.query(User)
+            .filter(User.org_code == team_code, User.role == ROLE_OWNER,
+                    User.user_code != target.user_code, User.is_active == True)  # noqa: E712
+            .count()
+        )
+        if other_owners == 0:
+            raise HTTPException(
+                status_code=409, detail="团队至少保留一位 owner，请先转移 owner 角色再降级")
+
+    target.role = body.role
+    db.commit()
+    db.refresh(target)
+    # QE4-4：审计改走 audited 路由依赖（team_code/新旧角色进 detail）
+    request.state.audit_resource = {
+        "id": target.user_code, "name": target.username or target.user_code,
+        "detail": {"team_code": team_code, "old_role": old_role, "new_role": body.role},
+    }
+    return {
+        "success": True,
+        "message": f"成员角色已调整为 {body.role}",
+        "user_code": user_code,
+        "role": body.role,
     }

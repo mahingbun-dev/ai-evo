@@ -1,8 +1,9 @@
 """
 评测指令配置API
 """
-from fastapi import APIRouter, Depends, HTTPException, Query
-from app.services.access_control import ensure_super_admin
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from app.services.access_control import ensure_permission, ensure_super_admin
+from app.services.audit_service import audited
 from sqlalchemy.orm import Session
 from typing import List, Dict, Any, Optional, Union
 from pydantic import BaseModel, Field, field_serializer, field_validator, ConfigDict
@@ -138,12 +139,15 @@ def _parse_metrics(metrics: List[EvaluationMetricModel] | List[Dict[str, Any]]) 
     return [m.model_dump() if hasattr(m, 'model_dump') else m for m in metrics]
 
 
-@router.post("/config", response_model=InstructionConfigResponse, summary="创建评测指令配置")
+@router.post("/config", response_model=InstructionConfigResponse, summary="创建评测指令配置",
+             dependencies=[Depends(audited("CREATE", "template"))])
 def create_instruction_config(
     body: CreateInstructionConfigRequest,
+    request: Request,
     db: Session = Depends(get_db),
 ):
     """创建新的评测指令配置"""
+    ensure_permission(request.state.user, "templates")  # RBAC（QE4-3）：viewer 只读
     builder = InstructionBuilder()
 
     # 构建模板
@@ -178,6 +182,9 @@ def create_instruction_config(
     db.commit()
     db.refresh(template)
 
+    # QE4-4：暂存新资源标识供 audited 依赖落审计（直调测试 request 可能缺 state）
+    if hasattr(request, "state"):
+        request.state.audit_resource = {"id": template.id, "name": template.name}
     return template
 
 
@@ -209,13 +216,16 @@ def get_instruction_config(
     return template
 
 
-@router.put("/config/{config_id}", response_model=InstructionConfigResponse, summary="更新配置")
+@router.put("/config/{config_id}", response_model=InstructionConfigResponse, summary="更新配置",
+            dependencies=[Depends(audited("UPDATE", "template", id_param="config_id"))])
 def update_instruction_config(
     config_id: str,
     body: UpdateInstructionConfigRequest,
+    request: Request,
     db: Session = Depends(get_db),
 ):
     """更新评测指令配置"""
+    ensure_permission(request.state.user, "templates")  # RBAC（QE4-3）：viewer 只读
     template = db.query(EvaluationTemplate).filter(EvaluationTemplate.id == config_id).first()
     if not template:
         raise HTTPException(status_code=404, detail="配置不存在")
@@ -249,12 +259,15 @@ def update_instruction_config(
     return template
 
 
-@router.delete("/config/{config_id}", summary="删除配置")
+@router.delete("/config/{config_id}", summary="删除配置",
+               dependencies=[Depends(audited("DELETE", "template", id_param="config_id"))])
 def delete_instruction_config(
     config_id: str,
+    request: Request,
     db: Session = Depends(get_db),
 ):
     """删除评测指令配置"""
+    ensure_permission(request.state.user, "templates")  # RBAC（QE4-3）：viewer 只读
     template = db.query(EvaluationTemplate).filter(EvaluationTemplate.id == config_id).first()
     if not template:
         raise HTTPException(status_code=404, detail="配置不存在")
@@ -278,7 +291,8 @@ def delete_instruction_config(
     return {"message": "删除成功"}
 
 
-@router.post("/configs/migrate-legacy-all", response_model=MigrateLegacyAllResponse, summary="批量迁移旧版评测模板", dependencies=[Depends(ensure_super_admin)])
+@router.post("/configs/migrate-legacy-all", response_model=MigrateLegacyAllResponse, summary="批量迁移旧版评测模板",
+             dependencies=[Depends(ensure_super_admin), Depends(audited("UPDATE", "template"))])
 def migrate_legacy_templates(
     db: Session = Depends(get_db),
 ):

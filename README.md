@@ -24,9 +24,9 @@ Preparation → Evaluation → Analysis, in one platform:
 | Evaluation tasks | AI judge / Agent long-session / consistency / success-rate / RAG retrieval / binary classification / latency / plugin, batch runs, real-time progress over WebSocket |
 | Judge engines | Claude Code judge (default) and the generic LLM judge graph are live; the DeepSeek harness judge is adapter-ready with task-flow wiring landing at M8; per-task evaluation dimensions |
 | Results & analytics | Score details, run-to-run history, Excel/JSON/CSV export, trend statistics, side-by-side A/B comparison |
-| Administration | Teams and user enable/disable (super admin), audit log, built-in user guide |
+| Administration | Teams, member enable/disable and role management (three roles: owner / engineer / viewer — writes are owner+engineer, viewer is read-only platform-wide; super admin keeps global rights), audit log (all write endpoints covered by a declarative `audited` dependency with a registry-scan static test; csv/xlsx export behind the `AUDIT_EXPORT_ENABLED` enterprise flag, off by default), built-in user guide |
 
-First registered user automatically becomes the super admin; sessions are JWT (`Authorization: Bearer`), passwords stored as PBKDF2-HMAC-SHA256 hashes.
+First registered user automatically becomes the super admin; sessions are JWT (`Authorization: Bearer`), passwords stored as PBKDF2-HMAC-SHA256 hashes. Enterprise identity: OIDC SSO (authorization code + PKCE S256) and LDAP/AD read-only auth (search + bind, with RFC 4515 filter-value escaping and empty-password rejection) can be enabled with `AUTH_METHODS=local,oidc,ldap` in any combination (a single `oidc` or `ldap` value disables local login/registration) — the super admin configures the IdP or directory (with connectivity self-check) in developer settings; first enterprise login JIT-provisions the account (or maps an existing one by email), and directory groups map to platform teams via a shared mapping table.
 
 ## Quick start (local development)
 
@@ -111,6 +111,14 @@ Dialogue evaluation is not a separate type — multi-turn scenarios are covered 
   startup fails fast when it is missing; the "derive from DATABASE_URL" fallback
   requires explicitly setting `AUTH_JWT_ALLOW_DERIVED=true`, is for local development
   only, and must never be enabled in enterprise deployments
+- OIDC SSO callback is state-checked and PKCE (S256)-protected; SSO login state
+  is a signed short-lived HttpOnly cookie — a mismatched state, forged/expired
+  cookie, replayed code, or open-redirect target is rejected without provisioning
+  anything (covered by `tests/security/test_oidc_attack_surface.py`)
+- LDAP login escapes filter values per RFC 4515 before substitution, rejects
+  empty passwords before any bind (anonymous-bind quirk), and reports directory
+  failures uniformly as "wrong username or password" without leaking directory
+  state (covered by `tests/security/test_ldap_attack_surface.py`)
 - `SCRIPT_EXEC_MODE=local` (pre-evaluation scripts run as plain subprocesses) is for
   development machines only and forbidden in enterprise deployments; the compliant
   path is `container` sandbox mode — see section 9 of [docs/build-pipeline.md](docs/build-pipeline.md)

@@ -1,5 +1,6 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import { authApi, getToken } from '@/api'
+import { isSuperAdmin, userRole } from '@/utils/permissions'
 
 const routes = [
   {
@@ -66,7 +67,8 @@ const routes = [
     path: '/dev-settings',
     name: 'DevSettings',
     component: () => import('@/views/DevSettings.vue'),
-    meta: { title: '开发者设置' }
+    // M4 QE4-3：页面主操作是创建 API Key/Webhook（写操作），viewer 只读禁入
+    meta: { title: '开发者设置', requireWrite: true }
   },
   {
     path: '/teams',
@@ -115,8 +117,21 @@ router.beforeEach(async (to, from, next) => {
     // 超管页面权限检查
     if (to.meta.requireSuperAdmin) {
       const user = status.user
-      const isSuperAdmin = user?.superAdminFlag === 1 || user?.super_admin_flag === 1
-      if (!isSuperAdmin) {
+      const isSuper = isSuperAdmin(user)
+      if (!isSuper) {
+        return next('/')
+      }
+    }
+
+    // 角色守卫（M4 QE4-3）：requireWrite 页面主操作为写（如开发者设置的
+    // Key/Webhook 创建），viewer 只读禁入；超管与 owner/engineer 放行。
+    // 只读浏览页（任务/数据集/模型等）不挂本守卫——viewer 可看不可写，
+    // 按钮级禁用联动在页面内（readonlyRole）。
+    if (to.meta.requireWrite) {
+      const user = status.user
+      const canWritePage = isSuperAdmin(user) || ['owner', 'engineer'].includes(userRole(user))
+      if (!canWritePage) {
+        console.warn('路由守卫：当前角色（viewer）无权访问该页面', to.path)
         return next('/')
       }
     }

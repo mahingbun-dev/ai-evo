@@ -6,7 +6,7 @@
           <span>数据集管理</span>
           <div>
             <el-button type="warning" :loading="cleanupLoading" @click="handleCleanupDuplicates">清理重复数据</el-button>
-            <el-button type="primary" :disabled="cleanupLoading" @click="openDialog()">新建数据集</el-button>
+            <el-button type="primary" :disabled="cleanupLoading || readonlyRole" :title="readonlyRole ? '当前角色（viewer）只读' : ''" @click="openDialog()">新建数据集</el-button>
           </div>
         </div>
       </template>
@@ -475,13 +475,18 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { ref, computed, inject, onMounted, onUnmounted, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { datasetApi, ossApi, hubApi, preJudgeScriptApi, hubImportApi } from '@/api'
 import { useTaskWebSocket } from '@/composables/useTaskWebSocket'
 import { Document, Download, Upload, CircleCheck, CircleClose, Warning, Box, Loading } from '@element-plus/icons-vue'
 import { formatTime } from '@/utils/time'
 import HubFileDrawer from '@/components/HubFileDrawer.vue'
+import { canWrite } from '@/utils/permissions'
+
+// M4 QE4-3：viewer 只读——写按钮禁用联动（canWrite 见 utils/permissions）
+const currentUser = inject('currentUser', null)
+const readonlyRole = computed(() => !canWrite(currentUser.value))
 
 const datasets = ref([])
 const dialogVisible = ref(false)

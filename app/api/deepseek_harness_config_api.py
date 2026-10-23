@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 from fastapi import APIRouter, HTTPException, Depends
 from app.services.access_control import ensure_super_admin
+from app.services.audit_service import audited
 from pydantic import BaseModel, Field
 
 from app.services.deepseek_adapter import is_native_deepseek_protocol
@@ -59,7 +60,8 @@ async def get_config():
     return DeepSeekHarnessConfigResponse(configured=config is not None, config=config)
 
 
-@router.put("", response_model=DeepSeekHarnessConfigResponse)
+@router.put("", response_model=DeepSeekHarnessConfigResponse,
+            dependencies=[Depends(audited("UPDATE", "deepseek_harness_config"))])
 async def update_config(payload: DeepSeekHarnessConfigPayload):
     """保存全局配置（单例 upsert）"""
     if not payload.provider.strip():

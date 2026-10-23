@@ -8,10 +8,11 @@ from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field, field_serializer, field_validator, computed_field, ConfigDict
 from datetime import datetime
 from app.db.session import get_db
-from app.services.access_control import ensure_task_access
+from app.services.access_control import ensure_permission, ensure_task_access
 from app.services.evaluation_task_service import EvaluationTaskService, TaskExecutionLogService
 from app.core import scopes
 from app.core.scopes import require_scope
+from app.services.audit_service import audited
 
 logger = logging.getLogger(__name__)
 
@@ -483,7 +484,8 @@ class VerifierDebugPayload(BaseModel):
 router = APIRouter(prefix="/evaluation/tasks", tags=["评测任务"])
 
 
-@router.post("", response_model=TaskResponse, summary="创建评测任务")
+@router.post("", response_model=TaskResponse, summary="创建评测任务",
+             dependencies=[Depends(audited("CREATE", "task"))])
 def create_task(
     body: CreateTaskRequest,
     request: Request,
@@ -491,6 +493,7 @@ def create_task(
 ):
     """创建新的评测任务"""
     user = request.state.user
+    ensure_permission(request.state.user, "tasks")  # RBAC（QE4-3）：viewer 只读
     # 支持字典和对象两种格式（字典是中间件传递的，对象是其他场景使用）
     user_code = user.get('user_code') if isinstance(user, dict) else (user.user_code if hasattr(user, 'user_code') else body.created_by)
     org_code = user.get('org_code') if isinstance(user, dict) else (user.org_code if hasattr(user, 'org_code') else None)
@@ -548,14 +551,8 @@ def create_task(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    # 记录审计日志（V2 新增）- 使用独立 session，不影响主业务
-    try:
-        from app.services.audit_service import log_operation
-        client_host = request.client.host if request.client else ""
-        log_operation(user, "CREATE", "task", task.id, task.name, ip_address=client_host)
-    except Exception as e:
-        logger.warning(f"审计日志记录失败: {e}")
-        db.rollback()  # 清理 session 状态
+    # QE4-4：审计改走 audited 路由依赖（teardown 统一落库），创建结果暂存标识
+    request.state.audit_resource = {"id": task.id, "name": task.name}
 
     return task
 
@@ -563,8 +560,12 @@ def create_task(
 # ==================== Variable Endpoints ====================
 # 注意：这些路由必须放在 /{task_id} 之前，否则会被 /{task_id} 匹配
 
-@router.post("/plugin-eval/upload", summary="上传插件包/SKILL.md（插件评测手动来源）")
-async def upload_plugin_package(file: UploadFile = File(..., description="zip 插件包（≤20MB）或 SKILL.md（≤2MB）")):
+@router.post("/plugin-eval/upload", summary="上传插件包/SKILL.md（插件评测手动来源）",
+             dependencies=[Depends(audited("CREATE", "plugin_upload"))])
+async def upload_plugin_package(
+    request: Request,
+    file: UploadFile = File(..., description="zip 插件包（≤20MB）或 SKILL.md（≤2MB）"),
+):
     """上传插件/skill 压缩包或 SKILL.md，供插件评测「手动指定」来源使用。
 
     - .zip：内存解包（路径穿越校验/大小限制/唯一顶层目录剥离）后落盘到
@@ -582,6 +583,10 @@ async def upload_plugin_package(file: UploadFile = File(..., description="zip �
     result = save_plugin_upload(file.filename or "", content)
     if result.get("error"):
         raise HTTPException(status_code=400, detail=result["error"])
+    # QE4-4：插件上传留痕（文件名/解包路径；内容不进审计）
+    request.state.audit_resource = {
+        "id": str(result.get("path") or result.get("dir") or ""), "name": file.filename or "",
+    }
     return result
 
 
@@ -762,7 +767,8 @@ def get_tasks(
     return tasks
 
 
-@router.post("/migrate-legacy-all", response_model=MigrateLegacyAllResponse, summary="批量迁移旧版任务配置")
+@router.post("/migrate-legacy-all", response_model=MigrateLegacyAllResponse, summary="批量迁移旧版任务配置",
+             dependencies=[Depends(audited("UPDATE", "task"))])
 def migrate_legacy_all_tasks(
     request: Request,
     db: Session = Depends(get_db),
@@ -778,8 +784,12 @@ def migrate_legacy_all_tasks(
     from app.services.config_migration_service import ConfigMigrationService
     service = ConfigMigrationService(db)
     if super_admin_flag == 1:
-        return service.migrate_all_tasks()
-    return service.migrate_all_tasks(team_code=org_code if org_code else "DEFAULT")
+        result = service.migrate_all_tasks()
+    else:
+        result = service.migrate_all_tasks(team_code=org_code if org_code else "DEFAULT")
+    # QE4-4：批量迁移结果进审计 detail
+    request.state.audit_resource = {"name": "migrate-legacy-all", "detail": dict(result)}
+    return result
 
 
 @router.get("/{task_id}", response_model=TaskDetailResponse, summary="获取任务详情")
@@ -849,7 +859,8 @@ def get_task_status(
     )
 
 
-@router.put("/{task_id}", response_model=TaskResponse, summary="更新任务")
+@router.put("/{task_id}", response_model=TaskResponse, summary="更新任务",
+            dependencies=[Depends(audited("UPDATE", "task", id_param="task_id"))])
 def update_task(
     task_id: str,
     body: UpdateTaskRequest,
@@ -857,6 +868,7 @@ def update_task(
     db: Session = Depends(get_db),
 ):
     """更新评测任务（W9：对象级归属校验，查出+校验一步完成防 TOCTOU）"""
+    ensure_permission(request.state.user, "tasks")  # RBAC（QE4-3）
     task = ensure_task_access(db, request.state.user, task_id)
     service = EvaluationTaskService(db)
 
@@ -875,13 +887,15 @@ def update_task(
     return task
 
 
-@router.delete("/{task_id}", summary="删除任务")
+@router.delete("/{task_id}", summary="删除任务",
+               dependencies=[Depends(audited("DELETE", "task", id_param="task_id"))])
 def delete_task(
     task_id: str,
     request: Request,
     db: Session = Depends(get_db),
 ):
     """删除评测任务（W9：对象级归属校验）"""
+    ensure_permission(request.state.user, "tasks")  # RBAC（QE4-3）
     ensure_task_access(db, request.state.user, task_id)
     service = EvaluationTaskService(db)
     success = service.delete_task(task_id)
@@ -894,7 +908,8 @@ def delete_task(
     "/{task_id}/run",
     response_model=TaskResponse,
     summary="执行评测",
-    dependencies=[Depends(require_scope(scopes.TASKS_RUN))],
+    dependencies=[Depends(require_scope(scopes.TASKS_RUN)),
+                  Depends(audited("RUN", "task", id_param="task_id"))],
 )
 def run_task(
     task_id: str,
@@ -905,8 +920,9 @@ def run_task(
 
     M1 QE1-4：scope 化——API Key 持 tasks:run 可触发（CI 门禁链路），
     浏览器 JWT 路径不受影响；归属校验对两种凭证同一口径（API Key 按
-    所属用户身份判团队）。
+    所属用户身份判团队）。RBAC（QE4-3）：viewer 不可触发运行。
     """
+    ensure_permission(request.state.user, "tasks")
     task = ensure_task_access(db, request.state.user, task_id)
 
     # 允许重新运行已停止或失败的任务
@@ -932,13 +948,15 @@ def run_task(
     return task
 
 
-@router.post("/{task_id}/stop", response_model=TaskResponse, summary="停止评测")
+@router.post("/{task_id}/stop", response_model=TaskResponse, summary="停止评测",
+             dependencies=[Depends(audited("STOP", "task", id_param="task_id"))])
 def stop_task(
     task_id: str,
     request: Request,
     db: Session = Depends(get_db),
 ):
     """停止评测任务（发送停止信号，真正中断执行中的任务；W9：对象级归属校验）"""
+    ensure_permission(request.state.user, "tasks")  # RBAC（QE4-3）
     task = ensure_task_access(db, request.state.user, task_id)
 
     # 如果任务已完成或已停止，直接返回成功
@@ -958,7 +976,8 @@ def stop_task(
     return task
 
 
-@router.post("/{task_id}/refresh-count", response_model=TaskResponse, summary="刷新题目数")
+@router.post("/{task_id}/refresh-count", response_model=TaskResponse, summary="刷新题目数",
+             dependencies=[Depends(audited("UPDATE", "task", id_param="task_id"))])
 def refresh_task_count(
     task_id: str,
     request: Request,
@@ -971,7 +990,8 @@ def refresh_task_count(
     return task
 
 
-@router.post("/{task_id}/migrate-config", response_model=TaskMigrateConfigResponse, summary="迁移旧版任务配置")
+@router.post("/{task_id}/migrate-config", response_model=TaskMigrateConfigResponse, summary="迁移旧版任务配置",
+             dependencies=[Depends(audited("UPDATE", "task", id_param="task_id"))])
 def migrate_task_config(
     task_id: str,
     request: Request,
@@ -1309,7 +1329,8 @@ class ExecutionExportRequest(BaseModel):
     format: str = Field("markdown", description="导出格式：markdown（全量报告；safety 任务出安全评测合规报告）| json（无损）| xlsx（仅 safety 任务：安全评测合规报告工作簿）")
 
 
-@results_router.post("/{task_id}/history/{execution_number}/export", summary="导出指定执行版本的结果文档")
+@results_router.post("/{task_id}/history/{execution_number}/export", summary="导出指定执行版本的结果文档",
+                     dependencies=[Depends(audited("EXPORT", "execution_record"))])
 def export_result_history_version(
     task_id: str,
     execution_number: int,
@@ -1414,16 +1435,12 @@ def export_result_history_version(
             logger.warning(f"导出登记写入失败（file_id={uploaded.get('file_id')}）: {e}")
             db.rollback()
 
-    try:
-        from app.services.audit_service import log_operation
-        client_host = request.client.host if request.client else ""
-        log_operation(
-            request.state.user, "EXPORT", "execution_record", record.id if is_db_record else task_id,
-            f"{task.name}#exec{execution_number}",
-            detail={"format": body.format, **uploaded}, ip_address=client_host,
-        )
-    except Exception as e:
-        logger.warning(f"审计日志记录失败: {e}")
+    # QE4-4：导出审计改走 audited 路由依赖；file_id/URL 等上传信息进 detail
+    request.state.audit_resource = {
+        "id": record.id if is_db_record else task_id,
+        "name": f"{task.name}#exec{execution_number}",
+        "detail": {"format": body.format, **uploaded},
+    }
 
     return {
         "task_id": task_id,

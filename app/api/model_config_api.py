@@ -12,12 +12,14 @@ from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field, field_serializer
 from datetime import datetime
 from app.db.session import get_db
+from app.services.audit_service import audited
 from app.services.model_config_service import ModelConfigService, PresetModelService
 from app.services.ws_auth import require_ws_user
 from app.services.access_control import (
     AccessDeniedError,
     check_team_access,
     ensure_model_access,
+    ensure_permission,
     user_team_code,
 )
 
@@ -183,13 +185,15 @@ class PresetModelResponse(BaseModel):
 router = APIRouter(prefix="/models", tags=["模型配置"])
 
 
-@router.post("", response_model=ModelResponse, summary="创建模型配置")
+@router.post("", response_model=ModelResponse, summary="创建模型配置",
+             dependencies=[Depends(audited("CREATE", "model"))])
 def create_model(
     request: Request,
     body: CreateModelRequest,
     db: Session = Depends(get_db),
 ):
     """创建新的模型配置（W19：team_code 盖创建人团队，空 org_code 按 DEFAULT）"""
+    ensure_permission(request.state.user, "models")  # RBAC（QE4-3）：viewer 只读
     service = ModelConfigService(db)
     model = service.create_model(
         name=body.name,
@@ -208,6 +212,7 @@ def create_model(
         created_by=body.created_by,
         team_code=user_team_code(request.state.user),
     )
+    request.state.audit_resource = {"id": model.id, "name": model.name}
     return model
 
 
@@ -238,7 +243,8 @@ def get_model(
     return model
 
 
-@router.put("/{model_id}", response_model=ModelResponse, summary="更新模型配置")
+@router.put("/{model_id}", response_model=ModelResponse, summary="更新模型配置",
+            dependencies=[Depends(audited("UPDATE", "model", id_param="model_id"))])
 def update_model(
     model_id: str,
     request: Request,
@@ -246,6 +252,7 @@ def update_model(
     db: Session = Depends(get_db),
 ):
     """更新模型配置（W19：团队收口）"""
+    ensure_permission(request.state.user, "models")  # RBAC（QE4-3）：viewer 只读
     ensure_model_access(db, request.state.user, model_id)
     update_data = body.model_dump(exclude_unset=True)
     # 如果 api_key 为空或包含脱敏字符 '*'，说明用户未修改，不更新
@@ -260,13 +267,15 @@ def update_model(
     return model
 
 
-@router.delete("/{model_id}", summary="删除模型配置")
+@router.delete("/{model_id}", summary="删除模型配置",
+               dependencies=[Depends(audited("DELETE", "model", id_param="model_id"))])
 def delete_model(
     model_id: str,
     request: Request,
     db: Session = Depends(get_db),
 ):
     """删除模型配置（W19：团队收口）"""
+    ensure_permission(request.state.user, "models")  # RBAC（QE4-3）：viewer 只读
     ensure_model_access(db, request.state.user, model_id)
     service = ModelConfigService(db)
     try:
@@ -347,7 +356,8 @@ def get_preset_models(
 router_judge = APIRouter(prefix="/judge-models", tags=["裁判模型"])
 
 
-@router_judge.post("", response_model=ModelResponse, summary="创建裁判模型配置")
+@router_judge.post("", response_model=ModelResponse, summary="创建裁判模型配置",
+                   dependencies=[Depends(audited("CREATE", "judge_model"))])
 def create_judge_model(
     request: Request,
     body: CreateModelRequest,
@@ -372,6 +382,7 @@ def create_judge_model(
         created_by=body.created_by,
         team_code=user_team_code(request.state.user),
     )
+    request.state.audit_resource = {"id": judge.id, "name": judge.name}
     return judge
 
 
@@ -397,7 +408,8 @@ def get_judge_model(
     return judge
 
 
-@router_judge.put("/{judge_id}", response_model=ModelResponse, summary="更新裁判模型配置")
+@router_judge.put("/{judge_id}", response_model=ModelResponse, summary="更新裁判模型配置",
+                  dependencies=[Depends(audited("UPDATE", "judge_model", id_param="judge_id"))])
 def update_judge_model(
     judge_id: str,
     request: Request,
@@ -421,7 +433,8 @@ def update_judge_model(
     return judge
 
 
-@router_judge.delete("/{judge_id}", summary="删除裁判模型配置")
+@router_judge.delete("/{judge_id}", summary="删除裁判模型配置",
+                     dependencies=[Depends(audited("DELETE", "judge_model", id_param="judge_id"))])
 def delete_judge_model(
     judge_id: str,
     request: Request,

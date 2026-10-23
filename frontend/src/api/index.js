@@ -366,24 +366,50 @@ export const docsApi = {
   updateUserGuide: (content) => request.put('/docs/user-guide', { content })
 }
 
-// 团队管理API（V2 新增）
+// 团队管理API（V2 新增；M4 QE4-3 增成员角色调整）
 export const teamApi = {
   list: (params) => request.get('/teams', { params }),
   getMembers: (teamCode, params) => request.get(`/teams/${teamCode}/members`, { params }),
-  setMemberStatus: (teamCode, userCode, isActive) => request.patch(`/teams/${teamCode}/members/${userCode}/status`, { is_active: isActive })
+  setMemberStatus: (teamCode, userCode, isActive) => request.patch(`/teams/${teamCode}/members/${userCode}/status`, { is_active: isActive }),
+  setMemberRole: (teamCode, userCode, role) => request.patch(`/teams/${teamCode}/members/${userCode}/role`, { role })
 }
 
-// 审计日志API（V2 新增）
+// 审计日志API（V2 新增；QE4-4 导出挂企业功能位 AUDIT_EXPORT_ENABLED）
 export const auditApi = {
-  list: (params) => request.get('/audit-logs', { params })
+  list: (params) => request.get('/audit-logs', { params }),
+  export: async (params) => {
+    const resp = await request.get('/audit-logs/export', { params, responseType: 'blob' })
+    return resp
+  }
 }
 
-// 认证API（本地账号密码登录）
+// 认证API（本地账号密码登录 + M4 QE4-1 OIDC SSO 登录方式公告）
 export const authApi = {
   status: () => request.get('/auth/status'),
   register: (data) => request.post('/auth/register', data),
   login: (data) => request.post('/auth/login', data),
-  logout: () => request.post('/auth/logout')
+  logout: () => request.post('/auth/logout'),
+  // 登录页渲染依据（匿名）：methods/register_enabled/oidc_configured
+  methods: () => request.get('/auth/methods')
+}
+
+// OIDC SSO 管理（M4 QE4-1，超管开发者设置页）：config 读接口脱敏回显，
+// client_secret 提交脱敏回显值=保留原值
+export const ssoApi = {
+  getConfig: () => request.get('/auth/oidc/config'),
+  saveConfig: (data) => request.put('/auth/oidc/config', data),
+  testConnectivity: (data) => request.post('/auth/oidc/test', data),
+  listTeamMappings: () => request.get('/auth/oidc/team-mappings'),
+  addTeamMapping: (data) => request.post('/auth/oidc/team-mappings', data),
+  removeTeamMapping: (id) => request.delete(`/auth/oidc/team-mappings/${id}`)
+}
+
+// LDAP/AD 只读认证管理（M4 QE4-2，超管开发者设置页）：config 读接口脱敏
+// 回显，bind_password 提交脱敏回显值=保留原值
+export const ldapApi = {
+  getConfig: () => request.get('/auth/ldap/config'),
+  saveConfig: (data) => request.put('/auth/ldap/config', data),
+  testConnectivity: (data) => request.post('/auth/ldap/test', data)
 }
 
 // OSS 直传上传API（企业内网 OSS 可选功能，地址经 VITE_OSS_BASE_URL 构建时注入；未配置则功能不可用）

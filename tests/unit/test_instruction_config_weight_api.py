@@ -38,6 +38,23 @@ Base.metadata.create_all(bind=_engine)
 
 # 独立测试 app：挂载生产同款 router 前缀（settings.API_V1_STR="/api/v1"）
 _test_app = FastAPI()
+
+# M4 QE4-3：模板写端点挂了 RBAC 闸（ensure_permission(request.state.user,...)），
+# 本测试 app 不带鉴权中间件——注入 engineer 用户上下文补齐（生产链路该
+# 上下文由 AuthMiddleware 设置）
+from starlette.middleware.base import BaseHTTPMiddleware
+
+
+class _UserInjectMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        request.state.user = {
+            "user_code": "u_test_engineer", "super_admin_flag": 0,
+            "role": "engineer", "org_code": "QE",
+        }
+        return await call_next(request)
+
+
+_test_app.add_middleware(_UserInjectMiddleware)
 _test_app.include_router(instruction_router, prefix="/api/v1")
 
 

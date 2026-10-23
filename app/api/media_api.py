@@ -13,7 +13,8 @@ from typing import List, Optional, Union
 from pydantic import BaseModel, Field, field_serializer
 from datetime import datetime
 from app.db.session import get_db
-from app.services.access_control import ensure_media_access, filter_team_code, user_team_code
+from app.services.access_control import ensure_media_access, ensure_permission, filter_team_code, user_team_code
+from app.services.audit_service import audited
 from app.services.media_service import MediaService
 
 
@@ -50,7 +51,8 @@ class MediaListResponse(BaseModel):
 router = APIRouter(prefix="/media", tags=["媒体资源"])
 
 
-@router.post("/upload", response_model=MediaResponse, summary="上传媒体文件")
+@router.post("/upload", response_model=MediaResponse, summary="上传媒体文件",
+             dependencies=[Depends(audited("CREATE", "media"))])
 async def upload_media(
     request: Request,
     file: UploadFile = File(..., description="要上传的文件"),
@@ -59,10 +61,12 @@ async def upload_media(
     db: Session = Depends(get_db),
 ):
     """上传媒体文件（图片、PDF等；W9：team_code 随用户团队落库）"""
+    ensure_permission(request.state.user, "media")  # RBAC（QE4-3）：viewer 只读
     service = MediaService(db)
     media = await service.upload_file(
         file, description, uploaded_by, team_code=user_team_code(request.state.user)
     )
+    request.state.audit_resource = {"id": media.id, "name": media.file_name}
     return media
 
 
@@ -120,13 +124,15 @@ def get_media_content(
     )
 
 
-@router.delete("/{media_id}", summary="删除媒体文件")
+@router.delete("/{media_id}", summary="删除媒体文件",
+               dependencies=[Depends(audited("DELETE", "media", id_param="media_id"))])
 def delete_media(
     media_id: str,
     request: Request,
     db: Session = Depends(get_db),
 ):
     """删除媒体文件（W9：对象级归属校验）"""
+    ensure_permission(request.state.user, "media")  # RBAC（QE4-3）：viewer 只读
     ensure_media_access(db, request.state.user, media_id)
     service = MediaService(db)
     success = service.delete_media(media_id)

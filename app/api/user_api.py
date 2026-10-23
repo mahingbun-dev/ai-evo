@@ -17,6 +17,7 @@ from app.models.user_models import User
 from app.services.jwt_service import create_token, decode_token
 from app.services.password_service import hash_password, verify_password
 from app.services.access_control import ensure_super_admin
+from app.services.audit_service import log_operation
 
 
 # ==================== Response Models ====================
@@ -131,6 +132,7 @@ def _user_brief(user: User) -> dict:
         "org_code": user.org_code,
         "org_name": user.org_name,
         "position_name": user.position_name,
+        "role": user.role,
         "user_type": user.user_type,
         "super_admin_flag": user.super_admin_flag,
         "application_admin": user.application_admin,
@@ -176,6 +178,9 @@ async def register(body: RegisterRequest, db: Session = Depends(get_db)):
     import uuid
     from app.core.config import get_settings
 
+    # M4 QE4-1：AUTH_METHODS 关掉 local（如纯 SSO 部署）即关闭本地注册
+    if "local" not in get_settings().auth_methods:
+        raise HTTPException(status_code=403, detail="本地账号登录未启用，请联系管理员使用 SSO 登录")
     if not get_settings().AUTH_REGISTER_ENABLED:
         raise HTTPException(status_code=403, detail="当前未开放注册")
 
@@ -190,6 +195,7 @@ async def register(body: RegisterRequest, db: Session = Depends(get_db)):
         password_hash=hash_password(body.password),
         user_name=body.user_name or body.username,
         email=body.email or "",
+        role="engineer",
         super_admin_flag=1 if is_first else 0,
         application_admin=0,
         is_active=True,
@@ -205,10 +211,34 @@ async def register(body: RegisterRequest, db: Session = Depends(get_db)):
 
 @auth_router.post("/login", summary="账号密码登录")
 async def login(body: LoginRequest, db: Session = Depends(get_db)):
-    """校验用户名密码，签发 JWT；此接口在白名单中，无需鉴权"""
+    """校验用户名密码，签发 JWT；此接口在白名单中，无需鉴权
+
+    通道优先级（M4 QE4-2）：
+    - 本地有密码的账号（平台自管账号）→ 本地校验，**不**旁路 LDAP；
+    - 其余情况（账号不存在/无本地密码）且 AUTH_METHODS 含 ldap 且已配置
+      → 旁路到 LDAP search+bind 只读认证，成功后 JIT 开户/映射并签发；
+    - 两条通道都不可用/都失败 → 401（文案与历史一致，不区分存在性）。
+    AUTH_METHODS 关掉 local（纯 SSO/LDAP 部署口径）时本地直登整体关闭。
+    """
+    from app.core.config import get_settings
+
+    methods = get_settings().auth_methods
+    if "local" not in methods and "ldap" not in methods:
+        raise HTTPException(status_code=403, detail="本地账号登录未启用，请联系管理员使用 SSO 登录")
+
     user = db.query(User).filter(User.username == body.username).first()
-    if not user or not user.password_hash or not verify_password(body.password, user.password_hash):
+    # 本地有密码的账号走本地校验（平台自管，不旁路——LDAP 侧同名账号
+    # 不构成对本地账号的密码证明）
+    if "local" in methods and user is not None and user.password_hash:
+        if not verify_password(body.password, user.password_hash):
+            raise HTTPException(status_code=401, detail="用户名或密码错误")
+    elif "ldap" in methods:
+        user = _ldap_login_fallback(db, body)
+        if user is None:
+            raise HTTPException(status_code=401, detail="用户名或密码错误")
+    else:
         raise HTTPException(status_code=401, detail="用户名或密码错误")
+
     if not user.is_active:
         raise HTTPException(status_code=403, detail="账号已被禁用，请联系管理员")
 
@@ -217,6 +247,46 @@ async def login(body: LoginRequest, db: Session = Depends(get_db)):
 
     logger.info(f"[AUTH] 用户登录: {user.username}")
     return {"token": create_token(user.user_code, user.username), "user": _user_brief(user)}
+
+
+def _ldap_login_fallback(db: Session, body: "LoginRequest"):
+    """LDAP search+bind 旁路（M4 QE4-2）：成功返回已 JIT 的用户，失败 None
+
+    - 目录交互（authenticate）的失败一律不外显：LdapError 与意外异常
+      （连接层抛错等）统一按 None（401「用户名或密码错误」），不向未认证方
+      暴露目录状态、不带病 500，详细原因进日志由管理员排障；
+    - 唯一例外是映射到本地已禁用账号（SsoError）：与本地登录同口径 403。
+    """
+    from app.services import ldap_service, sso_service
+    from app.services.sso_service import SsoError
+
+    config = ldap_service.get_active_config(db)
+    if config is None:
+        return None
+    try:
+        claims = ldap_service.authenticate(config, body.username, body.password)
+    except ldap_service.LdapError as e:
+        logger.warning(f"[AUTH] LDAP 旁路失败: {e}")
+        return None
+    except Exception as e:  # 目录层意外异常（连接抛错等）：失败关闭
+        logger.warning(f"[AUTH] LDAP 旁路异常: {e.__class__.__name__}: {e}", exc_info=True)
+        return None
+    try:
+        user, created = sso_service.provision_user(db, claims, source="ldap")
+    except SsoError as e:
+        # 映射到本地禁用账号等：语义性拒绝，403 与本地通道一致
+        raise HTTPException(status_code=403, detail=str(e))
+    log_operation(
+        {"user_code": user.user_code, "user_name": user.user_name,
+         "org_code": user.org_code},
+        action="CREATE" if created else "LOGIN",
+        resource_type="user" if created else "ldap",
+        resource_id=user.user_code,
+        resource_name=user.username,
+        detail={"via": "ldap", "email": claims["email"],
+                "groups": claims["groups"]},
+    )
+    return user
 
 
 @auth_router.get("/status", summary="检查登录状态")

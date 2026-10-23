@@ -9,7 +9,20 @@
         <p class="login-subtitle">AI 评测平台</p>
       </div>
 
-      <el-tabs v-model="activeTab" class="login-tabs" stretch>
+      <!-- M4 QE4-1：SSO 登录入口（AUTH_METHODS 含 oidc 且已配置 IdP 时显示） -->
+      <el-button
+        v-if="authMethods.oidc"
+        type="primary"
+        plain
+        class="submit-btn sso-btn"
+        :disabled="!authMethods.oidcConfigured"
+        @click="startSsoLogin"
+      >
+        {{ authMethods.oidcConfigured ? '使用企业账号登录（SSO）' : 'SSO 未配置，请联系管理员' }}
+      </el-button>
+      <el-divider v-if="authMethods.oidc && passwordFormVisible" class="sso-divider">或</el-divider>
+
+      <el-tabs v-if="passwordFormVisible" v-model="activeTab" class="login-tabs" stretch>
         <!-- 登录 -->
         <el-tab-pane label="登录" name="login">
           <el-form
@@ -38,6 +51,7 @@
                 autocomplete="current-password"
               />
             </el-form-item>
+            <div v-if="ldapOnly" class="ldap-hint">使用企业目录账号登录（LDAP/AD，由管理员统一配置）</div>
             <el-button
               type="primary"
               class="submit-btn"
@@ -50,7 +64,7 @@
         </el-tab-pane>
 
         <!-- 注册 -->
-        <el-tab-pane label="注册" name="register">
+        <el-tab-pane v-if="registerEnabled" label="注册" name="register">
           <el-form
             ref="registerFormRef"
             :model="registerForm"
@@ -127,6 +141,14 @@ const activeTab = ref('login')
 const loading = ref(false)
 const loginFormRef = ref(null)
 const registerFormRef = ref(null)
+
+// M4 QE4-1/QE4-2：登录方式开关（后端 /auth/methods 公告）——
+// 密码表单在 local 或 ldap 任一启用时显示（ldap 是账密表单的目录旁路），
+// local 关闭时只显 SSO 按钮 + （若启用 ldap）目录账密表单
+const authMethods = ref({ local: true, oidc: false, oidcConfigured: false })
+const passwordFormVisible = ref(true)
+const ldapOnly = ref(false)
+const registerEnabled = ref(true)
 
 const loginForm = reactive({ username: '', password: '' })
 const registerForm = reactive({ username: '', user_name: '', password: '', confirmPassword: '' })
@@ -211,8 +233,56 @@ const handleRegister = async () => {
   }
 }
 
-// 已登录用户访问登录页直接跳转
+// M4 QE4-1：发起 SSO 登录——302 到企业 IdP，回跳由 /login?sso_token= 接管
+const startSsoLogin = () => {
+  const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : '/'
+  window.location.href = `/api/v1/auth/oidc/login?redirect=${encodeURIComponent(redirect)}`
+}
+
+// SSO 回跳落袋：/login?sso_token=<JWT>（后端 callback 302 而来）
+const handleSsoCallback = async () => {
+  const token = typeof route.query.sso_token === 'string' ? route.query.sso_token : ''
+  if (!token) return false
+  setToken(token)
+  try {
+    const status = await authApi.status()
+    if (currentUser && status.user) {
+      currentUser.value = status.user
+    }
+    ElMessage.success('SSO 登录成功')
+  } catch {
+    // token 无效极罕见（签发即回跳）；按失败处理并留在登录页
+    ElMessage.error('SSO 登录态无效，请重试')
+    return false
+  }
+  gotoRedirect()
+  return true
+}
+
+// 已登录用户访问登录页直接跳转；SSO 回跳/失败提示优先处理
 onMounted(async () => {
+  // SSO 失败回跳：/login?sso_error=<原因>（URL 中文已解码）
+  if (typeof route.query.sso_error === 'string' && route.query.sso_error) {
+    ElMessage.error(route.query.sso_error)
+  }
+  if (await handleSsoCallback()) return
+
+  try {
+    const methods = await authApi.methods()
+    const list = methods.methods || []
+    authMethods.value = {
+      local: list.includes('local'),
+      oidc: list.includes('oidc'),
+      oidcConfigured: Boolean(methods.oidc_configured)
+    }
+    passwordFormVisible.value = list.includes('local') || list.includes('ldap')
+    ldapOnly.value = !list.includes('local') && list.includes('ldap')
+    registerEnabled.value = Boolean(methods.register_enabled)
+    if (!authMethods.value.local) activeTab.value = 'login'
+  } catch {
+    // 公告接口失败按缺省（local）渲染，本地账密仍可登录
+  }
+
   const { getToken, authApi: api } = await import('@/api/index.js')
   if (getToken()) {
     try {
@@ -286,5 +356,22 @@ onMounted(async () => {
   border-radius: 8px;
   font-weight: 500;
   letter-spacing: 4px;
+}
+
+/* M4 QE4-1：SSO 入口在本地表单上方，二者共存时加分隔线 */
+.sso-btn {
+  letter-spacing: 1px;
+}
+
+/* M4 QE4-2：纯 LDAP 部署（local 关闭）时账密表单的目录提示 */
+.ldap-hint {
+  font-size: 12px;
+  color: var(--text-secondary, #6B7280);
+  margin: -4px 0 8px;
+}
+
+.sso-divider :deep(.el-divider__text) {
+  font-size: 12px;
+  color: var(--text-secondary, #6B7280);
 }
 </style>

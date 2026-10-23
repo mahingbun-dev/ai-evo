@@ -45,20 +45,36 @@
     </el-card>
 
     <!-- 成员详情对话框 -->
-    <el-dialog v-model="membersDialogVisible" title="团队成员" width="700px">
+    <el-dialog v-model="membersDialogVisible" title="团队成员" width="760px">
       <el-table :data="members" v-loading="membersLoading" max-height="400">
         <el-table-column prop="user_code" label="用户代码" width="120" />
-        <el-table-column prop="user_name" label="姓名" width="120" />
-        <el-table-column prop="email" label="邮箱" min-width="180" />
-        <el-table-column prop="position_name" label="职位" width="120" />
-        <el-table-column prop="is_active" label="状态" width="80">
+        <el-table-column prop="user_name" label="姓名" width="110" />
+        <el-table-column prop="email" label="邮箱" min-width="170" />
+        <el-table-column prop="position_name" label="职位" width="100" />
+        <el-table-column label="角色" width="170">
           <template #default="{ row }">
-            <el-tag :type="row.is_active ? 'success' : 'info'">
+            <!-- M4 QE4-3：角色下拉（超管或本团队 owner 可改，viewer 只读展示） -->
+            <el-select
+              v-if="canManageRole"
+              :model-value="row.role || 'engineer'"
+              size="small"
+              style="width: 140px"
+              :loading="changingRoleId === row.user_code"
+              @change="(val) => changeMemberRole(row, val)"
+            >
+              <el-option v-for="opt in ROLE_OPTIONS" :key="opt.value" :value="opt.value" :label="opt.label" />
+            </el-select>
+            <el-tag v-else :type="roleTag(row.role)" size="small">{{ roleName(row.role) }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="is_active" label="状态" width="70">
+          <template #default="{ row }">
+            <el-tag :type="row.is_active ? 'success' : 'info'" size="small">
               {{ row.is_active ? '启用' : '禁用' }}
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="100" fixed="right">
+        <el-table-column label="操作" width="90" fixed="right">
           <template #default="{ row }">
             <el-popconfirm
               :title="`确定${row.is_active ? '禁用' : '启用'}该成员？`"
@@ -73,6 +89,7 @@
           </template>
         </el-table-column>
       </el-table>
+      <div v-if="!canManageRole" class="role-hint">只读视图：仅团队 owner 或超级管理员可调整成员角色</div>
       <template #footer>
         <el-button @click="membersDialogVisible = false">关闭</el-button>
       </template>
@@ -96,10 +113,14 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, computed, inject, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import { teamApi } from '@/api'
 import { formatTime } from '@/utils/time'
+import { ROLE_OPTIONS, canManageTeam } from '@/utils/permissions'
+
+// App 根组件共享用户信息（M4 QE4-3：角色下拉的编辑权限判定）
+const currentUser = inject('currentUser', null)
 
 const teams = ref([])
 const loading = ref(false)
@@ -113,6 +134,13 @@ const members = ref([])
 const membersLoading = ref(false)
 const selectedTeamCode = ref('')
 const togglingStatusId = ref(null)
+const changingRoleId = ref(null)
+
+// 当前查看团队是否可管理角色（超管或本团队 owner）
+const canManageRole = computed(() => canManageTeam(currentUser.value, selectedTeamCode.value))
+
+const roleName = (role) => ({ owner: 'Owner', engineer: 'Engineer', viewer: 'Viewer' }[role] || 'Engineer')
+const roleTag = (role) => ({ owner: 'danger', engineer: 'primary', viewer: 'info' }[role] || 'primary')
 
 // 统计对话框
 const statsDialogVisible = ref(false)
@@ -180,6 +208,21 @@ const toggleMemberStatus = async (row) => {
   }
 }
 
+// M4 QE4-3：调整成员角色（后端闸：本团队 owner 或超管；末位 owner 不可降级）
+const changeMemberRole = async (row, role) => {
+  if (changingRoleId.value !== null || role === (row.role || 'engineer')) return
+  changingRoleId.value = row.user_code
+  try {
+    await teamApi.setMemberRole(selectedTeamCode.value, row.user_code, role)
+    row.role = role
+    ElMessage.success(`成员角色已调整为 ${role}`)
+  } catch (e) {
+    ElMessage.error(e.message || '角色调整失败')
+  } finally {
+    changingRoleId.value = null
+  }
+}
+
 const viewStats = (row) => {
   currentTeam.value = row
   // 暂时使用团队成员数作为统计，实际应从后端获取
@@ -219,6 +262,13 @@ onMounted(() => {
   margin-top: 20px;
   display: flex;
   justify-content: flex-end;
+}
+
+/* M4 QE4-3：非 owner/超管的只读角色提示 */
+.role-hint {
+  margin-top: 10px;
+  font-size: 12px;
+  color: #909399;
 }
 
 :deep(.el-table) {

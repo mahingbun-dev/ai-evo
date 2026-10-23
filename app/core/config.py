@@ -85,6 +85,30 @@ class Settings(BaseSettings):
     AUTH_TOKEN_EXPIRE_HOURS: int = 168
     # 注册开关（关闭后仅已建账号可登录，登录页隐藏注册入口）
     AUTH_REGISTER_ENABLED: bool = True
+    # 认证方式开关（M4 QE4-1/QE4-2）：逗号分隔子集 local,oidc,ldap——
+    #   local —— 本地账号密码登录/注册（缺省，存量行为不变）；
+    #   oidc  —— OIDC SSO 登录（须同时在超管设置里配置 IdP，见
+    #            app/services/sso_service.py）；
+    #   ldap  —— LDAP/AD 只读认证（QE4-2）：登录页账密表单旁路到
+    #            search+bind 验证（须超管设置里配置目录，见
+    #            app/services/ldap_service.py）。
+    # 去掉 local（如 AUTH_METHODS=oidc）即关闭本地账密注册与直登；ldap
+    # 与 local 可并存（本地有密码的账号走本地，其余旁路 LDAP）。
+    # 校验见 _validate_auth_methods（非法值/空集启动即拒，不带病进登录面）。
+    AUTH_METHODS: str = "local"
+
+    @field_validator("AUTH_METHODS")
+    @classmethod
+    def _validate_auth_methods(cls, v: str) -> str:
+        """认证方式白名单闸（M4 QE4-1/QE4-2）：非空子集 local,oidc,ldap"""
+        methods = [m.strip().lower() for m in (v or "").split(",") if m.strip()]
+        allowed = ("local", "oidc", "ldap")
+        if not methods or any(m not in allowed for m in methods):
+            raise ValueError(
+                f"AUTH_METHODS 非法取值 {v!r}：仅允许 local/oidc/ldap 的非空逗号分隔组合"
+                "（如 local,oidc,ldap 或 oidc）"
+            )
+        return ",".join(dict.fromkeys(methods))  # 去重保序
 
     # 企业内网 OSS 媒体下载服务地址（可选功能：数据集媒体转存；留空则该功能不可用）
     OSS_BASE_URL: str = ""
@@ -225,6 +249,21 @@ class Settings(BaseSettings):
     # allow_private 只是任务侧意向，真正生效需本开关置 true（SSRF 控制面
     # 与 webhook 同口径——放行内网目标的决定权在部署管理员而非任务创建者）
     HTTP_ASSERT_ALLOW_PRIVATE_TARGETS: bool = False
+
+    # M4 QE4-4 审计导出（xlsx/csv）企业功能位（默认关）：审计日志整表导出
+    # 属企业治理诉求，非默认能力——开启后超管可在审计页导出（单次上限
+    # AUDIT_EXPORT_MAX_ROWS 行，防全表拖库打爆内存）；关闭时端点 404
+    AUDIT_EXPORT_ENABLED: bool = False
+    AUDIT_EXPORT_MAX_ROWS: int = 10000
+
+    @property
+    def auth_methods(self) -> set:
+        """已启用认证方式集合（M4 QE4-1/QE4-2）：AUTH_METHODS 解析结果，
+
+        供登录面（/auth/methods、/auth/login 本地/LDAP 闸、/auth/oidc/*
+        SSO 闸）共用同一口径；validator 保证非空且 ⊆ {local, oidc, ldap}。
+        """
+        return {m.strip().lower() for m in self.AUTH_METHODS.split(",") if m.strip()}
 
     @property
     def langfuse_config(self) -> Optional[Dict[str, str]]:

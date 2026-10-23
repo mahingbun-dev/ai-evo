@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
+from app.services.audit_service import audited
 from app.services.plugin_marketplace_service import (
     MarketplaceError,
     create_marketplace,
@@ -40,17 +41,20 @@ def get_marketplaces(db: Session = Depends(get_db)):
     return list_marketplaces(db)
 
 
-@router.post("", summary="新增插件市场（立即克隆）")
+@router.post("", summary="新增插件市场（立即克隆）",
+             dependencies=[Depends(audited("CREATE", "plugin_marketplace"))])
 def add_marketplace(payload: CreateMarketplaceRequest, db: Session = Depends(get_db)):
     return _biz(create_marketplace, db, payload.name, payload.git_url, payload.branch or "")
 
 
-@router.post("/{market_id}/sync", summary="同步插件市场（拉取远端最新）")
+@router.post("/{market_id}/sync", summary="同步插件市场（拉取远端最新）",
+             dependencies=[Depends(audited("UPDATE", "plugin_marketplace", id_param="market_id"))])
 def sync_marketplace_api(market_id: int, db: Session = Depends(get_db)):
     return _biz(sync_marketplace, db, market_id)
 
 
-@router.delete("/{market_id}", summary="删除插件市场（清理本地克隆）")
+@router.delete("/{market_id}", summary="删除插件市场（清理本地克隆）",
+               dependencies=[Depends(audited("DELETE", "plugin_marketplace", id_param="market_id"))])
 def remove_marketplace(market_id: int, db: Session = Depends(get_db)):
     return _biz(delete_marketplace, db, market_id)
 

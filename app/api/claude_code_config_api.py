@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, HTTPException, Depends
 from app.services.access_control import ensure_super_admin
+from app.services.audit_service import audited
 from pydantic import BaseModel, Field
 
 from app.services.claude_code_config_service import ClaudeCodeConfigService
@@ -46,7 +47,8 @@ async def get_config():
     return ClaudeCodeConfigResponse(configured=config is not None, config=config)
 
 
-@router.put("", response_model=ClaudeCodeConfigResponse)
+@router.put("", response_model=ClaudeCodeConfigResponse,
+            dependencies=[Depends(audited("UPDATE", "claude_code_config"))])
 async def update_config(payload: ClaudeCodeConfigPayload):
     """保存全局配置（单例 upsert）"""
     if not payload.base_url.strip():

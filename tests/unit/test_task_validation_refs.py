@@ -403,6 +403,7 @@ class TestApiErrorTranslation:
 
     def test_create_template_accepts_null_steps(self):
         """创建模板端点：steps 显式传 null 不再 422，且模板文本不渲染出 'None'（验收报告 issues#1 回归锁定）"""
+        from types import SimpleNamespace
         from app.api.instruction_config_api import (
             CreateInstructionConfigRequest,
             create_instruction_config,
@@ -415,7 +416,11 @@ class TestApiErrorTranslation:
         captured = []
         db = MagicMock()
         db.add.side_effect = lambda obj: captured.append(obj)
-        create_instruction_config(body, db)
+        # M4 QE4-3：写端点新增 RBAC 闸——直调需带 engineer 用户上下文
+        request = SimpleNamespace(state=SimpleNamespace(user={
+            "user_code": "u_test", "super_admin_flag": 0, "role": "engineer",
+        }))
+        create_instruction_config(body, request, db)
 
         assert db.commit.called
         assert captured and captured[0].steps is None

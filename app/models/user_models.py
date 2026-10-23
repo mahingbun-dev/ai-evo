@@ -19,6 +19,9 @@ class User(Base):
     org_code = Column(String, nullable=True, comment="部门编码")
     org_name = Column(String, nullable=True, comment="部门名称")
     position_name = Column(String, nullable=True, comment="职位名称")
+    # 团队角色（M4 QE4-3）：owner/engineer/viewer；NULL 按 engineer 兜底
+    # （迁移回填后仅历史行可能 NULL，语义缺省=engineer，见 access_control.user_role）
+    role = Column(String(20), nullable=True, comment="团队角色：owner/engineer/viewer（空按 engineer）")
 
     user_type = Column(Integer, nullable=True, comment="用户类型")
     super_admin_flag = Column(Integer, nullable=True, comment="超级管理员标志")

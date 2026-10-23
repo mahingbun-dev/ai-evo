@@ -247,7 +247,7 @@
               <el-option label="待评测模型" value="evaluation" />
               <el-option label="裁判模型" value="judge" />
             </el-select>
-            <el-button type="primary" @click="openDialog()">新增模型</el-button>
+            <el-button type="primary" :disabled="readonlyRole" :title="readonlyRole ? '当前角色（viewer）只读' : ''" @click="openDialog()">新增模型</el-button>
           </div>
         </div>
       </template>
@@ -788,7 +788,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, watch } from 'vue'
+import { ref, computed, inject, onMounted, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Loading, CircleCheck, CircleClose, Finished, Delete, Rank, InfoFilled, Upload } from '@element-plus/icons-vue'
 import { modelApi, claudeCodeApi, deepSeekHarnessApi } from '@/api'
@@ -796,6 +796,11 @@ import { formatTime } from '@/utils/time'
 import JsonFieldEditor from '@/components/JsonFieldEditor.vue'
 import ChainVariablePanel from '@/components/ChainVariablePanel.vue'
 import appConfig from '@/config'
+import { canWrite } from '@/utils/permissions'
+
+// M4 QE4-3：viewer 只读——写按钮禁用联动（canWrite 见 utils/permissions）
+const currentUser = inject('currentUser', null)
+const readonlyRole = computed(() => !canWrite(currentUser.value))
 
 const models = ref([])
 const dialogVisible = ref(false)

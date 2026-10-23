@@ -20,6 +20,7 @@ from app.services.ab_statistics import compute_ab_significance
 from app.services.model_config_service import ModelConfigService
 from app.services.ws_auth import require_ws_user
 from app.services.access_control import AccessDeniedError, check_team_access, is_super_admin
+from app.services.audit_service import audited
 # 复用现有序列化工具
 from app.api.model_config_api import _serialize_vars, _serialize_response
 
@@ -448,7 +449,8 @@ def _session_deletable(session, user: dict) -> bool:
     return bool(creator) and creator == user.get("user_code")
 
 
-@router.post("/sessions", summary="保存 A/B 测试记录")
+@router.post("/sessions", summary="保存 A/B 测试记录",
+             dependencies=[Depends(audited("CREATE", "ab_session"))])
 async def save_session(request: Request, body: SaveSessionRequest, db: Session = Depends(get_db)):
     """保存一次 A/B 测试历史记录（W19：created_by 盖创建人）"""
     service = ABTestService(db)
@@ -467,6 +469,10 @@ async def save_session(request: Request, body: SaveSessionRequest, db: Session =
         created_by=(request.state.user or {}).get("user_code"),
         significance=body.significance,
     )
+    # QE4-4：创建类端点无路径 ID，暂存新资源标识供 audited 依赖落审计
+    request.state.audit_resource = {
+        "id": session.id, "name": body.name or f"{body.model_a_name} vs {body.model_b_name}",
+    }
     return _session_to_dict(session)
 
 
@@ -517,7 +523,8 @@ async def get_session(session_id: str, request: Request, db: Session = Depends(g
     return _session_to_dict(session, include_results=True)
 
 
-@router.delete("/sessions/{session_id}", summary="删除 A/B 测试记录")
+@router.delete("/sessions/{session_id}", summary="删除 A/B 测试记录",
+               dependencies=[Depends(audited("DELETE", "ab_session", id_param="session_id"))])
 async def delete_session(session_id: str, request: Request, db: Session = Depends(get_db)):
     """删除历史记录（W19：仅创建人或超管；历史无主行仅超管可删）"""
     user = request.state.user or {}
@@ -527,6 +534,7 @@ async def delete_session(session_id: str, request: Request, db: Session = Depend
         raise HTTPException(status_code=404, detail="记录不存在")
     if not _session_deletable(session, user):
         raise HTTPException(status_code=403, detail="仅创建人或超级管理员可删除该记录")
+    request.state.audit_resource = {"id": session_id, "name": session.name}
     service.delete_session(session_id)
     return {"message": "删除成功"}
 

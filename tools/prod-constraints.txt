@@ -89,6 +89,7 @@ langgraph-prebuilt==1.1.0
 langgraph-sdk==0.4.4
 langgraph==1.2.11
 langsmith==0.11.0
+ldap3==2.9.1
 markdown-it-py==4.2.0
 mdurl==0.1.2
 multidict==6.7.1
@@ -121,6 +122,7 @@ propcache==0.5.2
 protobuf==7.36.2
 psycopg2-binary==2.9.11
 pyarrow==25.0.1
+pyasn1==0.6.4
 pycparser==3.0
 pydantic-settings==2.12.0
 pydantic==2.12.5

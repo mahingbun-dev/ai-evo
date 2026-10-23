@@ -17,6 +17,7 @@ from app.core import scopes
 from app.core.scopes import require_scope
 from app.db.session import get_db
 from app.services.access_control import user_team_code
+from app.services.audit_service import audited
 from app.services.dataset_service import DatasetService
 from app.services.redteam import list_packs, load_pack, pack_samples_as_dataset_rows
 
@@ -65,7 +66,8 @@ def get_packs():
     "/packs/{pack_name}/import-dataset",
     response_model=ImportPackResponse,
     summary="样本库导入为数据集（可导入可编辑）",
-    dependencies=[Depends(require_scope(scopes.DATASETS_WRITE))],
+    dependencies=[Depends(require_scope(scopes.DATASETS_WRITE)),
+                  Depends(audited("CREATE", "dataset"))],
 )
 def import_pack_as_dataset(
     pack_name: str,
@@ -125,6 +127,12 @@ def import_pack_as_dataset(
     ]
     imported = service.import_from_json(dataset.id, import_items)
 
+    # QE4-4：暂存审计标识（样本库版本/类目/条数进 detail）
+    request.state.audit_resource = {
+        "id": dataset.id, "name": dataset_name,
+        "detail": {"pack": pack["name"], "pack_version": pack["version"],
+                   "categories": pack["categories"], "imported_count": imported},
+    }
     return ImportPackResponse(
         dataset_id=dataset.id,
         dataset_name=dataset_name,

@@ -19,6 +19,7 @@ from app.models.stats_models import TaskExecutionStats, WeeklyCoverageConfig, We
 from app.models.plugin_marketplace_models import PluginMarketplace
 from app.models.api_key_models import ApiKey
 from app.models.webhook_models import WebhookEndpoint, WebhookDelivery
+from app.models.sso_models import SsoOidcConfig, SsoTeamMapping, LdapConfig
 
 __all__ = [
     # 原有模型
@@ -72,4 +73,7 @@ __all__ = [
     # Webhook（M1 QE1-3，门禁闭环通知面）
     "WebhookEndpoint",
     "WebhookDelivery",
+    # OIDC SSO（M4 QE4-1，企业身份）
+    "SsoOidcConfig",
+    "SsoTeamMapping",
 ]

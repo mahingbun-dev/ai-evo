@@ -15,9 +15,33 @@ MCP server 全链路……），此前隐式依赖「代码缺省 = local」。�
 不动 tests/integration（实机探针自管 env）与 tests/ 根 conftest（W1 fixture）。
 """
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
+from app.db.session import Base
+from app.models.audit_models import OperationLog
 
 
 @pytest.fixture(autouse=True)
 def _pin_script_exec_mode_local(monkeypatch):
     """单测套件显式 local（ARCH-1-4 后 local 须显式声明，不再依赖缺省）"""
     monkeypatch.setenv("SCRIPT_EXEC_MODE", "local")
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_audit_session(monkeypatch):
+    """QE4-4：审计落库替身——写端点统一接 audited 依赖后，审计写放大
+
+    走 TestClient 的用例若不隔离，log_operation 的独立 SessionLocal 会
+    连 .env 的开发库写脏数据（或连接失败告警）。本套件级替身把审计写
+    收进一次性内存 sqlite；用例自建 fixture 已 patch
+    app.services.audit_service.SessionLocal 的不受影响（后应用者胜出）。
+    """
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine, tables=[OperationLog.__table__])
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    monkeypatch.setattr("app.services.audit_service.SessionLocal", factory)
+    yield factory
+    engine.dispose()

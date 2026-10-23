@@ -162,9 +162,11 @@ class TestRegisterApi:
 
     def test_register_disabled_403(self, db, monkeypatch):
         from types import SimpleNamespace
+        # M4 QE4-1：注册闸新读 auth_methods（AUTH_METHODS），stub 一并补齐
         monkeypatch.setattr(
             "app.core.config.get_settings",
-            lambda: SimpleNamespace(AUTH_REGISTER_ENABLED=False))
+            lambda: SimpleNamespace(
+                AUTH_REGISTER_ENABLED=False, auth_methods={"local"}))
         with pytest.raises(HTTPException) as exc:
             _run(register(RegisterRequest(username="alice", password="secret1"), db))
         assert exc.value.status_code == 403

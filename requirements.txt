@@ -43,6 +43,11 @@ requests==2.32.5
 aiohttp==3.14.4
 websockets==16.0
 
+# ============ 企业身份：LDAP/AD 只读认证（M4 QE4-2） ============
+# ldap_service search+bind（纯 Python 实现，无 C 扩展，离线流水线可锁 wheel）；
+# 传递依赖 pyasn1 见 requirements.lock
+ldap3==2.9.1
+
 # ============ anc-hub 插件（app/hub_plugin，vendored hubkit 的运行时下限） ============
 # grpcio/protobuf 版本由 hubkit/proto/hubv1 生成代码在 import 期硬校验（低了直接抛错）；
 # 钉中台插件工程在部署机（缺 x86-64-v2 老CPU）验证过的同款版本组合

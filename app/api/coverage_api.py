@@ -4,6 +4,7 @@ from datetime import date
 from typing import Optional
 from fastapi import APIRouter, Depends, Query, HTTPException
 from app.services.access_control import ensure_super_admin
+from app.services.audit_service import audited
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
 from app.db.session import get_db
@@ -65,7 +66,8 @@ def get_config(db: Session = Depends(get_db)):
     return config
 
 
-@router.put("/config", response_model=ConfigResponse)
+@router.put("/config", response_model=ConfigResponse,
+            dependencies=[Depends(audited("UPDATE", "coverage_config"))])
 def update_config(body: UpdateConfigRequest, db: Session = Depends(get_db)):
     """更新周配置"""
     service = CoverageService(db)
@@ -87,7 +89,8 @@ def get_plans(
     return service.get_plans(page=page, page_size=page_size)
 
 
-@router.post("/plans", response_model=PlanItem)
+@router.post("/plans", response_model=PlanItem,
+             dependencies=[Depends(audited("CREATE", "coverage_plan"))])
 def upsert_plan(body: UpsertPlanRequest, db: Session = Depends(get_db)):
     """创建/更新周计划"""
     service = CoverageService(db)
@@ -102,7 +105,8 @@ def upsert_plan(body: UpsertPlanRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@router.delete("/plans/{plan_id}")
+@router.delete("/plans/{plan_id}",
+               dependencies=[Depends(audited("DELETE", "coverage_plan", id_param="plan_id"))])
 def delete_plan(plan_id: str, db: Session = Depends(get_db)):
     """删除周计划（仅未锁定周）"""
     service = CoverageService(db)

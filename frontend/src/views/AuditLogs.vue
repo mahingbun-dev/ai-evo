@@ -21,13 +21,17 @@
               <el-option label="导出" value="EXPORT" />
             </el-select>
           </el-form-item>
-          <el-form-item label="资源类型">
+            <el-form-item label="资源类型">
             <el-select v-model="filters.resource_type" placeholder="请选择" clearable style="width: 120px;">
               <el-option label="评测任务" value="task" />
               <el-option label="数据集" value="dataset" />
               <el-option label="模型配置" value="model" />
               <el-option label="评测模板" value="template" />
               <el-option label="媒体资源" value="media" />
+              <el-option label="API Key" value="api_key" />
+              <el-option label="Webhook" value="webhook" />
+              <el-option label="A/B 记录" value="ab_session" />
+              <el-option label="脚本" value="pre_judge_script" />
             </el-select>
           </el-form-item>
           <el-form-item label="时间范围">
@@ -44,6 +48,17 @@
           <el-form-item>
             <el-button type="primary" @click="handleSearch">查询</el-button>
             <el-button @click="handleReset">重置</el-button>
+            <el-dropdown style="margin-left: 12px;" @command="handleExport">
+              <el-button :loading="exporting">
+                导出<el-icon style="margin-left: 4px;"><arrow-down /></el-icon>
+              </el-button>
+              <template #dropdown>
+                <el-dropdown-menu>
+                  <el-dropdown-item command="csv">CSV</el-dropdown-item>
+                  <el-dropdown-item command="xlsx">Excel (xlsx)</el-dropdown-item>
+                </el-dropdown-menu>
+              </template>
+            </el-dropdown>
           </el-form-item>
         </el-form>
       </div>
@@ -125,11 +140,13 @@
 <script setup>
 import { ref, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
+import { ArrowDown } from '@element-plus/icons-vue'
 import { auditApi } from '@/api'
 import { formatTime } from '@/utils/time'
 
 const logs = ref([])
 const loading = ref(false)
+const exporting = ref(false)
 const currentPage = ref(1)
 const pageSize = ref(20)
 const total = ref(0)
@@ -228,6 +245,37 @@ const handleCurrentChange = (val) => {
 const viewDetail = (row) => {
   currentLog.value = row
   detailDialogVisible.value = true
+}
+
+// QE4-4：审计导出（csv/xlsx，企业功能位 AUDIT_EXPORT_ENABLED 开启才可用，
+// 未启用时后端 404 并带回提示；导出按当前筛选条件收窄）
+const handleExport = async (format) => {
+  exporting.value = true
+  try {
+    const params = { format, ...filters.value }
+    if (dateRange.value && dateRange.value.length === 2) {
+      params.start_date = dateRange.value[0]
+      params.end_date = dateRange.value[1]
+    }
+    const blob = await auditApi.export(params)
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `audit_logs_${Date.now()}.${format}`
+    link.click()
+    URL.revokeObjectURL(url)
+  } catch (e) {
+    // 404=企业功能位未启用；400=超行数上限（提示收窄条件）；blob 响应需先解包
+    let detail = e?.response?.data?.detail
+    if (!detail && e?.response?.data instanceof Blob) {
+      try {
+        detail = JSON.parse(await e.response.data.text())?.detail
+      } catch { /* 保底走默认提示 */ }
+    }
+    ElMessage.error(detail || '导出审计日志失败')
+  } finally {
+    exporting.value = false
+  }
 }
 
 onMounted(() => {

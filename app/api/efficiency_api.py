@@ -3,6 +3,7 @@ import logging
 from typing import Optional
 from fastapi import APIRouter, Depends, Query, HTTPException
 from app.services.access_control import ensure_super_admin
+from app.services.audit_service import audited
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
 from app.db.session import get_db
@@ -33,7 +34,8 @@ class TotalEfficiencyResponse(BaseModel):
     items: list
 
 
-@router.put("/manual-hours")
+@router.put("/manual-hours",
+            dependencies=[Depends(audited("UPDATE", "efficiency_manual_hours"))])
 def update_manual_hours(body: UpdateManualHoursRequest, db: Session = Depends(get_db)):
     """更新人工预计耗时"""
     service = EfficiencyService(db)

@@ -31,6 +31,7 @@ from sqlalchemy.orm import Session
 
 from app.db.session import get_db
 from app.services.access_control import ensure_dataset_access, ensure_hub_file_access
+from app.services.audit_service import audited
 from app.services.hub_file_service import (
     HubEndpointNotConfiguredError,
     HubFileError,
@@ -286,7 +287,8 @@ def _current_user_code(request: Optional[Request]) -> Optional[str]:
     return None
 
 
-@router.post("/{file_id}/supplements", summary="人工补传文件（散文件落指定子目录 / zip 自动解压）")
+@router.post("/{file_id}/supplements", summary="人工补传文件（散文件落指定子目录 / zip 自动解压）",
+             dependencies=[Depends(audited("UPDATE", "hub_file", id_param="file_id"))])
 def upload_supplements(
     file_id: str,
     request: Request,
@@ -316,7 +318,8 @@ def upload_supplements(
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@router.delete("/{file_id}/supplements", summary="删除人工补传文件（原始包文件只读）")
+@router.delete("/{file_id}/supplements", summary="删除人工补传文件（原始包文件只读）",
+               dependencies=[Depends(audited("DELETE", "hub_file", id_param="file_id"))])
 def delete_supplement_endpoint(
     file_id: str,
     request: Request,

@@ -21,7 +21,8 @@ from app.db.session import get_db
 from app.models.api_key_models import ApiKey
 from app.models.user_models import User
 from app.services import api_key_service
-from app.services.access_control import is_super_admin
+from app.services.access_control import ensure_permission, is_super_admin
+from app.services.audit_service import audited
 
 logger = logging.getLogger(__name__)
 
@@ -79,8 +80,10 @@ def _own_key_or_admin(db: Session, request: Request, key_id: int) -> ApiKey:
     return key
 
 
-@router.post("", response_model=ApiKeyCreateResponse, summary="创建 API Key")
+@router.post("", response_model=ApiKeyCreateResponse, summary="创建 API Key",
+             dependencies=[Depends(audited("CREATE", "api_key"))])
 def create_api_key(body: ApiKeyCreateRequest, request: Request, db: Session = Depends(get_db)):
+    ensure_permission(request.state.user, "api_keys")  # RBAC（QE4-3）：viewer 只读
     """创建 API Key（登录态）。完整 token 仅本次响应明文返回，库内只存
     sha256——丢失只能吊销重建。scope 须为白名单子集。"""
     from app.services.access_control import user_team_code
@@ -107,6 +110,10 @@ def create_api_key(body: ApiKeyCreateRequest, request: Request, db: Session = De
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     logger.info(f"[APIKEY] 创建 API Key: id={record.id} user={user_code} scopes={record.scopes}")
+    # QE4-4：完整 token 不进审计，只记 id/名称/scope
+    request.state.audit_resource = {
+        "id": record.id, "name": body.name, "detail": {"scopes": body.scopes},
+    }
     resp = ApiKeyCreateResponse(**ApiKeyResponse.model_validate(record).model_dump(), token=token)
     return resp
 
@@ -126,8 +133,10 @@ def list_api_keys(request: Request, db: Session = Depends(get_db)):
     )
 
 
-@router.delete("/{key_id}", response_model=ApiKeyResponse, summary="吊销 API Key")
+@router.delete("/{key_id}", response_model=ApiKeyResponse, summary="吊销 API Key",
+               dependencies=[Depends(audited("DELETE", "api_key", id_param="key_id"))])
 def revoke_api_key(key_id: int, request: Request, db: Session = Depends(get_db)):
+    ensure_permission(request.state.user, "api_keys")  # RBAC（QE4-3）：viewer 只读
     """吊销 API Key（软删：revoked_at 置时间，幂等；历史留痕不物理删除）"""
     key = _own_key_or_admin(db, request, key_id)
     if key.revoked_at is None:
@@ -135,4 +144,5 @@ def revoke_api_key(key_id: int, request: Request, db: Session = Depends(get_db))
         db.commit()
         db.refresh(key)
         logger.info(f"[APIKEY] 吊销 API Key: id={key.id} user={key.user_code}")
+    request.state.audit_resource = {"id": key_id, "name": key.name}
     return key

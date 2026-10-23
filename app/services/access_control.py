@@ -30,6 +30,89 @@ DEFAULT_TEAM_CODE = "DEFAULT"
 
 FORBIDDEN_DETAIL = "无权访问该资源（跨团队操作被拒绝）"
 
+# ==================== RBAC 三角色（M4 QE4-3） ====================
+
+ROLE_OWNER = "owner"
+ROLE_ENGINEER = "engineer"
+ROLE_VIEWER = "viewer"
+TEAM_ROLES = (ROLE_OWNER, ROLE_ENGINEER, ROLE_VIEWER)
+DEFAULT_ROLE = ROLE_ENGINEER
+
+# 权限矩阵：PERMISSIONS[role] -> {资源: {动作}}。
+# 口径（方案 §4.3）：写操作=owner+engineer，只读=viewer；脚本库写、裁判配置
+# 维持超管——不进矩阵（缺资源即全员 deny，超管由 is_super_admin 全局放行，
+# 脚本/裁判面的超管闸在各自 API：pre_judge_script_api._ensure_admin、
+# judge_config_api 的超管依赖）。
+# 动作取值：read（查询/导出/下载）、write（创建/更新/删除/运行/导入）、
+# manage（角色管理，仅 owner，team 资源专用）。
+# 项目级细粒度 RBAC 不做（留 M6 企业版 license 功能位）。
+_WRITE = ("read", "write")
+_READ = ("read",)
+PERMISSIONS = {
+    ROLE_OWNER: {
+        "tasks": _WRITE, "datasets": _WRITE, "models": _WRITE,
+        "templates": _WRITE, "media": _WRITE, "webhooks": _WRITE,
+        "api_keys": _WRITE, "team": ("read", "manage"),
+    },
+    ROLE_ENGINEER: {
+        "tasks": _WRITE, "datasets": _WRITE, "models": _WRITE,
+        "templates": _WRITE, "media": _WRITE, "webhooks": _WRITE,
+        "api_keys": _WRITE, "team": _READ,
+    },
+    ROLE_VIEWER: {
+        "tasks": _READ, "datasets": _READ, "models": _READ,
+        "templates": _READ, "media": _READ, "webhooks": _READ,
+        "api_keys": _READ, "team": _READ,
+    },
+}
+
+
+def user_role(user: Any) -> str:
+    """用户的团队角色：users.role，NULL/未知值按 engineer 兜底（默认角色）。
+
+    与 dict（request.state.user）与 ORM 对象两种用户形态兼容（_field 口径）。
+    """
+    role = str(_field(user, "role") or "").strip().lower()
+    return role if role in TEAM_ROLES else DEFAULT_ROLE
+
+
+def role_can(role: str, resource: str, action: str = "read") -> bool:
+    """角色权限判定内核（不抛 HTTP）：矩阵查表，缺资源/缺动作即 deny"""
+    return action in (PERMISSIONS.get(role, {}).get(resource) or ())
+
+
+def ensure_permission(user: Any, resource: str, action: str = "write") -> None:
+    """RBAC 写闸（M4 QE4-3）：超管放行（全局保留），角色无权 403。
+
+    语义与团队归属闸（ensure_team_access）正交：先过「看不看得见」（团队
+    隔离），再过「动不动得了」（角色）。viewer 的 403 文案直接可展示。
+    """
+    if is_super_admin(user):
+        return
+    role = user_role(user)
+    if role_can(role, resource, action):
+        return
+    logger.warning(
+        f"[ACCESS] 403 - 角色权限不足（role={role}, {action} {resource}）")
+    raise HTTPException(
+        status_code=403,
+        detail=f"当前角色（{role}）无权执行{resource}的{action}操作，请联系团队 owner 调整角色",
+    )
+
+
+def require_write(resource: str):
+    """FastAPI 依赖工厂：写端点声明式挂 RBAC 闸。
+
+    用法：``@router.post("", dependencies=[Depends(require_write("tasks"))])``。
+    依赖内取 request.state.user（中间件已注入；白名单端点不得挂本依赖）。
+    """
+    from fastapi import Depends, Request
+
+    def _dep(request: Request) -> None:
+        ensure_permission(request.state.user, resource, action="write")
+
+    return Depends(_dep)
+
 
 class AccessDeniedError(Exception):
     """跨团队访问被拒（消息中文，可直接透出；WS 侧映射 4403）"""
