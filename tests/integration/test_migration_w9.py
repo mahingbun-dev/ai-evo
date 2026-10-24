@@ -30,21 +30,8 @@ from tests.integration.conftest import BASE_DSN
 WORKTREE_ROOT = Path(__file__).resolve().parents[2]
 
 W3_HEAD = "c4e8f9a2b7d6"      # W9 迁移的直接父（stamp 基点，链上位置固定）
+W9_REV = "a1b2c3d4e5f6"       # W9 迁移本身；与 W3 用例同口径钉住本迁移，不追 head（链头新增建表迁移会让 expand-only 断言假红）
 
-
-def _repo_head() -> str:
-    """当前仓库迁移链 head——动态取，合入新迁移无需改本文件
-
-    （原写死 a1b2c3d4e5f6，plugin-eval 合入 head 推进后本用例假红；
-    2026-10-15 改为动态。）
-    """
-    from alembic.config import Config
-    from alembic.script import ScriptDirectory
-
-    cfg = Config(str(WORKTREE_ROOT / "alembic.ini"))
-    heads = ScriptDirectory.from_config(cfg).get_heads()
-    assert len(heads) == 1, f"迁移链应单 head，实得 {heads}"
-    return heads[0]
 
 _parts = urlsplit(BASE_DSN)
 _ADMIN_DSN = urlunsplit(_parts._replace(path="/postgres"))
@@ -198,14 +185,27 @@ def _all_tables_columns(dsn):
 # ---------------------------------------------------------------------------
 
 class TestMigrationUpgrade:
+
+    def test_repo_migration_chain_single_head(self):
+        """迁移链必须单 head（原 _repo_head() 内的不变量，钉住 W9 revision 后保留）"""
+        from alembic.config import Config
+        from alembic.script import ScriptDirectory
+
+        heads = ScriptDirectory.from_config(
+            Config(str(WORKTREE_ROOT / "alembic.ini"))
+        ).get_heads()
+        assert len(heads) == 1, f"迁移链应单 head，实得 {heads}"
+
     def test_upgrade_adds_team_code(self, pre_w9_db):
         before = _all_tables_columns(pre_w9_db)
         assert "team_code" not in before["hub_files"], "基线应无 team_code 列"
 
-        _alembic(pre_w9_db, "upgrade", "head")
+        # 钉住 W9 revision 本身（升级恰好建出 W9 对象）；不追 head——链头
+        # 新增建表迁移（如 judge-pool）会让 expand-only 断言假红
+        _alembic(pre_w9_db, "upgrade", W9_REV)
 
-        # alembic 版本推进到 W9 head
-        assert _fetchall(pre_w9_db, "SELECT version_num FROM alembic_version")[0][0] == _repo_head()
+        # alembic 版本推进到 W9 revision
+        assert _fetchall(pre_w9_db, "SELECT version_num FROM alembic_version")[0][0] == W9_REV
 
         after = _all_tables_columns(pre_w9_db)
         # expand-only：差异恰好 = hub_files.team_code 一列
@@ -281,6 +281,6 @@ class TestMigrationDowngrade:
         assert "team_code" not in after_down["hub_files"]
 
         # 再次 upgrade：干净重放（回滚后可恢复）
-        _alembic(pre_w9_db, "upgrade", "head")
-        assert _fetchall(pre_w9_db, "SELECT version_num FROM alembic_version")[0][0] == _repo_head()
+        _alembic(pre_w9_db, "upgrade", W9_REV)
+        assert _fetchall(pre_w9_db, "SELECT version_num FROM alembic_version")[0][0] == W9_REV
         assert "team_code" in _all_tables_columns(pre_w9_db)["hub_files"]

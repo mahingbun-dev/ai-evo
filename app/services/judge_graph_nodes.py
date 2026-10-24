@@ -11,6 +11,7 @@ import json
 import re
 import logging
 from typing import Dict, Any, List
+from app.services.judge_pool import judge_pool_slot
 from app.services.model_caller import ModelCallerSync
 from app.services.prompt_guard import EMPTY_VALUE_RULES, PROMPT_INJECTION_GUARD, wrap_eval_data
 from app.services.metric_scoring import (
@@ -45,7 +46,8 @@ def _call_llm(prompt: str, state: JudgeAgentState) -> str:
     ]
 
     caller = ModelCallerSync()
-    result = caller.call(messages, model_config, {})
+    with judge_pool_slot("graph", meta={"call_site": "judge_graph_nodes"}):
+        result = caller.call(messages, model_config, {})
 
     if result.get("success"):
         return result.get("content", "")

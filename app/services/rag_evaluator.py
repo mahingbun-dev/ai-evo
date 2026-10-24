@@ -11,6 +11,8 @@ import logging
 import re
 from typing import Dict, List, Any, Optional
 
+from app.services.judge_pool import JudgePoolAborted, JudgePoolTimeout, judge_pool_slot
+
 logger = logging.getLogger(__name__)
 
 
@@ -129,6 +131,10 @@ class RAGEvaluator:
                 for metric in ragas_metrics:
                     if metric in ragas_scores:
                         scores[metric] = ragas_scores[metric]
+            except (JudgePoolTimeout, JudgePoolAborted):
+                # 池等待超时/任务停止不是「RAGAS 指标失败」：吞掉会让该行拿到
+                # 缺指标的分数（超时）或掩盖停止信号（中止），必须原样上抛
+                raise
             except Exception as e:
                 logger.warning(f"RAGAS 评测失败，跳过: {e}")
 
@@ -158,6 +164,8 @@ class RAGEvaluator:
                     )
                     scores["noise_sensitivity"] = score
                     reasons["noise_sensitivity"] = reason
+                except (JudgePoolTimeout, JudgePoolAborted):
+                    raise  # 池超时/停止按行级失败与停止语义处理，不当成指标失败
                 except Exception as e:
                     logger.warning(f"noise_sensitivity 评测失败: {e}")
 
@@ -168,6 +176,8 @@ class RAGEvaluator:
                     )
                     scores["negative_rejection"] = score
                     reasons["negative_rejection"] = reason
+                except (JudgePoolTimeout, JudgePoolAborted):
+                    raise  # 池超时/停止按行级失败与停止语义处理，不当成指标失败
                 except Exception as e:
                     logger.warning(f"negative_rejection 评测失败: {e}")
 
@@ -233,6 +243,16 @@ class RagasEvaluator:
         return LangchainLLMWrapper(ChatOpenAI(**chat_kwargs))
 
     def _ragas_evaluate(self, question: str, ground_truth: str, contexts: List[str]) -> Dict[str, float]:
+        """调用 ragas 库评测（新/旧 API 两条分支都在并发池额度内）
+
+        ragas 用裁判模型 key 直接打 LLM（single_turn_ascore × 2 或旧 API 的
+        evaluate），不经 judge_client/model_caller，所以必须在这一层入池；
+        否则 RAG 评测链路完全不受 graph 限额约束。
+        """
+        with judge_pool_slot("graph", meta={"call_site": "rag_evaluator_ragas"}):
+            return self._ragas_evaluate_unpooled(question, ground_truth, contexts)
+
+    def _ragas_evaluate_unpooled(self, question: str, ground_truth: str, contexts: List[str]) -> Dict[str, float]:
         """调用 ragas 库评测，优先新 API，降级旧 API"""
         import asyncio
         # Python 3.14 下 nest_asyncio 会破坏 anyio 上下文检测（见 auth_handler 同款守卫），
@@ -314,6 +334,10 @@ class RagasEvaluator:
         if self.llm_config.get("api_key"):
             try:
                 return self._ragas_evaluate(question, ground_truth, contexts)
+            except (JudgePoolTimeout, JudgePoolAborted):
+                # 入池后池超时/任务停止必须穿透这一层：否则会被降级成关键词算法，
+                # 该行拿到一个「看起来正常」的分数，限额与停止语义双双失效
+                raise
             except Exception as e:
                 logger.warning("RAGAS 全链路失败，降级关键词算法: %s", e)
         else:
@@ -464,7 +488,8 @@ class LLMRagEvaluator:
                 "provider": "openai",
                 "model_type": "gpt-4o-mini",
             }
-            result = ModelCallerSync.call(messages, config)
+            with judge_pool_slot("graph", meta={"call_site": "rag_evaluator"}):
+                result = ModelCallerSync.call(messages, config)
             if result.get("success"):
                 content = result.get("content", "")
                 logger.warning("LLM裁判原始响应末尾: %r", content[-300:])
@@ -472,6 +497,10 @@ class LLMRagEvaluator:
             else:
                 logger.warning(f"LLM 调用失败: {result.get('error')}")
                 return None
+        except (JudgePoolTimeout, JudgePoolAborted):
+            # 并发池等待超时/任务停止不能被当作「LLM 调用异常」吞成 None：
+            # 否则超时会被上游伪造成「LLM 无响应」的中性分，停止信号也无法按设计标记该行
+            raise
         except Exception as e:
             logger.error(f"LLM 调用异常: {e}")
             return None

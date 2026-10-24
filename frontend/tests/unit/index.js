@@ -12,6 +12,7 @@
  * vitest 风格文件请放 tests/vitest-legacy/，见其 README）。
  */
 import './claudeCodeMcpSwitch.test.mjs';
+import './judge-pool-config.test.mjs';
 import './modelsPreScriptAdmin.test.mjs';
 import './refMarks.test.mjs';
 import './resultsPreScript.test.mjs';

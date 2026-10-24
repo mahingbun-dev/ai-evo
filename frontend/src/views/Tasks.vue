@@ -158,6 +158,11 @@
           <el-input-number v-model="form.judge_count" :min="1" :max="20" />
           <span style="margin-left: 10px; color: #909399; font-size: 12px;">同时发起多个裁判评分，最终结果取平均值</span>
         </el-form-item>
+        <!-- 行级并发数：同时处理的数据行数（与裁判数量解耦） -->
+        <el-form-item label="行级并发数">
+          <el-input-number v-model="form.concurrency" :min="1" :max="64" />
+          <span style="margin-left: 10px; color: #909399; font-size: 12px;">同时处理的数据行数；总并发仍受并发池限额约束</span>
+        </el-form-item>
 
         <!-- 空值校验开关 -->
         <el-form-item label="空值校验" v-if="form.evaluation_type === 'judge'">
@@ -1332,6 +1337,8 @@ const form = ref({
   // 裁判引擎：claude_agent（Claude Code Agent 引擎）/ deepseek_agent（DeepSeek Agent 引擎）/ graph（传统裁判图引擎）
   judge_engine: 'claude_agent',
   judge_count: 6,
+  // 行级并发数（同时处理的数据行数，与裁判数量解耦）
+  concurrency: 4,
   description: '',
   // 评测指令配置（steps/pre_scripts 已废弃：维度顺序即步骤，脚本在待评测数据行内编排，提交时一律发 null）
   template_id: '',
@@ -2288,6 +2295,8 @@ const openDialog = async (row = null) => {
       evaluation_scene: taskDetail.evaluation_scene || '',
       scene_desc: taskDetail.scene_desc || '',
       max_score: taskDetail.max_score || 10,
+      // 行级并发数（存量任务无值时回填默认 4）
+      concurrency: taskDetail.concurrency || 4,
       // 旧版 steps 展示归一化：拼进 score_details 并注明（保存后合并固化，提交时 steps 一律发 null）
       score_details: appendLegacySteps(
         taskDetail.score_details || '9-10分：优秀；7-8分：良好；5-6分：及格；<5分：不及格',
@@ -2387,6 +2396,7 @@ const openDialog = async (row = null) => {
       model_output_field: '',
       judge_engine: 'claude_agent',
       judge_count: 6,
+      concurrency: 4,
       description: '',
       template_id: '',
       evaluation_scene: '',
@@ -3613,6 +3623,8 @@ const submitForm = async () => {
     }
     // 复制表单数据并转换 judge_variable_config 为字典格式
     const submitData = JSON.parse(JSON.stringify(form.value))
+    // 行级并发数：编辑存量任务时该字段可能为 null/缺失，统一回填默认 4
+    submitData.concurrency = Number(submitData.concurrency) || 4
     // 待评测内容来源：仅 AI 裁判员评测使用；其它类型传 null，避免影响执行逻辑
     if (submitData.evaluation_type === 'judge') {
       submitData.model_output_source = submitData.model_output_source || 'model_call'

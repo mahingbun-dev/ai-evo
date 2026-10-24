@@ -7,6 +7,7 @@ from typing import Dict, Any, List, Optional, Callable
 from dataclasses import dataclass, field
 
 from app.services.judge_evaluation_engine import JudgeEvaluationEngine, WEIGHT_MAP
+from app.services.judge_pool import judge_pool_slot
 from app.services.prompt_builder import PromptBuilder
 from app.services.rule_metrics_calculator import RuleMetricsCalculator
 from app.services.response_parser import extract_json_from_response
@@ -286,7 +287,8 @@ class ConsistencyEvaluator:
         logger.info(f"[_judge_evaluate] evaluation_metrics={self.evaluation_metrics}")
         logger.info(f"[_judge_evaluate] system_prompt前500字符={system_prompt[:500]}")
 
-        judge_result = await self.engine._call_model(messages, self.judge_config)
+        with judge_pool_slot("graph", meta={"call_site": "consistency_evaluator"}):
+            judge_result = await self.engine._call_model(messages, self.judge_config)
 
         judge_assessment = {}
 

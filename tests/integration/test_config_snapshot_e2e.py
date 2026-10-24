@@ -113,6 +113,10 @@ def _make_task_via_service(db, dataset_id, model_id, judge_model_id):
         judge_model=judge_model_id,
         judge_engine="graph",  # graph 引擎：裁判走快照优先链（区别于 claude_agent 走 CC 全局）
         judge_count=1,
+        # 行并发已与裁判数量解耦（执行器取 task.concurrency，service 缺省 4）。
+        # 本文件按调用序断言（hooks["model_calls"] == [0, 1, 2]），依赖「串行
+        # 执行、行序确定」，必须显式钉住 1，否则 4 个 worker 并发跑行会乱序。
+        concurrency=1,
         max_score=10,
         evaluation_metrics=[
             {"name": "准确性", "weight": 0.6, "description": "答案准确程度"},
@@ -382,6 +386,10 @@ class TestLegacyTaskLiveFallback:
                 model_config=None,  # 存量任务：无快照
                 judge_engine="graph",
                 judge_count=1,
+                # 存量任务模拟的是「无 model_config 快照 → 回退实时配置」，与行并发
+                # 无关；执行器现在按 task.concurrency 跑行（列默认 4），本文件的
+                # 按调用序断言要求串行，故显式钉 1（不改生产默认值）
+                concurrency=1,
                 max_score=10,
                 evaluation_metrics=[{"name": "准确性", "weight": 1.0}],
                 evaluation_targets=[
