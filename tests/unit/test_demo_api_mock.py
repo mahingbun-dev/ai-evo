@@ -75,3 +75,48 @@ def test_resolve_demo_llm_backend_falls_back_to_mock(monkeypatch):
     assert backend["api_key"] == demo_seed_service.DEMO_MOCK_TOKEN
     assert backend["endpoint"].endswith("/api/v1/demo/mock-llm/chat/completions")
 
+
+
+def test_demo_model_parse_config_shape_extracts_content():
+    """E2E 回归钉：demo 模型的解析配置必须是平台正典结构（parse_type/parse_rule），
+    否则 ResponseParser 拿整个响应 dict 当 content，裁判评分解析全挂。"""
+    from app.services.response_parser import ResponseParser
+    from app.services.demo_seed_service import resolve_demo_llm_backend
+
+    mock_resp = {
+        "id": "chatcmpl-aievo-demo",
+        "object": "chat.completion",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "评分文本"}, "finish_reason": "stop"}],
+        "usage": {"total_tokens": 0},
+    }
+    # 与 seed_demo_data 的 _model_config 相同形状
+    parse_config = {
+        "parse_type": "json_path",
+        "parse_rule": {"content": "$.choices[0].message.content"},
+    }
+    assert ResponseParser.parse(mock_resp, parse_config) == "评分文本"
+    # seed 源码不得再出现 ResponseParser 不读的错误 "path" 键
+    import inspect
+    from app.services import demo_seed_service
+    assert '"path": "choices' not in inspect.getsource(demo_seed_service)
+
+
+def test_demo_task_targets_satisfy_contract_v3():
+    """E2E 回归钉：演示任务必须带 evaluation_targets（契约 v3 §五 judge 必填）。
+    旧版种子漏掉该行——任务能跑，但任何 PUT 局部更新（如配门禁）都会被
+    「必须配置待评测数据」校验拦成 400。"""
+    from app.services.demo_seed_service import DEMO_EVALUATION_TARGETS
+
+    assert isinstance(DEMO_EVALUATION_TARGETS, list) and DEMO_EVALUATION_TARGETS
+    row = DEMO_EVALUATION_TARGETS[0]
+    assert row["source"] in ("model_output", "dataset_field", "manual_input", "chain_result")
+    assert isinstance(row["source_config"], dict)
+    assert row.get("required") is True
+
+
+def test_task_detail_response_exposes_gate_config():
+    """E2E 回归钉：任务详情响应必须含 gate_config（编辑弹窗 applyGateConfig 回填
+    依据）。之前字段缺失导致已保存的门禁配置在详情接口恒为 undefined。"""
+    from app.api.evaluation_task_api import TaskDetailResponse
+
+    assert "gate_config" in TaskDetailResponse.model_fields

@@ -364,6 +364,9 @@ class TaskConfigResponse(BaseModel):
 class TaskDetailResponse(TaskResponse):
     # TaskDetailResponse 继承自 TaskResponse，包含所有基础字段
     # 以下是 TaskDetailResponse 特有的额外字段
+    # gate_config：编辑弹窗回填门禁表单（applyGateConfig）依赖此字段；
+    # 之前缺失导致已保存的门禁配置在详情接口恒为 undefined，用户无法查看/改回
+    gate_config: Optional[Dict[str, Any]] = None
     eval_model_config: Optional[Dict[str, Any]] = None
     consistency_config: Optional[Dict[str, Any]] = None
     success_rate_config: Optional[Dict[str, Any]] = None

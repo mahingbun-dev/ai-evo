@@ -146,8 +146,11 @@ import { authApi, getToken, clearToken } from '@/api/index.js'
 const route = useRoute()
 const router = useRouter()
 
-// 登录页使用独立布局
-const isLoginPage = computed(() => route.path === '/login')
+// 登录页使用独立布局；分享报告页（M5 QE5-4）同样免外壳——匿名访客
+// 不应看到应用侧边栏（菜单项对其无意义，点击只会撞登录墙）
+const isLoginPage = computed(
+  () => route.path === '/login' || route.path.startsWith('/share/')
+)
 
 // 用户信息
 const currentUser = ref(null)

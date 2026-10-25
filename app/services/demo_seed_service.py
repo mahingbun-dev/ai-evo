@@ -88,6 +88,21 @@ DEMO_EVALUATION_METRICS = [
     },
 ]
 
+# 演示任务待评测数据（契约 v3 §五：judge 任务必须配置 evaluation_targets）。
+# 旧版种子漏掉该行——任务能跑，但任何 PUT 局部更新（如配门禁）都会被
+# 「必须配置待评测数据」校验拦成 400，E2E 验收发现并修复
+DEMO_EVALUATION_TARGETS = [
+    {
+        "id": "demo-target-model-answer",
+        "name": "model_answer",
+        "display_name": "被测模型输出",
+        "source": "model_output",
+        "source_config": {},
+        "required": True,
+        "description": "被测模型的回答输出（演示任务）",
+    },
+]
+
 
 def resolve_demo_llm_backend() -> Dict[str, Any]:
     """演示模型/裁判的 LLM 后端选择（读取时机：每次 seed 调用实时读 env）
@@ -191,7 +206,13 @@ def seed_demo_data(db: Session, actor: str = "demo") -> Dict[str, Any]:
             auth_type="none",
             auth_config={},
             request_config={"temperature": 0.2, "max_tokens": 1024, "timeout": 30},
-            response_parse_config={"path": "choices.0.message.content"},
+            # 响应解析必须用平台正典结构（parse_type/parse_rule，与「模型配置」
+            # 表单一致）——ResponseParser 不读 "path" 键，写错形状会把整个响应
+            # dict 当 content 返回，裁判评分解析随之全挂（E2E 验收发现并修复）
+            response_parse_config={
+                "parse_type": "json_path",
+                "parse_rule": {"content": "$.choices[0].message.content"},
+            },
             supports_multimodal=False,
             description=(
                 "演示模式内置模型（mock 端点，零凭据可跑通）；"
@@ -250,7 +271,11 @@ def seed_demo_data(db: Session, actor: str = "demo") -> Dict[str, Any]:
         created["dataset_rows"] = True
 
     # ---- 3. 演示评测任务（AI 裁判员，graph 引擎）----
-    if db.get(EvaluationTask, DEMO_TASK_ID) is None:
+    # 幂等语义按「存在且 active」判定：软删除（is_active=0）的演示任务会被
+    # 重新激活并重建配置快照——否则一键体验在用户删除过演示任务后永远复用
+    # 软删行（created 恒空、旧配置快照不更新），E2E 验收发现并修复
+    _existing_task = db.get(EvaluationTask, DEMO_TASK_ID)
+    if _existing_task is None:
         db.add(
             EvaluationTask(
                 id=DEMO_TASK_ID,
@@ -270,6 +295,7 @@ def seed_demo_data(db: Session, actor: str = "demo") -> Dict[str, Any]:
                 dataset_id=DEMO_DATASET_ID,
                 input_field="user_input",
                 reference_field="answer",
+                evaluation_targets=DEMO_EVALUATION_TARGETS,
                 judge_variable_config={
                     "user_input": {"source": "dataset_field", "source_config": {"field": "user_input"}},
                     "ref_answer": {"source": "dataset_field", "source_config": {"field": "answer"}},
@@ -292,6 +318,20 @@ def seed_demo_data(db: Session, actor: str = "demo") -> Dict[str, Any]:
         )
         db.commit()
         created["task"] = True
+    elif not _existing_task.is_active:
+        # 软删行复活：重建配置快照，保证模型配置修复（如解析规则）能传播到演示任务
+        _existing_task.is_active = True
+        _existing_task.status = "pending"
+        _existing_task.model_config = build_model_config_snapshot(db, DEMO_EVAL_MODEL_ID)
+        _existing_task.judge_model_config = build_model_config_snapshot(db, DEMO_JUDGE_MODEL_ID)
+        _existing_task.evaluation_targets = DEMO_EVALUATION_TARGETS
+        db.commit()
+        created["task_reactivated"] = True
+    elif not _existing_task.evaluation_targets:
+        # 存量 active 行缺 targets（旧版种子产物）：就地回填，保证任务可正常编辑
+        _existing_task.evaluation_targets = DEMO_EVALUATION_TARGETS
+        db.commit()
+        created["task_targets_backfilled"] = True
 
     result = {
         "eval_model_id": DEMO_EVAL_MODEL_ID,
