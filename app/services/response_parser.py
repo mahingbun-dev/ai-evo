@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 from jsonpath import jsonpath
 
+from app.services.judge_pool import JudgePoolAborted, JudgePoolTimeout, judge_pool_slot
+
 logger = logging.getLogger(__name__)
 
 
@@ -380,7 +382,8 @@ class JudgeResponseParser:
             from app.services.model_caller import ModelCallerSync
 
             model_caller = ModelCallerSync()
-            result = model_caller.call(messages, self.judge_config, {})
+            with judge_pool_slot("graph", meta={"call_site": "response_parser"}):
+                result = model_caller.call(messages, self.judge_config, {})
 
             if result.get("success"):
                 content = result.get("content", "")
@@ -406,6 +409,10 @@ class JudgeResponseParser:
                 self.log_warning(f"[阶段4失败] AI校正调用失败: {error}，原始response前500字符: {raw_response[:500]}")
                 return None
 
+        except (JudgePoolTimeout, JudgePoolAborted):
+            # 并发池等待超时/任务停止不能被当作「AI校正异常」吞成 None：
+            # 否则超时会被上层伪造成解析失败回落，停止信号也无法按设计标记该行
+            raise
         except Exception as e:
             self.log_warning(f"[阶段4失败] AI校正异常: {e}，response前500字符: {raw_response[:500]}")
             return None

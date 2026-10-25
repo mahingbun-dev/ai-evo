@@ -17,6 +17,8 @@ from typing import Any, Dict, List, Optional, Union
 import httpx
 from deepeval.models import DeepEvalBaseLLM
 
+from app.services.judge_pool import judge_pool_slot
+
 logger = logging.getLogger(__name__)
 
 
@@ -63,6 +65,16 @@ class PlatformLLMWrapper(DeepEvalBaseLLM):
         return self
 
     def _generate(self, prompt: str) -> str:
+        """单次模型调用入口：先申请并发池额度。
+
+        generate / batch_generate / a_generate / a_generate_with_schema 最终都汇入
+        本方法（batch 为逐 prompt 调用），因此只在最内层入池，避免重复计数。
+        实际调用逻辑在 _generate_unpooled，避免 with 外层再套自身造成递归。
+        """
+        with judge_pool_slot("graph", meta={"call_site": "platform_llm_wrapper"}):
+            return self._generate_unpooled(prompt)
+
+    def _generate_unpooled(self, prompt: str) -> str:
         """
         调用模型生成响应
 

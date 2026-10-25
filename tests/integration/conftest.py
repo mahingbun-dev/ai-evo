@@ -491,6 +491,10 @@ def make_judge_task(db, n_rows: int = 10):
         dataset_id=dataset.id,
         judge_engine="graph",  # 走 JudgeLangGraphAgent 路径（mock 注入点）
         judge_count=1,  # max_workers=1：行序确定，断言可精确
+        # 行并发已与裁判数量解耦：执行器取 task.concurrency（模型默认 4）。
+        # 本组用例的行级断言依赖「串行执行 + 顺序确定」，必须显式钉住 1，
+        # 否则 4 个 worker 并发跑行，停止时机与落库行数都变成竞态结果。
+        concurrency=1,
         max_score=10,
         evaluation_metrics=[
             {"name": "准确性", "weight": 0.6, "description": "答案准确程度"},

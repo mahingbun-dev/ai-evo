@@ -48,6 +48,8 @@ from app.api.usage_api import router as usage_router
 from app.api.simulation_api import router as simulation_router
 # M8 QE8-4：OTel 兼容导入（OTLP/HTTP JSON / Phoenix / Langfuse → agent 会话数据集）
 from app.api.ingest_api import router as ingest_router
+# 裁判并发池（origin/main worktree-judge-concurrency-pool）：监控/配置/强制释放
+from app.api.judge_pool_api import router as judge_pool_router
 from app.middleware.auth_middleware import AuthMiddleware
 from app.db.session import engine, Base
 from app.core.config import get_settings, validate_runtime_settings
@@ -334,6 +336,8 @@ app.include_router(usage_router, prefix=settings.API_V1_STR)
 app.include_router(simulation_router, prefix=settings.API_V1_STR)
 # M8 QE8-4：OTel 兼容导入（/api/v1/ingest/otel-traces，trace → agent 会话数据集）
 app.include_router(ingest_router, prefix=settings.API_V1_STR)
+# 裁判并发池（/api/v1/judge-pool——状态/配置/租约强制释放/审计）
+app.include_router(judge_pool_router, prefix=settings.API_V1_STR)
 
 # WebSocket 路由（不需要 API_V1_STR 前缀）
 app.include_router(task_status_router)

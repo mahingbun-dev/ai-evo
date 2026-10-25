@@ -79,6 +79,10 @@
             <el-icon><Clock /></el-icon>
             <span>审计日志</span>
           </el-menu-item>
+          <el-menu-item index="/judge-pool" v-if="isSuperAdmin">
+            <el-icon><Odometer /></el-icon>
+            <span>并发池</span>
+          </el-menu-item>
           <el-menu-item index="/docs">
             <el-icon><QuestionFilled /></el-icon>
             <span>使用文档</span>
@@ -128,7 +132,7 @@
 <script setup>
 import { ref, computed, onMounted, provide } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Plus, User, Monitor, Cpu, HomeFilled, FolderOpened, List, Document, DataAnalysis, Fold, Expand, Switch, QuestionFilled, Clock, Share, ChatDotRound, TrendCharts, Files, Key, VideoPlay } from '@element-plus/icons-vue'
+import { Plus, User, Monitor, Cpu, HomeFilled, FolderOpened, List, Document, DataAnalysis, Fold, Expand, Switch, QuestionFilled, Clock, Share, ChatDotRound, TrendCharts, Files, Key, VideoPlay, Odometer } from '@element-plus/icons-vue'
 import { authApi, getToken, clearToken } from '@/api/index.js'
 
 const route = useRoute()

@@ -36,6 +36,7 @@ from app.services.claude_code_judge_agent import (
     _sanitize_path_segment,
     extract_json_object,
 )
+from app.services.judge_pool import judge_pool_slot
 
 logger = logging.getLogger(__name__)
 
@@ -169,16 +170,24 @@ class HarnessAdapter(ABC):
         ClaudeCodeJudgeAgent 等已有「自行组装最终 prompt」的调用方走此入口。
         """
         timeout = float(timeout or self._default_timeout())
-        raw, finish_reason = self._execute_raw(system_prompt, final_prompt, timeout)
-        parsed = extract_json_object(raw)
-        if parsed is None:
-            logger.warning(f"[{self._log_tag}] 首次解析失败，附加格式纠正指令重试一次")
-            retry_prompt = f"{final_prompt}{self.OUTPUT_CORRECTION_SUFFIX}"
-            raw, finish_reason = self._execute_raw(system_prompt, retry_prompt, timeout)
+        with judge_pool_slot(
+            self._pool_engine(), meta={"call_site": f"harness:{type(self).__name__}"}
+        ):
+            raw, finish_reason = self._execute_raw(system_prompt, final_prompt, timeout)
             parsed = extract_json_object(raw)
-        if parsed is None:
-            raise RuntimeError(f"裁判回复无法解析为 JSON: {raw[:200]}")
-        return normalize_judge_result(parsed, finish_reason)
+            if parsed is None:
+                logger.warning(f"[{self._log_tag}] 首次解析失败，附加格式纠正指令重试一次")
+                retry_prompt = f"{final_prompt}{self.OUTPUT_CORRECTION_SUFFIX}"
+                raw, finish_reason = self._execute_raw(system_prompt, retry_prompt, timeout)
+                parsed = extract_json_object(raw)
+            if parsed is None:
+                raise RuntimeError(f"裁判回复无法解析为 JSON: {raw[:200]}")
+            return normalize_judge_result(parsed, finish_reason)
+
+    def _pool_engine(self) -> str:
+        # Claude Code 与其余 harness（DeepSeek 等）各自独立限额：
+        # 只有 ClaudeCodeAdapter 归 claude_agent，非 CC 的 harness 一律归 harness
+        return "claude_agent" if isinstance(self, ClaudeCodeAdapter) else "harness"
 
     # ---------- 子类扩展点 ----------
 

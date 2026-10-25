@@ -43,10 +43,14 @@ def test_auth_handler_event_loop_poisoning_guard():
 
 
 def test_rag_evaluator_uses_same_version_guard():
-    """rag_evaluator 与 auth_handler 使用同一版本守卫模式（源码级检查）"""
+    """rag_evaluator 与 auth_handler 使用同一版本守卫模式（源码级检查）
+
+    C2 后 `_ragas_evaluate` 只是入池外壳（with judge_pool_slot），nest_asyncio
+    守卫随实现体一起搬到 `_ragas_evaluate_unpooled`，所以检查后者。
+    """
     import app.services.rag_evaluator as m
 
-    src = inspect.getsource(m.RagasEvaluator._ragas_evaluate)
+    src = inspect.getsource(m.RagasEvaluator._ragas_evaluate_unpooled)
     assert "sys.version_info < (3, 14)" in src, "rag_evaluator 应带 nest_asyncio 版本守卫"
 
 

@@ -38,6 +38,8 @@ from pathlib import Path
 from typing import Optional
 
 from app.services import model_caller
+from app.services.judge_pool import judge_pool_slot
+from app.services.judge_pool.context import capture_context, run_in_context
 from app.services.plugin_eval import engine as plugin_engine
 from app.services.plugin_eval.parser import detect_target, parse_plugin, parse_skill, parse_skill_content
 from app.services.plugin_eval.static_layer import StaticAnalyzer
@@ -773,9 +775,10 @@ class PluginEvaluator:
 
     def evaluate(self, plugin_path: str = "", skill_content: str = "") -> dict:
         """评测单个对象（目录或内联 SKILL.md），返回行结果 dict（不含 idx 等行标识）。"""
-        if self.engine == "market":
-            return self._evaluate_market(plugin_path, skill_content)
-        return self._evaluate_legacy(plugin_path, skill_content)
+        with judge_pool_slot("plugin", meta={"call_site": f"plugin_evaluator:{self.engine}"}):
+            if self.engine == "market":
+                return self._evaluate_market(plugin_path, skill_content)
+            return self._evaluate_legacy(plugin_path, skill_content)
 
     # ------------------------------------------------------------------
     # market 引擎：子进程执行市场克隆里的 plugin-eval
@@ -856,6 +859,13 @@ class PluginEvaluator:
         on_tick：评测单行可能跑几十分钟，任务层据此在评测动作执行期间刷新执行
         心跳并写进度日志（否则会被部署期的收尸 reaper 判为心跳超时）。
         """
+        with judge_pool_slot("plugin", meta={"call_site": "plugin_evaluator:trace"}):
+            return self._evaluate_trace_unpooled(package_dir, on_tick, design_cache)
+
+    def _evaluate_trace_unpooled(
+        self, package_dir: str, on_tick=None, design_cache: Optional[dict] = None
+    ) -> dict:
+        """evaluate_trace 的实现体（额度已由 evaluate_trace 入池，避免重复占用）"""
         started = time.perf_counter()
         detail: dict = {"mode": TRACE_MODE}
         if not package_dir:
@@ -1316,7 +1326,14 @@ class PluginEvaluator:
 
         results = {}
         with ThreadPoolExecutor(max_workers=4) as pool:
-            for key, parsed in pool.map(_call, assessments):
+            # 每次提交单独复制任务上下文（同一 Context 不可被多线程并发进入）；
+            # 按提交顺序取结果，与原先 pool.map 的迭代/异常语义一致
+            futures = [
+                pool.submit(run_in_context, capture_context(), _call, item)
+                for item in assessments
+            ]
+            for future in futures:
+                key, parsed = future.result()
                 results[key] = parsed
 
         raw_scores = {

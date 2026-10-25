@@ -16,6 +16,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+from app.services.judge_pool.context import capture_context, run_in_context
+from app.services.judge_pool.errors import JudgePoolAborted, JudgePoolTimeout
 from app.services.metric_scoring import format_score_range, metric_max_score
 
 logger = logging.getLogger(__name__)
@@ -108,15 +110,29 @@ class ClaudeCodeJudgeAgent:
         max_workers = min(judge_count, 4)
         results: List[Dict[str, Any]] = []
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # 每次 submit 单独复制任务上下文（同一 Context 不可被多线程并发进入）
             futures = {
                 executor.submit(
-                    self._run_single, config, system_prompt, user_prompt, session_file, i
+                    run_in_context,
+                    capture_context(),
+                    self._run_single,
+                    config,
+                    system_prompt,
+                    user_prompt,
+                    session_file,
+                    i,
                 ): i
                 for i in range(judge_count)
             }
             for future in as_completed(futures):
                 try:
                     results.append(future.result())
+                except JudgePoolAborted:
+                    # 停止信号导致的池中止不记裁判失败：上抛交给任务停止收尾
+                    raise
+                except JudgePoolTimeout:
+                    # 池满等待超时上抛，由行级逻辑落失败行（口径同 _run_single）
+                    raise
                 except Exception as e:
                     logger.error(f"[CCJudge] 并行执行中裁判 {futures[future]} 失败: {e}")
                     # W2-1 失败显式标记：score 置 None + judge_failed=True，
@@ -164,6 +180,15 @@ class ClaudeCodeJudgeAgent:
                 result["langfuse_trace_id"] = trace_id
                 result["langfuse_trace_url"] = trace_url
             return result
+        except JudgePoolAborted:
+            # 池等待期间任务被停止：停止不是裁判失败，上抛交给停止收尾链路，
+            # 不能被下面的宽 except 记成 judge_failed=True/llm_error
+            raise
+        except JudgePoolTimeout:
+            # 池满等待超时同样上抛：它要由行级逻辑落成「失败行」（携带额度耗尽的
+            # 真实原因），被这里吞掉就只剩一个语义错误的 judge_failed/llm_error，
+            # 运维据此判断不出是额度不够还是裁判本身报错
+            raise
         except Exception as e:
             logger.exception(f"[CCJudge] 裁判 {judge_index} 执行失败")
             if trace:

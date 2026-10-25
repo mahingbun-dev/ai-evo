@@ -66,6 +66,7 @@ class CreateTaskRequest(BaseModel):
     safety_config: Optional[Dict[str, Any]] = Field(None, description="安全评测配置（M3：攻击面/样本来源/变异增强/双通道开关）")
     multi_judge_config: Optional[Dict[str, Any]] = Field(None, description="多裁判配置")
     judge_count: Optional[int] = Field(6, description="裁判数量")
+    concurrency: Optional[int] = Field(4, ge=1, le=64, description="行级并发数")
     parallel_config: Optional[Dict[str, Any]] = Field(None, description="并行执行配置")
     # 评测指令配置
     evaluation_scene: Optional[str] = Field(None, description="评测场景")
@@ -148,6 +149,8 @@ class UpdateTaskRequest(BaseModel):
     rag_config: Optional[Dict[str, Any]] = None
     # 裁判数量配置
     judge_count: Optional[int] = None
+    # 行级并发数（None 表示本次不修改）
+    concurrency: Optional[int] = Field(None, ge=1, le=64)
     # 一致性评测配置
     consistency_config: Optional[Dict[str, Any]] = None
     # 成功率评测配置
@@ -218,6 +221,7 @@ class TaskResponse(BaseModel):
     user_import_template: Optional[str] = None
     judge_variable_config: Optional[List[Dict[str, Any]]] = None
     judge_count: Optional[int] = None
+    concurrency: Optional[int] = None
     # 评测目标配置（多评测目标）
     evaluation_targets: Optional[List[Dict[str, Any]]] = None
     # 空值校验开关
@@ -292,6 +296,7 @@ class TaskConfigResponse(BaseModel):
     user_import_template: Optional[str] = None
     judge_variable_config: Optional[List[Dict[str, Any]]] = None
     judge_count: Optional[int] = None
+    concurrency: Optional[int] = None
     # 评测目标配置（多评测目标）
     evaluation_targets: Optional[List[Dict[str, Any]]] = None
     # 空值校验开关
@@ -544,6 +549,7 @@ def create_task(
         enable_user_import=body.enable_user_import,
         user_import_template=body.user_import_template,
         judge_count=body.judge_count,
+        concurrency=body.concurrency,
         team_code=org_code if org_code else "DEFAULT",
         judge_variable_config=body.judge_variable_config,
         evaluation_targets=body.evaluation_targets,

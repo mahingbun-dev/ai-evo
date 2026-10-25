@@ -8,6 +8,8 @@ import re
 import logging
 from typing import Dict, Any, Optional
 
+from app.services.judge_pool import judge_pool_slot
+
 logger = logging.getLogger(__name__)
 
 
@@ -201,7 +203,8 @@ class JudgeClient:
 
             # 复用 ModelCallerSync 调用模型
             model_caller = ModelCallerSync()
-            result = model_caller.call(messages, judge_config, runtime_variables or {})
+            with judge_pool_slot("graph", meta={"call_site": "judge_client"}):
+                result = model_caller.call(messages, judge_config, runtime_variables or {})
 
             if result.get("success"):
                 return result.get("content", "")
@@ -236,7 +239,8 @@ class JudgeClient:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": compressed_user_prompt},
                 ]
-                retry_result = model_caller.call(retry_messages, judge_config, {})
+                with judge_pool_slot("graph", meta={"call_site": "judge_client_retry"}):
+                    retry_result = model_caller.call(retry_messages, judge_config, {})
                 if retry_result.get("success"):
                     logger.info("[重试] 兜底重试成功")
                     return retry_result.get("content", "")

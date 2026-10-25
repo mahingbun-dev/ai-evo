@@ -146,6 +146,7 @@ class EvaluationTaskService:
         enable_user_import: Optional[bool] = False,
         user_import_template: Optional[str] = None,
         judge_count: Optional[int] = 6,
+        concurrency: Optional[int] = None,
         team_code: Optional[str] = None,
         judge_variable_config: Optional[Dict] = None,
         evaluation_targets: Optional[List[Dict]] = None,
@@ -315,6 +316,8 @@ class EvaluationTaskService:
             safety_config=safety_config if evaluation_type == "safety" else None,
             multi_judge_config=multi_judge_config,
             judge_count=judge_count,
+            # 行级并发数：与裁判数量解耦（缺省 4，服务端/API 已钳制 1~64）
+            concurrency=concurrency if concurrency is not None else 4,
             # W4：创建时裁判配置快照（judge_model 为空时为 None，
             # claude_agent 引擎裁判走 CC 全局配置不消费该字段）
             judge_model_config=judge_model_config_snapshot,
@@ -535,6 +538,11 @@ class EvaluationTaskService:
             kwargs["pre_scripts"] = None
         if "steps" in kwargs:
             kwargs["steps"] = None
+
+        # 行级并发数：仅显式给值时才更新，None 视为「本次不修改」
+        # （前端未配置该字段的存量任务回传 null 时不得把行并发清空）
+        if kwargs.get("concurrency") is None:
+            kwargs.pop("concurrency", None)
 
         for key, value in kwargs.items():
             if hasattr(task, key):

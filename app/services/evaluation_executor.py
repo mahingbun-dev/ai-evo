@@ -1,7 +1,8 @@
 """
 并发评测执行器
 
-使用ThreadPoolExecutor实现最大并发数为4的评测执行，
+使用ThreadPoolExecutor实现评测执行：行并发数取任务 concurrency
+（缺省 4，钳制 1~64），总并发仍受 judge 并发池限额约束，
 支持通过 threading.Event 中断任务执行。
 """
 import json
@@ -9,12 +10,14 @@ import logging
 import threading
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 from celery.exceptions import SoftTimeLimitExceeded
 
 from app.db.session import engine, SessionLocal
+from app.services.judge_pool.errors import JudgePoolAborted
 from app.services.metric_scoring import has_custom_dimension_max
 
 logger = logging.getLogger(__name__)
@@ -36,12 +39,13 @@ class EvaluationExecutor:
         langfuse_host: str = "",
         execution_number: Optional[int] = None,
         progress_offset: int = 0,
+        concurrency: Optional[int] = None,
     ):
         """
         初始化执行器
 
         Args:
-            max_workers: 最大并发数
+            max_workers: 最大并发数（未传 concurrency 时的行级并发数）
             task_id: 任务ID，用于日志和进度更新
             stop_event: 停止信号，设置后执行器在下一个检查点退出
             langfuse_host: LangFuse 服务地址（用于 LangGraph 裁判追踪）
@@ -49,13 +53,53 @@ class EvaluationExecutor:
                 非任务执行链路（单测直调等），跳过行级 write-through
             progress_offset: 进度偏移（W3 断点续跑：本轮已跳过的已完成行数，
                 使续跑进度显示为累计值而非从零回退）
+            concurrency: 任务级行并发数（EvaluationTask.concurrency）；None 时
+                沿用 max_workers，钳制到 1~64
         """
-        self.max_workers = min(max_workers, 4)  # 最大并发数为4
+        base = concurrency if concurrency is not None else max_workers
+        self.max_workers = max(1, min(int(base or 1), 64))
+        # 公开属性与实际行为一致：存钳制后的值（入参 999 实际只跑 64）
+        self.concurrency = self.max_workers
         self.task_id = task_id
         self.stop_event = stop_event or threading.Event()
         self.langfuse_host = langfuse_host
         self.execution_number = execution_number
         self.progress_offset = progress_offset
+
+    def _signal_stop(self) -> None:
+        """置停止信号（幂等），失败只告警不抛
+
+        生产 stop_event 是 RedisStopSignalChecker，set() 是一次裸 Redis 写；
+        软超时收尾路径上若这里再抛 ConnectionError，会**替换掉正在传播的**
+        SoftTimeLimitExceeded，任务失败标签从「软超时」变成「Redis 异常」，
+        运维据此判断不出是评测跑太久还是中间件抖动。所以吞掉并继续收尾。
+        """
+        try:
+            self.stop_event.set()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"置停止信号失败（继续按软超时收尾）: {e}")
+
+    @contextmanager
+    def _soft_timeout_stops_pool(self):
+        """线程池块的软超时守卫：退出前一定先置停止信号
+
+        Celery 软超时是在主线程**任意字节码处**抛出的，不只落在行内 try 里：
+        `for future in as_completed(...)` 自身阻塞时会中，行内 try 之外的
+        `_persist_row_result`（落库）也会中。这些位置逃逸的异常不会进内层
+        `except SoftTimeLimitExceeded`，于是 stop_event 未置位，with 的
+        __exit__ 仍走 shutdown(wait=True)，排队行还卡在 judge_pool.acquire 里
+        最长等 wait_timeout（900s）；软超时 6600s / 硬超时 7200s 只剩 600s
+        余量，等不完就撞硬 SIGKILL，留下幽灵等待者扩散到其他任务。
+
+        contextmanager 的 __exit__ 后进先出：它先于 executor 的 __exit__ 执行，
+        因此置位发生在 shutdown(wait=True) 之前，池等待 ≤2s 内以
+        JudgePoolAborted 退出。
+        """
+        try:
+            yield
+        except SoftTimeLimitExceeded:
+            self._signal_stop()
+            raise
 
     def execute_batch(
         self,
@@ -75,8 +119,10 @@ class EvaluationExecutor:
         results = []
         total = len(payloads)
 
-        # 创建线程池
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+        # 创建线程池（_soft_timeout_stops_pool：软超时逃逸点不止行内 try，
+        # as_completed 与 _persist_row_result 也会中，守卫保证退出前先置停止信号）
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor, \
+                self._soft_timeout_stops_pool():
             # 提交所有任务（future -> (列表序号, payload)；payload 携带任务链路
             # 标注的 _orig_idx 数据项原始序号，作为行级落库键）
             future_to_payload = {
@@ -105,8 +151,23 @@ class EvaluationExecutor:
 
                 except SoftTimeLimitExceeded:
                     # 软超时不得按行失败吞掉（P0-E/W3-4）：立即上抛触发收尾，
-                    # 已落库行保留，由 run_evaluation_async 标记任务失败
+                    # 已落库行保留，由 run_evaluation_async 标记任务失败。
+                    # 上抛前先置停止信号：raise 会先走 with 块的 __exit__
+                    # （shutdown(wait=True)），排队行还卡在 judge_pool.acquire
+                    # 里最长等 wait_timeout（900s）；软超时 6600s / 硬超时
+                    # 7200s 只剩 600s 余量，等不完就撞硬 SIGKILL，留下幽灵
+                    # 等待者扩散到其他任务。置位后池等待 ≤2s 内以
+                    # JudgePoolAborted 退出。
+                    # 这里与外层 _soft_timeout_stops_pool 守卫重复置位（幂等）：
+                    # 守卫兜住 as_completed / _persist_row_result 等行内 try
+                    # 之外的逃逸点，统一走 _signal_stop 以免 set() 自身抛异常
+                    # 把 SoftTimeLimitExceeded 换成 Redis 异常
+                    self._signal_stop()
                     raise
+                except JudgePoolAborted:
+                    # 池等待期间任务被停止：按停止落行，不能被下面的宽 except
+                    # 洗成「评测执行失败」（停止不是裁判/评测错误）
+                    results.append({"idx": pos, "success": False, "error": "任务已停止"})
                 except Exception as e:
                     logger.exception(f"评测执行失败 (idx={pos})")
                     results.append({
@@ -587,6 +648,26 @@ class EvaluationExecutor:
             }
 
     def _evaluate_single(
+        self,
+        payload: Dict[str, Any],
+        task,
+    ) -> Dict[str, Any]:
+        """单条评测入口：先把 judge 上下文绑到本行工作线程再执行
+
+        裁判调用在池里排队时，只有工作线程携带 eval_task_id/row_idx/stop_checker，
+        才能把租约归属记到本行、并在排队期间响应停止信号（JudgePoolAborted）。
+        薄包装不消费 task 的任何新属性——单测直调（MockTask 无 concurrency）不受影响。
+        """
+        from app.services.judge_pool import bind_judge_context
+
+        with bind_judge_context(
+            eval_task_id=self.task_id,
+            row_idx=payload.get("idx", 0),
+            stop_checker=self.stop_event,
+        ):
+            return self._evaluate_single_inner(payload, task)
+
+    def _evaluate_single_inner(
         self,
         payload: Dict[str, Any],
         task,
@@ -1129,6 +1210,11 @@ class EvaluationExecutor:
 
             result["success"] = True
 
+        except JudgePoolAborted:
+            # 中止 = 任务已停止，不是本行评测失败。JudgePoolAborted 是 RuntimeError
+            # 子类，若被下面的宽 except 吞掉，execute_batch 的停止行分支永远走不到；
+            # 上抛后 finally 仍清理本条工作区。JudgePoolTimeout 保持失败行语义，不在此列。
+            raise
         except Exception as e:
             logger.exception("评测执行失败")
             result["error"] = str(e)
@@ -1184,7 +1270,8 @@ class EvaluationExecutor:
         results = []
         total = len(payloads)
 
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor, \
+                self._soft_timeout_stops_pool():
             future_to_idx = {
                 executor.submit(self._evaluate_single_rag, payload, task): (pos, payload)
                 for pos, payload in enumerate(payloads)
@@ -1197,8 +1284,15 @@ class EvaluationExecutor:
                     results.append(result)
                     self._update_progress(len(results), total)
                 except SoftTimeLimitExceeded:
-                    # 软超时不得按行失败吞掉（P0-E/W3-4）：上抛触发收尾
+                    # 软超时不得按行失败吞掉（P0-E/W3-4）：上抛触发收尾。
+                    # 先置停止信号，否则 with 块 __exit__ 的 shutdown(wait=True)
+                    # 会等排队行在 judge_pool.acquire 里耗到 wait_timeout，
+                    # 撞硬超时 SIGKILL 后留下幽灵等待者（详见 execute_batch）
+                    self._signal_stop()
                     raise
+                except JudgePoolAborted:
+                    # 池等待期间任务被停止：按停止落行，不伪装成 RAG 评测失败
+                    results.append({"idx": pos, "success": False, "error": "任务已停止"})
                 except Exception as e:
                     logger.exception(f"RAG 评测执行失败 (idx={pos})")
                     results.append({
@@ -1260,7 +1354,8 @@ class EvaluationExecutor:
         results = []
         total = len(payloads)
 
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor, \
+                self._soft_timeout_stops_pool():
             future_to_idx = {
                 executor.submit(self._evaluate_single_latency, payload, task): (pos, payload)
                 for pos, payload in enumerate(payloads)
@@ -1273,7 +1368,11 @@ class EvaluationExecutor:
                     results.append(result)
                     self._update_progress(len(results), total)
                 except SoftTimeLimitExceeded:
-                    # 软超时不得按行失败吞掉（P0-E/W3-4）：上抛触发收尾
+                    # 软超时不得按行失败吞掉（P0-E/W3-4）：上抛触发收尾。
+                    # 先置停止信号，否则 with 块 __exit__ 的 shutdown(wait=True)
+                    # 会等排队行在 judge_pool.acquire 里耗到 wait_timeout，
+                    # 撞硬超时 SIGKILL 后留下幽灵等待者（详见 execute_batch）
+                    self._signal_stop()
                     raise
                 except Exception as e:
                     logger.exception(f"耗时评测执行失败 (idx={pos})")
@@ -1581,6 +1680,25 @@ class EvaluationExecutor:
         payload: Dict[str, Any],
         task,
     ) -> Dict[str, Any]:
+        """单条 RAG 评测入口：先把 judge 上下文绑到本行工作线程再执行
+
+        同 _evaluate_single：RAG 指标裁判也要在池等待期响应停止信号，
+        并把租约归属记到本行。
+        """
+        from app.services.judge_pool import bind_judge_context
+
+        with bind_judge_context(
+            eval_task_id=self.task_id,
+            row_idx=payload.get("idx", 0),
+            stop_checker=self.stop_event,
+        ):
+            return self._evaluate_single_rag_inner(payload, task)
+
+    def _evaluate_single_rag_inner(
+        self,
+        payload: Dict[str, Any],
+        task,
+    ) -> Dict[str, Any]:
         """
         执行单条 RAG 评测
 
@@ -1833,6 +1951,10 @@ class EvaluationExecutor:
                 "reasons": eval_result.get("reasons", {}),
             })
 
+        except JudgePoolAborted:
+            # 中止 = 任务已停止，不是 RAG 行失败：上抛给 execute_batch_rag 的
+            # 停止行分支（同 _evaluate_single_inner 口径，超时仍按失败行处理）
+            raise
         except Exception as e:
             logger.exception("RAG 评测执行失败")
             result["error"] = str(e)
@@ -1950,6 +2072,7 @@ def _call_rag_api(
     payload = {"question": question, "top_k": top_k}
 
     try:
+        # norm-exempt: api-trace —— 这是调用被评测方 RAG 接口取上下文，非前端 UI 请求
         response = requests.post(
             endpoint,
             json=payload,

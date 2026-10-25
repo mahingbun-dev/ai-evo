@@ -97,6 +97,12 @@ const routes = [
     meta: { title: '审计日志', requireSuperAdmin: true }
   },
   {
+    path: '/judge-pool',
+    name: 'JudgePool',
+    component: () => import('@/views/JudgePool.vue'),
+    meta: { title: '并发池', requireSuperAdmin: true }
+  },
+  {
     path: '/docs',
     name: 'UserDocs',
     component: () => import('@/views/UserDocs.vue'),
