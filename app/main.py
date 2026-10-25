@@ -50,6 +50,8 @@ from app.api.simulation_api import router as simulation_router
 from app.api.ingest_api import router as ingest_router
 # 裁判并发池（origin/main worktree-judge-concurrency-pool）：监控/配置/强制释放
 from app.api.judge_pool_api import router as judge_pool_router
+# P0-D（降低使用门槛）：演示面——seed / seed-and-run 一键体验 + 零凭据 mock LLM
+from app.api.demo_api import router as demo_router
 from app.middleware.auth_middleware import AuthMiddleware
 from app.db.session import engine, Base
 from app.core.config import get_settings, validate_runtime_settings
@@ -338,6 +340,8 @@ app.include_router(simulation_router, prefix=settings.API_V1_STR)
 app.include_router(ingest_router, prefix=settings.API_V1_STR)
 # 裁判并发池（/api/v1/judge-pool——状态/配置/租约强制释放/审计）
 app.include_router(judge_pool_router, prefix=settings.API_V1_STR)
+# P0-D 演示面（/api/v1/demo——seed/seed-and-run 鉴权面 + mock-llm 白名单端点）
+app.include_router(demo_router, prefix=settings.API_V1_STR)
 
 # WebSocket 路由（不需要 API_V1_STR 前缀）
 app.include_router(task_status_router)

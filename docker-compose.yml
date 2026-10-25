@@ -61,6 +61,35 @@ services:
     network_mode: none
     restart: "no"
 
+  # P0-A（降低使用门槛）：一次性数据库迁移服务——compose up 时先跑
+  # alembic upgrade head 再起 api（api depends_on 本服务 service_completed_
+  # successfully）。此前迁移靠手工 docker exec，自托管用户首次部署普遍
+  # 「起来即 503」。与 entrypoint api 分支的迁移互为双保险：本服务先完成迁移，
+  # api entrypoint 内的迁移实际是幂等 no-op 兜底；两侧都先取 PG advisory
+  # lock（docker-entrypoint.sh run_db_migrations），并发启动不撞车。
+  #   - 与 volume-init 同款一次性形态（同镜像、restart: no、`docker compose ps`
+  #     显示 exited(0) 属正常），但需要数据库连接串，故挂 env_file（.env）；
+  #   - depends_on postgres 用 required: false：bundled-db profile 未启用
+  #     （外部数据库形态）时该依赖被忽略、不影响启动；启用时等 PG healthy
+  #     再迁移（compose >= 2.20 支持 required 字段）；
+  #   - 非 bundled-db 形态下外部 PG 尚未可达时本服务失败退出，api 不会带病
+  #     启动——排障入口 `docker compose logs migrate`，与 entrypoint 报错
+  #     文案一致。
+  migrate:
+    image: ai-evo:${IMAGE_TAG:-latest}
+    container_name: ai-evo-migrate
+    depends_on:
+      postgres:
+        condition: service_healthy
+        required: false
+    env_file:
+      - .env
+    environment:
+      - SERVICE_TYPE=migrate
+    networks:
+      - ai-evo-net
+    restart: "no"
+
   api:
     image: ai-evo:${IMAGE_TAG:-latest}
     build:
@@ -77,6 +106,9 @@ services:
         condition: service_started
       # ARCH-0-1：等卷属主迁移完成再起（见上方 volume-init）
       volume-init:
+        condition: service_completed_successfully
+      # P0-A：等一次性迁移服务成功退出再起（见上方 migrate）
+      migrate:
         condition: service_completed_successfully
     env_file:
       - .env

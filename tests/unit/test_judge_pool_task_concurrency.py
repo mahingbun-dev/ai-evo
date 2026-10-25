@@ -298,7 +298,17 @@ class TestApiAndServiceConcurrency:
         service.get_task = MagicMock(return_value=existing)
         with patch.object(EvaluationTaskService, "_validate_targets_required"), \
              patch.object(EvaluationTaskService, "_validate_script_targets"), \
-             patch.object(EvaluationTaskService, "_validate_reference_marks"):
+             patch.object(EvaluationTaskService, "_validate_reference_marks"), \
+             patch.object(EvaluationTaskService, "_validate_verifiers"), \
+             patch.object(EvaluationTaskService, "_validate_trajectory_config"), \
+             patch.object(EvaluationTaskService, "_validate_trials"), \
+             patch.object(EvaluationTaskService, "_validate_judge_governance"), \
+             patch.object(EvaluationTaskService, "_validate_dataset_version"), \
+             patch.object(EvaluationTaskService, "_validate_model_output_config"), \
+             patch.object(EvaluationTaskService, "_validate_plugin_config"), \
+             patch.object(EvaluationTaskService, "_validate_safety_config"), \
+             patch.object(EvaluationTaskService, "_validate_plugin_depth_target"), \
+             patch.object(EvaluationTaskService, "_validate_plugin_trace_config"):
             service.update_task("task-1", concurrency=None)
 
         # None 不写回（避免把已有值清空）；模型属性保持原值

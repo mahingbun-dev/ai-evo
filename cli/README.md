@@ -6,10 +6,15 @@ AI-Evo 评测平台命令行工具：触发评测、等待门禁判定，并以�
 ## 安装
 
 ```bash
-pip install aievo-cli        # 平台发布后；源码交付时随离线包安装 wheel
+pip install aievo-cli        # ① PyPI（发布后可用）
+pip install "aievo-cli @ git+https://github.com/mahingbun-dev/ai-evo#subdirectory=cli"
+                              # ② git 直装（PyPI 未发布 / 私有网络；可指向私有 fork）
+pip install -e cli/          # ③ 源码开发安装（本仓库）
 ```
 
-开发环境（本仓库）直接用源码：`pip install -e cli/`。
+CI 模板（ci-templates/）已内置 ①→② 双通道回退。离线交付场景随离线包安装
+wheel（见 docs/build-pipeline.md）。发布到 PyPI：打 tag 后手动触发
+`.github/workflows/publish-cli.yml`（需仓库配置 `PYPI_API_TOKEN` secret）。
 
 ## 快速上手
 

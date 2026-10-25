@@ -24,7 +24,9 @@
     # 覆盖默认等待时长（秒）
     AIEVO_TIMEOUT: "7200"
   before_script:
-    - pip install --quiet aievo-cli
+    # 双通道（P0-E）：优先 PyPI；未发布/私有网络回退 git 子目录安装
+    # AIEVO_CLI_REPO 可覆盖为私有 fork（默认评测任务所在仓库）
+    - pip install --quiet aievo-cli || pip install --quiet "aievo-cli @ git+${AIEVO_CLI_REPO:-$CI_PROJECT_URL}#subdirectory=cli"
     - aievo config add "$AIEVO_URL" "$AIEVO_API_KEY"
   script:
     - aievo run "$AIEVO_TASK_ID" --wait --timeout "$AIEVO_TIMEOUT" --json

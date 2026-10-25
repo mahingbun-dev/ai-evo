@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.db.session import get_db
 from app.services.access_control import ensure_super_admin
+from app.services.audit_service import audited
 from app.services.judge_pool.audit import query_audit, record_event
 from app.services.judge_pool.client import get_pool_client
 from app.services.judge_pool.config import load_config, save_config
@@ -84,7 +85,7 @@ def get_config() -> Dict[str, Any]:
     return load_config(force=True).to_dict()
 
 
-@router.put("/config")
+@router.put("/config", dependencies=[Depends(audited("UPDATE", "judge_pool_config"))])
 def update_config(payload: JudgePoolConfigPayload, request: Request) -> Dict[str, Any]:
     values = {k: v for k, v in payload.model_dump().items() if v is not None}
     # 关系校验（心跳 < 租约一半）由 save_config 在 DB 现值合并之后做，
@@ -106,7 +107,10 @@ def _redis_unavailable(e: Exception) -> HTTPException:
     return HTTPException(status_code=503, detail="Redis 不可用，无法确认租约状态，请稍后重试")
 
 
-@router.post("/leases/{lease_id}/release")
+@router.post(
+    "/leases/{lease_id}/release",
+    dependencies=[Depends(audited("UPDATE", "judge_pool_lease"))],
+)
 def force_release(lease_id: str, request: Request, engine: str = Query(...)) -> Dict[str, Any]:
     eng = _coerce_engine_or_400(engine)
     try:
@@ -124,7 +128,7 @@ def force_release(lease_id: str, request: Request, engine: str = Query(...)) -> 
     return {"released": released}
 
 
-@router.post("/release-all")
+@router.post("/release-all", dependencies=[Depends(audited("UPDATE", "judge_pool_lease"))])
 def release_all(request: Request, engine: Optional[str] = Query(None)) -> Dict[str, Any]:
     operator = _current_operator(request)
     if engine:

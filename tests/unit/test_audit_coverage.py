@@ -47,6 +47,8 @@ AUDIT_WRITE_WHITELIST = {
     "/deepseek-harness-config/test",
     "/models/{model_id}/test",
     "/models/parse-curl",
+    # --- 演示 mock LLM（P0-D）：无状态预置文案端点，不落任何库表，仅固定演示 token 约束 ---
+    "/demo/mock-llm/chat/completions",
     # --- 试算/校验/调试探针（纯计算或临时工作区产物，非治理对象） ---
     "/ab-test/significance",
     "/evaluation/judge-config/preview",

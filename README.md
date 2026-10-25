@@ -56,6 +56,14 @@ cd frontend && pnpm install && pnpm dev   # https://localhost:3000
 
 Open `https://localhost:3000` → register (first user becomes super admin) → add a target model and a judge model under **Model Configs** → import a dataset from Excel → create and run an evaluation task.
 
+Docker only and just want a taste? See the one-minute demo in
+[README.zh-CN.md](README.zh-CN.md)（一分钟演示）or [QUICK_START.md](QUICK_START.md):
+`AIEVO_DEMO_MODE=true` + `COMPOSE_PROFILES=bundled-db` starts a full stack with a
+bundled PostgreSQL, auto-generated JWT secret, automatic migrations and a
+one-click demo evaluation on the home page (built-in mock endpoint, no
+credentials needed; production deployments must set `AUTH_JWT_SECRET` explicitly
+and keep demo mode off).
+
 ## Deploy with Docker Compose
 
 The image is built online (`Dockerfile.online`: Node stage builds the frontend, Python stage installs dependencies):
@@ -67,6 +75,10 @@ docker compose up -d --build
 
 - `api` serves both the REST API and the built frontend on port 8100 (`AIEVO_PORT` to change)
 - `worker` runs Celery evaluation tasks; `logs/` and `uploads/` are persisted via volumes
+- database migrations run automatically on `up -d`: a one-shot `migrate` service runs
+  `alembic upgrade head` first (api depends on its successful exit) and the api
+  entrypoint re-runs it as an idempotent no-op safety net — no manual
+  `docker exec` migration after upgrades
 - on the first `up -d`, the one-shot `volume-init` service automatically migrates the
   `uploads/` and `logs/` volume ownership to the container runtime user (uid 10002) —
   no manual `chown` needed (`docker compose ps` showing it as `exited(0)` is normal)

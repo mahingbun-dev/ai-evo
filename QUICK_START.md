@@ -8,6 +8,25 @@
 - Node.js 18+ 与 pnpm
 - PostgreSQL 14+ 与 Redis 6+
 
+> 只有 Docker？直接看下面的「一分钟演示」，无需本地 Python/Node。
+
+## 一分钟演示（Docker 一键起栈）
+
+```bash
+cp .env.example .env
+cat >> .env <<'EOF'
+AIEVO_DEMO_MODE=true
+COMPOSE_PROFILES=bundled-db
+DATABASE_URL=postgresql://ai_evo:ai_evo_dev@postgres:5432/ai_evo
+EOF
+docker compose up -d --build
+```
+
+打开 `http://localhost:8100` 注册（首个用户自动成为超级管理员），首页点
+「一键体验：加载示例数据并跑一次演示评测」即可零凭据看到第一份评测结果。
+演示模式会自动生成 JWT secret（日志高亮提示），数据库迁移也自动执行；
+**生产部署必须显式配置 `AUTH_JWT_SECRET` 并关闭 `AIEVO_DEMO_MODE`**。
+
 ## 1. 安装与配置
 
 ```bash

@@ -38,6 +38,10 @@ middleware_logger.setLevel(logging.INFO)
 # M5 QE5-4：/api/v1/share/{token}/report 免登录只读报告——凭证即 token
 # 本身（sha256 比对 + 吊销/过期无差别 404），端点内另有 Redis IP 限流
 # （10 req/min）与访问审计；share 域没有其他匿名子路径
+# P0-D：/api/v1/demo/mock-llm/* 演示 mock LLM 端点——worker（模型调用器）
+# 不持有 JWT，无法走鉴权面；端点内校验固定演示 token（非机密，仅约束
+# 「按演示约定显式调用」），无状态、只返回预置文案；seed/seed-and-run
+# 等演示管理端点**不在**白名单（正常鉴权 + audited 审计）
 WHITELIST_PREFIXES = [
     "/health", "/docs", "/api-docs", "/openapi.json", "/assets",
     "/api/v1/health",
@@ -45,6 +49,7 @@ WHITELIST_PREFIXES = [
     "/api/v1/auth/status", "/api/v1/auth/methods",
     "/api/v1/auth/oidc/login", "/api/v1/auth/oidc/callback",
     "/api/v1/share/",
+    "/api/v1/demo/mock-llm",
 ]
 
 

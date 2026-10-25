@@ -19,7 +19,8 @@ pipeline {
             steps {
                 withCredentials([string(credentialsId: 'aievo-api-key', variable: 'AIEVO_API_KEY')]) {
                     sh '''
-                        pip install --quiet aievo-cli
+                        // 双通道（P0-E）：优先 PyPI；未发布/私有网络回退 git 子目录安装（AIEVO_CLI_REPO 可覆盖）
+                        pip install --quiet aievo-cli || pip install --quiet "aievo-cli @ git+${AIEVO_CLI_REPO:-https://github.com/mahingbun-dev/ai-evo.git}#subdirectory=cli"
                         aievo config add "$AIEVO_URL" "$AIEVO_API_KEY"
                         aievo run "$AIEVO_TASK_ID" --wait --timeout "$AIEVO_TIMEOUT" --json
                     '''

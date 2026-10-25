@@ -4,6 +4,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from pathlib import Path
 
 import logging
+import os
 import re
 from functools import lru_cache
 
@@ -81,6 +82,12 @@ class Settings(BaseSettings):
     # 「基于 DATABASE_URL 派生稳定密钥」——仅限本地开发机在 .env_local 显式
     # 打开（启动日志会告警留痕）；默认 false，企业部署档缺密钥即拒绝启动
     AUTH_JWT_ALLOW_DERIVED: bool = False
+    # 演示模式开关（P0-B，降低使用门槛）：默认 false。true 时适用于演示/试用
+    # 部署——AUTH_JWT_SECRET 未配置则首次启动自动生成随机密钥并写入持久卷
+    # uploads/.generated-jwt-secret（0600，重启复用，启动日志高亮提示），
+    # 见 _demo_jwt_secret；未开 demo 且未配置仍走 fail-fast，企业安全基线
+    # 不变。生产部署禁用 demo 模式（务必显式配置 AUTH_JWT_SECRET）。
+    AIEVO_DEMO_MODE: bool = False
     # 登录态有效期（小时），默认 7 天
     AUTH_TOKEN_EXPIRE_HOURS: int = 168
     # 注册开关（关闭后仅已建账号可登录，登录页隐藏注册入口）
@@ -307,13 +314,19 @@ class Settings(BaseSettings):
     def auth_jwt_secret(self) -> str:
         """JWT 签名密钥（ARCH-0-2，D6）。
 
-        优先级：显式配置 AUTH_JWT_SECRET > 本地开发派生回退（须显式开
-        AUTH_JWT_ALLOW_DERIVED）。两者皆无时抛 RuntimeError——不再静默从
+        优先级：显式配置 AUTH_JWT_SECRET > 演示模式自动生成密钥（P0-B，
+        AIEVO_DEMO_MODE=true 且未显式配置时，首次生成写入持久卷
+        uploads/.generated-jwt-secret 并复用）> 本地开发派生回退（须显式开
+        AUTH_JWT_ALLOW_DERIVED）。三者皆无时抛 RuntimeError——不再静默从
         DATABASE_URL 派生，保证企业部署档缺密钥时任何签发/校验入口都
         fail-fast（含不经应用 lifespan 的进程，如 celery worker）。
         """
         if self.AUTH_JWT_SECRET.strip():
             return self.AUTH_JWT_SECRET
+        if self.AIEVO_DEMO_MODE:
+            demo_secret = _demo_jwt_secret()
+            if demo_secret:
+                return demo_secret
         if not self.AUTH_JWT_ALLOW_DERIVED:
             raise RuntimeError(_jwt_secret_missing_message())
         # 本地开发派生回退：与 DATABASE_URL 挂钩的稳定密钥（仅开发语义）
@@ -348,18 +361,70 @@ def _jwt_secret_missing_message() -> str:
         "（ARCH-0-2，凭证解耦——轮换数据库口令不应作废全员登录态），"
         "请生成随机高熵密钥后写入部署目录 .env，示例：openssl rand -hex 32；"
         "仅本地开发机可显式设置 AUTH_JWT_ALLOW_DERIVED=true 保留派生回退"
-        "（启动日志会告警），企业部署严禁开启"
+        "（启动日志会告警），企业部署严禁开启；演示/试用部署可设 "
+        "AIEVO_DEMO_MODE=true 自动生成（生产禁用）"
     )
 
 
+_DEMO_JWT_SECRET_FILE = ".generated-jwt-secret"
+
+
+def _demo_jwt_secret() -> Optional[str]:
+    """演示模式 JWT 密钥（P0-B）：首次生成写入持久卷，之后复用。
+
+    - 文件落在 uploads/（compose 里是挂卷，重建容器不丢——密钥轮换不会
+      作废全员登录态）；
+    - 0600 权限 + O_CREAT|O_EXCL 原子创建：api/worker 并发首启时只有一方
+      写入（单写者由内核保证），其余方读既有文件；
+    - 读到即返回（不再重新生成）；写入失败（卷只读等）返回 None 交由调用
+      方决定（validate_runtime_settings 兜底生成失败时给出明确报错而不是
+      每次重启换密钥）。
+    """
+    import secrets as _secrets
+
+    uploads_dir = PROJECT_ROOT / "uploads"
+    secret_path = uploads_dir / _DEMO_JWT_SECRET_FILE
+    try:
+        if secret_path.is_file():
+            existing = secret_path.read_text(encoding="utf-8").strip()
+            if existing:
+                return existing
+        uploads_dir.mkdir(parents=True, exist_ok=True)
+        # 原子创建：并发的另一方已写入时 O_EXCL 失败，转而读其内容
+        fd = os.open(secret_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(_secrets.token_hex(32))
+        logger.warning(
+            "!" * 72 + "\n"
+            "[demo] 演示模式已自动生成 JWT secret 并写入 %s（0600）。\n"
+            "[demo] 生产部署必须显式配置 AUTH_JWT_SECRET"
+            "（openssl rand -hex 32），并关闭 AIEVO_DEMO_MODE！\n" + "!" * 72,
+            secret_path,
+        )
+        return secret_path.read_text(encoding="utf-8").strip()
+    except FileExistsError:
+        # 并发写者已落盘：读它的值
+        try:
+            return secret_path.read_text(encoding="utf-8").strip() or None
+        except OSError:
+            return None
+    except OSError as e:
+        logger.error(
+            "[demo] 演示模式生成 JWT secret 失败（%s 无法写入？：%s）——"
+            "请显式配置 AUTH_JWT_SECRET 或修复 uploads 卷可写性", secret_path, e
+        )
+        return None
+
+
 def validate_runtime_settings(settings: Settings) -> None:
-    """运行入口 fail-fast 校验（W6-3；ARCH-0-2 扩展 JWT 密钥校验）。
+    """运行入口 fail-fast 校验（W6-3；ARCH-0-2 扩展 JWT 密钥校验；P0-B 演示模式）。
 
     仅在应用启动入口（app.main 的 lifespan 开头）调用，不得在模块 import 时
     调用——保证 `import app.main` 在无 DATABASE_URL 的环境（如收集单测）仍可
     完成，导入不等于运行。缺 DATABASE_URL 时抛 RuntimeError 拒绝启动；
-    缺 AUTH_JWT_SECRET 时（ARCH-0-2）：企业部署档抛 RuntimeError 拒绝启动，
-    本地开发档（显式开 AUTH_JWT_ALLOW_DERIVED）放行但启动日志告警留痕。
+    缺 AUTH_JWT_SECRET 时：演示模式（AIEVO_DEMO_MODE=true，P0-B）生成/复用
+    自动密钥后放行并高亮告警；企业部署档抛 RuntimeError 拒绝启动；本地
+    开发档（显式开 AUTH_JWT_ALLOW_DERIVED）放行但启动日志告警留痕。
     """
     if not settings.DATABASE_URL.strip():
         raise RuntimeError(
@@ -369,7 +434,21 @@ def validate_runtime_settings(settings: Settings) -> None:
         )
     # ARCH-0-2（D6）：JWT 密钥独立化——企业部署档缺失即拒绝启动
     if not settings.AUTH_JWT_SECRET.strip():
-        if settings.AUTH_JWT_ALLOW_DERIVED:
+        if settings.AIEVO_DEMO_MODE:
+            # P0-B：演示模式自动生成/复用持久卷密钥（写失败则拒绝启动，
+            # 明确报错优于每次重启换密钥静默作废全员登录态）
+            if not _demo_jwt_secret():
+                raise RuntimeError(
+                    "演示模式（AIEVO_DEMO_MODE=true）自动生成 JWT secret 失败："
+                    "uploads/.generated-jwt-secret 不可写。修复 uploads 卷可写性，"
+                    "或显式配置 AUTH_JWT_SECRET（openssl rand -hex 32）"
+                )
+            logger.warning(
+                "[demo] AIEVO_DEMO_MODE=true：当前以演示模式运行"
+                "（JWT secret 已自动生成）——生产部署必须显式配置 "
+                "AUTH_JWT_SECRET 并关闭 AIEVO_DEMO_MODE"
+            )
+        elif settings.AUTH_JWT_ALLOW_DERIVED:
             logger.warning(
                 "AUTH_JWT_SECRET 未配置：当前为本地开发派生回退"
                 "（AUTH_JWT_ALLOW_DERIVED=true，密钥由 DATABASE_URL 派生）——"

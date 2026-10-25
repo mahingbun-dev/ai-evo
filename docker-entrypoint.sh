@@ -59,14 +59,61 @@ require_writable_data_dirs() {
   fi
 }
 
+# 数据库迁移（P0-A，降低使用门槛）：alembic upgrade head，失败则启动失败并给出
+# 明确日志——宁可不启动，不静默残废（此前 entrypoint 只起 uvicorn，迁移靠手工
+# docker exec，自托管用户首次部署普遍卡在「起来即 503」）。
+#
+# 并发防护：与 compose 的 migrate 一次性服务（api depends_on 其
+# service_completed_successfully）双机制并存——本函数先取 PG 会话级 advisory
+# lock（key 0xA1E0D0，十进制 10610000）串行化并发迁移；api 在 compose 形态下
+# 由 migrate 服务先行迁移完成，此处实际是幂等 no-op 兜底（多 api 副本 / 不经
+# compose 直起容器时仍能自迁移）。bundled-db 与外部数据库两种形态同样适用
+# （连接串一律来自 DATABASE_URL 环境变量，alembic/env.py 原生支持）。
+run_db_migrations() {
+  echo "[entrypoint] 执行数据库迁移 alembic upgrade head ..."
+  if python -c "
+import os, sys, subprocess
+from sqlalchemy import create_engine, text
+
+url = os.environ.get('AIEVO_DATABASE_URL') or os.environ.get('DATABASE_URL') or ''
+if not url:
+    print('[migrate] 错误: DATABASE_URL 未配置，无法执行迁移', file=sys.stderr)
+    sys.exit(2)
+
+engine = create_engine(url)
+with engine.connect() as conn:
+    conn.execute(text('SELECT pg_advisory_lock(10610000)'))
+    print('[migrate] 已获取迁移 advisory lock，执行 alembic upgrade head ...')
+    sys.stdout.flush()
+    rc = subprocess.call(['alembic', 'upgrade', 'head'])
+    conn.execute(text('SELECT pg_advisory_unlock(10610000)'))
+sys.exit(rc)
+"; then
+    echo "[entrypoint] 数据库迁移完成（库已是最新时为 no-op）"
+  else
+    echo "[entrypoint] 错误: 数据库迁移失败，服务拒绝启动（宁可不启动，不静默残废）" >&2
+    echo "[entrypoint] 排查步骤:" >&2
+    echo "[entrypoint]   1) 确认 .env 的 DATABASE_URL 指向可达的 PostgreSQL（bundled-db 形态需 COMPOSE_PROFILES=bundled-db）" >&2
+    echo "[entrypoint]   2) 查看一次性迁移服务日志: docker compose logs migrate" >&2
+    echo "[entrypoint]   3) 手工重试: docker compose run --rm migrate" >&2
+    exit 1
+  fi
+}
+
 case "${SERVICE_TYPE}" in
   volume-init)
     # ARCH-0-1：compose 一次性服务（user: "0:0"，cap 仅 CHOWN/DAC_OVERRIDE），
     # 迁移完退出 0，api/worker depends_on 其 service_completed_successfully
     migrate_volume_ownership
     ;;
+  migrate)
+    # P0-A：compose 一次性迁移服务（api depends_on 其 service_completed_successfully），
+    # 复用与 api 相同的镜像/env；迁移成功退出 0，失败退出非 0（api 不启动）
+    run_db_migrations
+    ;;
   api)
     require_writable_data_dirs
+    run_db_migrations
     exec uvicorn app.main:app --host 0.0.0.0 --port 8100
     ;;
   worker)
@@ -81,7 +128,7 @@ case "${SERVICE_TYPE}" in
     ;;
   *)
     echo "Unknown SERVICE_TYPE: ${SERVICE_TYPE}"
-    echo "Usage: SERVICE_TYPE=api|worker|hub-plugin|volume-init"
+    echo "Usage: SERVICE_TYPE=api|worker|hub-plugin|volume-init|migrate"
     exit 1
     ;;
 esac

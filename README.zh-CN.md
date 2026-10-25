@@ -26,6 +26,34 @@
 
 本地账号密码登录：首个注册用户自动成为超级管理员；密码 PBKDF2-HMAC-SHA256 哈希存储，会话为 HS256 JWT（`Authorization: Bearer`）。企业统一身份：`AUTH_METHODS`（`local,oidc,ldap` 任意组合，单选 `oidc`/`ldap` 即纯企业身份部署——关闭本地登录注册）开启 OIDC SSO（授权码 + PKCE S256）与 LDAP/AD 只读认证（search+bind，滤值 RFC 4515 转义、空密码直拒）；超管在「开发者设置」配置 IdP / 目录（含连通性自检）；首次企业登录自动开户（JIT）或按邮箱映射既有账号，目录组与 SSO 组共用 groups→团队映射。
 
+## 一分钟演示（Docker，零编辑起栈）
+
+只想先看看平台长什么样、跑通第一次评测：
+
+```bash
+cp .env.example .env
+cat >> .env <<'EOF'
+AIEVO_DEMO_MODE=true
+COMPOSE_PROFILES=bundled-db
+DATABASE_URL=postgresql://ai_evo:ai_evo_dev@postgres:5432/ai_evo
+EOF
+docker compose up -d --build
+```
+
+- `COMPOSE_PROFILES=bundled-db` 连内置 PostgreSQL 一起起，`DATABASE_URL`
+  用上面现成的连接串即可；`AIEVO_DEMO_MODE=true` 下 `AUTH_JWT_SECRET`
+  不用填（首启自动生成并写入 `uploads/.generated-jwt-secret`，日志会高亮
+  提示；**生产部署必须显式配置并关闭 demo 模式**）
+- 数据库迁移自动执行（`migrate` 一次性服务 + api 启动兜底），起来即是
+  可用状态，不再是「起来即 503」
+- 打开 `http://<主机>:8100` 注册（首个用户自动成为超级管理员）→ 首页点
+  「一键体验：加载示例数据并跑一次演示评测」——演示模型默认走平台内置
+  mock 端点，**零凭据**即可看到第一份评测结果（配置了
+  `LITELLM_BASE_URL`/`LITELLM_API_KEY` 时自动改走 LiteLLM 真实网关）
+
+试用满意后，把 `.env` 里的 `AIEVO_DEMO_MODE` 删掉、按「Docker Compose 部署」
+配好生产参数即可。
+
 ## 快速开始（本地开发）
 
 依赖：Python 3.12+、Node.js 18+（pnpm）、Docker（跑 PostgreSQL / Redis）。
@@ -66,6 +94,10 @@ docker compose up -d --build
 
 - `api` 在 8100 端口同时承载 REST API 与前端构建产物（`AIEVO_PORT` 可改端口）
 - `worker` 执行 Celery 评测任务；`logs/` 与 `uploads/` 经卷持久化
+- 数据库迁移自动执行：`migrate` 一次性服务先跑 `alembic upgrade head`
+  （api `depends_on` 其成功退出），api 启动时再做一次幂等兜底——升级部署
+  不再需要手工 `docker exec` 迁移（`docker compose ps` 里 migrate 显示
+  exited(0) 属正常）
 - 首次 `up -d` 时 `volume-init` 一次性服务会自动把 `uploads/`、`logs/` 卷属主
   迁移为容器运行用户（uid 10002），无需手工 chown（`docker compose ps` 里它显示
   exited(0) 属正常）

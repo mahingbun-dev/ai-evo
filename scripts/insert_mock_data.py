@@ -1,6 +1,12 @@
 """
 插入Mock数据到数据库
 
+用途（P0-D 起明确）：开发/联调环境的命令行 Mock 数据播种脚本。产品内的
+「一键体验：加载示例数据并跑一次演示评测」（首页按钮，POST /api/v1/demo/seed）
+不复用本脚本入口，而是把同源逻辑实现在 app/services/demo_seed_service.py
+（幂等、带权限与审计、演示任务可直接跑通）——两处共存：本脚本服务
+开发者终端，demo_seed_service 服务终端用户页面。
+
 运行方式:
     python scripts/insert_mock_data.py
 
@@ -8,6 +14,10 @@
     - 模型配置（待评测模型 + 裁判模型）
     - 数据集
     - 评测任务（4种类型：一致性评测-有裁判、一致性评测-无裁判、成功率评测、AI裁判员评测）
+
+注意: 本脚本写的是 V1 数据表（evaluation_data.question/ref_answer 列），
+评测执行链路已只加载 V2 数据（evaluation_data_v2）——脚本仅用于填充
+模型配置等基础表联调；页面内演示数据请用首页「一键体验」。
 """
 import sys
 import os

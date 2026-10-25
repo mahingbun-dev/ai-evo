@@ -512,3 +512,9 @@ export const ossApi = {
     return downloadUrl
   }
 }
+
+// P0-D（降低使用门槛）：一键演示——seed 幂等播种示例数据；seed-and-run 播种并触发演示任务
+export const demoApi = {
+  seed: () => request.post('/demo/seed'),
+  seedAndRun: () => request.post('/demo/seed-and-run')
+}

@@ -22,6 +22,10 @@ inputs:
     description: '安装 aievo-cli 使用的 Python 版本'
     required: false
     default: '3.11'
+  cli-repo:
+    description: 'aievo-cli 源码仓库（含 cli/ 子目录）；PyPI 未发布或私有网络时作为回退安装源'
+    required: false
+    default: 'https://github.com/mahingbun-dev/ai-evo.git'
 
 runs:
   using: 'composite'
@@ -33,7 +37,10 @@ runs:
 
     - name: 安装 aievo-cli
       shell: bash
-      run: pip install aievo-cli
+      # 双通道（P0-E）：优先 PyPI；未发布/私有网络回退 git 子目录安装
+      run: pip install aievo-cli || pip install "aievo-cli @ git+${AIEVO_CLI_REPO}#subdirectory=cli"
+      env:
+        AIEVO_CLI_REPO: ${{ inputs.cli-repo }}
 
     - name: 评测门禁（exit 0=通过 / 1=门禁失败 / 2=错误）
       shell: bash

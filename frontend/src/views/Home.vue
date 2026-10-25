@@ -1,32 +1,72 @@
 <template>
   <div class="home">
-    <!-- 步骤引导区 -->
+    <!-- 步骤引导区（P0-D：按已有统计动态显示完成态） -->
     <div class="steps-section">
-      <div class="step-card" @click="$router.push('/models')">
-        <div class="step-number">1</div>
+      <div class="step-card" :class="{ done: stepDone(1), current: stepCurrent(1) }" @click="$router.push('/models')">
+        <div class="step-number">
+          <el-icon v-if="stepDone(1)"><CircleCheckFilled /></el-icon>
+          <template v-else>1</template>
+        </div>
         <div class="step-content">
-          <div class="step-title">配置模型</div>
-          <div class="step-desc">选择并配置待评测的AI模型</div>
+          <div class="step-title">{{ stepDone(1) ? '模型已就绪' : '配置模型' }}</div>
+          <div class="step-desc">{{ stepDone(1) ? '去查看 / 新增模型配置' : '选择并配置待评测的AI模型' }}</div>
         </div>
         <el-icon class="step-arrow"><ArrowRight /></el-icon>
       </div>
-      <div class="step-card" @click="$router.push('/datasets')">
-        <div class="step-number">2</div>
+      <div class="step-card" :class="{ done: stepDone(2), current: stepCurrent(2) }" @click="$router.push('/datasets')">
+        <div class="step-number">
+          <el-icon v-if="stepDone(2)"><CircleCheckFilled /></el-icon>
+          <template v-else>2</template>
+        </div>
         <div class="step-content">
-          <div class="step-title">上传数据集</div>
-          <div class="step-desc">上传测试数据或选择已有数据集</div>
+          <div class="step-title">{{ stepDone(2) ? '数据集已就绪' : '上传数据集' }}</div>
+          <div class="step-desc">{{ stepDone(2) ? '去查看 / 上传数据集' : '上传测试数据或选择已有数据集' }}</div>
         </div>
         <el-icon class="step-arrow"><ArrowRight /></el-icon>
       </div>
-      <div class="step-card" @click="$router.push('/tasks')">
-        <div class="step-number">3</div>
+      <div class="step-card" :class="{ done: stepDone(3), current: stepCurrent(3) }" @click="$router.push('/tasks')">
+        <div class="step-number">
+          <el-icon v-if="stepDone(3)"><CircleCheckFilled /></el-icon>
+          <template v-else>3</template>
+        </div>
         <div class="step-content">
-          <div class="step-title">创建任务</div>
-          <div class="step-desc">选择模板并创建评测任务</div>
+          <div class="step-title">{{ stepDone(3) ? '任务已创建' : '创建任务' }}</div>
+          <div class="step-desc">{{ stepDone(3) ? '去执行 / 查看任务' : '选择模板并创建评测任务' }}</div>
+        </div>
+        <el-icon class="step-arrow"><ArrowRight /></el-icon>
+      </div>
+      <div class="step-card" :class="{ done: stepDone(4), current: stepCurrent(4) }" @click="$router.push('/results')">
+        <div class="step-number">
+          <el-icon v-if="stepDone(4)"><CircleCheckFilled /></el-icon>
+          <template v-else>4</template>
+        </div>
+        <div class="step-content">
+          <div class="step-title">{{ stepDone(4) ? '已看到评测结果' : '查看结果' }}</div>
+          <div class="step-desc">{{ stepDone(4) ? '去查看结果与分析' : '在结果页查看评分明细' }}</div>
         </div>
         <el-icon class="step-arrow"><ArrowRight /></el-icon>
       </div>
     </div>
+
+    <!-- 一键体验（P0-D：空库或演示数据未加载时展示） -->
+    <el-alert
+      v-if="showDemoBanner"
+      class="demo-banner"
+      type="success"
+      :closable="false"
+      show-icon
+    >
+      <template #title>
+        <span>第一次使用？加载示例数据并跑一次演示评测，10 秒看到第一个评测结果。</span>
+        <el-button
+          class="demo-btn"
+          type="primary"
+          size="small"
+          :loading="demoLoading"
+          @click="runDemo"
+        >一键体验演示评测</el-button>
+      </template>
+    </el-alert>
 
     <!-- 统计卡片 -->
     <el-row :gutter="20" class="stats-row">
@@ -93,6 +133,11 @@
         </div>
       </template>
       <el-table :data="recentTasks" style="width: 100%" :header-cell-style="{ background: '#F9FAFB', color: '#374151', fontWeight: 500 }">
+        <template #empty>
+          <div class="empty-tasks">
+            <p>还没有评测任务——从上方步骤 ① 开始，或点「一键体验演示评测」直接看一次完整评测。</p>
+          </div>
+        </template>
         <el-table-column prop="name" label="任务名称" min-width="200">
           <template #default="{ row }">
             <span class="task-name">{{ row.name || '-' }}</span>
@@ -117,10 +162,14 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
-import { modelApi, datasetApi, taskApi } from '@/api'
+import { ref, computed, onMounted } from 'vue'
+import { useRouter } from 'vue-router'
+import { ElMessage } from 'element-plus'
+import { modelApi, datasetApi, taskApi, demoApi } from '@/api'
 import { Cpu, FolderOpened, List, CircleCheckFilled, ArrowRight } from '@element-plus/icons-vue'
 import { formatTime } from '@/utils/time'
+
+const router = useRouter()
 
 const stats = ref({
   models: 0,
@@ -130,6 +179,37 @@ const stats = ref({
 })
 
 const recentTasks = ref([])
+
+const demoLoading = ref(false)
+// 空库（models=0）或从未跑完过任务时展示一键体验横幅（P0-D）
+const showDemoBanner = computed(() => stats.value.models === 0 || stats.value.completedTasks === 0)
+
+const stepDone = (n) => {
+  if (n === 1) return stats.value.models > 0
+  if (n === 2) return stats.value.datasets > 0
+  if (n === 3) return stats.value.tasks > 0
+  return stats.value.completedTasks > 0
+}
+const stepCurrent = (n) => !stepDone(n) && (n === 1 || stepDone(n - 1))
+
+const runDemo = async () => {
+  demoLoading.value = true
+  try {
+    const res = await demoApi.seedAndRun()
+    ElMessage.success('演示评测已启动，正在跳转任务进度…')
+    const taskId = res?.task_id || res?.data?.task_id
+    if (taskId) {
+      router.push('/tasks')
+    } else {
+      router.push('/tasks')
+    }
+  } catch (e) {
+    const detail = e?.response?.data?.detail || e?.message || '演示数据加载失败'
+    ElMessage.error(typeof detail === 'string' ? detail : '演示数据加载失败')
+  } finally {
+    demoLoading.value = false
+  }
+}
 
 const getStatusType = (status) => {
   const map = {
@@ -177,6 +257,26 @@ onMounted(async () => {
   margin: 0 auto;
 }
 
+/* 一键体验横幅 */
+.demo-banner {
+  margin-bottom: 20px;
+}
+.demo-banner :deep(.el-alert__title) {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 14px;
+}
+.demo-btn {
+  flex-shrink: 0;
+}
+
+.empty-tasks {
+  padding: 12px 0;
+  color: var(--aievo-text-3, #9CA3AF);
+  font-size: 13px;
+}
+
 /* 步骤引导区 */
 .steps-section {
   display: flex;
@@ -196,6 +296,23 @@ onMounted(async () => {
   transition: all 0.2s ease;
 }
 
+.step-card.done {
+  background: linear-gradient(135deg, #F0FDF4 0%, #DCFCE7 100%);
+  border-color: #86EFAC;
+}
+.step-card.done .step-number {
+  background: #059669;
+  color: #fff;
+  border: none;
+  font-size: 18px;
+}
+.step-card.done .step-title {
+  color: #047857;
+}
+.step-card.current {
+  border-color: var(--aievo-primary, #4F46E5);
+  box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.12);
+}
 .step-card:hover {
   transform: translateY(-2px);
   box-shadow: 0 4px 12px rgba(54, 98, 236, 0.15);
