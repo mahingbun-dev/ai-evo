@@ -1,0 +1,186 @@
+/* ==========================================================================
+   AgentEvo 全局设计令牌与 Element Plus 主题覆盖（「墨蓝 × 靛蓝」工程控制台风格）
+   --------------------------------------------------------------------------
+   分层结构：
+     1. 设计令牌（:root）——品牌色阶、中性色、圆角、阴影、间距节奏
+     2. Element Plus 变量映射——组件库统一取色/圆角入口（改主题只动这里）
+     3. 全局组件润色——卡片/表格/对话框/按钮/标签的默认观感
+     4. 滚动条与基础排版
+   页面级样式一律引用 var(--aievo-*)，不再散落硬编码色值。
+   ========================================================================== */
+
+/* ---------- 1. 设计令牌 ---------- */
+:root {
+  /* 品牌色阶（靛蓝） */
+  --aievo-primary: #4F46E5;
+  --aievo-primary-strong: #4338CA;
+  --aievo-primary-soft: #EEF2FF;
+  --aievo-primary-hover: #635BEB;
+  --aievo-accent: #22D3EE;          /* 品牌渐变的青色端，仅用于品牌标记/强调 */
+  --aievo-brand-gradient: linear-gradient(135deg, #4F46E5 0%, #22D3EE 100%);
+
+  /* 中性色 */
+  --aievo-ink-900: #0B1220;         /* 侧边栏深墨蓝底 */
+  --aievo-ink-850: #101A30;
+  --aievo-ink-800: #1E293B;         /* 侧边栏描边 */
+  --aievo-bg: #F4F5FA;              /* 内容区底 */
+  --aievo-surface: #FFFFFF;         /* 卡片面 */
+  --aievo-text-1: #111827;
+  --aievo-text-2: #4B5563;
+  --aievo-text-3: #9CA3AF;
+  --aievo-line: #E5E7EB;
+  --aievo-line-soft: #EEF0F4;
+
+  /* 状态色（与 EP 对齐但略收敛） */
+  --aievo-success: #059669;
+  --aievo-warning: #D97706;
+  --aievo-danger: #DC2626;
+  --aievo-info: #0EA5E9;
+
+  /* 圆角与阴影 */
+  --aievo-radius-s: 6px;
+  --aievo-radius-m: 10px;
+  --aievo-radius-l: 14px;
+  --aievo-shadow-card: 0 1px 2px rgba(15, 23, 42, 0.04), 0 4px 16px rgba(15, 23, 42, 0.06);
+  --aievo-shadow-pop: 0 8px 30px rgba(15, 23, 42, 0.14);
+  --aievo-ring: 0 0 0 3px rgba(79, 70, 229, 0.22);
+}
+
+/* ---------- 2. Element Plus 变量映射 ---------- */
+:root {
+  --el-color-primary: var(--aievo-primary);
+  --el-color-primary-dark-2: var(--aievo-primary-strong);
+  --el-color-primary-light-3: #7C75EA;
+  --el-color-primary-light-5: #A5A0F1;
+  --el-color-primary-light-7: #CECBF7;
+  --el-color-primary-light-8: #E0DEF9;
+  --el-color-primary-light-9: var(--aievo-primary-soft);
+
+  --el-border-radius-base: var(--aievo-radius-s);
+  --el-border-radius-small: 4px;
+  --el-border-radius-round: 999px;
+
+  --el-text-color-primary: var(--aievo-text-1);
+  --el-text-color-regular: var(--aievo-text-2);
+  --el-border-color: var(--aievo-line);
+  --el-border-color-light: var(--aievo-line-soft);
+  --el-fill-color-blank: var(--aievo-surface);
+  --el-bg-color: var(--aievo-surface);
+  --el-bg-color-page: var(--aievo-bg);
+
+  --el-font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Hiragino Sans GB', 'Microsoft YaHei', 'Helvetica Neue', Arial, sans-serif;
+
+  --el-box-shadow-light: var(--aievo-shadow-card);
+  --el-box-shadow: var(--aievo-shadow-pop);
+}
+
+/* ---------- 3. 全局组件润色 ---------- */
+
+/* 卡片：更大圆角、轻浮起、清晰的标题层级 */
+.el-card {
+  border-radius: var(--aievo-radius-l);
+  border-color: var(--aievo-line-soft);
+  box-shadow: var(--aievo-shadow-card);
+}
+.el-card__header {
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--aievo-text-1);
+  border-bottom-color: var(--aievo-line-soft);
+}
+
+/* 表格：小号大写风表头、冷灰表头底、行悬浮微着色 */
+.el-table {
+  --el-table-header-bg-color: #F8FAFC;
+  --el-table-header-text-color: #64748B;
+  --el-table-row-hover-bg-color: #F6F7FF;
+  --el-table-border-color: var(--aievo-line-soft);
+}
+.el-table th.el-table__cell {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+/* 对话框/抽屉：大圆角与柔和投影 */
+.el-dialog {
+  border-radius: var(--aievo-radius-l);
+  box-shadow: var(--aievo-shadow-pop);
+}
+.el-dialog__title {
+  font-weight: 600;
+}
+.el-drawer {
+  --el-drawer-bg-color: var(--aievo-surface);
+}
+
+/* 按钮：中字重；主按钮带品牌色淡投影 */
+.el-button {
+  font-weight: 500;
+}
+.el-button--primary {
+  --el-button-active-bg-color: var(--aievo-primary-strong);
+  box-shadow: 0 2px 8px rgba(79, 70, 229, 0.28);
+}
+.el-button--primary.is-plain,
+.el-button--primary.is-text,
+.el-button--primary.is-link {
+  box-shadow: none;
+}
+
+/* 输入类控件聚焦环 */
+.el-input__wrapper.is-focus,
+.el-textarea__inner:focus,
+.el-select .el-input.is-focus .el-input__wrapper {
+  box-shadow: 0 0 0 1px var(--aievo-primary) inset, var(--aievo-ring) !important;
+}
+
+/* 标签：统一胶囊观感 */
+.el-tag {
+  border-radius: 999px;
+  font-weight: 500;
+}
+
+/* 分页与消息提示微调 */
+.el-pagination.is-background .el-pager li.is-active {
+  box-shadow: 0 2px 6px rgba(79, 70, 229, 0.25);
+}
+.el-message {
+  border-radius: var(--aievo-radius-m);
+}
+
+/* ---------- 4. 滚动条与基础排版 ---------- */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #C7CDD9 transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: #C7CDD9;
+  border-radius: 4px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: #AAB3C2;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+body {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-feature-settings: 'tnum' 1; /* 数字表格化：统计卡/分数对齐更稳 */
+  color: var(--aievo-text-1);
+  background: var(--aievo-bg);
+}
+
+/* 键盘可达性：统一聚焦环 */
+:focus-visible {
+  outline: none;
+  box-shadow: var(--aievo-ring);
+  border-radius: var(--aievo-radius-s);
+}

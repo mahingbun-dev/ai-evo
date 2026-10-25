@@ -24,13 +24,15 @@
           :default-active="route.path"
           router
           class="menu"
-          :active-text-color="'#3662EC'"
           :collapse="isCollapse"
         >
+          <div class="menu-group-title" v-show="!isCollapse">概览</div>
           <el-menu-item index="/">
             <el-icon><HomeFilled /></el-icon>
             <span>首页</span>
           </el-menu-item>
+
+          <div class="menu-group-title" v-show="!isCollapse">评测准备</div>
           <el-menu-item index="/models">
             <el-icon><Cpu /></el-icon>
             <span>模型配置</span>
@@ -51,6 +53,8 @@
             <el-icon><Document /></el-icon>
             <span>评测模板</span>
           </el-menu-item>
+
+          <div class="menu-group-title" v-show="!isCollapse">结果与分析</div>
           <el-menu-item index="/results">
             <el-icon><DataAnalysis /></el-icon>
             <span>结果展示</span>
@@ -59,14 +63,16 @@
             <el-icon><VideoPlay /></el-icon>
             <span>仿真评测</span>
           </el-menu-item>
-          <el-menu-item index="/statistics" v-if="isSuperAdmin">
-            <el-icon><TrendCharts /></el-icon>
-            <span>统计分析</span>
-          </el-menu-item>
           <el-menu-item index="/ab-test">
             <el-icon><Switch /></el-icon>
             <span>A/B 对比测试</span>
           </el-menu-item>
+          <el-menu-item index="/statistics" v-if="isSuperAdmin">
+            <el-icon><TrendCharts /></el-icon>
+            <span>统计分析</span>
+          </el-menu-item>
+
+          <div class="menu-group-title" v-show="!isCollapse">系统与治理</div>
           <el-menu-item index="/dev-settings">
             <el-icon><Key /></el-icon>
             <span>开发者设置</span>
@@ -83,6 +89,8 @@
             <el-icon><Odometer /></el-icon>
             <span>并发池</span>
           </el-menu-item>
+
+          <div class="menu-group-title" v-show="!isCollapse">帮助</div>
           <el-menu-item index="/docs">
             <el-icon><QuestionFilled /></el-icon>
             <span>使用文档</span>
@@ -204,46 +212,41 @@ const handleUserCommand = (command) => {
 </script>
 
 <style>
+/* 应用外壳样式：墨蓝侧边栏 + 靛蓝主色的工程控制台风格。
+   设计令牌与 Element Plus 全局覆盖统一在 src/styles/theme.css，这里只管外壳布局。 */
+
 * {
   margin: 0;
   padding: 0;
   box-sizing: border-box;
 }
 
-:root {
-  --primary-color: #3662EC;
-  --primary-light: #EEF2FF;
-  --bg-color: #F7F8FA;
-  --text-primary: #1F2937;
-  --text-secondary: #6B7280;
-  --border-color: #E5E7EB;
-  --sidebar-bg: #FFFFFF;
-  --header-bg: #FFFFFF;
-}
-
 #app {
   height: 100vh;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Helvetica Neue', sans-serif;
+  font-family: var(--el-font-family);
 }
 
 .layout-container {
   height: 100%;
 }
 
-/* 侧边栏样式 */
+/* ---------- 侧边栏（深墨蓝） ---------- */
 .el-aside {
-  background-color: var(--sidebar-bg);
-  border-right: 1px solid var(--border-color);
+  background: linear-gradient(180deg, var(--aievo-ink-900) 0%, var(--aievo-ink-850) 100%);
+  border-right: 1px solid var(--aievo-ink-800);
+  display: flex;
+  flex-direction: column;
 }
 
 .logo {
   height: 64px;
   display: flex;
   align-items: center;
-  padding: 0 20px;
+  padding: 0 16px;
   gap: 12px;
-  border-bottom: 1px solid var(--border-color);
+  border-bottom: 1px solid var(--aievo-ink-800);
   transition: all 0.3s ease;
+  flex-shrink: 0;
 }
 
 .logo-collapsed {
@@ -254,18 +257,21 @@ const handleUserCommand = (command) => {
 .logo-icon {
   width: 36px;
   height: 36px;
-  background: linear-gradient(135deg, #3662EC 0%, #5B8DEF 100%);
-  border-radius: 8px;
+  background: var(--aievo-brand-gradient);
+  border-radius: var(--aievo-radius-m);
   display: flex;
   align-items: center;
   justify-content: center;
   color: #fff;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08) inset, 0 2px 10px rgba(79, 70, 229, 0.45);
+  flex-shrink: 0;
 }
 
 .logo-text {
-  font-size: 18px;
-  font-weight: 600;
-  color: var(--text-primary);
+  font-size: 17px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  color: #F8FAFC;
   flex: 1;
   white-space: nowrap;
 }
@@ -273,42 +279,76 @@ const handleUserCommand = (command) => {
 .collapse-btn {
   margin-left: auto;
   padding: 4px;
+  color: #7C8AA5;
 }
 
 .collapse-btn:hover {
-  background-color: var(--primary-light);
+  background-color: rgba(148, 163, 184, 0.12);
+  color: #E2E8F0;
 }
 
+/* ---------- 菜单 ---------- */
 .menu {
   border-right: none;
   background-color: transparent;
-  padding: 12px;
+  padding: 10px 12px 20px;
+  overflow-y: auto;
+  flex: 1;
+  --el-menu-bg-color: transparent;
+  --el-menu-text-color: #94A3B8;
+  --el-menu-hover-bg-color: rgba(148, 163, 184, 0.10);
+  --el-menu-active-color: #C7D2FE;
+}
+
+.menu-group-title {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: #5B6B8C;
+  padding: 14px 10px 6px;
+  white-space: nowrap;
+}
+
+.menu-group-title:first-child {
+  padding-top: 6px;
 }
 
 .menu .el-menu-item {
-  height: 44px;
-  line-height: 44px;
-  border-radius: 8px;
-  margin-bottom: 4px;
-  color: var(--text-secondary);
+  height: 40px;
+  line-height: 40px;
+  border-radius: var(--aievo-radius-m);
+  margin-bottom: 2px;
+  color: #94A3B8;
   font-size: 14px;
-  transition: all 0.2s ease;
+  transition: background-color 0.18s ease, color 0.18s ease;
 }
 
 .menu .el-menu-item:hover {
-  background-color: var(--primary-light);
-  color: var(--primary-color);
+  background-color: rgba(148, 163, 184, 0.10);
+  color: #E2E8F0;
 }
 
 .menu .el-menu-item.is-active {
-  background-color: var(--primary-light);
-  color: var(--primary-color);
+  background-color: rgba(99, 102, 241, 0.20);
+  color: #FFFFFF;
   font-weight: 500;
+  position: relative;
+}
+
+.menu .el-menu-item.is-active::before {
+  content: '';
+  position: absolute;
+  left: -12px;
+  top: 8px;
+  bottom: 8px;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
+  background: var(--aievo-brand-gradient);
 }
 
 .menu .el-menu-item .el-icon {
   margin-right: 12px;
-  font-size: 18px;
+  font-size: 17px;
 }
 
 /* 收起状态下的菜单样式 */
@@ -321,33 +361,38 @@ const handleUserCommand = (command) => {
   margin-right: 0;
 }
 
-/* 主内容区容器 */
+.menu.el-menu--collapse .el-menu-item.is-active::before {
+  left: 4px;
+}
+
+/* ---------- 顶部导航 ---------- */
 .main-container {
-  background-color: var(--bg-color);
+  background-color: var(--aievo-bg);
   min-height: 100vh;
 }
 
-/* 顶部导航 */
 .el-header {
-  background-color: var(--header-bg);
-  border-bottom: 1px solid var(--border-color);
+  background-color: var(--aievo-surface);
+  border-bottom: 1px solid var(--aievo-line-soft);
   display: flex;
   align-items: center;
   justify-content: space-between;
   padding: 0 24px;
-  height: 64px;
+  height: 60px;
 }
 
 .header-left {
   display: flex;
   align-items: center;
+  gap: 10px;
 }
 
 .page-title {
-  font-size: 20px;
+  font-size: 17px;
   font-weight: 600;
-  color: var(--text-primary);
+  color: var(--aievo-text-1);
   margin: 0;
+  letter-spacing: 0.01em;
 }
 
 .header-right {
@@ -356,43 +401,34 @@ const handleUserCommand = (command) => {
   gap: 16px;
 }
 
-.header-right .el-button {
-  border-radius: 8px;
-  font-weight: 500;
-}
-
 .user-info {
   cursor: pointer;
   display: flex;
   align-items: center;
   gap: 8px;
+  padding: 4px 8px;
+  border-radius: var(--aievo-radius-m);
+  transition: background-color 0.18s ease;
+}
+
+.user-info:hover {
+  background-color: var(--aievo-primary-soft);
 }
 
 .user-info .el-avatar {
-  background-color: var(--primary-light);
-  color: var(--primary-color);
+  background: var(--aievo-brand-gradient);
+  color: #fff;
 }
 
 .user-name {
   font-size: 14px;
-  color: var(--text-primary);
+  color: var(--aievo-text-1);
   white-space: nowrap;
 }
 
-/* 主内容区 */
+/* ---------- 主内容区 ---------- */
 .el-main {
-  background-color: var(--bg-color);
+  background-color: var(--aievo-bg);
   padding: 24px;
-}
-
-/* 全局卡片样式覆盖 */
-.el-card {
-  border: 1px solid var(--border-color);
-  border-radius: 12px;
-  box-shadow: none;
-}
-
-.el-card:hover {
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
 }
 </style>

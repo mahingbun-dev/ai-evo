@@ -33,7 +33,7 @@
       <el-col :span="6">
         <el-card class="stat-card">
           <div class="stat-content">
-            <div class="stat-icon" style="background: linear-gradient(135deg, #3662EC 0%, #5B8DEF 100%);">
+            <div class="stat-icon" style="background: linear-gradient(135deg, #4F46E5 0%, #22D3EE 100%);">
               <el-icon :size="24"><Cpu /></el-icon>
             </div>
             <div class="stat-info">
@@ -204,7 +204,7 @@ onMounted(async () => {
 .step-number {
   width: 36px;
   height: 36px;
-  background: #3662EC;
+  background: #4F46E5;
   color: #fff;
   border-radius: 8px;
   display: flex;
@@ -232,7 +232,7 @@ onMounted(async () => {
 }
 
 .step-arrow {
-  color: #3662EC;
+  color: #4F46E5;
   font-size: 18px;
 }
 
@@ -300,7 +300,7 @@ onMounted(async () => {
 }
 
 .task-name {
-  color: #3662EC;
+  color: #4F46E5;
   font-weight: 500;
 }
 

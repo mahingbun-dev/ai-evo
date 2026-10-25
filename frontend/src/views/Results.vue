@@ -5465,7 +5465,7 @@ const renderRadarChart = (dimensionScores) => {
         },
         rich: {
           v: { color: '#666', fontSize: 12, lineHeight: 16, align: 'center' },
-          s: { color: '#3662EC', fontSize: 12, fontWeight: 600, lineHeight: 16, align: 'center' }
+          s: { color: '#4F46E5', fontSize: 12, fontWeight: 600, lineHeight: 16, align: 'center' }
         }
       }
     },
@@ -5475,8 +5475,8 @@ const renderRadarChart = (dimensionScores) => {
         value: indicators.map(i => i.score),
         name: '平均分',
         areaStyle: { color: 'rgba(54, 98, 236, 0.2)' },
-        lineStyle: { color: '#3662EC' },
-        itemStyle: { color: '#3662EC' }
+        lineStyle: { color: '#4F46E5' },
+        itemStyle: { color: '#4F46E5' }
       }]
     }]
   })
@@ -5514,7 +5514,7 @@ const renderBarChart = (res) => {
       type: 'bar',
       data: Object.values(buckets),
       itemStyle: {
-        color: '#3662EC'
+        color: '#4F46E5'
       }
     }]
   })
@@ -5572,8 +5572,8 @@ const renderLineChart = (items) => {
       data: scoredItems.map(item => item.average_score),
       smooth: true,
       areaStyle: { color: 'rgba(54, 98, 236, 0.1)' },
-      lineStyle: { color: '#3662EC' },
-      itemStyle: { color: '#3662EC' }
+      lineStyle: { color: '#4F46E5' },
+      itemStyle: { color: '#4F46E5' }
     }]
   })
 }
@@ -5582,7 +5582,7 @@ const renderLineChart = (items) => {
 // 数据来源：GET /evaluation/results/{id}/dimension-trend，按 execution_number 升序的
 // {execution_number, dimension_scores} 快照数组；旧后端无该端点时 executionTrend 保持空数组
 
-const TREND_SERIES_COLORS = ['#3662EC', '#67C23A', '#E6A23C', '#F56C6C', '#9254DE', '#00B2FF', '#FF7D00']
+const TREND_SERIES_COLORS = ['#4F46E5', '#67C23A', '#E6A23C', '#F56C6C', '#9254DE', '#00B2FF', '#FF7D00']
 const TREND_MAX_DIMENSIONS = 10
 const TREND_LEGEND_VISIBLE_COUNT = 5
 
@@ -6173,7 +6173,7 @@ const renderLatencyHistogram = (res) => {
 }
 
 .stat-value.highlight {
-  color: #3662EC;
+  color: #4F46E5;
 }
 
 .result-detail {
@@ -6276,7 +6276,7 @@ const renderLatencyHistogram = (res) => {
 }
 
 .reason-hint:hover {
-  color: #3662EC;
+  color: #4F46E5;
 }
 
 .no-reason {
@@ -6388,7 +6388,7 @@ const renderLatencyHistogram = (res) => {
   font-weight: 600;
   text-align: center;
   padding: 20px 0;
-  color: #3662EC;
+  color: #4F46E5;
 }
 
 /* 表格样式 */
@@ -6433,7 +6433,7 @@ const renderLatencyHistogram = (res) => {
 
 .judge-score-pill-clickable {
   cursor: pointer;
-  color: #3662EC;
+  color: #4F46E5;
   border-color: #C7D2FE;
   background: #EEF2FF;
 }
@@ -6697,7 +6697,7 @@ const renderLatencyHistogram = (res) => {
 }
 
 .observation-text.clickable:hover {
-  color: #3662EC;
+  color: #4F46E5;
 }
 
 /* 耗时分布阈值参考卡片 */
@@ -6742,7 +6742,7 @@ const renderLatencyHistogram = (res) => {
 }
 
 .cell-preview:hover {
-  color: #3662EC;
+  color: #4F46E5;
 }
 
 /* 失败状态 tag（执行失败 / 裁判失败，可点击打开失败详情弹窗） */
@@ -6868,7 +6868,7 @@ const renderLatencyHistogram = (res) => {
 .expand-field-name {
   font-size: 12px;
   font-weight: 600;
-  color: #3662EC;
+  color: #4F46E5;
   white-space: nowrap;
 }
 
@@ -6880,7 +6880,7 @@ const renderLatencyHistogram = (res) => {
 }
 
 .expand-field-value:hover {
-  color: #3662EC;
+  color: #4F46E5;
 }
 
 /* 安全评测样式 */
@@ -7075,7 +7075,7 @@ const renderLatencyHistogram = (res) => {
 }
 
 .failure-model-output:hover {
-  color: #3662EC;
+  color: #4F46E5;
 }
 
 /* 裁判详情弹窗：分维度理由 tooltip（popper 挂在 body 上，样式必须全局才生效） */
