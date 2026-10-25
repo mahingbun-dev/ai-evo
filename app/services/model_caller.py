@@ -2,11 +2,14 @@
 通用模型调用服务
 根据模型类型自动选择合适的调用方式
 """
+import asyncio
 import logging
 import threading
+import weakref
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import httpx
+import requests
 
 from app.utils.llm_retry import with_llm_retry, with_llm_retry_async, is_retryable_llm_error
 
@@ -123,6 +126,84 @@ try:
     import anthropic
 except ImportError:
     anthropic = None
+
+
+# ==================== P0-2 SDK 客户端复用 ====================
+#
+# 原实现每次模型调用 new openai.OpenAI / anthropic.Anthropic / httpx
+# AsyncClient——1000 行任务 = 2000+ 次 TCP+TLS 握手（IO 面最大单点浪费）。
+# openai/anthropic SDK 客户端官方支持线程安全复用，这里按 (endpoint,
+# api_key) 键控进程级缓存；httpx.AsyncClient 按「当前事件循环」弱引用缓存
+# （连接池绑定创建它的 loop，跨 loop 复用会报 Event loop is closed——
+# 评测行线程各自 new_event_loop 的场景下必须按 loop 隔离，loop 关闭后
+# 弱引用条目自动回收、连接随 loop 一起销毁，无需 atexit 显式清理）。
+
+_client_cache_lock = threading.Lock()
+_openai_clients: Dict[Tuple[str, str], Any] = {}
+_anthropic_clients: Dict[Tuple[str, str], Any] = {}
+
+
+def _shared_openai_client(endpoint: Optional[str], api_key: str):
+    """(endpoint, api_key) 键控的 openai.OpenAI 进程级单例（线程安全）"""
+    cache_key = (endpoint or "", api_key or "")
+    with _client_cache_lock:
+        client = _openai_clients.get(cache_key)
+        if client is None:
+            client_kwargs = {"api_key": api_key}
+            if endpoint:
+                client_kwargs["base_url"] = endpoint
+            client = openai.OpenAI(**client_kwargs)
+            _openai_clients[cache_key] = client
+        return client
+
+
+def _shared_anthropic_client(endpoint: Optional[str], api_key: str):
+    """(endpoint, api_key) 键控的 anthropic.Anthropic 进程级单例（线程安全）"""
+    cache_key = (endpoint or "", api_key or "")
+    with _client_cache_lock:
+        client = _anthropic_clients.get(cache_key)
+        if client is None:
+            client_kwargs = {"api_key": api_key}
+            if endpoint:
+                client_kwargs["base_url"] = endpoint
+            client = anthropic.Anthropic(**client_kwargs)
+            _anthropic_clients[cache_key] = client
+        return client
+
+
+# httpx.AsyncClient 按 loop 弱引用缓存：loop -> client（见上方注释）
+_async_http_clients: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+def _get_shared_async_http_client() -> httpx.AsyncClient:
+    """当前事件循环共用的 httpx.AsyncClient（连接池限额 64/16）
+
+    请求级超时由各调用点的 client.post(timeout=...) 覆盖，不依赖客户端
+    默认值；limit 防行线程并发把对端打满。
+    """
+    loop = asyncio.get_running_loop()
+    with _client_cache_lock:
+        client = _async_http_clients.get(loop)
+        if client is None or client.is_closed:
+            client = httpx.AsyncClient(
+                timeout=60.0,
+                limits=httpx.Limits(max_connections=64, max_keepalive_connections=16),
+            )
+            _async_http_clients[loop] = client
+        return client
+
+
+# 同步散装 HTTP 调用的进程级会话（urllib3 连接池线程安全；进程退出由 OS 回收）
+_shared_requests_session: Optional[requests.Session] = None
+
+
+def _get_shared_requests_session() -> "requests.Session":
+    """进程级 requests.Session 单例（P0-2：同步 custom_http 路径免逐次握手）"""
+    global _shared_requests_session
+    with _client_cache_lock:
+        if _shared_requests_session is None:
+            _shared_requests_session = requests.Session()
+        return _shared_requests_session
 
 
 class _RetryableProviderFailure(Exception):
@@ -338,12 +419,8 @@ class ModelCaller:
         request_config = config.get("request_config", {})
 
         try:
-            # 设置客户端参数
-            client_kwargs = {"api_key": api_key}
-            if endpoint:
-                client_kwargs["base_url"] = endpoint
-
-            client = openai.OpenAI(**client_kwargs)
+            # P0-2：客户端按 (endpoint, api_key) 进程级复用（SDK 客户端线程安全）
+            client = _shared_openai_client(endpoint, api_key)
 
             # 构建请求参数
             kwargs = {
@@ -399,12 +476,8 @@ class ModelCaller:
         request_config = config.get("request_config", {})
 
         try:
-            # 设置客户端参数
-            client_kwargs = {"api_key": api_key}
-            if endpoint:
-                client_kwargs["base_url"] = endpoint
-
-            client = anthropic.Anthropic(**client_kwargs)
+            # P0-2：客户端按 (endpoint, api_key) 进程级复用（SDK 客户端线程安全）
+            client = _shared_anthropic_client(endpoint, api_key)
 
             # 转换消息格式（OpenAI格式 -> Anthropic格式）
             anthropic_messages = []
@@ -712,11 +785,8 @@ class ModelCallerSync:
         request_config = config.get("request_config", {})
 
         try:
-            client_kwargs = {"api_key": api_key}
-            if endpoint:
-                client_kwargs["base_url"] = endpoint
-
-            client = openai.OpenAI(**client_kwargs)
+            # P0-2：客户端按 (endpoint, api_key) 进程级复用（SDK 客户端线程安全）
+            client = _shared_openai_client(endpoint, api_key)
 
             kwargs = {
                 "model": model,

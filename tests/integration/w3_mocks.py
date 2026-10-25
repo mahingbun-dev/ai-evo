@@ -143,11 +143,13 @@ def install_w3_mocks(hooks: Optional[Dict[str, Any]] = None) -> ExitStack:
 
         original_update_progress = EvaluationExecutor._update_progress
 
-        def update_progress_with_soft_limit(self, completed, total):
+        def update_progress_with_soft_limit(self, completed, total, force=False):
+            # P0-4 给 _update_progress 加了 force 关键字（末行强制刷新），
+            # mock 需按新签名透传，否则 TypeError 会让软超时路径失真
             if completed >= soft_limit_on_progress:
                 hooks["soft_limit_raised"] = True
                 raise SoftTimeLimitExceeded()
-            return original_update_progress(self, completed, total)
+            return original_update_progress(self, completed, total, force=force)
 
         stack.enter_context(
             patch.object(EvaluationExecutor, "_update_progress", update_progress_with_soft_limit)

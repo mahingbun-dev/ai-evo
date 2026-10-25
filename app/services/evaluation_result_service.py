@@ -12,13 +12,18 @@ write-through 的存储面：
   （complete_task 聚合优先用行级表，含续跑前次已完成行）；
 - delete_execution_rows：行级表随 TaskExecutionRecord 生命周期联动删除。
 
+P0-4：persist_row_result 由逐行一 commit 改为进程内有界缓冲——N=20 行
+或 500ms 先到即批量 upsert + 单次 commit（fsync 从 行数 次降到 行数/20
+次）；停止/软超时/任务收尾路径经 flush_pending_rows 显式冲刷。
+
 落库失败不阻断评测主流程（只告警）：迁移未执行/DB 抖动时评测仍按
 旧口径完成，只是中途被杀仍会丢——expand-only 迁移执行后本表即生效。
 软超时异常（SoftTimeLimitExceeded）不吞：由上层收尾逻辑处理。
 """
 import logging
 import threading
-from typing import Any, Dict, List, Set
+import time
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from celery.exceptions import SoftTimeLimitExceeded
 from sqlalchemy import func
@@ -33,6 +38,24 @@ logger = logging.getLogger(__name__)
 # 断点续跑跳过的行状态：已完成行与裁判全失败行（judge_failed，W2 口径合入后
 # 由执行器打标）不重跑，缺失/failed/pending 行重跑
 RESUME_SKIP_STATUSES = ("completed", "judge_failed")
+
+# ---------------- P0-4 进程内有界落库缓冲 ----------------
+#
+# 触发条件：缓冲满 _FLUSH_BATCH_ROWS 行，或首行入缓冲超过
+# _FLUSH_INTERVAL_SECONDS 仍未冲刷（下一次 persist 调用顺带触发，无需
+# 后台定时线程）。冲刷 = 一次多值 upsert + 单次 commit。
+# 崩溃语义：flush 前崩溃最多重评最近 ≤20 行（断点续跑按行级表跳过已
+# 完成行，未 flush 的行不在表里会被重跑）——相比每行一次 fsync 的写
+# 放大，该代价可接受；任务收尾路径（run_evaluation_async finally /
+# executor 批次收尾）显式 flush 保证正常结束零丢失。
+_FLUSH_BATCH_ROWS = 20
+_FLUSH_INTERVAL_SECONDS = 0.5
+
+# (task_id, execution_number) -> 待落库行列表 [(data_index, result), ...]
+_pending_rows: Dict[Tuple[str, int], List[Tuple[int, Dict[str, Any]]]] = {}
+# (task_id, execution_number) -> 首行入缓冲时间（monotonic）
+_pending_since: Dict[Tuple[str, int], float] = {}
+_pending_lock = threading.Lock()
 
 # row_result / input_data 投影排除的输出侧结构化键（其余行字段视为输入侧平铺字段）
 _ROW_OUTPUT_KEYS = frozenset({
@@ -108,19 +131,14 @@ def _aggregate_projection(result: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def upsert_row_result(
-    db: Session,
+def _build_row_upsert_stmt(
     *,
     task_id: str,
     execution_number: int,
     data_index: int,
     result: Dict[str, Any],
-) -> None:
-    """按 UNIQUE(task_id, execution_number, data_index) 幂等 upsert 一行结果
-
-    冲突时更新除业务键与 created_at 外的全部列（同键重写不产生重复行）。
-    异常向上抛出（含 SoftTimeLimitExceeded），由调用方决定吞/放。
-    """
+):
+    """构造单行幂等 upsert 语句（ON CONFLICT DO UPDATE，单行/批量共用）"""
     row_values = {
         "task_id": task_id,
         "execution_number": execution_number,
@@ -143,12 +161,90 @@ def upsert_row_result(
         if column not in ("task_id", "execution_number", "data_index")
     }
     update_cols["updated_at"] = func.now()
-    stmt = stmt.on_conflict_do_update(
+    return stmt.on_conflict_do_update(
         index_elements=["task_id", "execution_number", "data_index"],
         set_=update_cols,
     )
-    db.execute(stmt)
+
+
+def upsert_row_result(
+    db: Session,
+    *,
+    task_id: str,
+    execution_number: int,
+    data_index: int,
+    result: Dict[str, Any],
+) -> None:
+    """按 UNIQUE(task_id, execution_number, data_index) 幂等 upsert 一行结果
+
+    冲突时更新除业务键与 created_at 外的全部列（同键重写不产生重复行）。
+    异常向上抛出（含 SoftTimeLimitExceeded），由调用方决定吞/放。
+    """
+    db.execute(_build_row_upsert_stmt(
+        task_id=task_id,
+        execution_number=execution_number,
+        data_index=data_index,
+        result=result,
+    ))
     db.commit()
+
+
+def _flush_rows(rows: List[Tuple[str, int, int, Dict[str, Any]]]) -> bool:
+    """把一批缓冲行写入行级表：多值 upsert + 单次 commit（P0-4）
+
+    rows: [(task_id, execution_number, data_index, result), ...]
+    失败只告警并返回 False（同旧逐行落库的失败口径：该批行从行级表缺失，
+    内存聚合不受影响）；软超时异常上抛由收尾处理。
+    """
+    db = None
+    try:
+        db = SessionLocal()
+        for task_id, execution_number, data_index, result in rows:
+            db.execute(_build_row_upsert_stmt(
+                task_id=task_id,
+                execution_number=execution_number,
+                data_index=data_index,
+                result=result,
+            ))
+        db.commit()
+        _reset_persist_failure_note()
+        return True
+    except SoftTimeLimitExceeded:
+        raise
+    except Exception as e:
+        _note_persist_failure(f"批量落库失败（{len(rows)} 行）: {e}")
+        return False
+    finally:
+        if db is not None:
+            db.close()
+
+
+def flush_pending_rows(
+    task_id: Optional[str] = None,
+    execution_number: Optional[int] = None,
+) -> None:
+    """显式冲刷进程内落库缓冲（P0-4：停止/软超时/任务收尾路径调用）
+
+    不带参数冲刷全部缓冲（celery prefork 一子进程同时只跑一个任务）；
+    带 (task_id[, execution_number]) 只冲刷匹配键。失败只告警——缓冲行
+    随进程退出丢失，等价旧实现「逐行落库失败只告警」的口径。
+    """
+    with _pending_lock:
+        keys = [
+            key for key in list(_pending_rows)
+            if (task_id is None or key[0] == task_id)
+            and (execution_number is None or key[1] == execution_number)
+        ]
+        batches = [(key, _pending_rows.pop(key)) for key in keys]
+        for key in keys:
+            _pending_since.pop(key, None)
+
+    for key, buffered in batches:
+        rows = [
+            (key[0], key[1], data_index, result)
+            for data_index, result in buffered
+        ]
+        _flush_rows(rows)
 
 
 def persist_row_result(
@@ -157,40 +253,50 @@ def persist_row_result(
     execution_number: int,
     data_index: int,
     result: Dict[str, Any],
+    flush: bool = False,
 ) -> bool:
-    """行级 write-through 落库入口（评测执行链路调用）
+    """行级 write-through 落库入口（评测执行链路调用，P0-4 有界缓冲版）
 
     - 注入行身份 result["_orig_idx"]（下划线内部键，聚合平铺/展示均排除），
       供 complete 合并时对齐行级表与内存结果；
-    - 自管短会话（评测执行线程外无长事务），逐行一 commit（写放大预算
-      见计划 W3 测试设计：超 15% 再改批量 flush）；
-    - 落库失败不阻断评测（只告警一次），软超时异常上抛由收尾处理。
-
-    Returns: 是否落库成功
+    - 进程内有界缓冲：N=20 行或 500ms 先到触发一次批量 upsert + 单次
+      commit（不再每行新开 Session、每行一次 fsync）；flush=True 或触发
+      条件满足时同步落库。崩溃语义：flush 前崩溃最多重评最近 ≤20 行
+      （断点续跑按行级表跳过，未 flush 的行会重跑），可接受；停止/
+      软超时/任务收尾路径由调用方 flush_pending_rows 显式冲刷兜底；
+    - 返回值：入缓冲即返回 True（批量结果由触发那次调用上报）；
+      触发冲刷时返回该批写入结果；落库失败不阻断评测（只告警一次），
+      软超时异常上抛由收尾处理。
     """
     if not isinstance(result, dict):
         return False
     # 行身份先行：即便落库失败，内存合并仍可对齐
     result["_orig_idx"] = data_index
-    try:
-        db = SessionLocal()
-        try:
-            upsert_row_result(
-                db,
-                task_id=task_id,
-                execution_number=execution_number,
-                data_index=data_index,
-                result=result,
-            )
-        finally:
-            db.close()
-        _reset_persist_failure_note()
+    key = (str(task_id), int(execution_number))
+    now = time.monotonic()
+    with _pending_lock:
+        buffered = _pending_rows.setdefault(key, [])
+        if not buffered:
+            _pending_since[key] = now
+        buffered.append((data_index, result))
+        should_flush = (
+            flush
+            or len(buffered) >= _FLUSH_BATCH_ROWS
+            or (now - _pending_since.get(key, now)) >= _FLUSH_INTERVAL_SECONDS
+        )
+        if should_flush:
+            pending = buffered[:]
+            _pending_rows.pop(key, None)
+            _pending_since.pop(key, None)
+        else:
+            pending = []
+    if not pending:
         return True
-    except SoftTimeLimitExceeded:
-        raise
-    except Exception as e:
-        _note_persist_failure(f"task={task_id} exec={execution_number} idx={data_index}: {e}")
-        return False
+    ok = _flush_rows([
+        (key[0], key[1], data_index, row_result)
+        for data_index, row_result in pending
+    ])
+    return ok
 
 
 def get_completed_data_indexes(

@@ -8,6 +8,8 @@ import asyncio
 import logging
 import os
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Any, List, Optional, Protocol
 
 from celery.exceptions import SoftTimeLimitExceeded
@@ -324,6 +326,10 @@ def run_evaluation_async(task_id: str, stop_event: Optional[StopEventProtocol] =
         raise
 
     finally:
+        # P0-4：行级落库进程内缓冲的兜底 flush——成功/停止/软超时/异常所有
+        # 收尾路径都经过这里，保证断点续跑的事实源（行级表）不缺已完成行
+        # （flush 前崩溃最多重评最近 ≤20 行，见 persist_row_result docstring）
+        _flush_pending_row_results()
         db.close()
         # ARCH-2-4：任务结束工作区归档（tar + 清原目录，失败保留原目录）——
         # 沿用本清理点（成功/失败/停止统一覆盖），见 _archive_task_workspace
@@ -357,6 +363,162 @@ def _persist_row(task_id: str, execution_number: Optional[int], data_index: int,
         raise
     except Exception as e:  # noqa: BLE001
         logger.warning(f"[RowPersist] 行级结果落库失败（不影响评测主流程）idx={data_index}: {e}")
+
+
+def _flush_pending_row_results() -> None:
+    """P0-4：冲刷行级落库进程内缓冲（evaluation_result_service 的有界批量缓冲）
+
+    任务收尾（成功/停止/软超时/异常）路径统一调用：保证断点续跑的事实源
+    （行级表）不缺已完成的行。失败只告警——缓冲行随进程退出丢失等价于
+    旧实现「逐行落库失败只告警」的口径。
+    """
+    try:
+        from app.services.evaluation_result_service import flush_pending_rows
+
+        flush_pending_rows()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[RowPersist] 收尾 flush 行级缓冲失败: {e}")
+
+
+def _row_thread_count(task, cap: int = 16) -> int:
+    """P0-1：行级线程并发数——任务 concurrency（缺省 4）钳制 [1, cap]
+
+    行并发与裁判池限额是两层正交机制：这里只决定同时有多少行线程在跑，
+    每行内部的裁判调用仍由 judge_pool 按引擎限额兜底。
+    """
+    try:
+        raw = int(getattr(task, "concurrency", 4) or 4)
+    except (TypeError, ValueError):
+        raw = 4
+    return max(1, min(raw, cap))
+
+
+def _signal_stop(stop_event) -> None:
+    """置停止信号（幂等，失败只告警不抛）
+
+    口径同 EvaluationExecutor._signal_stop：软超时收尾路径上 stop_event.set()
+    自身抛异常会替换正在传播的 SoftTimeLimitExceeded，故吞掉继续收尾。
+    """
+    if stop_event is None:
+        return
+    try:
+        stop_event.set()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"置停止信号失败（继续收尾）: {e}")
+
+
+def _collect_row_results(
+    futures: Dict,
+    total: int,
+    task_id: str,
+    stop_event,
+    execution_number: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """P0-1：五类行循环共用的 as_completed 收集面（异常口径照抄 executor 线程池）
+
+    - 行 worker 返回 None 表示行首停止检查未通过（该行跳过，不产结果不落库），
+      收到后不再处理后续行——等价旧串行循环头部的 break；
+    - SoftTimeLimitExceeded：上抛前先置停止信号（排队行在 judge_pool 里
+      ≤2s 内以 JudgePoolAborted 退出，避免撞硬 SIGKILL 留幽灵等待者）；
+    - JudgePoolTimeout / JudgePoolAborted：原样上抛，不得洗成行失败；
+    - 其余异常：行 worker 内已按行兜底为失败行并落库，这里的 except 是
+      防御位（同样上抛，与旧循环的逃逸行为一致）。
+    - 进度更新在收集线程单点执行（P0-4 节流 + 末行强制刷新），
+      逐行落库与停止检查保留在行 worker 线程内（断点续跑语义不变）。
+    """
+    results: List[Dict[str, Any]] = []
+    stop_requested = False
+    for future in as_completed(futures):
+        if stop_requested:
+            continue
+        try:
+            result_item = future.result()
+        except SoftTimeLimitExceeded:
+            # W3-4/P0-E：软超时不得按行失败吞掉，上抛触发收尾
+            _signal_stop(stop_event)
+            raise
+        except (JudgePoolTimeout, JudgePoolAborted):
+            # 池等待超时/中止：上抛走快速失败或停止收尾，不按行失败慢速消耗
+            raise
+        except Exception:
+            logger.exception(f"评测行结果收集异常（task={task_id}）")
+            raise
+        if result_item is None:
+            stop_requested = True
+            continue
+        results.append(result_item)
+        _update_progress(
+            len(results), total, task_id, execution_number,
+            force=len(results) >= total,
+        )
+        # 每条完成后检查停止信号，不再处理新完成的结果
+        if stop_event is not None and stop_event.is_set():
+            logger.info(
+                f"评测任务 {task_id} 收到停止信号，"
+                f"已完成 {len(results)}/{total} 条，取消剩余"
+            )
+            stop_requested = True
+    return results
+
+
+class _ConcurrentDesignCache(dict):
+    """design_cache 的线程安全包装（P0-1：trace 行并发化）
+
+    plugin_evaluator 对同一插件的设计质量线任务内只评一次、其余行复用
+    （design_cache 的 get/set）；行并发后多个行线程可能同时 miss 同一键，
+    裸 dict 会重复跑 N 路静态层与 judge（设计线单次可达分钟级）。用
+    「在算标记 + Event」让后到行等待首算行完成后直接复用：
+    - get 未命中且无人在算 → 登记在算标记（记到本线程），返回 None（调用方去算）；
+    - get 未命中但有人在算 → 等待其完成（带超时兜底）后复读缓存；
+    - __setitem__ 写入并唤醒全部等待者；
+    - abandon_pending_for_current_thread：登记线程的评测动作收尾（含未测早退/
+      异常路径）时放弃在算标记并唤醒等待者（等待者接管为首算行）。
+    继承 dict 保持 plugin_evaluator 侧 get/set 用法零改动（空 dict 为假值
+    不影响 `(design_cache or {}).get(...)` 的取值结果）。
+    """
+
+    # 设计线单次可达数十分钟：等待超时后自行重算（避免异常收尾漏唤醒时卡死）
+    _WAIT_TIMEOUT_SECONDS = 3600.0
+
+    def __init__(self):
+        super().__init__()
+        self._lock = threading.Lock()
+        self._computing: Dict[tuple, threading.Event] = {}
+        self._local = threading.local()
+
+    def get(self, key, default=None):  # noqa: D102 - 语义见类 docstring
+        while True:
+            with self._lock:
+                if dict.__contains__(self, key):
+                    return dict.__getitem__(self, key)
+                event = self._computing.get(key)
+                if event is None:
+                    self._computing[key] = threading.Event()
+                    self._local.pending_key = key
+                    return default
+            # 同键已有行在算：等它完成再复读（被 abandon 唤醒则接管为首算行）
+            if not event.wait(timeout=self._WAIT_TIMEOUT_SECONDS):
+                return default
+
+    def __setitem__(self, key, value):
+        with self._lock:
+            dict.__setitem__(self, key, value)
+            event = self._computing.pop(key, None)
+        if getattr(self._local, "pending_key", None) == key:
+            self._local.pending_key = None
+        if event is not None:
+            event.set()
+
+    def abandon_pending_for_current_thread(self) -> None:
+        """放弃本线程登记的在算标记（行收尾统一调用：set 已发生时为 no-op）"""
+        key = getattr(self._local, "pending_key", None)
+        if key is None:
+            return
+        self._local.pending_key = None
+        with self._lock:
+            event = self._computing.pop(key, None)
+        if event is not None:
+            event.set()
 
 
 def _merge_row_table_results(
@@ -768,11 +930,18 @@ def _execute_consistency_evaluation(task, payloads: List[Dict], db, task_id: str
 
     results = []
     total = len(payloads)
+    if total == 0:
+        return results
 
-    for idx, payload in enumerate(payloads):
+    # P0-1：行循环并发化——主体抽 _row_worker，外包线程池收集（口径照抄
+    # EvaluationExecutor.execute_batch：逐行落库/停止检查留在行线程内，
+    # 软超时/池中止从 future.result() 原样上抛，进度更新在收集线程单点执行）
+    from app.services.judge_pool import bind_judge_context
+
+    def _row_worker(idx: int, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if stop_event and stop_event.is_set():
-            logger.info(f"一致性评测任务 {task_id} 收到停止信号，已完成 {len(results)}/{total} 条")
-            break
+            logger.info(f"一致性评测任务 {task_id} 行首检查发现停止信号，跳过 idx={idx}")
+            return None
 
         # 平铺 payload 中的输入变量
         input_variables = {k: v for k, v in payload.items()
@@ -809,8 +978,6 @@ def _execute_consistency_evaluation(task, payloads: List[Dict], db, task_id: str
             try:
                 # 行级 judge 上下文：一致性评测启用裁判时同样在池里排队，
                 # 绑定任务/行/停止信号才能归属租约并在排队期响应停止
-                from app.services.judge_pool import bind_judge_context
-
                 with bind_judge_context(
                     eval_task_id=task_id,
                     row_idx=payload.get("idx", idx),
@@ -833,13 +1000,10 @@ def _execute_consistency_evaluation(task, payloads: List[Dict], db, task_id: str
             }
             # 平铺输入变量
             result_item.update(input_variables)
-            results.append(result_item)
 
             # W3-2：行级 write-through（每行终态即时幂等落库，P0-E）
             _persist_row(task_id, execution_number, payload.get("_orig_idx", idx), result_item)
-
-            # 更新进度
-            _update_progress(len(results), total, task_id, execution_number)
+            return result_item
 
         except SoftTimeLimitExceeded:
             # W3-4：软超时不得按行失败吞掉（P0-E），上抛触发收尾
@@ -859,8 +1023,17 @@ def _execute_consistency_evaluation(task, payloads: List[Dict], db, task_id: str
                 "success": False,
                 "error": str(e),
             }
-            results.append(failed_item)
             _persist_row(task_id, execution_number, payload.get("_orig_idx", idx), failed_item)
+            return failed_item
+
+    with ThreadPoolExecutor(
+        max_workers=_row_thread_count(task), thread_name_prefix="consistency-rows"
+    ) as row_pool:
+        futures = {
+            row_pool.submit(_row_worker, idx, payload): idx
+            for idx, payload in enumerate(payloads)
+        }
+        results = _collect_row_results(futures, total, task_id, stop_event, execution_number)
 
     # 按原始顺序排序结果
     results.sort(key=lambda x: x.get("idx", 0))
@@ -892,11 +1065,17 @@ def _execute_success_rate_evaluation(task, payloads: List[Dict], task_id: str, d
 
     results = []
     total = len(payloads)
+    if total == 0:
+        return results
 
-    for idx, payload in enumerate(payloads):
+    # P0-1：行循环并发化（口径同一致性评测：落库/停止检查在行线程，
+    # 软超时上抛，进度更新在收集线程）
+    from app.services.judge_pool import bind_judge_context
+
+    def _row_worker(idx: int, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if stop_event and stop_event.is_set():
-            logger.info(f"成功率评测任务 {task_id} 收到停止信号，已完成 {len(results)}/{total} 条")
-            break
+            logger.info(f"成功率评测任务 {task_id} 行首检查发现停止信号，跳过 idx={idx}")
+            return None
 
         # 平铺 payload 中的输入变量
         input_variables = {k: v for k, v in payload.items()
@@ -918,9 +1097,14 @@ def _execute_success_rate_evaluation(task, payloads: List[Dict], task_id: str, d
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
-                success_rate_result = loop.run_until_complete(
-                    evaluator.evaluate_single(user_input, repeat_count)
-                )
+                with bind_judge_context(
+                    eval_task_id=task_id,
+                    row_idx=payload.get("idx", idx),
+                    stop_checker=stop_event,
+                ):
+                    success_rate_result = loop.run_until_complete(
+                        evaluator.evaluate_single(user_input, repeat_count)
+                    )
             finally:
                 _restore_event_loop(prev_loop)
                 loop.close()
@@ -934,13 +1118,10 @@ def _execute_success_rate_evaluation(task, payloads: List[Dict], task_id: str, d
             }
             # 平铺输入变量
             result_item.update(input_variables)
-            results.append(result_item)
 
             # W3-2：行级 write-through（每行终态即时幂等落库，P0-E）
             _persist_row(task_id, execution_number, payload.get("_orig_idx", idx), result_item)
-
-            # 更新进度
-            _update_progress(len(results), total, task_id, execution_number)
+            return result_item
 
         except SoftTimeLimitExceeded:
             # W3-4：软超时不得按行失败吞掉（P0-E），上抛触发收尾
@@ -952,8 +1133,17 @@ def _execute_success_rate_evaluation(task, payloads: List[Dict], task_id: str, d
                 "success": False,
                 "error": str(e),
             }
-            results.append(failed_item)
             _persist_row(task_id, execution_number, payload.get("_orig_idx", idx), failed_item)
+            return failed_item
+
+    with ThreadPoolExecutor(
+        max_workers=_row_thread_count(task), thread_name_prefix="success-rate-rows"
+    ) as row_pool:
+        futures = {
+            row_pool.submit(_row_worker, idx, payload): idx
+            for idx, payload in enumerate(payloads)
+        }
+        results = _collect_row_results(futures, total, task_id, stop_event, execution_number)
 
     # 按原始顺序排序结果
     results.sort(key=lambda x: x.get("idx", 0))
@@ -990,11 +1180,17 @@ def _execute_binary_classification_evaluation(task, payloads: List[Dict], task_i
     results = []
     total = len(payloads)
     model_caller = ModelCallerSync()
+    if total == 0:
+        return results
 
-    for idx, payload in enumerate(payloads):
+    # P0-1：行循环并发化（口径同一致性评测：落库/停止检查在行线程，
+    # 软超时上抛，进度更新在收集线程）
+    from app.services.judge_pool import bind_judge_context
+
+    def _row_worker(idx: int, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if stop_event and stop_event.is_set():
-            logger.info(f"二分分类评测任务 {task_id} 收到停止信号，已完成 {len(results)}/{total} 条")
-            break
+            logger.info(f"二分分类评测任务 {task_id} 行首检查发现停止信号，跳过 idx={idx}")
+            return None
 
         try:
             # 平铺 payload 中的输入变量
@@ -1060,9 +1256,14 @@ def _execute_binary_classification_evaluation(task, payloads: List[Dict], task_i
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
-                eval_results = loop.run_until_complete(
-                    evaluator.evaluate_batch([payload], [model_output], [chain_results])
-                )
+                with bind_judge_context(
+                    eval_task_id=task_id,
+                    row_idx=payload.get("idx", idx),
+                    stop_checker=stop_event,
+                ):
+                    eval_results = loop.run_until_complete(
+                        evaluator.evaluate_batch([payload], [model_output], [chain_results])
+                    )
             finally:
                 _restore_event_loop(prev_loop)
                 loop.close()
@@ -1084,19 +1285,16 @@ def _execute_binary_classification_evaluation(task, payloads: List[Dict], task_i
                 # 平铺 input_data（来自 evaluator）
                 if result.input_data:
                     result_item.update(result.input_data)
-                results.append(result_item)
             else:
                 result_item = {
                     "idx": idx,
                     "success": False,
                     "error": "No evaluation result returned",
                 }
-                results.append(result_item)
 
             # W3-2：行级 write-through（每行终态即时幂等落库，P0-E）
-            _persist_row(task_id, execution_number, payload.get("_orig_idx", idx), results[-1])
-
-            _update_progress(len(results), total, task_id, execution_number)
+            _persist_row(task_id, execution_number, payload.get("_orig_idx", idx), result_item)
+            return result_item
 
         except SoftTimeLimitExceeded:
             # W3-4：软超时不得按行失败吞掉（P0-E），上抛触发收尾
@@ -1108,8 +1306,17 @@ def _execute_binary_classification_evaluation(task, payloads: List[Dict], task_i
                 "success": False,
                 "error": str(e),
             }
-            results.append(failed_item)
             _persist_row(task_id, execution_number, payload.get("_orig_idx", idx), failed_item)
+            return failed_item
+
+    with ThreadPoolExecutor(
+        max_workers=_row_thread_count(task), thread_name_prefix="binary-rows"
+    ) as row_pool:
+        futures = {
+            row_pool.submit(_row_worker, idx, payload): idx
+            for idx, payload in enumerate(payloads)
+        }
+        results = _collect_row_results(futures, total, task_id, stop_event, execution_number)
 
     results.sort(key=lambda x: x.get("idx", 0))
     return results
@@ -1206,15 +1413,23 @@ def _execute_plugin_evaluation(task, payloads: List[Dict], task_id: str, db, sto
 
     results = []
     total = len(rows)
+    if total == 0:
+        return results
 
     # 行级 judge 上下文：插件评测的裁判调用会在池里排队，绑定任务/行/停止信号
     # 才能归属租约并在排队期响应停止（否则停止要等满 wait_timeout）
     from app.services.judge_pool import bind_judge_context
 
-    for idx, payload in enumerate(rows):
+    # P0-1：行循环并发化（口径同一致性评测：落库/停止检查在行线程，
+    # 软超时/池异常上抛，进度更新在收集线程）。
+    # 插件线特殊值：plugin_evaluator 内部已有线程评测（trace_concurrency，
+    # 上限 20），外层行并发取 min(行并发, 4) 保守值防止线程爆炸
+    row_concurrency = min(_row_thread_count(task), 4)
+
+    def _row_worker(idx: int, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if stop_event and stop_event.is_set():
-            logger.info(f"插件评测任务 {task_id} 收到停止信号，已完成 {len(results)}/{total} 行")
-            break
+            logger.info(f"插件评测任务 {task_id} 行首检查发现停止信号，跳过 idx={idx}")
+            return None
 
         # 平铺 payload 中的输入变量（行标识除外）
         input_variables = {k: v for k, v in payload.items()
@@ -1247,13 +1462,10 @@ def _execute_plugin_evaluation(task, payloads: List[Dict], task_id: str, db, sto
             if market_info:
                 # 版本锚点：该行评测对象来自哪个市场的哪个 commit
                 row["market_info"] = market_info
-            results.append(row)
 
             # W3-2：行级 write-through（每行终态即时幂等落库，P0-E）
             _persist_row(task_id, execution_number, payload.get("_orig_idx", row["idx"]), row)
-
-            # 更新进度
-            _update_progress(len(results), total, task_id)
+            return row
 
         except SoftTimeLimitExceeded:
             # W3-4：软超时不得按行失败吞掉（P0-E），上抛触发收尾
@@ -1278,8 +1490,17 @@ def _execute_plugin_evaluation(task, payloads: List[Dict], task_id: str, db, sto
                 "error": str(e),
             }
             failed_item.update(input_variables)
-            results.append(failed_item)
             _persist_row(task_id, execution_number, payload.get("_orig_idx", failed_item["idx"]), failed_item)
+            return failed_item
+
+    with ThreadPoolExecutor(
+        max_workers=row_concurrency, thread_name_prefix="plugin-rows"
+    ) as row_pool:
+        futures = {
+            row_pool.submit(_row_worker, idx, payload): idx
+            for idx, payload in enumerate(rows)
+        }
+        results = _collect_row_results(futures, total, task_id, stop_event, execution_number)
 
     # 按原始顺序排序结果
     results.sort(key=lambda x: x.get("idx", 0))
@@ -1325,37 +1546,53 @@ def _execute_plugin_trace_evaluation(task, payloads: List[Dict], task_id: str, d
 
     results: List[Dict] = []
     total = len(payloads)
+    if total == 0:
+        return results
     # 设计质量线：只与插件有关，同一插件（版本/路径/判定方式一致）任务内只评一次，
-    # 其余行复用快照、只跑历史线（--history-only），避免 N 行重复静态层与 judge
-    design_cache: Dict[tuple, Dict] = {}
+    # 其余行复用快照、只跑历史线（--history-only），避免 N 行重复静态层与 judge。
+    # P0-1：行并发化后换线程安全包装（并发首算同一插件时后到行等待复用，
+    # 而不是各跑一遍分钟级的设计线）
+    design_cache = _ConcurrentDesignCache()
 
     # 进度与心跳：历史评测单行可能跑近一小时，行内必须有可见进度，
     # 且必须在评测动作执行期间持续刷新执行心跳（收尸 reaper 阈值 15 分钟，
-    # 一次部署重启就会把还在跑的任务误判为 failed）
-    task_service = None
-    log_service = None
-    try:  # db 不可用（直调/测试链路）时退化为「无日志无心跳」，不影响评测本身
-        task_service = EvaluationTaskService(db)
-        log_service = TaskExecutionLogService(db)
-    except Exception as e:
-        logger.warning(f"[插件Trace评测] 任务日志/心跳服务不可用（忽略）: {e}")
-
+    # 一次部署重启就会把还在跑的任务误判为 failed）。
+    # P0-1：行线程不得复用主线程的 db 会话（Session 非线程安全），
+    # 日志/心跳改为每次短会话自开自关；db 不可用（直调/测试链路）时
+    # 退化为「无日志无心跳」，不影响评测本身
     def _add_log(level: str, message: str) -> None:
-        if log_service is None:
-            return
         try:
-            log_service.add_log(task_id, level, message)
+            log_db = get_db_session()
+            try:
+                TaskExecutionLogService(log_db).add_log(task_id, level, message)
+            finally:
+                log_db.close()
         except Exception as e:  # 日志不可用不阻断评测
             logger.warning(f"[插件Trace评测] 写任务日志失败（忽略）: {e}")
+
+    def _touch_heartbeat() -> None:
+        try:
+            hb_db = get_db_session()
+            try:
+                EvaluationTaskService(hb_db).touch_heartbeat(task_id, execution_number)
+            finally:
+                hb_db.close()
+        except Exception as e:  # 心跳缺失只影响收尸判定，不阻断评测
+            logger.warning(f"[插件Trace评测] 刷新执行心跳失败（忽略）: {e}")
 
     # 行级 judge 上下文：trace 行的裁判调用会在池里排队，绑定任务/行/停止信号
     # 才能归属租约并在排队期响应停止（否则停止要等满 wait_timeout）
     from app.services.judge_pool import bind_judge_context
 
-    for idx, payload in enumerate(payloads):
+    # P0-1：行循环并发化（口径同插件评测：落库/停止检查在行线程，软超时/池异常
+    # 上抛，进度更新在收集线程）；行并发取 min(行并发, 4) 保守值——
+    # trace 行内部还有 trace_concurrency 线程评测，防止线程爆炸
+    row_concurrency = min(_row_thread_count(task), 4)
+
+    def _row_worker(idx: int, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if stop_event and stop_event.is_set():
-            logger.info(f"插件 trace 评测任务 {task_id} 收到停止信号，已完成 {len(results)}/{total} 行")
-            break
+            logger.info(f"插件 trace 评测任务 {task_id} 行首检查发现停止信号，跳过 idx={idx}")
+            return None
 
         input_variables = {k: v for k, v in payload.items()
                            if k not in ("_dataset_item", "idx") and not k.startswith("_")}
@@ -1386,8 +1623,7 @@ def _execute_plugin_trace_evaluation(task, payloads: List[Dict], task_id: str, d
 
             def _on_tick(elapsed: int) -> None:
                 # 心跳必须刷新（部署重启不误判）；日志按分钟节流避免刷屏
-                if task_service is not None:
-                    task_service.touch_heartbeat(task_id, execution_number)
+                _touch_heartbeat()
                 if elapsed % 600 < 60:
                     _add_log("info", f"[{row_no}/{total}] 评测动作执行中（已 {max(1, elapsed // 60)} 分钟）")
 
@@ -1396,12 +1632,16 @@ def _execute_plugin_trace_evaluation(task, payloads: List[Dict], task_id: str, d
                 row_idx=payload.get("_orig_idx", idx),
                 stop_checker=stop_event,
             ):
-                row = evaluator.evaluate_trace(
-                    package_dir, on_tick=_on_tick, design_cache=design_cache
-                )
+                try:
+                    row = evaluator.evaluate_trace(
+                        package_dir, on_tick=_on_tick, design_cache=design_cache
+                    )
+                finally:
+                    # 设计线在算标记统一收尾（set 已发生时为 no-op；未测早退/异常
+                    # 路径放弃标记并唤醒等待行，由其接管为首算行）
+                    design_cache.abandon_pending_for_current_thread()
             row["idx"] = payload.get("_orig_idx", payload.get("idx", idx))
             row.update(input_variables)
-            results.append(row)
 
             real_data = row.get("real_data") or {}
             counts = real_data.get("counts") or {}
@@ -1424,7 +1664,7 @@ def _execute_plugin_trace_evaluation(task, payloads: List[Dict], task_id: str, d
 
             # W3-2：行级 write-through（每行终态即时幂等落库，P0-E）
             _persist_row(task_id, execution_number, payload.get("_orig_idx", row["idx"]), row)
-            _update_progress(len(results), total, task_id, execution_number)
+            return row
 
         except SoftTimeLimitExceeded:
             # W3-4：软超时不得按行失败吞掉（P0-E），上抛触发收尾
@@ -1453,8 +1693,17 @@ def _execute_plugin_trace_evaluation(task, payloads: List[Dict], task_id: str, d
                 "error": str(e),
             }
             failed_item.update(input_variables)
-            results.append(failed_item)
             _persist_row(task_id, execution_number, payload.get("_orig_idx", failed_item["idx"]), failed_item)
+            return failed_item
+
+    with ThreadPoolExecutor(
+        max_workers=row_concurrency, thread_name_prefix="plugin-trace-rows"
+    ) as row_pool:
+        futures = {
+            row_pool.submit(_row_worker, idx, payload): idx
+            for idx, payload in enumerate(payloads)
+        }
+        results = _collect_row_results(futures, total, task_id, stop_event, execution_number)
 
     results.sort(key=lambda x: x.get("idx", 0))
     return results
@@ -1479,12 +1728,59 @@ def _restore_event_loop(loop):
     asyncio.set_event_loop(loop)
 
 
-def _update_progress(completed: int, total: int, task_id: str, execution_number: Optional[int] = None):
-    """更新任务进度（consistency/success_rate/binary 专用路径）
+# ---------------- P0-4 进度更新节流（与执行心跳节流同款模式） ----------------
+
+# 同任务两次进度写库的最小间隔（秒）：进度 UPDATE+commit 与随行的 Redis
+# PUBLISH（WS 推送）按此窗口节流，行级完成高频时避免每行 ≥3 个 DB 会话
+PROGRESS_MIN_INTERVAL_SECONDS = 1.0
+# 节流表容量上限：超过即清理过期项（worker 常驻进程防无界增长）
+_PROGRESS_TABLE_MAX = 4096
+
+# task_id -> (上次写库 monotonic 时间, 上次写库 completed)
+_progress_last_write: Dict[str, tuple] = {}
+_progress_lock = threading.Lock()
+
+
+def _progress_throttled(task_id: str, completed: int, total: int) -> bool:
+    """节流判定：距上次进度写库不足窗口且行数增量不足步长时返回 True（并登记意图）
+
+    步长 = max(1, total // 100)：大任务每 1% 行落一次库，小任务退化为
+    纯时间窗口；force（末行/收尾）由调用方绕过本判定。
+    """
+    now = time.monotonic()
+    step = max(1, total // 100) if total > 0 else 1
+    with _progress_lock:
+        if len(_progress_last_write) > _PROGRESS_TABLE_MAX:
+            for k in [k for k, (t, _) in _progress_last_write.items()
+                      if now - t > PROGRESS_MIN_INTERVAL_SECONDS]:
+                _progress_last_write.pop(k, None)
+        last = _progress_last_write.get(task_id)
+        if last is not None:
+            last_t, last_c = last
+            if (now - last_t) < PROGRESS_MIN_INTERVAL_SECONDS and (completed - last_c) < step:
+                return True
+        _progress_last_write[task_id] = (now, completed)
+        return False
+
+
+def _update_progress(
+    completed: int,
+    total: int,
+    task_id: str,
+    execution_number: Optional[int] = None,
+    force: bool = False,
+):
+    """更新任务进度（consistency/success_rate/binary/plugin 专用路径）
 
     W10-4：进度推进即一批行完成，同步刷新执行记录心跳（heartbeat_at）——
     API 启动期收尸 reaper 以心跳区分「正在执行」与「worker 已死」。
+    P0-4：进度写库（1 SELECT + UPDATE + commit + refresh）与随行的
+    _publish_status_update（Redis PUBLISH → WS 推送）按 1s 窗口或
+    max(1, total//100) 行步长节流；末行完成由调用方 force=True 强制
+    刷新，保证终态进度准确（心跳自身另有 60s 节流，不受影响）。
     """
+    if not force and _progress_throttled(task_id, completed, total):
+        return
     try:
         from app.services.evaluation_task_service import EvaluationTaskService
 

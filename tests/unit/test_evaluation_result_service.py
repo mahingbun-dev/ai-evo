@@ -91,20 +91,24 @@ class TestResumeSkipStatuses:
 
 
 class TestPersistRowResultFailureSemantics:
-    """persist_row_result：落库失败不阻断评测、软超时不吞、行身份先行注入"""
+    """persist_row_result：落库失败不阻断评测、软超时不吞、行身份先行注入
+
+    P0-4 后 persist 为有界缓冲版：单行调用只入缓冲（不触发 DB），flush
+    触发时（本组用例显式 flush=True）才走到 SessionLocal / upsert。
+    """
 
     def test_persist_failure_returns_false_not_raise(self):
         """DB 异常（如迁移未执行）→ 返回 False，不向评测主流程抛异常"""
         result = {"idx": 0, "success": True, "model_output": "x"}
         with patch.object(svc, "SessionLocal", side_effect=RuntimeError("relation evaluation_results does not exist")):
-            ok = svc.persist_row_result(task_id="t1", execution_number=1, data_index=0, result=result)
+            ok = svc.persist_row_result(task_id="t1", execution_number=1, data_index=0, result=result, flush=True)
         assert ok is False
 
     def test_persist_failure_still_injects_row_identity(self):
         """落库失败时内存合并仍可对齐：_orig_idx 先行注入"""
         result = {"idx": 7, "success": True}
         with patch.object(svc, "SessionLocal", side_effect=RuntimeError("db down")):
-            svc.persist_row_result(task_id="t1", execution_number=1, data_index=7, result=result)
+            svc.persist_row_result(task_id="t1", execution_number=1, data_index=7, result=result, flush=True)
         assert result["_orig_idx"] == 7
 
     def test_soft_time_limit_not_swallowed(self):
@@ -112,24 +116,117 @@ class TestPersistRowResultFailureSemantics:
         result = {"idx": 0, "success": True}
         with patch.object(svc, "SessionLocal", side_effect=SoftTimeLimitExceeded()):
             with pytest.raises(SoftTimeLimitExceeded):
-                svc.persist_row_result(task_id="t1", execution_number=1, data_index=0, result=result)
+                svc.persist_row_result(task_id="t1", execution_number=1, data_index=0, result=result, flush=True)
 
     def test_non_dict_result_returns_false(self):
         assert svc.persist_row_result(task_id="t1", execution_number=1, data_index=0, result="bad") is False
 
     def test_persist_success_returns_true_and_injects_identity(self):
-        """正常落库：委托 upsert_row_result，返回 True，注入行身份"""
+        """正常落库：flush 后批量写入生效，返回 True，注入行身份"""
         result = {"idx": 3, "success": True, "average_score": 7.0}
-        with patch.object(svc, "upsert_row_result") as mock_upsert:
-            ok = svc.persist_row_result(task_id="t1", execution_number=2, data_index=3, result=result)
+        with patch.object(svc, "SessionLocal") as session_factory:
+            ok = svc.persist_row_result(task_id="t1", execution_number=2, data_index=3, result=result, flush=True)
         assert ok is True
         assert result["_orig_idx"] == 3
-        mock_upsert.assert_called_once()
-        _, kwargs = mock_upsert.call_args
-        assert kwargs["task_id"] == "t1"
-        assert kwargs["execution_number"] == 2
-        assert kwargs["data_index"] == 3
-        assert kwargs["result"] is result
+        db = session_factory.return_value
+        # 批量落库：一次会话内 1 次 execute + 单次 commit
+        assert db.execute.call_count == 1
+        assert db.commit.call_count == 1
+        db.close.assert_called_once()
+
+
+class TestPersistRowBuffering:
+    """P0-4 有界落库缓冲：N=20 行或 500ms 先到批量 upsert + 单次 commit"""
+
+    @pytest.fixture(autouse=True)
+    def _drain_buffer(self):
+        """每用例前后清空进程级缓冲，隔离串账"""
+        with svc._pending_lock:
+            svc._pending_rows.clear()
+            svc._pending_since.clear()
+        yield
+        with svc._pending_lock:
+            svc._pending_rows.clear()
+            svc._pending_since.clear()
+
+    def _row(self, idx):
+        return {"idx": idx, "success": True, "average_score": 8.0}
+
+    def test_within_batch_no_db_touch(self):
+        """不足 20 行且在窗口内：仅入缓冲，不触发任何 DB 访问"""
+        with patch.object(svc, "SessionLocal") as session_factory:
+            ok = svc.persist_row_result(task_id="bt", execution_number=1, data_index=0, result=self._row(0))
+        assert ok is True
+        session_factory.assert_not_called()
+
+    def test_batch_size_triggers_single_commit(self):
+        """满 20 行自动触发：一次会话 20 次 execute + 单次 commit"""
+        with patch.object(svc, "SessionLocal") as session_factory:
+            for idx in range(svc._FLUSH_BATCH_ROWS - 1):
+                svc.persist_row_result(task_id="bt", execution_number=1, data_index=idx, result=self._row(idx))
+            ok = svc.persist_row_result(
+                task_id="bt", execution_number=1, data_index=svc._FLUSH_BATCH_ROWS - 1,
+                result=self._row(svc._FLUSH_BATCH_ROWS - 1),
+            )
+        assert ok is True
+        db = session_factory.return_value
+        assert db.execute.call_count == svc._FLUSH_BATCH_ROWS
+        assert db.commit.call_count == 1  # 批量一次 commit（旧实现为 20 次）
+
+    def test_interval_expiry_triggers_flush_on_next_call(self):
+        """首行入缓冲超 500ms：下一次 persist 顺带触发冲刷（含缓冲中的全部行）"""
+        with patch.object(svc, "SessionLocal") as session_factory, \
+             patch.object(svc.time, "monotonic") as mono:
+            mono.return_value = 1000.0
+            svc.persist_row_result(task_id="bt", execution_number=1, data_index=0, result=self._row(0))
+            mono.return_value = 1000.0 + svc._FLUSH_INTERVAL_SECONDS + 0.01
+            svc.persist_row_result(task_id="bt", execution_number=1, data_index=1, result=self._row(1))
+        db = session_factory.return_value
+        # 窗口超时按首行计时：两行同批冲刷，单次 commit
+        assert db.execute.call_count == 2
+        assert db.commit.call_count == 1
+        with svc._pending_lock:
+            assert not svc._pending_rows
+
+    def test_flush_param_forces_immediate_write(self):
+        """flush=True 强制落库（停止/软超时/收尾路径）"""
+        with patch.object(svc, "SessionLocal") as session_factory:
+            svc.persist_row_result(task_id="bt", execution_number=1, data_index=0, result=self._row(0))
+            assert session_factory.call_count == 0
+            svc.persist_row_result(task_id="bt", execution_number=1, data_index=1, result=self._row(1), flush=True)
+        db = session_factory.return_value
+        assert db.execute.call_count == 2
+        assert db.commit.call_count == 1
+
+    def test_flush_pending_rows_writes_and_drains(self):
+        """显式 flush_pending_rows：全部缓冲行一次会话写入并清空缓冲"""
+        with patch.object(svc, "SessionLocal") as session_factory:
+            for idx in range(3):
+                svc.persist_row_result(task_id="bt", execution_number=1, data_index=idx, result=self._row(idx))
+            svc.flush_pending_rows()
+        db = session_factory.return_value
+        assert db.execute.call_count == 3
+        assert db.commit.call_count == 1
+        with svc._pending_lock:
+            assert not svc._pending_rows
+
+    def test_flush_pending_rows_scoped_by_task(self):
+        """按 task_id 定向冲刷：只清匹配键，其它任务的缓冲保留"""
+        with patch.object(svc, "SessionLocal"):
+            svc.persist_row_result(task_id="t-a", execution_number=1, data_index=0, result=self._row(0))
+            svc.persist_row_result(task_id="t-b", execution_number=1, data_index=0, result=self._row(0))
+            svc.flush_pending_rows(task_id="t-a")
+        with svc._pending_lock:
+            assert ("t-a", 1) not in svc._pending_rows
+            assert ("t-b", 1) in svc._pending_rows
+
+    def test_flush_failure_drops_batch_and_returns_false(self):
+        """冲刷失败：该批行从行级表缺失（口径同旧逐行失败），不抛异常"""
+        with patch.object(svc, "SessionLocal", side_effect=RuntimeError("db down")):
+            ok = svc.persist_row_result(task_id="bt", execution_number=1, data_index=0, result=self._row(0), flush=True)
+        assert ok is False
+        with svc._pending_lock:
+            assert not svc._pending_rows  # 失败批次不回灌（避免 DB 故障时缓冲无界增长）
 
 
 class TestUpsertRowResultStatement:

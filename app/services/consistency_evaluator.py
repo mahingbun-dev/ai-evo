@@ -374,23 +374,28 @@ class ConsistencyEvaluator:
 
         runtime_variables = self._extract_runtime_variables()
 
-        repeat_results = []
+        # P0-1④：repeat_count 次调用并发执行（asyncio.gather 保持结果顺序，
+        # repeat_id 与调用序号一一对应）；每路调用各自受 judge_pool 与
+        # provider 限流保护，原串行循环每次 await sleep(0.5) 的间隔节流
+        # 随串行结构一并移除
+        messages = [{"role": "user", "content": question}]
 
-        for i in range(repeat_count):
-            await self._report_progress(i + 1, repeat_count, f"第 {i + 1}/{repeat_count} 次调用")
+        async def _call_once() -> Dict[str, Any]:
+            return await self.engine._call_model(
+                messages, self.model_config, runtime_variables=runtime_variables, debug=True
+            )
 
-            messages = [{"role": "user", "content": question}]
-            result = await self.engine._call_model(messages, self.model_config, runtime_variables=runtime_variables, debug=True)
-
-            repeat_results.append({
+        call_results = await asyncio.gather(*[_call_once() for _ in range(repeat_count)])
+        repeat_results = [
+            {
                 "repeat_id": i + 1,
-                "result": result.get("content", "") if result.get("success") else "",
-                "success": result.get("success", False),
+                "result": r.get("content", "") if r.get("success") else "",
+                "success": r.get("success", False),
                 "timestamp": "",
-                "chain_results": result.get("chain_results", []),
-            })
-
-            await asyncio.sleep(0.5)
+                "chain_results": r.get("chain_results", []),
+            }
+            for i, r in enumerate(call_results)
+        ]
 
         successful_results = [r["result"] for r in repeat_results if r["success"]]
 

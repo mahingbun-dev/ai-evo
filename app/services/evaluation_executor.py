@@ -8,6 +8,7 @@
 import json
 import logging
 import threading
+import time
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
@@ -65,6 +66,11 @@ class EvaluationExecutor:
         self.langfuse_host = langfuse_host
         self.execution_number = execution_number
         self.progress_offset = progress_offset
+        # P0-4 进度节流状态（实例级：一个执行器对应一次任务执行；
+        # 写库（SELECT+UPDATE+commit+refresh）与 Redis PUBLISH（WS 推送）
+        # 按 1s 窗口或 max(1, total//100) 行步长节流，末行 force 刷新）
+        self._progress_last_write = 0.0
+        self._progress_last_completed = -1
 
     def _signal_stop(self) -> None:
         """置停止信号（幂等），失败只告警不抛
@@ -146,8 +152,8 @@ class EvaluationExecutor:
                     result = future.result()
                     results.append(result)
 
-                    # 更新进度
-                    self._update_progress(len(results), total)
+                    # 更新进度（P0-4 节流 + 末行强制刷新，保证终态进度准确）
+                    self._update_progress(len(results), total, force=len(results) >= total)
 
                 except SoftTimeLimitExceeded:
                     # 软超时不得按行失败吞掉（P0-E/W3-4）：立即上抛触发收尾，
@@ -189,6 +195,9 @@ class EvaluationExecutor:
                     # 标记停止请求，不再处理新结果
                     stop_requested = True
                     # 注意：已开始的 future 无法取消，只能等待其完成或忽略其结果
+
+        # P0-4：批次收尾冲刷行级落库缓冲（行级表是断点续跑的事实源）
+        self._flush_pending_row_results()
 
         # 按原始顺序排序结果
         results.sort(key=lambda x: x.get("idx", 0))
@@ -1282,7 +1291,7 @@ class EvaluationExecutor:
                 try:
                     result = future.result()
                     results.append(result)
-                    self._update_progress(len(results), total)
+                    self._update_progress(len(results), total, force=len(results) >= total)
                 except SoftTimeLimitExceeded:
                     # 软超时不得按行失败吞掉（P0-E/W3-4）：上抛触发收尾。
                     # 先置停止信号，否则 with 块 __exit__ 的 shutdown(wait=True)
@@ -1310,6 +1319,9 @@ class EvaluationExecutor:
                         if not f.done():
                             f.cancel()
                     break
+
+        # P0-4：批次收尾冲刷行级落库缓冲（行级表是断点续跑的事实源）
+        self._flush_pending_row_results()
 
         results.sort(key=lambda x: x.get("idx", 0))
         return results
@@ -1366,7 +1378,7 @@ class EvaluationExecutor:
                 try:
                     result = future.result()
                     results.append(result)
-                    self._update_progress(len(results), total)
+                    self._update_progress(len(results), total, force=len(results) >= total)
                 except SoftTimeLimitExceeded:
                     # 软超时不得按行失败吞掉（P0-E/W3-4）：上抛触发收尾。
                     # 先置停止信号，否则 with 块 __exit__ 的 shutdown(wait=True)
@@ -1391,6 +1403,9 @@ class EvaluationExecutor:
                         if not f.done():
                             f.cancel()
                     break
+
+        # P0-4：批次收尾冲刷行级落库缓冲（行级表是断点续跑的事实源）
+        self._flush_pending_row_results()
 
         results.sort(key=lambda x: x.get("idx", 0))
         return results
@@ -1586,7 +1601,7 @@ class EvaluationExecutor:
                 try:
                     result = future.result()
                     results.append(result)
-                    self._update_progress(len(results), total)
+                    self._update_progress(len(results), total, force=len(results) >= total)
                 except SoftTimeLimitExceeded:
                     # 软超时不得按行失败吞掉（P0-E/W3-4）：上抛触发收尾
                     raise
@@ -1607,6 +1622,9 @@ class EvaluationExecutor:
                         if not f.done():
                             f.cancel()
                     break
+
+        # P0-4：批次收尾冲刷行级落库缓冲（行级表是断点续跑的事实源）
+        self._flush_pending_row_results()
 
         results.sort(key=lambda x: x.get("idx", 0))
         return results
@@ -2013,15 +2031,32 @@ class EvaluationExecutor:
 
         return json.dumps(input_data, ensure_ascii=False, indent=2)
 
-    def _update_progress(self, completed: int, total: int):
+    def _update_progress(self, completed: int, total: int, force: bool = False):
         """更新任务进度（W3 断点续跑：叠加本轮已跳过的已完成行偏移，进度为累计值）
 
         W10-4：进度推进即一批行完成，同步刷新执行记录心跳（heartbeat_at）——
         API 启动期收尸 reaper 以心跳区分「正在执行」与「worker 已死」的
         running 任务，部署重启不再误标。
+
+        P0-4 进度节流（照抄 evaluation_task_service 心跳节流模式）：写库
+        （1 SELECT + UPDATE + commit + refresh）与随行的 _publish_status_update
+        （Redis PUBLISH → WS 推送）按 1s 窗口或 max(1, total//100) 行步长
+        节流，行级完成高频时避免每行 ≥3 个 DB 会话；末行完成由调用方
+        force=True 强制刷新，保证终态进度准确。心跳自身另有 60s 节流。
         """
         if not self.task_id:
             return
+
+        now = time.monotonic()
+        step = max(1, total // 100) if total > 0 else 1
+        if not force:
+            if (
+                (now - self._progress_last_write) < 1.0
+                and (completed - self._progress_last_completed) < step
+            ):
+                return
+        self._progress_last_write = now
+        self._progress_last_completed = completed
 
         try:
             from app.services.evaluation_task_service import EvaluationTaskService
@@ -2042,6 +2077,17 @@ class EvaluationExecutor:
 
         except Exception as e:
             logger.warning(f"更新进度失败: {e}")
+
+    def _flush_pending_row_results(self) -> None:
+        """P0-4：批次收尾冲刷行级落库缓冲（任务层 finally 另有全局兜底）"""
+        if not self.task_id or self.execution_number is None:
+            return
+        try:
+            from app.services.evaluation_result_service import flush_pending_rows
+
+            flush_pending_rows()
+        except Exception as e:  # noqa: BLE001 - flush 失败只告警（任务层 finally 兜底）
+            logger.warning(f"[RowPersist] 批次收尾 flush 行级缓冲失败: {e}")
 
 
 def _call_rag_api(

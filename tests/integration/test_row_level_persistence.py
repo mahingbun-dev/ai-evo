@@ -185,13 +185,21 @@ class TestUpsertIdempotency:
         assert row.aggregate["average_score"] == expected_score(0)
 
     def test_persist_row_result_twice_still_one_row(self, db_session, judge_task_10_rows):
-        """执行器入口 persist_row_result 重复投递同键 → 仍 1 行（幂等）"""
-        from app.services.evaluation_result_service import persist_row_result
+        """执行器入口 persist_row_result 重复投递同键 → 仍 1 行（幂等）
+
+        P0-4 起为有界缓冲语义：入缓冲即返回 True，测试内显式 flush 落库
+        （停止/收尾路径由调用方 flush_pending_rows 冲刷，语义一致）。
+        """
+        from app.services.evaluation_result_service import (
+            flush_pending_rows,
+            persist_row_result,
+        )
 
         task_id = judge_task_10_rows
         result = {"idx": 1, "success": True, "average_score": 6}
         assert persist_row_result(task_id=task_id, execution_number=1, data_index=1, result=result) is True
         assert persist_row_result(task_id=task_id, execution_number=1, data_index=1, result=result) is True
+        flush_pending_rows(task_id=task_id, execution_number=1)
         rows = fetch_result_rows(db_session, task_id)
         assert len(rows) == 1
         assert rows[0].data_index == 1
