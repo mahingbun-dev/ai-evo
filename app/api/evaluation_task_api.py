@@ -1078,7 +1078,7 @@ def export_result_history_version(
 ):
     """把单次执行结果渲染成文档并上传 anc-hub file-store，返回 file_id（W9：对象级归属校验）
 
-    插件 task_execution_export 工具的入口：markdown 为全量人读报告（failed/stopped
+    插件 task_execution_detail（action=export）的入口：markdown 为全量人读报告（failed/stopped
     只出失败简报），json 为无损结构。同版本同格式幂等——exported_files 已登记的
     file_id 直接复用（cached=true），不重复上传。上传以调用者平台登录态
     （平台登录态 Cookie，名由 HUB_SSO_COOKIE_NAME 配置）执行，file-store 侧落调用者身份审计。

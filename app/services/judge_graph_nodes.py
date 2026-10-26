@@ -18,6 +18,7 @@ from app.services.metric_scoring import (
     format_score_range,
     metric_max_score,
     normalize_dimension_score,
+    weight_value,
 )
 from .judge_graph_state import JudgeAgentState
 
@@ -269,12 +270,9 @@ def create_score_dimension_node(metric: dict):
     return score_dimension_node
 
 
-# 权重文字到数值的映射
-WEIGHT_MAP = {
-    "高": 3, "中": 2, "低": 1,
-    "high": 3, "medium": 2, "low": 1,
-    "High": 3, "Medium": 2, "Low": 1,
-}
+# 权重文字到数值的映射：统一收敛到 metric_scoring.WEIGHT_MAP /
+# weight_value（W4：高/中/低 与 high/medium/low 双向支持，本文件原
+# 含首字母大写变体的本地副本已删除，lower 归一后行为覆盖不变）
 
 
 def _compute_weighted_scores(metrics, dim_results, max_score):
@@ -298,10 +296,10 @@ def _compute_weighted_scores(metrics, dim_results, max_score):
 
     for metric in metrics:
         name = metric.get("name", "")
-        weight = metric.get("weight", 1)
 
-        if isinstance(weight, str):
-            weight = WEIGHT_MAP.get(weight, 1)
+        # 文字权重（高/中/低 与 high/medium/low）统一走
+        # metric_scoring.weight_value（W4 收敛点，未知取值兜底 1）
+        weight = weight_value(metric.get("weight", 1))
 
         dim_data = dim_results.get(name, {})
         score = dim_data.get("score", 0)

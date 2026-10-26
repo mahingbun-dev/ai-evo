@@ -1,7 +1,8 @@
 """
 空值校验单元测试
 
-测试场景：当待评测内容为空时，裁判评测应直接返回0分，而不是调用裁判模型
+测试场景：当待评测内容为空时，裁判评测应直接跳过打分（W4 起空输入行
+average_score=None、row_status=empty_input，不进任务均分），而不是调用裁判模型
 """
 import pytest
 import asyncio
@@ -59,7 +60,7 @@ class TestEmptyContentValidation:
     """空值校验测试"""
 
     def test_empty_model_output_returns_zero_score(self):
-        """当模型输出为空字符串时，应直接返回0分，不调用裁判模型"""
+        """当模型输出为空字符串时，应直接跳过打分（None），不调用裁判模型"""
         from app.services.evaluation_executor import EvaluationExecutor
 
         executor = EvaluationExecutor(task_id="test-task")
@@ -72,12 +73,14 @@ class TestEmptyContentValidation:
                 result = executor._evaluate_single(payload, MockTask())
 
         assert result["success"] is True, "评测应该成功"
-        assert result["average_score"] == 0, "空内容应返回0分"
+        # W4：空输入行 average_score=None（与 judge_failed 同口径，不进任务均分）
+        assert result["average_score"] is None, "空内容应跳过打分（None）"
+        assert result["row_status"] == "empty_input"
         assert result["judge_scores"] == [], "不应有裁判评分"
         assert "空" in result["feedback"], "反馈应包含空值提示"
 
     def test_whitespace_only_model_output_returns_zero_score(self):
-        """当模型输出只有空白字符时，应直接返回0分"""
+        """当模型输出只有空白字符时，应直接跳过打分（None）"""
         from app.services.evaluation_executor import EvaluationExecutor
 
         executor = EvaluationExecutor(task_id="test-task")
@@ -90,7 +93,8 @@ class TestEmptyContentValidation:
                 result = executor._evaluate_single(payload, MockTask())
 
         assert result["success"] is True
-        assert result["average_score"] == 0, "纯空白内容应返回0分"
+        # W4：纯空白内容同样走 empty_input 口径（None，不进任务均分）
+        assert result["average_score"] is None, "纯空白内容应跳过打分（None）"
         assert result["judge_scores"] == []
 
     def test_empty_content_judge_not_called(self):
@@ -111,7 +115,8 @@ class TestEmptyContentValidation:
                     MockJudge.assert_not_called()
 
         assert result["success"] is True
-        assert result["average_score"] == 0
+        # W4：空输入行跳过打分（None，不进任务均分）
+        assert result["average_score"] is None
 
     def test_empty_content_dimension_scores_empty(self):
         """当内容为空时，维度评分应为空"""
@@ -187,7 +192,7 @@ class TestEvaluationExecutorWithChainResult:
         assert result.get("average_score") != 0 or result.get("success") is True
 
     def test_chain_result_content_empty_should_return_zero(self):
-        """当 evaluation_targets 配置为 chain_result 但 chain_result 内容为空时，应返回0分"""
+        """当 evaluation_targets 配置为 chain_result 但内容为空时，应跳过打分（None）"""
         from app.services.evaluation_executor import EvaluationExecutor
 
         executor = EvaluationExecutor(task_id="test-task")
@@ -228,7 +233,8 @@ class TestEvaluationExecutorWithChainResult:
                 result = executor._evaluate_single(payload, task)
 
         assert result["success"] is True
-        assert result["average_score"] == 0
+        # W4：chain_result 内容为空 → empty_input 口径（None，不进任务均分）
+        assert result["average_score"] is None
         assert "空" in result["feedback"]
 
     def test_no_evaluation_targets_falls_back_to_model_output(self):
@@ -249,7 +255,8 @@ class TestEvaluationExecutorWithChainResult:
                 result = executor._evaluate_single(payload, task)
 
         assert result["success"] is True
-        assert result["average_score"] == 0
+        # W4：回退校验同样走 empty_input 口径（None，不进任务均分）
+        assert result["average_score"] is None
         assert "空" in result["feedback"]
 
 

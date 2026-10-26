@@ -313,7 +313,11 @@ export const pluginMarketplaceApi = {
   create: (data) => request.post('/evaluation/plugin-marketplaces', data),
   sync: (id) => request.post(`/evaluation/plugin-marketplaces/${id}/sync`),
   remove: (id) => request.delete(`/evaluation/plugin-marketplaces/${id}`),
-  plugins: (id) => request.get(`/evaluation/plugin-marketplaces/${id}/plugins`)
+  branches: (id) => request.get(`/evaluation/plugin-marketplaces/${id}/branches`),
+  plugins: (id, branch) => request.get(
+    `/evaluation/plugin-marketplaces/${id}/plugins`,
+    branch ? { params: { branch } } : undefined
+  )
 }
 
 // 批量操作API

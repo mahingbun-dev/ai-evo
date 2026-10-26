@@ -248,18 +248,21 @@ def _manifest_plugin_name(directory: str) -> str:
     return str(record.get("name") or "")
 
 
-def resolve_plugin_dir(market_id: int, plugin_name: str) -> Optional[Dict[str, Any]]:
+def resolve_plugin_dir(
+    market_id: int, plugin_name: str, branch: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
     """在市场（已懒加载到最新）里定位被测插件目录
 
     先用市场清单的条目名匹配，再按各插件目录 manifest 的 name 兜底核对
     （条目名与 manifest name 不一致时仍能命中）。未收录返回 None。
+    ``branch`` 非空时从该分支的独立副本读取（首次会拉取该分支）。
     """
     from app.db.session import SessionLocal
     from app.services.plugin_marketplace_service import list_marketplace_plugins
 
     db = SessionLocal()
     try:
-        items = list_marketplace_plugins(db, market_id)
+        items = list_marketplace_plugins(db, market_id, branch=branch)
     finally:
         db.close()
 

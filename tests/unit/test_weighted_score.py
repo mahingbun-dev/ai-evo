@@ -8,10 +8,14 @@ pytestmark = pytest.mark.unit  # W8 分类：unit（无网络/无 DB）
 
 
 class TestWeightMap:
-    """WEIGHT_MAP 常量测试"""
+    """WEIGHT_MAP 常量测试（W4：统一收敛到 metric_scoring，中英文双向支持）"""
 
     def test_weight_map_values(self):
-        assert WEIGHT_MAP == {"高": 3, "中": 2, "低": 1}
+        # W4 统一映射：中文「高/中/低」与英文 high/medium/low（lower 归一）同表
+        assert WEIGHT_MAP == {
+            "高": 3, "中": 2, "低": 1,
+            "high": 3, "medium": 2, "low": 1,
+        }
 
 
 class TestCalculateWeightedScore:

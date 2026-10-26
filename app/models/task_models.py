@@ -181,7 +181,7 @@ class TaskExecutionRecord(Base):
     config_snapshot = Column(JSON, nullable=True, comment="本次执行使用的模型/裁判配置快照（W4 写入，禁止落明文 api_key）")
     heartbeat_at = Column(DateTime(timezone=True), nullable=True, comment="执行心跳时间（W10 收尸 reaper 判断依据）")
 
-    # 导出登记（插件 task_execution_export 幂等复用）：{format: {file_id, filename, size, sha256, uploaded_at}}
+    # 导出登记（插件 task_execution_detail action=export 幂等复用）：{format: {file_id, filename, size, sha256, uploaded_at}}
     exported_files = Column(JSON, nullable=True, comment="已上传 anc-hub file-store 的导出文档登记（按格式幂等复用 file_id）")
 
 

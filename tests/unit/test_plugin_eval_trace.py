@@ -604,7 +604,7 @@ class TestEvaluateTrace:
         )
         monkeypatch.setattr(
             "app.services.plugin_evaluator.resolve_plugin_dir",
-            lambda market_id, name: {"name": name, "source": f"./project/{name}",
+            lambda market_id, name, branch=None: {"name": name, "source": f"./project/{name}",
                                      "path": f"/market/project/{name}", "version": "0.15.1",
                                      "target_type": "plugin"},
         )
@@ -997,7 +997,7 @@ class TestEvaluateTrace:
         thread = _write_thread(tmp_path / "t.jsonl")
         self._patch_env(monkeypatch, tmp_path, package_dir=thread)
         monkeypatch.setattr(
-            "app.services.plugin_evaluator.resolve_plugin_dir", lambda market_id, name: None
+            "app.services.plugin_evaluator.resolve_plugin_dir", lambda market_id, name, branch=None: None
         )
         row = self._evaluator().evaluate_trace(str(tmp_path))
         assert row["success"] is True
