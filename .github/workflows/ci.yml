@@ -68,8 +68,29 @@ jobs:
       - name: Build script-runner sandbox image
         run: docker build -f docker/script-runner/Dockerfile -t ai-evo-script-runner:latest .
 
+      # 观测层：judge-pool 合入后套件在 CI 上偶发静默死（同树重跑 4m21s 绿 vs
+      # 30min 整段无输出被 job 超时取消，且被取消 job 的日志 blob 会被 GitHub
+      # 清除——BlobNotFound 无从追责）。两层兜底：
+      # ① pytest-timeout 单测 240s 强杀（最长已知用例 30s，8 倍余量），
+      #    method=thread 挂死时 dump 全线程栈，把「静默死」变「当场红 + 栈证据」；
+      # ② junitxml 工件 always() 上传，job 被取消也能看到最后在跑的用例。
+      #    （faulthandler 的 --faulthandler-timeout 在 pytest 9 未暴露为 CLI 旗标，
+      #    pytest-timeout 的 thread method 已覆盖 dump 需求，不再单加。）
+      - name: Install pytest-timeout
+        run: .venv/bin/pip install pytest-timeout
+
       - name: Run test suite
-        run: .venv/bin/pytest
+        run: >-
+          .venv/bin/pytest --junitxml=pytest-result.xml
+          --timeout=240 --timeout-method=thread
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-result
+          path: pytest-result.xml
+          retention-days: 7
 
   frontend-build:
     name: Frontend build
