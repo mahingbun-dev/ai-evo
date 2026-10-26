@@ -1,17 +1,25 @@
-"""工具清单：23 个 MCP 工具的单一事实源。
+"""工具清单：15 个 MCP 工具（23 条路由）的单一事实源。
 
-每个工具的 route 声明 HTTP 方法、URL 模板、参数去向与 input schema，
-manifest 的 ToolDecl 与 handle 的分发共用这一张表，杜绝声明与实现漂移。
+两层结构：
+
+- ``TOOL_ROUTES`` 是**路由表**，一条 route 对应 ai-evo 的一个 HTTP 端点，
+  声明方法、URL 模板、参数去向与 schema；
+- ``TOOL_GROUPS`` 是**工具面**，一个工具通过选择器参数（``action``/``view``/
+  ``format``）在若干 route 之间分发。工具名与路由名不必相同：合并后的工具用
+  新名，被下游脚本显式点名的名字保持原名。
+
+未进 ``TOOL_GROUPS`` 的 route 是**隐藏别名**——不出现在 tools/list，但仍可经
+``invoke_plugin`` 的 ``payload.op`` 调用，保证旧调用方一个版本周期内不炸。
 
 参数去向三类：
 - ``path_params``  替换 URL 模板里的 ``{占位符}``，如 ``/evaluation/tasks/{task_id}``；
 - ``query_params`` 仅当调用方给了才拼进 query string（列表分页/过滤）；
-- 其余参数（去掉 ``op`` 与 path_params 后）作为 JSON body 发送（POST/PUT）。
+- 其余参数（去掉选择器、``op`` 与 path_params 后）作为 JSON body 发送（POST/PUT）。
 
-``requires_approval`` 按「删除+修改需人工审批」的策略标记：agent 只能提交
-草稿，由人在中台侧确认后才执行。
+``requires_approval`` 是**工具级**布尔（中台无按调用审批），因此只能把审批
+策略相同的 route 合进同一个工具；「删除+修改」需人工审批，其余全自动。
 
-route 可选 ``timeout_seconds``：该工具对 ai-evo 的 HTTP 请求超时覆盖值
+route 可选 ``timeout_seconds``：该 route 对 ai-evo 的 HTTP 请求超时覆盖值
 （缺省用插件级 AIEVO_TIMEOUT），慢操作（如文档导出的生成+上传）单独放宽。
 """
 
@@ -35,12 +43,10 @@ from .result_summary import (
 
 PLUGIN_NAME = "ai-evo"
 # 中台规则：同版本号契约不可变（VERSION_CONFLICT 拒绝注册）——凡动工具/描述/schema/消息契约必须升此号
-PLUGIN_VERSION = "1.3.0"
+PLUGIN_VERSION = "1.4.0"
 PLUGIN_DESCRIPTION = (
-    "AI 评测平台（ai-evo）代理：数据集管理与导入（经 anc-hub file-store 的 file_id）、"
-    "评测任务的创建/修改/删除与执行、任务轻量状态轮询与执行历史、"
-    "单次执行明细分页查询与结果文档导出（markdown/json 上传 file-store 返回 file_id）、"
-    "评测结果摘要查询与任务日志。"
+    "AI 评测平台（ai-evo）代理：数据集管理与导入、评测任务创建与执行、"
+    "执行历史明细查询与结果文档导出、结果摘要与日志。"
     "调用方需有平台登录态（经 anc-hub 登录后透传），所有操作以真实用户身份执行并落审计。"
 )
 
@@ -138,12 +144,12 @@ TOOL_ROUTES: Dict[str, _ROUTE_TYPE] = {
         "method": "POST",
         "path": "/api/v1/evaluation/datasets",
         "body": True,
-        "desc": "创建空数据集（字段结构由导入流程回填；带文件的数据集请用 dataset_import_hub_files）",
+        "desc": "创建空数据集（带文件的数据集用 dataset_import_hub_files）",
         "schema": {
             "type": "object",
             "properties": {
                 "name": {"type": "string", "description": "数据集名称"},
-                "description": {"type": "string", "description": "数据集描述（可选）"},
+                "description": {"type": "string", "description": "数据集描述"},
             },
             "required": ["name"],
         },
@@ -208,10 +214,9 @@ TOOL_ROUTES: Dict[str, _ROUTE_TYPE] = {
         "path": "/api/v1/evaluation/datasets/import/hub-files",
         "body": True,
         "desc": (
-            "把 anc-hub file-store 的执行包文件导入为评测数据集（异步任务，返回 job_id，"
-            "用 hub_import_job_status 查进度）。新建数据集给 name；追加到已有数据集给 real_dataset_id；"
-            "挂清洗脚本给 script_id（脚本库 id 或名称）——非空时逐包执行清洗、脚本产出的行内容"
-            "作为数据集行，不传则只登记执行包引用（数据行停在 hub_file_id/hub_summary、内容不展开）"
+            "把 file-store 的执行包导入为数据集（异步，返回 job_id，用 hub_import_query 查进度）。"
+            "新建给 name，追加给 real_dataset_id；不传 script_id 只登记执行包引用，"
+            "传了则逐包执行清洗、脚本产出行作为数据行"
         ),
         "schema": {
             "type": "object",
@@ -219,18 +224,12 @@ TOOL_ROUTES: Dict[str, _ROUTE_TYPE] = {
                 "file_ids": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "file-store 的 file_id 列表（file_upload 成功后返回的 id）",
+                    "description": "file-store 的 file_id 列表（先经 file_upload 分块上传）",
                 },
-                "name": {"type": "string", "description": "新建数据集的名称（新建模式必填）"},
-                "description": {"type": "string", "description": "数据集描述（可选）"},
-                "real_dataset_id": {"type": "string", "description": "追加模式下目标数据集 ID"},
-                "script_id": {
-                    "type": "string",
-                    "description": (
-                        "可选：脚本库清洗脚本 ID 或名称——非空时逐包执行清洗，脚本产出的行内容"
-                        "作为数据集行；不传则只登记执行包引用（数据行只有 hub_file_id/hub_summary，内容不展开）"
-                    ),
-                },
+                "name": {"type": "string", "description": "新建数据集名称"},
+                "description": {"type": "string"},
+                "real_dataset_id": {"type": "string", "description": "追加模式的目标数据集 ID"},
+                "script_id": {"type": "string", "description": "清洗脚本 ID 或名称；不传则不展开数据行"},
             },
             "required": ["file_ids"],
         },
@@ -255,7 +254,7 @@ TOOL_ROUTES: Dict[str, _ROUTE_TYPE] = {
         "method": "GET",
         "path": "/api/v1/models",
         "body": False,
-        "desc": "列出可选的被评测模型配置（建评测任务时把模型 id 填进 model_provider）",
+        "desc": "列出可选的被评测模型配置（id 填入 task_create 的 model_provider）",
         "schema": {"type": "object", "properties": {}},
     },
     "task_list": {
@@ -263,15 +262,15 @@ TOOL_ROUTES: Dict[str, _ROUTE_TYPE] = {
         "path": "/api/v1/evaluation/tasks",
         "query_params": ["status", "evaluation_type", "name", "skip", "limit"],
         "body": False,
-        "desc": "列出评测任务（可按状态/评测类型/名称模糊过滤）",
+        "desc": "列出评测任务（可按状态/类型/名称过滤）",
         "schema": {
             "type": "object",
             "properties": {
-                "status": {"type": "string", "description": "状态过滤：pending/running/completed/failed/stopped（可选）"},
-                "evaluation_type": {"type": "string", "description": "评测类型过滤：judge/consistency/success_rate/rag/binary_classification（可选）"},
-                "name": {"type": "string", "description": "任务名称模糊过滤（不区分大小写的子串匹配，可选）"},
-                "skip": {"type": "integer", "description": "跳过条数（默认 0）"},
-                "limit": {"type": "integer", "description": "返回条数上限（默认 100，最大 1000）"},
+                "status": {"type": "string", "enum": ["pending", "running", "completed", "failed", "stopped"]},
+                "evaluation_type": {"type": "string", "enum": ["judge", "consistency", "success_rate", "rag", "binary_classification"]},
+                "name": {"type": "string", "description": "名称子串（不区分大小写）"},
+                "skip": {"type": "integer", "description": "默认 0"},
+                "limit": {"type": "integer", "description": "默认 100（最大 1000）"},
             },
         },
     },
@@ -299,47 +298,37 @@ TOOL_ROUTES: Dict[str, _ROUTE_TYPE] = {
         "path": "/api/v1/evaluation/tasks",
         "body": True,
         "desc": (
-            "创建评测任务。必填 name 与 evaluation_type（judge/consistency/success_rate/"
-            "rag/binary_classification）；judge 类型还需数据集（dataset_id）、待评测数据行"
-            "（evaluation_targets，见该字段说明）、被评测模型（model_provider，见 model_list）"
-            "与评测维度（evaluation_metrics，含 name/weight/description 的维度列表），"
-            "裁判可配 judge_model/judge_count/judge_prompt 等"
+            "创建评测任务；judge 类型需 dataset_id/evaluation_metrics/evaluation_targets。"
+            "judge_engine、score_details、steps、runtime_variables、variable_source 可原样传入"
         ),
         "schema": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "任务名称"},
-                "description": {"type": "string", "description": "任务描述（可选）"},
+                "name": {"type": "string"},
+                "description": {"type": "string"},
                 "evaluation_type": {
                     "type": "string",
-                    "description": "评测类型：judge（裁判打分）/consistency/success_rate/rag/binary_classification",
+                    "enum": ["judge", "consistency", "success_rate", "rag", "binary_classification"],
                 },
-                "dataset_id": {"type": "string", "description": "评测数据集 ID（见 dataset_list）"},
-                "model_provider": {"type": "string", "description": "被评测模型配置 ID（见 model_list）"},
-                "judge_model": {"type": "string", "description": "裁判模型配置 ID（judge 类型，可选）"},
-                "judge_engine": {"type": "string", "description": "裁判引擎：claude_agent（默认）/graph"},
-                "judge_count": {"type": "integer", "description": "裁判数量（默认 6）"},
-                "judge_prompt": {"type": "string", "description": "自定义评测 prompt（可选）"},
+                "dataset_id": {"type": "string", "description": "数据集 ID（dataset_query 查）"},
+                "model_provider": {"type": "string", "description": "被评测模型 ID（model_list 查）"},
+                "judge_model": {"type": "string", "description": "裁判模型 ID"},
+                "judge_count": {"type": "integer", "description": "裁判数，默认 6"},
+                "judge_prompt": {"type": "string", "description": "自定义评测 prompt"},
                 "evaluation_metrics": {
                     "type": "array",
                     "items": {"type": "object"},
-                    "description": "评测维度列表，如 [{\"name\": \"准确性\", \"weight\": 0.6, \"description\": \"...\"}]",
+                    "description": '维度 [{"name":"准确性","weight":0.6,"description":"..."}]，weight 合计 1',
                 },
                 "evaluation_targets": {
                     "type": "array",
                     "items": {"type": "object"},
                     "description": (
-                        "待评测数据行（judge/agent 类型必填，否则 400）。每行如 "
-                        "{\"id\": \"target_xxx\", \"name\": \"模型输出\", \"display_name\": \"模型输出\", "
-                        "\"source\": \"model_output\", \"source_config\": {}, \"required\": true, \"description\": \"\"}；"
+                        '待评测行 [{"id":"target_x","name":"模型输出","source":"model_output"}]；'
                         "source 可选 model_output/chain_result/dataset_field/script_output/manual_input"
                     ),
                 },
-                "max_score": {"type": "integer", "description": "最大分值（默认 10）"},
-                "score_details": {"type": "string", "description": "分值标准说明（可选）"},
-                "steps": {"type": "array", "items": {"type": "string"}, "description": "评分步骤（可选）"},
-                "runtime_variables": {"type": "object", "description": "运行时变量（可选）"},
-                "variable_source": {"type": "string", "description": "变量来源：manual（默认）/dataset"},
+                "max_score": {"type": "integer", "description": "满分，默认 10"},
             },
             "required": ["name", "evaluation_type"],
         },
@@ -420,10 +409,7 @@ TOOL_ROUTES: Dict[str, _ROUTE_TYPE] = {
         "path_params": ["task_id"],
         "body": False,
         "postprocess": _summarize_result,
-        "desc": (
-            "获取评测结果摘要：通过率/平均分/各维度得分/top 失败样例（含裁判评语，已截断）"
-            "与前端结果页链接。全量成功项明细已省略（载荷过大），人类查看完整报告请访问返回的 result_url"
-        ),
+        "desc": "评测结果摘要：通过率/平均分/维度分/top10 失败样例与前端结果页链接",
         "schema": {
             "type": "object",
             "properties": {
@@ -437,11 +423,7 @@ TOOL_ROUTES: Dict[str, _ROUTE_TYPE] = {
         "path": "/api/v1/evaluation/tasks/{task_id}/status",
         "path_params": ["task_id"],
         "body": False,
-        "desc": (
-            "获取评测任务轻量状态（轮询专用）：仅 status/progress/completed_questions/total "
-            "四个字段，后端不碰大 JSON 列。评测执行中的显式状态查询用本工具——agent 需要轮询时"
-            "自行按自己的节奏重复调用，插件不做自动轮询；需要任务配置全量详情时再用 task_get"
-        ),
+        "desc": "轻量状态轮询：仅 status/progress/completed_questions/total",
         "schema": {
             "type": "object",
             "properties": {
@@ -457,16 +439,12 @@ TOOL_ROUTES: Dict[str, _ROUTE_TYPE] = {
         "query_params": ["limit"],
         "body": False,
         "postprocess": _strip_execution_records,
-        "desc": (
-            "获取评测任务的执行历史列表（按执行次数倒序）：每次返回执行序号/状态/成本/"
-            "错误信息/起止时间，用于定位「第几次执行」。返回体已剥掉每版全量 result 与配置"
-            "快照大列；单版全量明细用 task_execution_detail，文档归档用 task_execution_export"
-        ),
+        "desc": "执行历史列表（倒序）：序号/状态/成本/错误/起止时间，不含每版全量 result",
         "schema": {
             "type": "object",
             "properties": {
                 "task_id": {"type": "string", "description": "任务 ID"},
-                "limit": {"type": "integer", "description": "返回条数上限（默认 50，最大 200）"},
+                "limit": {"type": "integer", "description": "返回上限，默认 50（最大 200）"},
             },
             "required": ["task_id"],
         },
@@ -536,19 +514,178 @@ TOOL_ROUTES: Dict[str, _ROUTE_TYPE] = {
     },
 }
 
-_OPS = frozenset(TOOL_ROUTES)
+# ── 工具面：暴露给 agent 的 15 个工具 ─────────────────────────────
+# 一个工具 = 一个选择器（默认 action）+ 若干路由。合并带来的上下文收益来自
+# 「工具条目数」而非 schema 体量，因此只合并语义相邻、审批策略相同的路由。
+# 未在此声明的 route（dataset_list/dataset_get/...）是隐藏别名，tools/list 看不到，
+# 但仍可经 invoke_plugin 的 payload.op 调用——下游未点名使用的旧名保留一个版本周期。
+
+TOOL_GROUPS: Dict[str, Dict[str, Any]] = {
+    "dataset_query": {
+        "selector": "view",
+        "default": "list",
+        "actions": {
+            "list": "dataset_list",
+            "detail": "dataset_get",
+            "rows": "dataset_data_list",
+        },
+        "desc": "查询数据集：list=列表、detail=单个详情、rows=数据行分页（后两者需 dataset_id）",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "view": {"type": "string", "enum": ["list", "detail", "rows"]},
+                "dataset_id": {"type": "string", "description": "detail/rows 必填"},
+                "skip": {"type": "integer", "description": "默认 0"},
+                "limit": {"type": "integer", "description": "默认 100（rows 最大 500）"},
+            },
+        },
+    },
+    "dataset_create": {"actions": {"create": "dataset_create"}},
+    "dataset_import_hub_files": {"actions": {"import": "dataset_import_hub_files"}},
+    "dataset_manage": {
+        "selector": "action",
+        "default": "update",
+        "actions": {"update": "dataset_update", "delete": "dataset_delete"},
+        "requires_approval": True,
+        "desc": "修改或删除数据集（需人工审批）",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["update", "delete"], "description": "update=改名/改描述；delete=软删除"},
+                "dataset_id": {"type": "string", "description": "数据集 ID"},
+                "name": {"type": "string", "description": "新名称（update）"},
+                "description": {"type": "string", "description": "新描述（update）"},
+            },
+            "required": ["action", "dataset_id"],
+        },
+    },
+    "hub_import_query": {
+        "selector": "view",
+        "default": "files",
+        "actions": {"files": "hub_files_query", "job": "hub_import_job_status"},
+        "desc": "导入链路查询：files=file-store 已上传文件（找 file_id）、job=导入任务进度（需 job_id）",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "view": {"type": "string", "enum": ["files", "job"], "description": "files=已上传文件（默认）；job=导入进度"},
+                "job_id": {"type": "string", "description": "view=job 必填"},
+                "name_like": {"type": "string", "description": "文件名子串（不区分大小写）"},
+                "uploaded_after": {"type": "string", "description": "RFC3339，含边界"},
+                "uploaded_before": {"type": "string", "description": "RFC3339"},
+                "uploader": {"type": "string"},
+                "page": {"type": "integer", "description": "页号，从 1 起"},
+                "page_size": {"type": "integer", "description": "1-200"},
+            },
+        },
+    },
+    "model_list": {"actions": {"list": "model_list"}},
+    "task_create": {"actions": {"create": "task_create"}},
+    "task_list": {"actions": {"list": "task_list"}},
+    "task_get": {
+        "selector": "view",
+        "default": "detail",
+        "actions": {"detail": "task_get", "logs": "task_logs"},
+        "desc": "任务详情：detail=状态/进度/配置、logs=执行日志（可按 level 过滤）",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "view": {"type": "string", "enum": ["detail", "logs"], "description": "detail=状态/进度/配置（默认）；logs=执行日志"},
+                "task_id": {"type": "string", "description": "任务 ID"},
+                "level": {"type": "string", "description": "日志级别（view=logs）：error/warning/info"},
+                "limit": {"type": "integer", "description": "日志条数上限，默认 100（最大 500）"},
+            },
+            "required": ["task_id"],
+        },
+    },
+    "task_status": {"actions": {"status": "task_status"}},
+    "task_results": {"actions": {"results": "task_results"}},
+    "task_executions": {"actions": {"list": "task_executions"}},
+    "task_execution_detail": {
+        "selector": "action",
+        "default": "page",
+        "actions": {"page": "task_execution_detail", "export": "task_execution_export"},
+        "desc": (
+            "指定执行版本：page=逐题明细分页（默认 10 题/页，当页长文本不截断）、"
+            "export=导出 markdown 全量报告或 json 无损文档到 file-store 返 file_id"
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string"},
+                "execution_number": {"type": "integer", "description": "执行序号，从 1 起"},
+                "action": {"type": "string", "enum": ["page", "export"]},
+                "format": {"type": "string", "enum": ["markdown", "json"], "description": "action=export 的格式，默认 markdown"},
+                "skip": {"type": "integer", "description": "跳过条数，默认 0"},
+                "limit": {"type": "integer", "description": f"分页大小，默认 {DETAIL_PAGE_SIZE}（最大 {DETAIL_MAX_PAGE_SIZE}）"},
+            },
+            "required": ["task_id", "execution_number"],
+        },
+    },
+    "task_run": {
+        "selector": "action",
+        "default": "run",
+        "actions": {"run": "task_run", "stop": "task_stop"},
+        "desc": "触发或停止评测执行（run 异步提交，用 task_status 轮询进度）",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "description": "任务 ID"},
+                "action": {"type": "string", "enum": ["run", "stop"], "description": "run=触发执行（默认）；stop=停止"},
+            },
+            "required": ["task_id"],
+        },
+    },
+    "task_manage": {
+        "selector": "action",
+        "default": "update",
+        "actions": {"update": "task_update", "delete": "task_delete"},
+        "requires_approval": True,
+        "desc": "修改或删除评测任务（需人工审批；update 只传要改的字段）",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["update", "delete"]},
+                "task_id": {"type": "string"},
+                "name": {"type": "string"},
+                "description": {"type": "string"},
+                "dataset_id": {"type": "string"},
+                "model_provider": {"type": "string"},
+                "judge_model": {"type": "string"},
+                "judge_count": {"type": "integer"},
+                "judge_prompt": {"type": "string"},
+                "evaluation_metrics": {"type": "array", "items": {"type": "object"}},
+                "max_score": {"type": "integer"},
+            },
+            "required": ["action", "task_id"],
+        },
+    },
+}
+
+# 选择器参数：分发前必须从载荷里摘掉，不能拼进 URL/query/body
+SELECTOR_KEYS = frozenset({"action", "view"})
+
+
+def _group_default_action(group: Dict[str, Any]) -> str:
+    """工具的默认动作：``default`` 优先，否则取第一个声明（单动作工具）。"""
+    return group.get("default") or next(iter(group["actions"]))
 
 
 def build_tool_decls() -> list[plugin_pb2.ToolDecl]:
-    """把 TOOL_ROUTES 转成 manifest 的工具声明列表。"""
+    """把 TOOL_GROUPS 转成 manifest 的工具声明列表（隐藏别名不声明）。"""
     tools: list[plugin_pb2.ToolDecl] = []
-    for name, route in TOOL_ROUTES.items():
+    for name, group in TOOL_GROUPS.items():
+        first_route = TOOL_ROUTES[next(iter(group["actions"].values()))]
+        approval = group.get("requires_approval")
+        if approval is None:
+            approval = first_route.get("requires_approval", False)
         tools.append(
             plugin_pb2.ToolDecl(
                 name=name,
-                description=route["desc"],
-                input_schema_json=json.dumps(route["schema"], ensure_ascii=False),
-                requires_approval=bool(route.get("requires_approval", False)),
+                description=group.get("desc") or first_route["desc"],
+                input_schema_json=json.dumps(
+                    group.get("schema") or first_route["schema"], ensure_ascii=False
+                ),
+                requires_approval=bool(approval),
             )
         )
     return tools
@@ -566,15 +703,62 @@ def build_manifest() -> plugin_pb2.PluginManifest:
     )
 
 
-def resolve_op(env_meta: dict, payload: dict) -> str | None:
-    """确定本次调用要执行的工具：meta['hub.tool'] 优先，payload['op'] 兜底。"""
+def resolve_dispatch(env_meta: dict, payload: dict) -> tuple[str | None, str | None]:
+    """确定本次调用：``(工具名, 路由名)``。
+
+    meta['hub.tool'] 优先，payload['op'] 兜底。工具名命中 TOOL_GROUPS 时按选择器
+    解析到具体 route；否则按隐藏别名/``invoke_plugin`` 旧 op 直接匹配 TOOL_ROUTES。
+    任一环节不成立时路由名为 None，由调用方给出可行动的错误卡。
+    """
     tool = env_meta.get("hub.tool")
-    if tool:
-        return tool
-    op = payload.get("op")
-    return op if isinstance(op, str) else None
+    if not tool:
+        op = payload.get("op")
+        tool = op if isinstance(op, str) else None
+    if not tool:
+        return None, None
+
+    group = TOOL_GROUPS.get(tool)
+    if group is None:
+        return tool, tool if tool in TOOL_ROUTES else None
+
+    selector = group.get("selector", "action")
+    action = payload.get(selector) or _group_default_action(group)
+    if not isinstance(action, str):
+        return tool, None
+    return tool, group["actions"].get(action)
+
+
+def group_actions(tool: str) -> list[str]:
+    """工具的选择器取值清单（错误卡里给 agent 看）。"""
+    group = TOOL_GROUPS.get(tool)
+    return sorted(group["actions"]) if group else []
+
+
+def sibling_param_keys(tool: str, op: str) -> frozenset[str]:
+    """合并工具里「属于兄弟动作、不属于本次路由」的参数键。
+
+    这些键不得进请求体：例如 ``task_execution_detail`` 导出时残留的 ``skip``/``limit``、
+    ``hub_import_query`` 查文件时残留的 ``job_id``。单动作工具返回空集（保留自由透传）。
+    """
+    group = TOOL_GROUPS.get(tool)
+    if not group or len(group["actions"]) < 2 or op not in TOOL_ROUTES:
+        return frozenset()
+
+    route = TOOL_ROUTES[op]
+    own = (
+        set(route.get("path_params", []))
+        | set(route.get("query_params", []))
+        | set((route.get("schema") or {}).get("properties", {}))
+    )
+    others: set[str] = set()
+    for other_op in group["actions"].values():
+        if other_op == op:
+            continue
+        other = TOOL_ROUTES[other_op]
+        others |= set(other.get("path_params", [])) | set(other.get("query_params", []))
+    return frozenset(others - own)
 
 
 def postprocess_of(op: str) -> Callable[[Any, Dict[str, Any]], Any] | None:
-    """取该工具的响应后处理函数，签名 ``fn(data, ctx) -> data``。"""
+    """取该路由的响应后处理函数，签名 ``fn(data, ctx) -> data``。"""
     return TOOL_ROUTES[op].get("postprocess")

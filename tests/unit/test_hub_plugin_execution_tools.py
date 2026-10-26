@@ -15,7 +15,7 @@ import pytest
 import hubkit
 
 from app.hub_plugin import manifest
-from app.hub_plugin.manifest import PLUGIN_VERSION, TOOL_ROUTES, postprocess_of
+from app.hub_plugin.manifest import PLUGIN_VERSION, TOOL_GROUPS, TOOL_ROUTES, postprocess_of
 from app.hub_plugin.plugin import AievoHubPlugin
 from app.hub_plugin.result_pagination import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 
@@ -325,7 +325,7 @@ def test_detail_postprocess_default_page_10():
     assert len(result["rows"]) == DEFAULT_PAGE_SIZE
     assert result["rows"][0]["idx"] == 0
     assert result["rows_page"] == {"skip": 0, "limit": DEFAULT_PAGE_SIZE, "returned": 10, "total": 14}
-    assert "task_execution_export" in result["note"]
+    assert "action=export" in result["note"]
 
 
 def test_detail_postprocess_explicit_skip_limit_and_page2():
@@ -462,18 +462,19 @@ def test_tools_without_route_timeout_use_plugin_default():
 
 
 def test_manifest_declares_new_tools():
-    for name in (
-        "task_status",
-        "task_executions",
-        "task_execution_detail",
-        "task_execution_export",
-        "task_logs",
-    ):
-        assert name in TOOL_ROUTES
-        route = TOOL_ROUTES[name]
+    for name in ("task_status", "task_executions", "task_execution_detail"):
+        assert name in TOOL_GROUPS
+        route = TOOL_ROUTES[next(iter(TOOL_GROUPS[name]["actions"].values()))]
         assert route["method"] in ("GET", "POST")
         assert route["schema"]["required"], name
-    assert PLUGIN_VERSION == "1.3.0"
+    assert PLUGIN_VERSION == "1.4.0"
+
+
+def test_export_and_logs_are_hidden_aliases():
+    """task_execution_export/task_logs 已并入工具面，但 route 保留可经 op 调用。"""
+    for name in ("task_execution_export", "task_logs"):
+        assert name in TOOL_ROUTES
+        assert name not in TOOL_GROUPS
 
 
 def test_manifest_export_route_timeout_declared():

@@ -7,9 +7,10 @@ import json
 from typing import Dict, Any, Optional, List
 
 from app.services.prompt_guard import EMPTY_VALUE_RULES, PROMPT_INJECTION_GUARD, wrap_eval_data
-from app.services.metric_scoring import format_score_range, metric_max_score
+from app.services.metric_scoring import WEIGHT_MAP, format_score_range, metric_max_score, weight_value
 
-WEIGHT_MAP = {"高": 3, "中": 2, "低": 1}
+# WEIGHT_MAP 自 metric_scoring 统一（W4：中/英文双向支持）；
+# 此处 re-export 保持存量 import 路径（tests/unit/test_prompt_builder_weight.py）不变。
 
 
 class PromptBuilder:
@@ -933,14 +934,13 @@ class PromptBuilder:
             for i, metric in enumerate(self.evaluation_metrics, 1):
                 metric_name = metric.get("name", "")
                 metric_desc = metric.get("description", "")
-                weight = metric.get("weight", 1)
 
-                if isinstance(weight, str):
-                    weight_num = WEIGHT_MAP.get(weight, 1)
-                    weight_label = f"{weight}({weight_num})"
-                else:
-                    weight_num = weight
-                    weight_label = str(weight)
+                # 文字权重（高/中/低 与 high/medium/low）统一走
+                # metric_scoring.weight_value（W4 收敛点，未知取值兜底 1）；
+                # 数值权重原样展示（int 不转 float，避免文案出现 3.0）
+                weight = metric.get("weight", 1)
+                weight_num = weight_value(weight)
+                weight_label = f"{weight}({weight_num})" if isinstance(weight, str) else str(weight)
 
                 if metric_name:
                     # 维度最高分：每个维度按自己的量程评分（缺省回退任务满分）

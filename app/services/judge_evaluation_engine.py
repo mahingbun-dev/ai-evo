@@ -14,9 +14,10 @@ from app.services.model_caller import ModelCaller
 from app.services.instruction_builder import InstructionBuilder
 from app.services.judge_variable_resolver import JudgeVariableResolver, EvaluationTarget
 from app.services.judge_validation_service import JudgeValidationService
-from app.services.metric_scoring import normalize_dimension_score
+from app.services.metric_scoring import WEIGHT_MAP, normalize_dimension_score, weight_value
 
-WEIGHT_MAP = {"高": 3, "中": 2, "低": 1}
+# WEIGHT_MAP 自 metric_scoring 统一（W4：中/英文双向支持）；
+# 此处 re-export 保持 consistency_evaluator 等存量 import 路径不变。
 
 
 @dataclass
@@ -394,11 +395,10 @@ class JudgeEvaluationEngine:
 
         for metric in evaluation_metrics:
             name = metric.get("name", "")
-            weight = metric.get("weight", 1)
 
-            # 支持文字权重和数值权重
-            if isinstance(weight, str):
-                weight = WEIGHT_MAP.get(weight, 1)
+            # 支持文字权重（高/中/低 与 high/medium/low）和数值权重，
+            # 统一走 metric_scoring.weight_value（W4 收敛点，未知取值兜底 1）
+            weight = weight_value(metric.get("weight", 1))
 
             # 从 dimension_scores 中获取对应维度的评分
             dim_data = dimension_scores.get(name, {})

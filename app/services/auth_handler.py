@@ -9,9 +9,12 @@ from typing import Dict, Any, Optional
 import httpx
 # nest_asyncio 1.6.0 在 Python 3.14 下会破坏 sniffio/anyio 的 asyncio 上下文检测
 # （asyncio.current_task() 返回 None），导致 claude-agent-sdk 等抛 NoEventLoopError；
-# 3.12（生产镜像）不受影响，故仅在 <3.14 时应用嵌套补丁
+# 3.12（生产镜像）不受影响，故仅在 <3.14 时应用嵌套补丁。
+# 单测进程跳过：本补丁是进程级全局 patch，全量套件下嵌套 loop 会累积陈旧 I/O，
+# 使 deepeval 度量的 run_until_complete 在 select 上无限挂死（Python 3.13 CI 实测
+# 整轮无输出直至被杀）；3.14 无补丁全量套件全绿，证明单测不依赖嵌套语义。
 import sys
-if sys.version_info < (3, 14):
+if sys.version_info < (3, 14) and "pytest" not in sys.modules:
     import nest_asyncio
     # 允许在已有事件循环中嵌套运行asyncio
     nest_asyncio.apply()

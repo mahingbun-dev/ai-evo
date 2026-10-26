@@ -338,6 +338,143 @@ class TestResolveMarketPluginPath:
             prepare_market_plugin_for_eval(424242, "./public/anc-demo")
 
 
+class TestBranchSelection:
+    """按分支评测：远端分支列表、分支独立副本、已有副本复用、并发首次拉取"""
+
+    @pytest.fixture
+    def branched_market(self, db_session, marketplace_base, remote_marketplace):
+        """main 与 feature 两个分支：feature 上新增一个 only-feature 插件"""
+        _git("checkout", "-b", "feature", cwd=remote_marketplace)
+        feature_plugin = remote_marketplace / "public" / "only-feature"
+        (feature_plugin / ".claude-plugin").mkdir(parents=True)
+        (feature_plugin / ".claude-plugin" / "plugin.json").write_text(
+            json.dumps({"name": "only-feature"}), encoding="utf-8")
+        manifest = remote_marketplace / ".claude-plugin" / "marketplace.json"
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        data["plugins"].append(
+            {"name": "only-feature", "description": "", "source": "./public/only-feature"}
+        )
+        manifest.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        _git("add", ".", cwd=remote_marketplace)
+        _git("commit", "-m", "feature only", cwd=remote_marketplace)
+        _git("checkout", "main", cwd=remote_marketplace)
+        record = create_marketplace(db_session, "m", f"file://{remote_marketplace}")
+        return record
+
+    def _branch_head(self, remote: Path, branch: str) -> str:
+        return subprocess.run(
+            ["git", "rev-parse", "--short=12", branch], cwd=str(remote),
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    def test_list_branches_default_first(self, db_session, branched_market):
+        branches = svc.list_marketplace_branches(db_session, branched_market["id"])
+        names = [b["name"] for b in branches]
+        assert set(names) == {"main", "feature"}
+        assert names[0] == "main"
+        assert branches[0]["is_default"] is True
+        assert branches[0]["cached"] is False
+
+    def test_list_plugins_from_branch(self, db_session, branched_market, remote_marketplace):
+        main_names = {i["name"] for i in list_marketplace_plugins(db_session, branched_market["id"])}
+        feature_names = {
+            i["name"] for i in list_marketplace_plugins(
+                db_session, branched_market["id"], branch="feature")
+        }
+        assert "only-feature" not in main_names
+        assert "only-feature" in feature_names
+        assert "anc-demo" in feature_names
+
+    def test_prepare_uses_branch_copy_and_commit(self, db_session, branched_market, remote_marketplace):
+        info = prepare_market_plugin_for_eval(
+            branched_market["id"], "./public/only-feature", branch="feature")
+        expected_commit = self._branch_head(remote_marketplace, "feature")
+        assert info["branch"] == "feature"
+        assert info["branch_selected"] == "feature"
+        assert info["commit"] == expected_commit
+        assert info["repo_root"] != branched_market["local_path"]
+        assert (Path(info["path"]) / ".claude-plugin" / "plugin.json").is_file()
+
+    def test_default_branch_unchanged(self, db_session, branched_market):
+        info = prepare_market_plugin_for_eval(branched_market["id"], "./public/anc-demo")
+        assert info["branch_selected"] == ""
+        assert info["repo_root"] == branched_market["local_path"]
+        assert info["commit"] == svc._head_commit(Path(branched_market["local_path"]))
+
+    def test_existing_branch_copy_reused_without_pull(
+        self, db_session, branched_market, monkeypatch
+    ):
+        calls = []
+        original = svc._clone_marketplace
+
+        def counting(git_url, branch, dest):
+            calls.append(branch)
+            return original(git_url, branch, dest)
+
+        monkeypatch.setattr(svc, "_clone_marketplace", counting)
+
+        first = prepare_market_plugin_for_eval(
+            branched_market["id"], "./public/anc-demo", branch="feature")
+        second = prepare_market_plugin_for_eval(
+            branched_market["id"], "./public/anc-demo", branch="feature")
+
+        assert calls == ["feature"]  # 只拉一次，第二次直接复用
+        assert first["path"] == second["path"]
+        assert first["commit"] == second["commit"]
+
+    def test_branch_names_isolated(self, db_session, branched_market):
+        """不同分支各用独立目录：同一插件在两分支的路径不同"""
+        main_info = prepare_market_plugin_for_eval(
+            branched_market["id"], "./public/anc-demo")
+        dev_info = prepare_market_plugin_for_eval(
+            branched_market["id"], "./public/anc-demo", branch="feature")
+        assert main_info["path"] != dev_info["path"]
+        assert dev_info["path"].startswith(dev_info["repo_root"])
+        assert main_info["path"].startswith(main_info["repo_root"])
+
+    def test_invalid_branch_rejected(self, db_session, branched_market):
+        for bad in ("-evil", "a b", "a..b", "x.lock", "a//b", "分支"):
+            with pytest.raises(MarketplaceError, match="分支名不合法"):
+                list_marketplace_plugins(db_session, branched_market["id"], branch=bad)
+
+    def test_branch_not_on_remote_raises(self, db_session, branched_market):
+        with pytest.raises(MarketplaceError, match="拉取失败"):
+            prepare_market_plugin_for_eval(
+                branched_market["id"], "./public/anc-demo", branch="no-such-branch")
+
+    def test_concurrent_first_pull_clones_once(self, db_session, branched_market, monkeypatch):
+        """并发首次拉同一分支：flock 串行化，只克隆一次，其余复用"""
+        from concurrent.futures import ThreadPoolExecutor
+
+        calls = []
+        original = svc._clone_marketplace
+
+        def counting(git_url, branch, dest):
+            calls.append(branch)
+            return original(git_url, branch, dest)
+
+        monkeypatch.setattr(svc, "_clone_marketplace", counting)
+        market = (
+            db_session.query(PluginMarketplace)
+            .filter(PluginMarketplace.id == branched_market["id"]).first()
+        )
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            paths = list(pool.map(lambda _: svc._ensure_branch_copy(market, "feature"), range(4)))
+
+        assert calls == ["feature"]
+        assert len(set(paths)) == 1
+        assert (paths[0] / ".git").exists()
+
+    def test_delete_cleans_branch_copies(self, db_session, branched_market):
+        prepare_market_plugin_for_eval(
+            branched_market["id"], "./public/anc-demo", branch="feature")
+        branch_root = svc._branch_base_dir() / str(branched_market["id"])
+        assert branch_root.is_dir()
+        delete_marketplace(db_session, branched_market["id"])
+        assert not branch_root.exists()
+
+
 def _age_market(db_session, market_id: int, seconds: int) -> None:
     """把市场上次同步时间人为拨旧（节流窗口判定用）"""
     market = db_session.query(PluginMarketplace).filter(PluginMarketplace.id == market_id).first()

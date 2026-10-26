@@ -27,7 +27,7 @@ _IDX_SENTINEL = 10 ** 9
 
 NOTE_TEXT = (
     "明细已按 skip/limit 切页（默认 10 题/页，上限 50），当页长文本未截断；"
-    "翻页继续调本工具，全量归档请用 task_execution_export 导出 markdown/json 文档"
+    "翻页继续调本工具，全量归档请用 action=export 导出 markdown/json 文档"
 )
 
 

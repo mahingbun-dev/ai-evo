@@ -1,6 +1,6 @@
 """评测执行结果导出文档渲染。
 
-插件 task_execution_export 工具的文档生成侧：把单次执行记录渲染成两种格式——
+插件 task_execution_detail（action=export）的文档生成侧：把单次执行记录渲染成两种格式——
 
 - ``build_json_export``：json 无损导出，result 原始结构原样保留（loads 后与
   库内 dict 深相等），失败版本同样可导（错误上下文齐全）；

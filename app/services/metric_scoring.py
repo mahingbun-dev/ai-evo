@@ -12,6 +12,28 @@ claude_code_judge_agent 共用（无循环导入）。
 """
 from typing import Any, Dict, Optional
 
+# 权重文字到数值的统一映射（W4 收敛点）：中文「高/中/低」与英文
+# high/medium/low 双向支持，查表前按 lower() 归一（兼容 High/HIGH 等变体）。
+# 历史各处（judge_evaluation_engine / prompt_builder / judge_graph_nodes /
+# deepeval_result_transformer）的本地副本已删除，统一引用本表。
+WEIGHT_MAP: Dict[str, int] = {
+    "高": 3, "中": 2, "低": 1,
+    "high": 3, "medium": 2, "low": 1,
+}
+
+
+def weight_value(raw: Any, default: int = 1) -> Any:
+    """权重原始值 → 数值（W4 三处调用点收敛的统一口径）
+
+    - 文字权重（str）：高/中/低 与 high/medium/low（strip + lower 归一，
+      大小写不敏感）；
+    - 数值权重（int/float）：原样返回（保留 int，避免 prompt 文案出现 3.0）；
+    - 未知文字取值：兜底 default=1（等权，与历史口径一致）。
+    """
+    if isinstance(raw, str):
+        return WEIGHT_MAP.get(raw.strip().lower(), default)
+    return raw
+
 
 def metric_max_score(metric: Optional[Dict[str, Any]], task_max_score) -> float:
     """读取单个维度的最高分，缺省/非法/≤0 回退任务满分"""

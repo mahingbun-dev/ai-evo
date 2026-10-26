@@ -93,7 +93,7 @@ def test_registers_with_mockhub():
             reg = hub.last_registration
             assert reg is not None
             assert reg.manifest.name == "ai-evo"
-            assert reg.manifest.version == "1.3.0"
+            assert reg.manifest.version == "1.4.0"
             assert reg.instance_id == "aievo-register"
     finally:
         hub.close()

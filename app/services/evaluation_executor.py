@@ -761,12 +761,17 @@ class EvaluationExecutor:
             if not content_to_validate or not str(content_to_validate).strip():
                 logger.info(f"[空值校验] idx={payload.get('idx', 0)} 待评测内容为空，跳过裁判评测")
                 result["success"] = True
-                result["average_score"] = 0
+                # W4：空输入行不再以 0 分拉低任务均分——average_score=None
+                # 与 judge_failed 同口径（result_aggregator.aggregate 对 None
+                # 行自动排除，均分分母同步缩小）；行级明细经 _format_items
+                # 省略 average_score 键，前端据 row_status=empty_input 显示
+                # 「空输入」而非 0 分。
+                result["average_score"] = None
                 result["judge_scores"] = []
                 result["feedback"] = "待评测内容为空，无法进行有效评估"
                 result["dimension_scores"] = {}
-                # W2-2: 空输入行 0 分口径保留，但显式标记 row_status，
-                # 与真低分（completed）/ 裁判全失败（judge_failed）三种 0 可辨
+                # W2-2: 空输入行显式标记 row_status，与真低分（completed）/
+                # 裁判全失败（judge_failed）三种无分行可辨
                 result["row_status"] = "empty_input"
                 result["judge_count"] = 0
                 result["failed_judge_count"] = 0
