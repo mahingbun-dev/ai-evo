@@ -57,6 +57,18 @@ langgraph==1.2.11
 langfuse==4.14.4
 ragas==0.4.3
 deepeval==4.1.8
+# langchain 全家族精确钉版（同上 W18 口径，与 requirements.lock /
+# tools/prod-constraints.txt 一致）：CI 用本文件全新解析，community 一度漂到
+# 0.4.2——ragas==0.4.3 在 import 期硬依赖其已删除的 chat_models.vertexai
+# 模块，全新环境必炸 ModuleNotFoundError（2026-10-24 起 CI 连续三轮红）。
+# community 钉 0.4.1（保留 vertexai 模块的最后一个版本），ragas 升级前不得前移。
+langchain==1.3.2
+langchain-classic==1.0.8
+langchain-community==0.4.1
+langchain-core==1.5.6
+langchain-openai==1.1.10
+langchain-protocol==0.0.18
+langchain-text-splitters==1.1.2
 # Claude Code Agent 裁判引擎（运行时依赖镜像内 Claude Code CLI，见 Dockerfile）
 claude-agent-sdk==0.2.163
 # DeepSeek Harness Agent 裁判引擎（捆绑 linux/amd64 原生运行时 wheel，无需 Node.js）

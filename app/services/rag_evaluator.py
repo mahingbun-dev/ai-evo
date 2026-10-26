@@ -256,9 +256,10 @@ class RagasEvaluator:
         """调用 ragas 库评测，优先新 API，降级旧 API"""
         import asyncio
         # Python 3.14 下 nest_asyncio 会破坏 anyio 上下文检测（见 auth_handler 同款守卫），
-        # 且 worker 线程内本无运行中的 loop，asyncio.run 可直接用
+        # 且 worker 线程内本无运行中的 loop，asyncio.run 可直接用；
+        # 单测进程同样跳过（理由见 auth_handler：全量套件下嵌套补丁致 select 挂死）
         import sys
-        if sys.version_info < (3, 14):
+        if sys.version_info < (3, 14) and "pytest" not in sys.modules:
             import nest_asyncio
             nest_asyncio.apply()
 
