@@ -135,10 +135,12 @@ def baseline_env(monkeypatch):
     JudgeLangGraphAgent.clear_cache()
     router = _BaselineJudgeLLM()
     monkeypatch.setattr(ModelCallerSync, "_call_http", staticmethod(router))
-    # 退避等待记录器：patch 全局 time.sleep 时必须保留真实睡眠——前序用例
-    # 遗留的后台线程（如 pubsub 监听线程的重连 sleep(1) 轮询）一旦被换成
-    # no-op 记录器，会以 CPU 速度空转，把 waits 撑到千万级（GIL 饥饿拖慢
-    # 全部并发裁判 + 断言 pformat 耗数分钟，CI 上表现为整段无输出直至超时）。
+    # 退避等待记录器：patch 全局 time.sleep 必须保留真实睡眠。进程里存在
+    # 每秒 time.sleep(1) 的库级后台线程（ragas 遥测 flush 线程，根治见
+    # tests/conftest.py 顶部歼灭块）：旧版本本测试用 no-op 假时钟时曾被它
+    # 塞入千万级记录（GIL 饥饿拖慢全部并发裁判 + 断言 pformat 数分钟，
+    # CI 表现为整段无输出直至 30 分钟超时）。passthrough 让后台线程照常
+    # 真睡，记录里只会混入少量 1s 轮询，由末尾断言的退避过滤消化。
     waits = []
     _real_sleep = time.sleep
 
@@ -250,8 +252,8 @@ class TestJudgeScoringBaselineComparison:
 
         # ── 重试链路确实为注入裁判工作过：失败裁判的第一个维度评分节点（score_0）
         # 经 2 次退避重试（2s/8s）后耗尽，图在该节点中断 → 裁判标记 judge_failed ──
-        # 全局 sleep 流会混入后台线程的轮询（pubsub 重连 sleep(1) 等），
-        # 只断言注入裁判的退避子序列
+        # 全局 sleep 流会混入后台线程的秒级轮询（ragas 遥测 flush 线程等，
+        # 见 tests/conftest.py 顶部歼灭块说明），只断言注入裁判的退避子序列
         backoffs = [w for w in waits if w in (2.0, 8.0)]
         assert backoffs == [2.0, 8.0], (
             f"退避序列漂移: 前 20 项={waits[:20]}（共 {len(waits)} 项）"

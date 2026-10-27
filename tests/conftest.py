@@ -12,12 +12,32 @@
 定义（模块级 fixture 优先于 conftest，为避免同名遮蔽歧义，遵循现状）。
 """
 import json
+import os
 import sqlite3
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+# ── ragas 遥测线程歼灭（测试进程专用，必须在任何测试模块被收集前执行）──
+# import ragas 会在模块级无条件启动 AnalyticsBatcher daemon 线程：
+# `while self._running: time.sleep(1)` 每秒空醒检查上报缓冲，永不退出；
+# RAGAS_DO_NOT_TRACK 只挡事件上报（track()）、不挡线程本身。
+# 这对套件是隐形地雷：任何把全局 time.sleep 换成 no-op 假时钟的测试
+# （LLM 退避序列断言等 7 处）都会被它以 CPU 速度塞入千万级记录——
+# 2026-10-26 CI 三轮「整段无输出 30 分钟被杀」的真凶（fixture 窗口实测
+# 1858 万条 sleep 记录，线程栈指认 ragas._analytics._flush_loop）。
+# 测试进程不该发遥测：这里设 DO_NOT_TRACK 并抢先 import 后置 _running=False，
+# 线程在下一次 1 秒检查时静默退出。代价是每次 pytest 会话多付一次 ragas
+# 导入（~2s）；全量套件本来就要导入它，只有跑单个无关测试时纯多付。
+os.environ.setdefault("RAGAS_DO_NOT_TRACK", "true")
+try:
+    from ragas import _analytics as _ragas_analytics
+
+    _ragas_analytics._analytics_batcher._running = False
+except Exception:  # pragma: no cover - ragas 缺失/内部结构变化不阻塞测试
+    pass
 
 # 脚手架模板 zip（预置模板，包根含 scripts/{name}/main.py 与 inputs/ 样例）
 _TEMPLATE_ZIP = Path(__file__).resolve().parents[1] / "app" / "static" / "script_templates" / "hub_package.zip"
