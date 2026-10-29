@@ -186,9 +186,10 @@ class TestResultAggregatorTaskLevel:
 
     @staticmethod
     def _empty_input_row(idx):
-        # executor 空值校验分支的输出形态（evaluation_executor.py:478-490）
+        # executor 空值校验分支的输出形态（evaluation_executor.py:680-692）；
+        # W4 起空输入行 average_score=None（与 judge_failed 同口径，不进任务均分）
         return {
-            "idx": idx, "success": True, "average_score": 0,
+            "idx": idx, "success": True, "average_score": None,
             "row_status": "empty_input", "judge_count": 0, "failed_judge_count": 0,
             "judge_scores": [], "dimension_scores": {},
             "feedback": "待评测内容为空，无法进行有效评估", "model_output": "",
@@ -206,45 +207,47 @@ class TestResultAggregatorTaskLevel:
         assert agg["success_count"] == 2
 
     def test_empty_input_and_judge_failed_rows_distinguishable(self):
-        """三种 0 分行在聚合里分别可辨：真低分 / judge_failed / empty_input"""
+        """三种无分行在聚合里分别可辨：真低分 / judge_failed / empty_input"""
         rows = [
             self._normal_row(0, 0.0, {"A": 0, "B": 0}),   # 真低分（全部裁判给了 0 分）
-            self._empty_input_row(1),                     # 空输入 0 分
+            self._empty_input_row(1),                     # 空输入（W4：不进均分）
             self._judge_failed_row(2),                    # 裁判全失败
         ]
 
         agg = ResultAggregator(self._task()).aggregate(rows)
 
         by_idx = {item["idx"]: item for item in agg["items"]}
-        # 真低分行：completed + average_score=0
+        # 真低分行：completed + average_score=0（真 0 分，进均分）
         assert by_idx[0]["row_status"] == "completed"
         assert by_idx[0]["average_score"] == 0
-        # 空输入行：empty_input + average_score=0（旧口径的 0 分行为保留）
+        # 空输入行：empty_input + average_score 字段缺省（None 不落 JSON，W4）
         assert by_idx[1]["row_status"] == "empty_input"
-        assert by_idx[1]["average_score"] == 0
+        assert "average_score" not in by_idx[1]
         # 裁判全失败行：judge_failed + average_score 字段缺省（None 不落 JSON）
         assert by_idx[2]["row_status"] == "judge_failed"
         assert "average_score" not in by_idx[2]
         # 三行 row_status 互不相同 → 可辨
         assert len({by_idx[i]["row_status"] for i in range(3)}) == 3
 
-        # 任务均分：真低分 0 与 empty_input 0 计入（旧口径行为），judge_failed 行排除
+        # 任务均分（W4）：只有真低分的 0 分计入，empty_input/judge_failed 均排除
         assert agg["average_score"] == 0.0
         assert agg["failed_judge_rows"] == 1
 
-    def test_judge_failed_row_excluded_but_empty_input_counted(self):
-        """empty_input 的 0 进任务均分（保持旧口径），judge_failed 的 None 不进"""
+    def test_judge_failed_and_empty_input_rows_excluded(self):
+        """empty_input 的 None 不进任务均分（W4 与 judge_failed 同口径）"""
         rows = [self._empty_input_row(0), self._judge_failed_row(1)]
 
         agg = ResultAggregator(self._task()).aggregate(rows)
+        # 两行均排除 → 无有效分，均分回退 0（分母为 0 而非被 None 拉低）
+        assert agg["average_score"] == 0.0
+        assert agg["failed_judge_rows"] == 1
 
-        # 只有 empty_input 的 0 分进均分；若 judge_failed 也以 0 计入，均值同为 0，
-        # 但 items 内容可辨——此处以混合行进一步验证排除语义：
+        # 混合行进一步验证排除语义：
         rows2 = [self._normal_row(0, 8.0, {"A": 8, "B": 8}), self._empty_input_row(1),
                  self._judge_failed_row(2)]
         agg2 = ResultAggregator(self._task()).aggregate(rows2)
-        # (8 + 0) / 2 = 4.0：empty_input 计入、judge_failed 排除
-        assert agg2["average_score"] == 4.0
+        # 8.0 / 1 = 8.0：empty_input 与 judge_failed 均排除（W2 旧口径为 (8+0)/2=4.0）
+        assert agg2["average_score"] == 8.0
         assert agg2["failed_judge_rows"] == 1
 
     def test_items_judge_details_carry_failure_flags(self):
@@ -271,7 +274,7 @@ class TestResultAggregatorTaskLevel:
 
 
 class TestExecutorEmptyInputBranch:
-    """executor 空值校验分支显式标记 row_status=empty_input（evaluation_executor.py:478-490）"""
+    """executor 空值校验分支显式标记 row_status=empty_input（evaluation_executor.py:680-692）"""
 
     def test_empty_model_output_marks_row_empty_input(self, monkeypatch):
         task = type("Task", (), {
@@ -287,7 +290,8 @@ class TestExecutorEmptyInputBranch:
         result = executor._evaluate_single({"idx": 3, "user_input": "问题"}, task)
 
         assert result["success"] is True
-        assert result["average_score"] == 0
+        # W4：空输入行 average_score=None（与 judge_failed 同口径，不进任务均分）
+        assert result["average_score"] is None
         assert result["row_status"] == "empty_input"
         assert result["judge_count"] == 0
         assert result["failed_judge_count"] == 0

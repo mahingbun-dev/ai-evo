@@ -434,7 +434,7 @@ class TestExecutorModelOutputSource:
         assert not mock_caller.called
         assert result["success"] is True
         assert result["model_output"] == ""
-        # 空值校验按既有口径返回 0 分空输入
+        # 空值校验走 empty_input 口径（W4：average_score=None 不进任务均分）
         assert result["row_status"] == "empty_input"
 
     def test_source_with_whitespace_still_skips_model(self):

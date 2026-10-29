@@ -598,6 +598,26 @@ class TestMarketplaceSourceRow:
         # 版本锚点随行结果落库（回答「这个分是哪个 commit 的插件」）
         assert results[0]["market_info"]["commit"] == "abc123def456"
 
+    def test_marketplace_branch_passed_to_resolver(self, good_skill_dir):
+        """选了分支：任务级解析按该分支取副本，分支锚点随行结果落库"""
+        task = self._make_task({"depth": "quick", "source": "marketplace", "market_id": 1,
+                                "market_plugin": "./public/anc-demo",
+                                "market_branch": "feature/plugin-x"})
+        info = {"path": str(good_skill_dir), "market_id": 1, "market_name": "m",
+                "branch": "feature/plugin-x", "branch_selected": "feature/plugin-x",
+                "repo_root": "/market/branches/1/feature%2Fplugin-x",
+                "source": "./public/anc-demo", "commit": "abc123def456",
+                "stale": False, "refreshed": False, "refresh_error": "", "last_synced_at": None}
+        with patch("app.services.plugin_marketplace_service.prepare_market_plugin_for_eval",
+                   return_value=info) as mock_prepare, \
+             patch("app.tasks.evaluation_tasks_async._persist_row"), \
+             patch("app.tasks.evaluation_tasks_async._update_progress"):
+            results = _execute_plugin_evaluation(task, [], "task-1", None, None, execution_number=1)
+
+        assert mock_prepare.call_args.kwargs["branch"] == "feature/plugin-x"
+        assert results[0]["market_info"]["branch_selected"] == "feature/plugin-x"
+        assert results[0]["market_info"]["commit"] == "abc123def456"
+
     def test_marketplace_resolution_failure_yields_failed_row(self):
         task = self._make_task({"depth": "quick", "source": "marketplace", "market_id": 1,
                                 "market_plugin": "./gone"})

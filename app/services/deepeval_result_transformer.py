@@ -10,9 +10,10 @@ DeepEval 结果转换器
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from app.services.metric_scoring import weight_value
 
-# 权重映射：文字权重 -> 数值权重
-WEIGHT_MAP: Dict[str, int] = {"高": 3, "中": 2, "低": 1}
+# 权重映射：文字权重 -> 数值权重，统一收敛到 metric_scoring.WEIGHT_MAP /
+# weight_value（W4：高/中/低 与 high/medium/low 双向支持，本地副本已删除）
 
 
 @dataclass
@@ -215,9 +216,8 @@ class DeepEvalResultTransformer:
         for key, score in scores.items():
             weight = weights.get(key, 1)
 
-            # 处理文字权重
-            if isinstance(weight, str):
-                weight = WEIGHT_MAP.get(weight, 1)
+            # 处理文字权重：统一走 metric_scoring.weight_value（W4 收敛点）
+            weight = weight_value(weight)
 
             total_weighted += score * weight
             total_weight += weight

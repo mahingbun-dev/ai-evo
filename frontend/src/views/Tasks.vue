@@ -593,6 +593,41 @@
                 <el-button :loading="marketPluginsLoading" :disabled="!form.plugin_config.market_id || dialogBusy" @click="loadMarketPlugins(true)">刷新</el-button>
               </div>
             </el-form-item>
+            <el-form-item label="评测分支">
+              <div style="display: flex; gap: 8px; width: 100%;">
+                <el-select
+                  v-model="form.plugin_config.market_branch"
+                  placeholder="默认分支（留空 = 市场默认分支）"
+                  style="flex: 1"
+                  clearable
+                  filterable
+                  :loading="marketBranchesLoading"
+                  :disabled="dialogBusy || !form.plugin_config.market_id"
+                  @change="handleBranchChange"
+                >
+                  <el-option
+                    v-for="b in marketBranches"
+                    :key="b.name"
+                    :value="b.name"
+                    :label="b.is_default ? `${b.name}（默认）` : b.name"
+                  >
+                    <span>{{ b.name }}</span>
+                    <span style="float: right; color: #909399; font-size: 12px;">
+                      {{ b.is_default ? '默认分支' : b.commit }}{{ b.cached ? ' · 已缓存' : '' }}
+                    </span>
+                  </el-option>
+                </el-select>
+                <el-button
+                  :loading="marketBranchesLoading"
+                  :disabled="!form.plugin_config.market_id || dialogBusy"
+                  @click="loadMarketBranches(true)"
+                >加载分支</el-button>
+              </div>
+              <div style="color: #909399; font-size: 12px; margin-top: 4px;">
+                留空 = 市场默认分支。首次选择某分支时后台拉取该分支最新代码并缓存；
+                <b>已拉取过的分支直接复用，不重复拉取</b>。不同分支各自独立副本，可同时评测互不影响。
+              </div>
+            </el-form-item>
             <el-form-item label="评测对象">
               <el-select
                 v-model="form.plugin_config.market_plugin"
@@ -1850,7 +1885,7 @@ const form = ref({
   // 安全评测配置
   safety_config: {},
   // 插件评测配置（source 为表单态字段：manual-任务级路径/内联内容，dataset-数据集行字段）
-  plugin_config: { depth: 'quick', source: 'manual', plugin_path: '', skill_content: '', market_id: null, market_plugin: '', trace_judgement: 'model', trace_concurrency: null },
+  plugin_config: { depth: 'quick', source: 'manual', plugin_path: '', skill_content: '', market_id: null, market_plugin: '', market_branch: '', trace_judgement: 'model', trace_concurrency: null },
 })
 
 // 变量注入相关状态
@@ -3101,7 +3136,7 @@ const openDialog = async (row = null) => {
       // 插件评测配置（source 为表单态：显式 trace 优先，含市场来源即 marketplace，
       // 含路径/内容即手动指定，否则数据集批量）
       plugin_config: (function (pc) {
-        const base = { depth: 'quick', source: 'manual', plugin_path: '', skill_content: '', market_id: null, market_plugin: '', trace_judgement: 'model', trace_concurrency: null }
+        const base = { depth: 'quick', source: 'manual', plugin_path: '', skill_content: '', market_id: null, market_plugin: '', market_branch: '', trace_judgement: 'model', trace_concurrency: null }
         if (!pc || typeof pc !== 'object') return base
         if (pc.source === 'trace') {
           // trace 深度不可选，回显登记值 standard（旧记录可能是 quick）
@@ -3115,7 +3150,8 @@ const openDialog = async (row = null) => {
           plugin_path: pc.plugin_path || '',
           skill_content: pc.skill_content || '',
           market_id: hasMarket ? pc.market_id : null,
-          market_plugin: hasMarket ? (pc.market_plugin || '') : ''
+          market_plugin: hasMarket ? (pc.market_plugin || '') : '',
+          market_branch: hasMarket ? (pc.market_branch || '') : ''
         }
       })(taskDetail.plugin_config)
     }
@@ -3144,10 +3180,11 @@ const openDialog = async (row = null) => {
     if (!form.value.runtime_variables) {
       form.value.runtime_variables = {}
     }
-    // 插件评测编辑回显：拉市场列表；市场来源时进一步拉该市场的插件列表
+    // 插件评测编辑回显：拉市场列表；市场来源时进一步拉该市场的分支与插件列表
     if (form.value.evaluation_type === 'plugin') {
       loadMarketplaces().then(() => {
         if (form.value.plugin_config?.source === 'marketplace' && form.value.plugin_config.market_id) {
+          loadMarketBranches()
           loadMarketPlugins()
         }
       })
@@ -3205,7 +3242,7 @@ const openDialog = async (row = null) => {
       binary_label_type: 'boolean',
       agent_config: {},
       safety_config: {},
-      plugin_config: { depth: 'quick', source: 'manual', plugin_path: '', skill_content: '', market_id: null, market_plugin: '', trace_judgement: 'model', trace_concurrency: null }
+      plugin_config: { depth: 'quick', source: 'manual', plugin_path: '', skill_content: '', market_id: null, market_plugin: '', market_branch: '', trace_judgement: 'model', trace_concurrency: null }
     }
     // 新建任务无旧版结构
     legacyConfigDetected.value = false
@@ -3621,6 +3658,8 @@ const marketDialogVisible = ref(false)
 const marketForm = reactive({ name: '', git_url: '', branch: '' })
 const marketPlugins = ref([])
 const marketPluginsLoading = ref(false)
+const marketBranches = ref([])
+const marketBranchesLoading = ref(false)
 
 const loadMarketplaces = async () => {
   marketListLoading.value = true
@@ -3633,6 +3672,24 @@ const loadMarketplaces = async () => {
   }
 }
 
+const loadMarketBranches = async (force = false) => {
+  const marketId = form.value.plugin_config?.market_id
+  if (!marketId) {
+    marketBranches.value = []
+    return
+  }
+  if (!force && marketBranches.value.length) return
+  marketBranchesLoading.value = true
+  try {
+    marketBranches.value = await pluginMarketplaceApi.branches(marketId)
+  } catch (e) {
+    marketBranches.value = []
+    ElMessage.error(e.message || '加载市场分支失败')
+  } finally {
+    marketBranchesLoading.value = false
+  }
+}
+
 const loadMarketPlugins = async (force = false) => {
   const marketId = form.value.plugin_config?.market_id
   if (!marketId) {
@@ -3642,7 +3699,8 @@ const loadMarketPlugins = async (force = false) => {
   if (!force && marketPlugins.value.length) return
   marketPluginsLoading.value = true
   try {
-    marketPlugins.value = await pluginMarketplaceApi.plugins(marketId)
+    const branch = form.value.plugin_config?.market_branch || ''
+    marketPlugins.value = await pluginMarketplaceApi.plugins(marketId, branch)
   } catch (e) {
     marketPlugins.value = []
     ElMessage.error(e.message || '加载市场插件列表失败')
@@ -3651,9 +3709,18 @@ const loadMarketPlugins = async (force = false) => {
   }
 }
 
-const handleMarketChange = () => {
+const handleBranchChange = () => {
   form.value.plugin_config.market_plugin = ''
   marketPlugins.value = []
+  loadMarketPlugins(true)
+}
+
+const handleMarketChange = () => {
+  form.value.plugin_config.market_plugin = ''
+  form.value.plugin_config.market_branch = ''
+  marketPlugins.value = []
+  marketBranches.value = []
+  loadMarketBranches(true)
   loadMarketPlugins(true)
 }
 

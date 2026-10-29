@@ -756,9 +756,13 @@ class PluginEvaluator:
         engine: Optional[str] = None,
         trace_judgement: Optional[str] = None,
         trace_concurrency: Optional[int] = None,
+        market_branch: Optional[str] = None,
     ):
         self.depth = depth if depth in VALID_DEPTHS else "quick"
         self.market_id = market_id
+        # 市场分支（plugin_config.market_branch）：trace 口径按该分支的市场副本定位被测插件；
+        # marketplace 口径的路径解析在任务层完成（见 prepare_market_plugin_for_eval）
+        self.market_branch = (market_branch or "").strip() or None
         # 历史评测判定方式（trace 口径用）：model=模型判定（默认）/ offline=仅确定性检查
         self.trace_judgement = (
             trace_judgement if trace_judgement in TRACE_MODES else DEFAULT_TRACE_MODE
@@ -915,7 +919,11 @@ class PluginEvaluator:
                 )
 
             try:
-                item = resolve_plugin_dir(int(evaluator["market_id"]), detected["plugin"])
+                item = resolve_plugin_dir(
+                    int(evaluator["market_id"]),
+                    detected["plugin"],
+                    branch=self.market_branch,
+                )
             except Exception as e:  # 市场未同步/目录缺失：按失败行给明确原因
                 return self._trace_failure_row(f"市场插件目录解析失败: {e}")
             if item is None:

@@ -11,29 +11,40 @@ agent ──MCP──▶ anc-hub ──meta[hub.mas_token]──▶ ai-evo-hub-p
                                             ai-evo api(:8100, /api/v1)
 ```
 
-## 能力面（23 个 MCP 工具）
+## 能力面（15 个 MCP 工具，23 条路由）
 
 中台把 manifest 声明的工具聚合进 MCP 工具面，工具名带 `ai-evo__` 前缀。
 agent 从 `tools/list` 直接选用；也可走 `invoke_plugin` 通用入口（载荷里加 `op` 字段）。
 
+v1.4.0 起把 23 个工具按「同审批策略 + 同类语义」收敛为 15 个：一个工具用选择器
+参数（`action`/`view`）分发到多条路由，减少工具条目与描述对上下文的占用
+（`build_tool_decls()` 的工具名+描述+schema 字符数由约 9.1k 降到约 6.3k）。
+
 | 分组 | 工具 | 说明 |
 |---|---|---|
-| 数据集 | dataset_list / dataset_get / dataset_data_list | 浏览数据集与数据行 |
-| 数据集 | dataset_create / dataset_update\* / dataset_delete\* | CRUD；update/delete 需人工审批 |
-| 文件导入 | hub_files_query | 查询 anc-hub file-store 里的文件（找 file_id） |
-| 文件导入 | dataset_import_hub_files | 按 file_ids 建/追加数据集（异步 job） |
-| 文件导入 | hub_import_job_status | 查导入进度 |
-| 评测任务 | model_list / task_list / task_get | 选模型、列任务（名称/状态/类型过滤）、查状态与配置 |
-| 评测任务 | task_create / task_update\* / task_delete\* | CRUD；update/delete 需人工审批 |
-| 评测任务 | task_run / task_stop | 触发执行（异步）/停止 |
-| 评测任务 | task_status | 轻量状态轮询（status/progress/完成数/总数，四字段） |
-| 执行历史 | task_executions | 执行历史列表（第几次执行/状态/成本/起止时间，剥大列） |
-| 执行历史 | task_execution_detail | 指定执行版本逐题明细分页（默认 10 题/页，长文本不截断） |
-| 执行历史 | task_execution_export | 导出 markdown 全量报告/json 无损文档上传 file-store 返 file_id（同版本幂等） |
-| 执行历史 | task_logs | 任务执行日志（按级别过滤） |
+| 数据集 | dataset_query | `view=list` 列表 / `detail` 详情 / `rows` 数据行分页 |
+| 数据集 | dataset_create / dataset_import_hub_files | 建空数据集 / 按 file_ids 建或追加（异步 job） |
+| 数据集 | dataset_manage\* | `action=update\|delete` |
+| 文件导入 | hub_import_query | `view=files` 查 file-store 文件（找 file_id）/ `job` 查导入进度 |
+| 评测任务 | model_list / task_list / task_status | 选模型、列任务、轻量状态轮询 |
+| 评测任务 | task_get | `view=detail` 状态/进度/配置、`view=logs` 执行日志 |
+| 评测任务 | task_create / task_manage\* | 创建 / `action=update\|delete` |
+| 评测任务 | task_run | `action=run` 触发执行（异步）/ `stop` 停止 |
 | 评测任务 | task_results | 结果摘要（通过率/平均分/维度分/top失败样例）+ 前端链接 |
+| 执行历史 | task_executions | 执行历史列表（序号/状态/成本/起止时间，剥大列） |
+| 执行历史 | task_execution_detail | `action=page` 逐题明细分页（默认 10 题/页）；`action=export` 导出 markdown/json 到 file-store 返 file_id |
 
 \* 标记的工具 `requires_approval=true`：autonomous agent 只能提交草稿，由人在中台侧确认后执行。
+审批是**工具级**布尔（中台无按调用审批），因此需审批与不需审批的操作不能合进同一个工具。
+
+### 隐藏别名（v1.4.0）
+
+合并前的工具名（`dataset_list`/`dataset_get`/`dataset_data_list`/`dataset_update`/
+`dataset_delete`/`hub_files_query`/`hub_import_job_status`/`task_update`/`task_delete`/
+`task_stop`/`task_execution_export`/`task_logs`）不再出现在 `tools/list`，但路由仍保留，
+可经 `invoke_plugin` 的 `payload.op` 调用——给旧调用方一个版本周期的缓冲。
+下游脚本显式点名的 7 个名字（`task_list`/`task_get`/`task_status`/`task_results`/
+`task_executions`/`task_execution_detail`/`dataset_import_hub_files`）保持原名与原语义。
 
 ### 数据集文件通道
 
@@ -68,11 +79,11 @@ agent 需要状态就用 `task_status`（轻量四字段，高频轮询首选）
 每个任务可多次执行（后端按 `execution_number` 留档 `task_execution_records`）：
 
 1. `task_executions` 列执行历史（倒序，只带标量元信息，不带每版 result 大列）；
-2. `task_execution_detail` 按执行序号翻页看逐题明细——插件侧把全量 result 的
-   items/failed_items（judge/plugin）或 detail_results（rag）/records（latency）
+2. `task_execution_detail`（`action=page`，默认）按执行序号翻页看逐题明细——插件侧把
+   全量 result 的 items/failed_items（judge/plugin）或 detail_results（rag）/records（latency）
    合并排序后按 `skip/limit` 切页（默认 10 题/页、上限 50），当页长文本不截断，
    汇总指标随页返回；failed/stopped 版本返回错误摘要；
-3. `task_execution_export` 把该版本渲染成文档上传 anc-hub file-store，返回
+3. 同一工具的 `action=export` 把该版本渲染成文档上传 anc-hub file-store，返回
    `file_id`——markdown 为全量人读报告（含逐题裁判评语全文；failed 版只出失败
    简报），json 为无损结构。上传以调用者身份执行（Bearer 即 mas_token，落审计），
    同版本同格式幂等复用已传 file_id（`task_execution_records.exported_files` 登记）。

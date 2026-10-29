@@ -234,7 +234,9 @@ class ResultAggregator:
         success_count = len(successful_results)
         failed_count = len(failed_results)
 
-        # 计算平均分（行级 average_score 为 None 的 judge_failed 行自动排除，W2-2）
+        # 计算平均分（行级 average_score 为 None 的行自动排除，W2-2/W4：
+        # judge_failed 行与 empty_input 行同一口径，均不以 0 分拉低任务均分，
+        # 分母同步缩小）
         scores = [r.get("average_score", 0) for r in successful_results if r.get("average_score") is not None]
         average_score = sum(scores) / len(scores) if scores else 0
 
@@ -491,8 +493,9 @@ class ResultAggregator:
             # W2-2 增量：行级评分口径字段（completed / judge_failed / empty_input）
             item["row_status"] = result.get("row_status", "completed")
             item["failed_judge_count"] = result.get("failed_judge_count", 0)
-            # average_score 为 None（judge_failed 行）时省略该字段：
-            # 前端 Results.vue 对 null 会调 toFixed 抛错，缺 key 走 undefined 分支安全
+            # average_score 为 None（judge_failed 行 / W4 起 empty_input 空输入行）
+            # 时省略该字段：前端 Results.vue 对 null 会调 toFixed 抛错，缺 key
+            # 走 undefined 分支安全（空输入行据 row_status 显示「空输入」而非 0）
             avg_score = result.get("average_score", 0)
             if avg_score is not None:
                 item["average_score"] = avg_score

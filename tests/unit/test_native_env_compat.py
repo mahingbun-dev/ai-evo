@@ -5,6 +5,9 @@
 - auth_handler / rag_evaluator：Python 3.14 下不再 apply nest_asyncio
   （nest_asyncio 1.6.0 在 3.14 破坏 sniffio/anyio 上下文检测 → claude-agent-sdk
   抛 NoEventLoopError）；3.12（生产镜像）行为不变。
+  单测进程（pytest 在 sys.modules）同样跳过：嵌套补丁是进程级 patch，全量套件
+  下嵌套 loop 累积陈旧 I/O，会让 deepeval 度量的 run_until_complete 在 select
+  上挂死（Python 3.13 CI 实测整轮无输出直至被杀）。
 - app/db/session.py：macOS 上默认 PGGSSENCMODE=disable（libpq GSS 初始化在
   celery prefork 子进程内 SIGSEGV）。
 本文件守住这两处不回退。
@@ -30,13 +33,19 @@ def _loop_method_module() -> str:
 
 
 def test_auth_handler_event_loop_poisoning_guard():
-    """导入 auth_handler 后事件循环不被 nest_asyncio 污染（3.14）/ 保持嵌套补丁（<3.14）"""
+    """导入 auth_handler 后事件循环不被 nest_asyncio 污染（3.14 / 单测）/ 保持嵌套补丁（<3.14 非单测）"""
     import app.services.auth_handler  # noqa: F401
 
     if sys.version_info >= (3, 14):
         assert _loop_method_module() != "nest_asyncio", (
             "Python 3.14 下 nest_asyncio.apply() 必须被版本守卫跳过，"
             "否则 anyio 上下文检测失效（NoEventLoopError）"
+        )
+    elif "pytest" in sys.modules:
+        # 单测进程守卫同款跳过：嵌套补丁在全量套件下挂死 deepeval 度量（见模块 docstring）
+        assert _loop_method_module() != "nest_asyncio", (
+            "pytest 进程下 nest_asyncio.apply() 必须被跳过，"
+            "否则全量套件在 3.13 上会累积陈旧嵌套 loop 挂死"
         )
     else:
         assert _loop_method_module() == "nest_asyncio"

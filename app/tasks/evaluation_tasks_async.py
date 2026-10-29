@@ -1351,8 +1351,11 @@ def _execute_plugin_evaluation(task, payloads: List[Dict], task_id: str, db, sto
 
     # market 引擎要按同一个市场加载评测动作（plugin-eval 与被测插件同源，一起懒加载）
     _market_id = plugin_config.get("market_id")
+    _market_branch = str(plugin_config.get("market_branch") or "").strip() or None
     evaluator = PluginEvaluator(
-        depth=depth, market_id=int(_market_id) if isinstance(_market_id, int) else None
+        depth=depth,
+        market_id=int(_market_id) if isinstance(_market_id, int) else None,
+        market_branch=_market_branch,
     )
 
     rows = list(payloads)
@@ -1368,9 +1371,12 @@ def _execute_plugin_evaluation(task, payloads: List[Dict], task_id: str, db, sto
                 from app.services.plugin_marketplace_service import prepare_market_plugin_for_eval
 
                 # 懒加载：评测开始前把市场更新到远端最新（节流 + 失败降级），
-                # 并把被评测插件的 commit 作为版本锚点带进结果
+                # 并把被评测插件的 commit 作为版本锚点带进结果；
+                # 指定了分支时从该分支的独立副本解析（首次拉取，已有则复用）
                 market_info = prepare_market_plugin_for_eval(
-                    int(plugin_config["market_id"]), str(plugin_config["market_plugin"])
+                    int(plugin_config["market_id"]),
+                    str(plugin_config["market_plugin"]),
+                    branch=_market_branch,
                 )
                 rows = [{
                     "idx": 0,
@@ -1535,6 +1541,7 @@ def _execute_plugin_trace_evaluation(task, payloads: List[Dict], task_id: str, d
         market_id=int(market_id) if isinstance(market_id, int) else None,
         trace_judgement=plugin_config.get("trace_judgement"),
         trace_concurrency=plugin_config.get("trace_concurrency"),
+        market_branch=str(plugin_config.get("market_branch") or "").strip() or None,
     )
 
     # 数据集的 hub_file 类型字段名（执行包通道）：行值即任务内镜像目录

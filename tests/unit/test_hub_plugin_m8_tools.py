@@ -7,7 +7,7 @@ simulation_run_status（HTTP 客户端桩替换，仿 test_hub_plugin_execution_
   回放留指标与 trial 概要（turns_omitted 计数口径）、running 态无 result
   原样返回、非 dict 响应不炸；
 - manifest 接线：三工具进 TOOL_ROUTES 与 build_tool_decls、
-  simulation_run_status 挂后处理、工具总数 28（v1.5.0 契约）。
+  simulation_run_status 挂后处理、路由总数 28（v1.6.0 契约）。
 """
 import pytest
 
@@ -16,6 +16,7 @@ import hubkit
 from app.hub_plugin import manifest
 from app.hub_plugin.manifest import (
     PLUGIN_VERSION,
+    TOOL_GROUPS,
     TOOL_ROUTES,
     build_tool_decls,
     postprocess_of,
@@ -197,8 +198,8 @@ def test_manifest_declares_m8_tools():
 
 
 def test_manifest_tool_count_matches_version_contract():
-    """v1.5.0 契约 = 28 个工具：声明与路由一一对应（中台同版本号契约不可变）。"""
+    """v1.6.0 契约 = 28 条路由收拢为 20 个工具：声明与工具面对应（中台同版本号契约不可变）。"""
     decls = {t.name for t in build_tool_decls()}
-    assert decls == set(TOOL_ROUTES)
+    assert decls == set(TOOL_GROUPS)
     assert len(TOOL_ROUTES) == 28
-    assert PLUGIN_VERSION == "1.5.0"
+    assert PLUGIN_VERSION == "1.6.0"

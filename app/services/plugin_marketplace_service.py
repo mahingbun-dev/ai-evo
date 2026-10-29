@@ -13,12 +13,14 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 from urllib.parse import quote, urlparse, urlunparse
 
 from sqlalchemy import func
@@ -37,6 +39,13 @@ GIT_TIMEOUT = 300  # 单次 git 命令超时（秒）
 # 评测期懒加载节流窗口：同一市场在窗口内已同步过就跳过 fetch（避免连续评测重复拉
 # 同一仓库）。置 0 = 每次评测都拉。可经 PLUGIN_MARKET_LAZY_SYNC_INTERVAL 覆盖。
 LAZY_SYNC_MIN_INTERVAL = 60
+
+# 分支副本根目录（市场根目录下的 branches/{market_id}/{编码后的分支名}）：
+# 同一市场的不同分支各自一份浅克隆，互不干扰，可并行评测。
+BRANCH_DIR_NAME = "branches"
+
+# 分支名白名单：只允许 git 引用名里的常规字符，且不得以 - 开头（防被 git 当作选项）
+_BRANCH_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 
 
 class MarketplaceError(Exception):
@@ -116,6 +125,151 @@ def _fetch_and_reset(repo_dir: Path, branch: str, git_url: str = "") -> None:
         args.append(branch)
     _run_git(args, cwd=str(repo_dir))
     _run_git(["reset", "--hard", "FETCH_HEAD"], cwd=str(repo_dir))
+
+
+# ---------------------------------------------------------------------------
+# 分支副本（评测时可选分支）
+# ---------------------------------------------------------------------------
+
+
+def _branch_base_dir() -> Path:
+    """分支副本根目录（随 MARKETPLACE_BASE_DIR 动态解析，便于测试替换）"""
+    return MARKETPLACE_BASE_DIR / BRANCH_DIR_NAME
+
+
+def validate_branch_name(branch: str) -> str:
+    """校验并规范化分支名（空串表示默认分支）
+
+    分支名会拼进目录名并作为 git 参数：只接受常规引用字符，拒绝 `..`、`//`、
+    结尾 `.` 与 `.lock` 后缀，避免目录穿越或非法引用。
+    """
+    name = (branch or "").strip()
+    if not name:
+        return ""
+    if (
+        not _BRANCH_NAME_RE.match(name)
+        or ".." in name
+        or "//" in name
+        or name.endswith(".")
+        or name.endswith(".lock")
+    ):
+        raise MarketplaceError(f"分支名不合法: {branch}")
+    return name
+
+
+def _branch_dir(market_id: int, branch: str) -> Path:
+    """分支副本目录：branches/{market_id}/{URL 编码后的分支名}
+
+    分支名里的 `/` 编码成 `%2F`，保证每个分支只占一层目录。
+    """
+    return _branch_base_dir() / str(market_id) / quote(branch, safe="")
+
+
+@contextmanager
+def _branch_lock(market_id: int, branch: str) -> Iterator[None]:
+    """分支级跨进程互斥锁（flock）：并发首次拉同一分支时只允许一个进程克隆
+
+    flock 按打开的文件描述加锁，同一进程内不同线程各自 open 也会互斥。
+    不支持 fcntl 的平台降级为无锁（部署机为 Linux，不受影响）。
+    """
+    lock_dir = _branch_base_dir() / str(market_id)
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / f".{quote(branch, safe='')}.lock"
+    with open(lock_path, "w", encoding="utf-8") as handle:
+        try:
+            import fcntl
+        except ImportError:
+            yield
+            return
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _ensure_branch_copy(market: PluginMarketplace, branch: str) -> Path:
+    """确保该分支有一份本地副本并返回目录（已存在则直接复用，不再拉取）
+
+    并发口径：
+    - 不同分支 = 不同目录、各自浅克隆，多个用户并行评测互不影响；
+    - 同一分支首次并发：flock 串行化，先到的克隆，后到的直接复用同一份；
+    - 副本建好后不再改写（评测只读），同一分支的并发评测共享它是安全的。
+    """
+    name = validate_branch_name(branch)
+    if not name:
+        raise MarketplaceError("分支副本需要指定分支名")
+    dest = _branch_dir(int(market.id), name)
+    if (dest / ".git").exists():
+        return dest.resolve()
+
+    with _branch_lock(int(market.id), name):
+        if (dest / ".git").exists():  # 另一进程已在本锁期间建好
+            return dest.resolve()
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.parent / (
+            f".tmp-{quote(name, safe='')}-{os.getpid()}-{int(time.time() * 1000)}"
+        )
+        shutil.rmtree(tmp, ignore_errors=True)
+        try:
+            _clone_marketplace(market.git_url, name, tmp)
+            if dest.exists():
+                shutil.rmtree(dest, ignore_errors=True)
+            os.replace(tmp, dest)
+        except MarketplaceError as e:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise MarketplaceError(f"分支「{name}」拉取失败: {e}")
+        except Exception:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise
+
+    logger.info(f"[插件市场] 市场 {market.id}({market.name}) 已拉取分支 {name} → {dest}")
+    return dest.resolve()
+
+
+def _remote_default_branch(url: str) -> str:
+    """远端默认分支名（ls-remote --symref HEAD）；取不到返回空串"""
+    try:
+        output = _run_git(["ls-remote", "--symref", url, "HEAD"])
+    except MarketplaceError as e:
+        logger.warning(f"[插件市场] 读取远端默认分支失败: {e}")
+        return ""
+    for line in output.splitlines():
+        if not line.startswith("ref: ") or not line.endswith("\tHEAD"):
+            continue
+        ref = line[len("ref: "):].split("\t", 1)[0]
+        prefix = "refs/heads/"
+        if ref.startswith(prefix):
+            return ref[len(prefix):]
+    return ""
+
+
+def list_marketplace_branches(db, market_id: int) -> List[Dict[str, Any]]:
+    """列出远端全部分支（默认分支置顶），并标注哪些分支已有本地副本"""
+    market = _get_market(db, market_id)
+    url = _git_credential_url(market.git_url)
+    output = _run_git(["ls-remote", "--heads", url])
+    # 「默认分支」= 市场登记的分支（空则远端 HEAD）：留空选择时用的就是这一份本地副本
+    default_branch = (market.branch or "").strip() or _remote_default_branch(url)
+
+    branches: List[Dict[str, Any]] = []
+    for line in output.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 2:
+            continue
+        sha, ref = parts
+        prefix = "refs/heads/"
+        if not ref.startswith(prefix):
+            continue
+        name = ref[len(prefix):]
+        branches.append({
+            "name": name,
+            "commit": sha[:12],
+            "is_default": name == default_branch,
+            "cached": (_branch_dir(market.id, name) / ".git").exists(),
+        })
+    branches.sort(key=lambda item: (not item["is_default"], item["name"]))
+    return branches
 
 
 def _to_record(market: PluginMarketplace) -> Dict[str, Any]:
@@ -234,11 +388,12 @@ def sync_marketplace(db, market_id: int) -> Dict[str, Any]:
 
 
 def delete_marketplace(db, market_id: int) -> Dict[str, Any]:
-    """删除市场记录并清理本地克隆目录"""
+    """删除市场记录并清理本地克隆目录（含各分支副本）"""
     market = _get_market(db, market_id)
     record = _to_record(market)
     if market.local_path:
         shutil.rmtree(market.local_path, ignore_errors=True)
+    shutil.rmtree(_branch_base_dir() / str(market_id), ignore_errors=True)
     db.delete(market)
     db.commit()
     logger.info(f"[插件市场] 已删除市场 {market_id}({record['name']})")
@@ -374,18 +529,26 @@ def _list_by_scan(local_path: Path) -> List[Dict[str, Any]]:
     return items
 
 
-def list_marketplace_plugins(db, market_id: int) -> List[Dict[str, Any]]:
+def list_marketplace_plugins(
+    db, market_id: int, branch: Optional[str] = None
+) -> List[Dict[str, Any]]:
     """列出市场中可评测的插件/skill（评测对象候选）
 
     顺序：marketplace.json 声明顺序，插件条目后紧跟其 skill 级条目
     （插件级仅静态层、skill 级可深度评，两类都要能选）。
+    ``branch`` 非空时从该分支的独立副本读取（首次会拉取该分支），
+    留空沿用市场默认分支的本地副本。
     """
     market = _get_market(db, market_id)
-    if market.sync_status != "ok" or not market.local_path:
-        raise MarketplaceError(f"市场尚未同步成功，请先同步: {market.name}")
-    local_path = Path(market.local_path)
-    if not local_path.is_dir():
-        raise MarketplaceError(f"市场本地目录缺失，请重新同步: {market.local_path}")
+    branch_name = validate_branch_name(branch or "")
+    if branch_name:
+        local_path = _ensure_branch_copy(market, branch_name)
+    else:
+        if market.sync_status != "ok" or not market.local_path:
+            raise MarketplaceError(f"市场尚未同步成功，请先同步: {market.name}")
+        local_path = Path(market.local_path)
+        if not local_path.is_dir():
+            raise MarketplaceError(f"市场本地目录缺失，请重新同步: {market.local_path}")
 
     items = _list_from_marketplace_json(local_path)
     if not items:
@@ -451,25 +614,42 @@ def refresh_marketplace_if_stale(
 
 
 def prepare_market_plugin_for_eval(
-    market_id: int, source: str, min_interval: Optional[float] = None
+    market_id: int,
+    source: str,
+    min_interval: Optional[float] = None,
+    branch: Optional[str] = None,
 ) -> Dict[str, Any]:
     """评测执行期入口：懒加载同步 → 路径解析 → 版本锚点
 
     market_id + source 相对路径 → 本地插件目录绝对路径（防目录穿越），并在评测
     开始前把本地副本更新到远端最新（节流 + 失败降级，见 refresh_marketplace_if_stale）。
     市场不存在/未克隆/目录缺失/路径非法均抛 MarketplaceError。
+
+    ``branch`` 非空时改从该分支的独立副本解析：不同分支各用一份浅克隆（可并行
+    评测），该分支已有副本则直接复用、不再拉取（见 _ensure_branch_copy）。
     """
     db = SessionLocal()
     try:
         market = _get_market(db, market_id)
-        refresh = refresh_marketplace_if_stale(db, market, min_interval=min_interval)
+        branch_name = validate_branch_name(branch or "")
 
-        if not market.local_path:
-            raise MarketplaceError(f"市场尚未克隆: {market.name}")
-        local_path = Path(market.local_path)
-        if not local_path.is_dir():
-            raise MarketplaceError(f"市场本地目录缺失，请先同步市场: {market.name}")
-        target = _safe_resolve(local_path, source)
+        if branch_name:
+            repo_root = _ensure_branch_copy(market, branch_name)
+            refresh = {
+                "refreshed": False,
+                "stale": False,
+                "age_seconds": None,
+                "error": "",
+            }
+        else:
+            refresh = refresh_marketplace_if_stale(db, market, min_interval=min_interval)
+            if not market.local_path:
+                raise MarketplaceError(f"市场尚未克隆: {market.name}")
+            repo_root = Path(market.local_path)
+            if not repo_root.is_dir():
+                raise MarketplaceError(f"市场本地目录缺失，请先同步市场: {market.name}")
+
+        target = _safe_resolve(repo_root, source)
         if target is None:
             raise MarketplaceError(f"市场内未找到插件目录「{source}」，请重新同步市场后重试")
 
@@ -477,9 +657,11 @@ def prepare_market_plugin_for_eval(
             "path": str(target),
             "market_id": market.id,
             "market_name": market.name,
-            "branch": market.branch or "",
+            "branch": branch_name or (market.branch or ""),
+            "branch_selected": branch_name,
+            "repo_root": str(repo_root),
             "source": source,
-            "commit": _head_commit(local_path),
+            "commit": _head_commit(repo_root),
             "stale": refresh["stale"],
             "refreshed": refresh["refreshed"],
             "refresh_error": refresh["error"],

@@ -760,6 +760,21 @@ class EvaluationTaskService:
             if source == "marketplace" and not str(plugin_config.get("market_plugin") or "").strip():
                 raise ValueError("marketplace 来源必须指定 market_plugin（市场内插件路径）")
 
+        market_branch = plugin_config.get("market_branch")
+        if market_branch is not None:
+            if not isinstance(market_branch, str):
+                raise ValueError("plugin_config.market_branch 必须是字符串")
+            if market_branch.strip():
+                from app.services.plugin_marketplace_service import (
+                    MarketplaceError,
+                    validate_branch_name,
+                )
+
+                try:
+                    validate_branch_name(market_branch)
+                except MarketplaceError as e:
+                    raise ValueError(str(e))
+
         if source == "trace":
             # trace 口径的深度由服务端固定（合并口径：模型判定=standard 静态 + LLM 评审，
             # 离线判定=quick 仅静态），与「综合分口径的深度」无关，

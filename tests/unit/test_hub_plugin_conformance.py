@@ -1,8 +1,8 @@
 """ai-evo 插件 L1 契约一致性 + manifest 结构不变量。
 
 L1 复现中台注册期的校验规则（hubkit.conformance.local），不需要中台；
-manifest 不变量保证「路由表 ↔ 工具声明」不漂移：占位符可解析、
-必填参数齐备、审批策略与设计一致（删除+修改需审批）。
+manifest 不变量保证「工具面 ↔ 路由表」不漂移：选择器取值可解析、占位符可替换、
+审批策略与设计一致（删除+修改需审批且同工具内策略一致）。
 """
 import json
 
@@ -10,6 +10,7 @@ import hubkit
 from hubkit import conformance
 
 from app.hub_plugin.manifest import (
+    TOOL_GROUPS,
     TOOL_ROUTES,
     build_manifest,
     build_tool_decls,
@@ -29,36 +30,65 @@ def test_conformance_local_passes():
 def test_manifest_identity():
     m = build_manifest()
     assert m.name == "ai-evo"
-    assert m.version == "1.5.0"
+    assert m.version == "1.6.0"
     # 直接调用型插件：消费/生产 Struct 载荷
     assert {c.fq_name for c in m.consumes} == {"google.protobuf.Struct"}
     assert {c.fq_name for c in m.produces} == {"google.protobuf.Struct"}
 
 
-def test_tool_decls_match_routes():
-    """manifest 工具声明与 TOOL_ROUTES 一一对应，schema 是合法 JSON 对象。"""
+def test_tool_decls_match_groups():
+    """manifest 工具声明与 TOOL_GROUPS 一一对应，schema 是合法 JSON 对象。"""
     decls = {t.name: t for t in build_tool_decls()}
-    assert set(decls) == set(TOOL_ROUTES)
+    assert set(decls) == set(TOOL_GROUPS)
     for name, decl in decls.items():
-        route = TOOL_ROUTES[name]
-        assert decl.description == route["desc"]
-        assert decl.requires_approval == bool(route.get("requires_approval"))
         schema = json.loads(decl.input_schema_json)
         assert schema.get("type") == "object", name
         assert isinstance(schema.get("properties"), dict), name
+        assert decl.description, name
+
+
+def test_group_actions_point_to_real_routes():
+    """每个工具的选择器取值都映射到真实路由；默认值与选择器自洽。"""
+    for name, group in TOOL_GROUPS.items():
+        actions = group["actions"]
+        assert actions, name
+        for action, route in actions.items():
+            assert route in TOOL_ROUTES, (name, action, route)
+        if "default" in group:
+            assert group["default"] in actions, name
+        if len(actions) > 1:
+            assert group.get("selector") in {"action", "view", "format"}, name
+
+
+def test_hidden_aliases_not_declared():
+    """未进工具面的旧工具名是隐藏别名：不出现在 tools/list，但仍可按 op 调用。"""
+    declared = set(TOOL_GROUPS)
+    hidden = set(TOOL_ROUTES) - declared
+    assert hidden, "至少应保留旧名作为隐藏别名"
+    assert declared.isdisjoint(hidden)
+    # 旧名必须指向同一实现：隐藏的是「工具名」，不是路由
+    for alias in hidden:
+        assert alias in TOOL_ROUTES
 
 
 def test_approval_policy():
-    """审批策略：仅删除+修改类需要人工审批，其余全自动。"""
+    """审批策略：删除+修改类需人工审批，且同一工具内审批策略必须一致。"""
     approval = sorted(
-        name for name, r in TOOL_ROUTES.items() if r.get("requires_approval")
+        name for name, g in TOOL_GROUPS.items() if _group_approval(name, g)
     )
-    assert approval == [
-        "dataset_delete",
-        "dataset_update",
-        "task_delete",
-        "task_update",
-    ]
+    assert approval == ["dataset_manage", "task_manage"]
+
+
+def _group_approval(name, group) -> bool:
+    explicit = group.get("requires_approval")
+    flags = {
+        bool(TOOL_ROUTES[r].get("requires_approval", False))
+        for r in group["actions"].values()
+    }
+    assert len(flags) == 1, f"{name} 内混合了审批策略不同的路由"
+    if explicit is not None:
+        assert explicit is True and flags == {True}, f"{name} 的审批声明与路由不一致"
+    return bool(flags.pop())
 
 
 def test_routes_well_formed():

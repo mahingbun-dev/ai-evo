@@ -96,7 +96,8 @@ def derive_row_status(result: Dict[str, Any]) -> str:
 
     - row_status=="judge_failed" 透传（W2 评分口径合入后由执行器打标，
       本分支先行识别，保证 W3 续跑跳过语义与 W2 对齐）；
-    - success=True → completed（含空值校验 0 分行：已完成评测，续跑重跑结果相同）；
+    - success=True → completed（含空输入行：W4 起其 average_score=None
+      不进任务均分，但行本身已执行完成，续跑重跑结果相同）；
     - 其余 → failed（含模型调用失败、on_fail=abort、停止产物行：续跑重跑）。
       W12-3 的 pre_script_failed 行（脚本输出缺失，success=False）落在此分支：
       落库为 failed 可断点续跑重跑，脚本修复后重跑即可恢复。

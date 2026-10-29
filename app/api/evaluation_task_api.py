@@ -1551,14 +1551,14 @@ def export_result_history_version(
 ):
     """把单次执行结果渲染成文档并上传 anc-hub file-store，返回 file_id（W9：对象级归属校验）
 
-    插件 task_execution_export 工具的入口：markdown 为全量人读报告（failed/stopped
-    只出失败简报），json 为无损结构。M3 QE3-2：safety 任务的 markdown 自动切换为
-    「安全评测报告（合规证据）」模板（检查项对齐《生成式人工智能服务安全基本
-    要求》类目命名 → 结果 → 证据 → 复测建议），并可显式 format=xlsx 导出三工作表
-    证据工作簿（检查项汇总/违规证据/复测建议），作为门禁材料外发。同版本同格式
-    幂等——exported_files 已登记的 file_id 直接复用（cached=true），不重复上传。
-    上传以调用者平台登录态（平台登录态 Cookie，名由 HUB_SSO_COOKIE_NAME 配置）执行，
-    file-store 侧落调用者身份审计。
+    插件 task_execution_detail（action=export；隐藏别名 task_execution_export）的入口：
+    markdown 为全量人读报告（failed/stopped 只出失败简报），json 为无损结构。
+    M3 QE3-2：safety 任务的 markdown 自动切换为「安全评测报告（合规证据）」模板
+    （检查项对齐《生成式人工智能服务安全基本要求》类目命名 → 结果 → 证据 → 复测建议），
+    并可显式 format=xlsx 导出三工作表证据工作簿（检查项汇总/违规证据/复测建议），
+    作为门禁材料外发。同版本同格式幂等——exported_files 已登记的 file_id 直接复用
+    （cached=true），不重复上传。上传以调用者平台登录态（平台登录态 Cookie，
+    名由 HUB_SSO_COOKIE_NAME 配置）执行，file-store 侧落调用者身份审计。
     """
     from types import SimpleNamespace
 

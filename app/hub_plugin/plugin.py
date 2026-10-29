@@ -17,11 +17,14 @@ from .client import AievoApiError, AievoClient
 from .manifest import (
     PLUGIN_NAME,
     PLUGIN_VERSION,
+    SELECTOR_KEYS,
+    TOOL_GROUPS,
     TOOL_ROUTES,
-    _OPS,
     build_manifest,
+    group_actions,
     postprocess_of,
-    resolve_op,
+    resolve_dispatch,
+    sibling_param_keys,
 )
 
 # hub 侧登录闸门通过后才会注入的 meta 键（见 plugin-hub 仓库 hub-core/src/auth.rs，开源与企业中台同键名）
@@ -33,7 +36,7 @@ DEFAULT_TIMEOUT_SECONDS = 30.0
 
 
 class AievoHubPlugin(hubkit.Plugin):
-    """把 ai-evo 的 25 个核心操作暴露为 anc-hub MCP 工具。"""
+    """把 ai-evo 的核心操作暴露为 anc-hub MCP 工具（20 个工具，28 条路由）。"""
 
     def __init__(self) -> None:
         self._base = os.environ.get("AIEVO_API_BASE", DEFAULT_API_BASE).rstrip("/")
@@ -55,18 +58,20 @@ class AievoHubPlugin(hubkit.Plugin):
         if not is_json:
             return hubkit.invalid(hubkit.issue("payload", "载荷必须是 JSON 对象"))
 
-        op = resolve_op(env.meta, payload or {})
-        if op is None:
+        tool, op = resolve_dispatch(env.meta, payload or {})
+        if tool is None:
             return hubkit.invalid(
                 hubkit.issue(
                     "payload",
                     f"无法确定要调用的工具：meta 里没有 hub.tool，载荷里也没有 op。"
-                    f"已知工具：{sorted(_OPS)}",
+                    f"已知工具：{sorted(TOOL_GROUPS)}",
                 )
             )
-        if op not in _OPS:
+        if op is None:
+            actions = group_actions(tool)
+            hint = f"，可选 {tool}.action/view ∈ {actions}" if actions else ""
             return hubkit.invalid(
-                hubkit.issue("payload", f"未知的工具 {op!r}，已知：{sorted(_OPS)}")
+                hubkit.issue("payload", f"未知的工具或动作 {tool!r}{hint}")
             )
         return hubkit.valid()
 
@@ -75,7 +80,7 @@ class AievoHubPlugin(hubkit.Plugin):
     def handle(self, ctx: Any, env: envelope_pb2.Envelope) -> envelope_pb2.Envelope:
         payload, _ = hubkit.payload_json(env)
         payload = payload or {}
-        op = resolve_op(env.meta, payload) or ""
+        tool, op = resolve_dispatch(env.meta, payload)
 
         mas_token = (env.meta.get(MAS_TOKEN_META) or "").strip()
         if not mas_token:
@@ -86,7 +91,7 @@ class AievoHubPlugin(hubkit.Plugin):
                     "success": False,
                     "error_code": "login_required",
                     "plugin": PLUGIN_NAME,
-                    "tool": op,
+                    "tool": tool or "",
                     "message": (
                         "缺少平台登录态：请先经 anc-hub 登录（auth__login，或在 MCP "
                         "客户端配置 Authorization: Bearer <平台token>）后再调用 ai-evo 工具"
@@ -94,25 +99,31 @@ class AievoHubPlugin(hubkit.Plugin):
                 },
             )
 
-        route = TOOL_ROUTES.get(op)
+        route = TOOL_ROUTES.get(op) if op else None
         if route is None:
             # 正常链路走不到这里（validate 已拦），防御性兜底：不给中台记 INTERNAL
+            actions = group_actions(tool) if tool else []
+            hint = f"，可选 {tool}.action/view ∈ {actions}" if actions else ""
             return hubkit.with_payload_json(
                 env,
                 {
                     "success": False,
                     "error_code": "unknown_tool",
                     "plugin": PLUGIN_NAME,
-                    "tool": op or "",
-                    "message": f"未知的工具 {op!r}，已知：{sorted(_OPS)}",
+                    "tool": tool or "",
+                    "message": f"未知的工具或动作 {tool!r}{hint}，已知：{sorted(TOOL_GROUPS)}",
                 },
             )
 
-        built = _build_request(route, payload)
+        built = _build_request(
+            route,
+            payload,
+            drop_keys=sibling_param_keys(tool, op) if tool else frozenset(),
+        )
         if isinstance(built, dict):
             # 参数缺失的错误卡（补齐与其他卡一致的标识字段）
             built.setdefault("plugin", PLUGIN_NAME)
-            built.setdefault("tool", op)
+            built.setdefault("tool", tool or op)
             return hubkit.with_payload_json(env, built)
 
         method, path, query, body = built
@@ -130,7 +141,7 @@ class AievoHubPlugin(hubkit.Plugin):
                     "success": False,
                     "error_code": e.error_code,
                     "plugin": PLUGIN_NAME,
-                    "tool": op,
+                    "tool": tool or op,
                     "message": e.message,
                 },
             )
@@ -147,7 +158,7 @@ class AievoHubPlugin(hubkit.Plugin):
                     "success": False,
                     "error_code": "login_invalid",
                     "plugin": PLUGIN_NAME,
-                    "tool": op,
+                    "tool": tool or op,
                     "message": "平台登录态无效或已过期（ai-evo 返回 401），请重新登录后重试",
                     "http_status": status,
                 },
@@ -166,7 +177,7 @@ class AievoHubPlugin(hubkit.Plugin):
             "http_status": status,
             "plugin": PLUGIN_NAME,
             "version": PLUGIN_VERSION,
-            "tool": op,
+            "tool": tool or op,
             "data": data,
         }
         return hubkit.with_payload_json(env, result)
@@ -199,13 +210,24 @@ def _normalize_value(value: Any) -> Any:
     return value
 
 
-def _build_request(route: Dict[str, Any], payload: Dict[str, Any]):
-    """按 route 把 payload 拼成 (method, path, query, body)；参数缺失返回错误卡。"""
+def _build_request(
+    route: Dict[str, Any],
+    payload: Dict[str, Any],
+    drop_keys: frozenset[str] = frozenset(),
+):
+    """按 route 把 payload 拼成 (method, path, query, body)；参数缺失返回错误卡。
+
+    ``drop_keys`` 是合并工具里属于兄弟动作的参数键，必须在拼装前摘掉。
+    """
     method = route["method"]
     path = route["path"]
 
     params = {k: _normalize_value(v) for k, v in payload.items()}
     params.pop("op", None)
+    for key in SELECTOR_KEYS:
+        params.pop(key, None)
+    for key in drop_keys:
+        params.pop(key, None)
 
     for key in route.get("path_params", []):
         value = params.pop(key, None)

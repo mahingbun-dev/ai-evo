@@ -435,3 +435,146 @@ def test_manifest_declares_hub_import_script_id():
     props = TOOL_ROUTES["dataset_import_hub_files"]["schema"]["properties"]
     assert "script_id" in props
     assert props["script_id"]["type"] == "string"
+
+
+# ── 工具面合并：选择器分发 ─────────────────────────────────────────
+
+
+def test_validate_rejects_unknown_action():
+    plugin = AievoHubPlugin()
+    resp = plugin.validate(None, make_env({"task_id": "t1", "action": "drop"},
+                                          {"hub.tool": "task_run"}))
+    assert not resp.valid
+    assert any("task_run" in i.message for i in resp.issues)
+
+
+def test_task_run_default_action_is_run():
+    fake = FakeClient(status=200, data={})
+    env = make_env({"task_id": "t1"}, {"hub.tool": "task_run", "hub.mas_token": "tok"})
+    out = payload_of(make_plugin(fake).handle(None, env))
+    assert out["success"] is True
+    assert fake.calls[0]["path"] == "/api/v1/evaluation/tasks/t1/run"
+
+
+def test_task_run_stop_routes_to_stop_endpoint():
+    fake = FakeClient(status=200, data={})
+    env = make_env({"task_id": "t1", "action": "stop"},
+                   {"hub.tool": "task_run", "hub.mas_token": "tok"})
+    out = payload_of(make_plugin(fake).handle(None, env))
+    assert out["tool"] == "task_run"
+    call = fake.calls[0]
+    assert call["path"] == "/api/v1/evaluation/tasks/t1/stop"
+    assert call["json_body"] is None
+
+
+def test_dataset_query_views_route_correctly():
+    cases = {
+        "list": ({"skip": 1}, "/api/v1/evaluation/datasets"),
+        "detail": ({"dataset_id": "d1"}, "/api/v1/evaluation/datasets/d1"),
+        "rows": ({"dataset_id": "d1", "limit": 5}, "/api/v1/evaluation/datasets/d1/data/v2"),
+    }
+    for view, (payload, path) in cases.items():
+        fake = FakeClient(status=200, data={})
+        env = make_env({**payload, "view": view},
+                       {"hub.tool": "dataset_query", "hub.mas_token": "tok"})
+        out = payload_of(make_plugin(fake).handle(None, env))
+        assert out["success"] is True, view
+        assert fake.calls[0]["path"] == path, view
+
+
+def test_selector_not_leaked_into_request():
+    """选择器参数只用于分发，绝不能拼进 query 或 body。"""
+    fake = FakeClient(status=200, data={})
+    env = make_env({"job_id": "j1", "view": "job"},
+                   {"hub.tool": "hub_import_query", "hub.mas_token": "tok"})
+    make_plugin(fake).handle(None, env)
+    call = fake.calls[0]
+    assert call["path"] == "/api/v1/hub-import-jobs/j1"
+    assert call["params"] == {}
+    assert call["json_body"] is None
+
+
+def test_sibling_action_params_not_leaked_into_body():
+    """跨动作残留参数不得进请求体：导出时残留的 skip/limit、查文件时残留的 job_id。"""
+    fake = FakeClient(status=200, data={})
+    env = make_env(
+        {"task_id": "t7", "execution_number": 2, "action": "export",
+         "format": "json", "skip": 10, "limit": 5},
+        {"hub.tool": "task_execution_detail", "hub.mas_token": "tok"},
+    )
+    make_plugin(fake).handle(None, env)
+    assert fake.calls[0]["json_body"] == {"format": "json"}
+
+    fake = FakeClient(status=200, data={})
+    env = make_env(
+        {"view": "files", "job_id": "stale-job", "name_like": "x"},
+        {"hub.tool": "hub_import_query", "hub.mas_token": "tok"},
+    )
+    make_plugin(fake).handle(None, env)
+    assert fake.calls[0]["json_body"] == {"name_like": "x"}
+
+
+def test_single_action_tool_keeps_free_form_body():
+    """单动作工具不做白名单裁剪：未声明字段仍原样透传（如 task_create 的高级字段）。"""
+    fake = FakeClient(status=200, data={})
+    env = make_env(
+        {"name": "n", "evaluation_type": "judge", "judge_engine": "graph", "steps": ["a"]},
+        {"hub.tool": "task_create", "hub.mas_token": "tok"},
+    )
+    make_plugin(fake).handle(None, env)
+    assert fake.calls[0]["json_body"]["judge_engine"] == "graph"
+    assert fake.calls[0]["json_body"]["steps"] == ["a"]
+
+
+def test_task_get_logs_view_routes_to_logs():
+    fake = FakeClient(status=200, data=[])
+    env = make_env({"task_id": "t1", "view": "logs", "level": "error", "limit": 30},
+                   {"hub.tool": "task_get", "hub.mas_token": "tok"})
+    payload_of(make_plugin(fake).handle(None, env))
+    call = fake.calls[0]
+    assert call["path"] == "/api/v1/evaluation/tasks/t1/logs"
+    assert call["params"] == {"level": "error", "limit": 30}
+
+
+def test_task_execution_detail_export_action():
+    fake = FakeClient(status=200, data={"file_id": "f1"})
+    env = make_env(
+        {"task_id": "t7", "execution_number": 2, "action": "export", "format": "json"},
+        {"hub.tool": "task_execution_detail", "hub.mas_token": "tok"},
+    )
+    payload_of(make_plugin(fake).handle(None, env))
+    call = fake.calls[0]
+    assert call["method"] == "POST"
+    assert call["path"] == "/api/v1/evaluation/results/t7/history/2/export"
+    assert call["json_body"] == {"format": "json"}
+
+
+def test_task_manage_delete_action_uses_delete_method():
+    fake = FakeClient(status=200, data={})
+    env = make_env({"task_id": "t1", "action": "delete"},
+                   {"hub.tool": "task_manage", "hub.mas_token": "tok"})
+    payload_of(make_plugin(fake).handle(None, env))
+    call = fake.calls[0]
+    assert call["method"] == "DELETE"
+    assert call["path"] == "/api/v1/evaluation/tasks/t1"
+
+
+def test_dataset_manage_update_action_sends_body():
+    fake = FakeClient(status=200, data={})
+    env = make_env({"dataset_id": "d1", "action": "update", "name": "新名"},
+                   {"hub.tool": "dataset_manage", "hub.mas_token": "tok"})
+    payload_of(make_plugin(fake).handle(None, env))
+    call = fake.calls[0]
+    assert call["method"] == "PUT"
+    assert call["json_body"] == {"name": "新名"}
+
+
+def test_hidden_alias_still_callable_via_op():
+    """旧路由名不在工具面，但仍可按 op 调用（invoke_plugin 兜底）。"""
+    fake = FakeClient(status=200, data={})
+    env = make_env({"op": "hub_import_job_status", "job_id": "j9"},
+                   {"hub.mas_token": "tok"})
+    out = payload_of(make_plugin(fake).handle(None, env))
+    assert out["success"] is True
+    assert out["tool"] == "hub_import_job_status"
+    assert fake.calls[0]["path"] == "/api/v1/hub-import-jobs/j9"

@@ -2,7 +2,7 @@
 import logging
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -12,6 +12,7 @@ from app.services.plugin_marketplace_service import (
     MarketplaceError,
     create_marketplace,
     delete_marketplace,
+    list_marketplace_branches,
     list_marketplace_plugins,
     list_marketplaces,
     sync_marketplace,
@@ -59,6 +60,15 @@ def remove_marketplace(market_id: int, db: Session = Depends(get_db)):
     return _biz(delete_marketplace, db, market_id)
 
 
+@router.get("/{market_id}/branches", summary="列出市场远端分支（默认分支置顶）")
+def get_marketplace_branches(market_id: int, db: Session = Depends(get_db)):
+    return _biz(list_marketplace_branches, db, market_id)
+
+
 @router.get("/{market_id}/plugins", summary="列出市场中可评测的插件/skill")
-def get_marketplace_plugins(market_id: int, db: Session = Depends(get_db)):
-    return _biz(list_marketplace_plugins, db, market_id)
+def get_marketplace_plugins(
+    market_id: int,
+    branch: Optional[str] = Query(None, description="分支（空=市场默认分支）"),
+    db: Session = Depends(get_db),
+):
+    return _biz(list_marketplace_plugins, db, market_id, branch)

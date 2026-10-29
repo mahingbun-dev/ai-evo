@@ -361,7 +361,11 @@ export const pluginMarketplaceApi = {
   create: (data) => request.post('/evaluation/plugin-marketplaces', data),
   sync: (id) => request.post(`/evaluation/plugin-marketplaces/${id}/sync`),
   remove: (id) => request.delete(`/evaluation/plugin-marketplaces/${id}`),
-  plugins: (id) => request.get(`/evaluation/plugin-marketplaces/${id}/plugins`)
+  branches: (id) => request.get(`/evaluation/plugin-marketplaces/${id}/branches`),
+  plugins: (id, branch) => request.get(
+    `/evaluation/plugin-marketplaces/${id}/plugins`,
+    branch ? { params: { branch } } : undefined
+  )
 }
 
 // 红队攻击样本库API（M3 安全评测）：列表 + 导入为数据集（可导入可编辑）
