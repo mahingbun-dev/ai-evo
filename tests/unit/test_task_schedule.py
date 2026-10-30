@@ -431,6 +431,33 @@ class TestWeeklyReport:
         assert "通过 1、失败 1" in content
         assert "50.0%" in content  # 门禁通过率 1/2
 
+    def test_push_webhooks_filters_subscriptions(self, stack, monkeypatch):
+        """_push_webhooks 的订阅过滤（回归）：events 是 JSON 列，订阅过滤禁止
+        下推 SQL——通用 LIKE contains 在 PG 上编译为 ``'%' || json`` 拼接，
+        无 || 运算符直接报错（35288cc 部署后周报定时任务实测）。"""
+        from app.services.weekly_report_service import _push_webhooks
+        with stack.session() as db:
+            db.add_all([
+                WebhookEndpoint(id=1, team_code="DEFAULT", name="ok", url="https://e.com/1",
+                                secret="s", events=["weekly.report.ready"], active=True),
+                WebhookEndpoint(id=2, team_code="ALPHA", name="stopped", url="https://e.com/2",
+                                secret="s", events=["weekly.report.ready"], active=False),
+                WebhookEndpoint(id=3, team_code="ALPHA", name="other-event", url="https://e.com/3",
+                                secret="s", events=["task.execution.completed"], active=True),
+                WebhookEndpoint(id=4, team_code="BETA", name="no-events", url="https://e.com/4",
+                                secret="s", events=None, active=True),
+            ])
+            db.commit()
+            dispatched = []
+            monkeypatch.setattr(
+                "app.services.weekly_report_service.dispatch_event",
+                lambda event, team, payload, db=None: dispatched.append(team) or 1)
+            created = _push_webhooks(db, {"week_start": "2026-10-12", "week_end": "2026-10-18",
+                                          "summary": {}, "coverage": {}, "efficiency": {}, "gate": {}})
+        assert created == 1
+        # 停用端点/未订阅端点/events=None 端点都不产生派发
+        assert dispatched == ["DEFAULT"]
+
     def test_generate_if_due_gating_and_idempotent(self, stack, monkeypatch):
         from datetime import date
         # 周一 08:00 生成的是「上一个自然周」的报告：10-19（周一）生成 10-12~18

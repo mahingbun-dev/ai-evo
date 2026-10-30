@@ -152,18 +152,21 @@ def build_weekly_report(db: Session, week_start: date) -> Dict[str, Any]:
 
 
 def _push_webhooks(db: Session, payload: Dict[str, Any]) -> int:
-    """按订阅了周报事件的活跃端点所在团队逐一派发（尊重 webhook 团队隔离）。"""
-    teams = (
-        db.query(WebhookEndpoint.team_code)
-        .filter(
-            WebhookEndpoint.active.is_(True),
-            WebhookEndpoint.events.contains([EVENT_WEEKLY_REPORT]),
-        )
+    """按订阅了周报事件的活跃端点所在团队逐一派发（尊重 webhook 团队隔离）。
+
+    订阅过滤在 Python 侧做（与 dispatch_event 同口径）：events 是 JSON 列，
+    通用 LIKE contains 在 PG 上编译为 ``'%' || events_param::json`` 拼接，
+    无 || 运算符直接报错——订阅过滤不能下推 SQL。
+    """
+    rows = (
+        db.query(WebhookEndpoint.team_code, WebhookEndpoint.events)
+        .filter(WebhookEndpoint.active.is_(True))
         .distinct()
         .all()
     )
+    teams = sorted({team for team, events in rows if EVENT_WEEKLY_REPORT in (events or [])})
     created = 0
-    for (team_code,) in teams:
+    for team_code in teams:
         created += dispatch_event(
             EVENT_WEEKLY_REPORT, team_code,
             {"week_start": payload["week_start"], "week_end": payload["week_end"],
